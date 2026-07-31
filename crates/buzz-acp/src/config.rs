@@ -477,6 +477,22 @@ pub struct CliArgs {
     /// Connect and subscribe before starting the ACP/LLM subprocess pool.
     #[arg(long, env = "BUZZ_ACP_LAZY_POOL", default_value_t = false)]
     pub lazy_pool: bool,
+
+    /// Route project (issue / pull-request) mentions to the agent.
+    ///
+    /// Default OFF. This changes what wakes the harness, so a bug here does not
+    /// produce a wrong answer — it produces an agent that wakes on things it
+    /// should not, or stops waking on things it should, across every channel.
+    /// Default-off keeps the blast radius of a bad release at zero until
+    /// someone opts in, and makes recovery a config change rather than a
+    /// redeploy. Global and orthogonal to channels, hence a top-level option
+    /// rather than a `ChannelFilter` field.
+    #[arg(
+        long,
+        env = "BUZZ_ACP_PROJECT_ROUTING_ENABLED",
+        default_value_t = false
+    )]
+    pub project_routing_enabled: bool,
 }
 
 /// Merged NIP-01 subscription filter for a single channel.
@@ -552,6 +568,11 @@ pub struct Config {
     pub relay_observer: bool,
     /// Whether ACP/LLM subprocess initialization is deferred until accepted work arrives.
     pub lazy_pool: bool,
+    /// Whether project (issue / pull-request) mention routing is enabled.
+    /// Default `false`. While false the harness must open no project
+    /// subscription, run no project discovery, and reconstruct no enrolments —
+    /// channel routing behaves exactly as before.
+    pub project_routing_enabled: bool,
     /// Agent owner pubkey (hex). Used for `--respond-to=owner-only` gate.
     /// Replaces the old REST-based owner lookup.
     pub agent_owner: Option<String>,
@@ -1099,6 +1120,7 @@ impl Config {
             has_generated_codex_config,
             relay_observer: args.relay_observer,
             lazy_pool: args.lazy_pool,
+            project_routing_enabled: args.project_routing_enabled,
             agent_owner: args.agent_owner.map(|s| s.trim().to_ascii_lowercase()),
             no_base_prompt: args.no_base_prompt,
             base_prompt_content,
@@ -1123,7 +1145,7 @@ impl Config {
             format!(" allowed_respond_to=[{}]", modes.join(","))
         };
         format!(
-            "relay={} pubkey={} agent_cmd={} {} mcp_cmd={} idle_timeout={}s max_turn={}s agents={} heartbeat={}s subscribe={:?} dedup={:?} meh={:?} ignore_self={} context_limit={} max_turns_per_session={} presence={} typing={} memory={} model={} permission_mode={} {}{}",
+            "relay={} pubkey={} agent_cmd={} {} mcp_cmd={} idle_timeout={}s max_turn={}s agents={} heartbeat={}s subscribe={:?} dedup={:?} meh={:?} ignore_self={} context_limit={} max_turns_per_session={} presence={} typing={} memory={} model={} permission_mode={} project_routing={} {}{}",
             self.relay_url,
             self.keys.public_key().to_hex(),
             self.agent_command,
@@ -1144,6 +1166,9 @@ impl Config {
             self.memory_enabled,
             self.model.as_deref().unwrap_or("(agent default)"),
             self.permission_mode,
+            // Deployment verification reads this: two independent booleans
+            // (here and in Hermes) do not stay in agreement by good intentions.
+            self.project_routing_enabled,
             respond_to_detail,
             allowed_respond_to_detail,
         )
@@ -1469,6 +1494,7 @@ mod tests {
             has_generated_codex_config: false,
             relay_observer: false,
             lazy_pool: false,
+            project_routing_enabled: false,
             agent_owner: None,
             no_base_prompt: false,
             base_prompt_content: None,
@@ -2179,6 +2205,73 @@ channels = "ALL"
         let args = CliArgs::try_parse_from(["buzz-acp", "--private-key", &key, "--lazy-pool=true"]);
         assert!(args.is_err(), "bool flags do not take an explicit value");
         assert!(CliArgs::parse_from(["buzz-acp", "--private-key", &key, "--lazy-pool"]).lazy_pool);
+    }
+
+    #[test]
+    fn project_routing_defaults_off() {
+        // R1: the rollout gate ships disabled. A default flip here silently
+        // changes what wakes the harness across every channel, so it is
+        // asserted directly rather than inferred from a fixture field.
+        let key = "0".repeat(64);
+        assert!(
+            !CliArgs::parse_from(["buzz-acp", "--private-key", &key]).project_routing_enabled,
+            "project routing must default to disabled"
+        );
+    }
+
+    #[test]
+    fn project_routing_cli_flag_enables_it() {
+        let key = "0".repeat(64);
+        assert!(
+            CliArgs::parse_from([
+                "buzz-acp",
+                "--private-key",
+                &key,
+                "--project-routing-enabled",
+            ])
+            .project_routing_enabled
+        );
+    }
+
+    #[test]
+    fn project_routing_flag_survives_into_config() {
+        // The gate is only real if it reaches `Config`; a parsed-but-dropped
+        // CLI flag would read as enabled and behave as disabled.
+        // `--respond-to` / `--allowed-respond-to` are passed explicitly so an
+        // ambient `BUZZ_ACP_*` value cannot reach clap's env fallback and fail
+        // this test for an unrelated reason — the isolation defect that already
+        // bites two existing tests in this module when run inside a harness.
+        let args = CliArgs::try_parse_from([
+            "buzz-acp",
+            "--private-key",
+            TEST_PRIVATE_KEY,
+            "--respond-to",
+            "owner-only",
+            "--allowed-respond-to",
+            "owner-only,allowlist",
+            "--project-routing-enabled",
+        ])
+        .expect("clap should parse args");
+        let config = Config::from_args(args).expect("config should build");
+        assert!(config.project_routing_enabled);
+    }
+
+    #[test]
+    fn summary_reports_resolved_project_routing_state() {
+        // Deployment verification reads the resolved state out of this line,
+        // so both renderings are pinned.
+        let mut config = test_config(SubscribeMode::Mentions);
+        assert!(
+            config.summary().contains("project_routing=false"),
+            "summary should report project_routing=false, got: {}",
+            config.summary()
+        );
+        config.project_routing_enabled = true;
+        assert!(
+            config.summary().contains("project_routing=true"),
+            "summary should report project_routing=true, got: {}",
+            config.summary()
+        );
     }
 
     #[test]

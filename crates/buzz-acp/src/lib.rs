@@ -7,6 +7,7 @@ mod filter;
 mod observer;
 mod pool;
 mod pool_lifecycle;
+mod project;
 mod queue;
 mod relay;
 mod setup_mode;
@@ -5032,6 +5033,7 @@ mod build_mcp_servers_tests {
             has_generated_codex_config: false,
             relay_observer: false,
             lazy_pool: false,
+            project_routing_enabled: false,
             agent_owner: None,
             no_base_prompt: false,
             base_prompt_content: None,
@@ -5253,6 +5255,7 @@ mod error_outcome_emission_tests {
             has_generated_codex_config: false,
             relay_observer: false,
             lazy_pool: false,
+            project_routing_enabled: false,
             agent_owner: None,
             no_base_prompt: false,
             base_prompt_content: None,
