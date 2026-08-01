@@ -7987,6 +7987,240 @@ mod tests {
         );
     }
 
+    /// **Phase A end to end: relay bytes to the agent's stdin.**
+    ///
+    /// One scenario, not two green halves. The batch the pool claims is the
+    /// batch the relay-byte path produced — nothing here builds a `FlushBatch`,
+    /// a `ProjectOrigin`, or a classification.
+    ///
+    /// ```text
+    /// discovery REQ on a real socket → announcement EVENT on that id
+    /// → enrolment REQ → p-tagged root EVENT on that id
+    /// → authority gate → enrol → queue under the root's UUIDv5
+    /// → queue.flush_next() → pool.try_claim(root key) → run_prompt_task
+    /// → AcpClient drives initialize / session/new / session/prompt
+    /// → the child writes what it received to a capture file
+    /// ```
+    #[tokio::test]
+    async fn phase_a_end_to_end_relay_bytes_reach_the_agents_stdin() {
+        // A protocol stub hanging forever would be a tedious way to end the
+        // night, so the whole scenario is bounded.
+        timeout(Duration::from_secs(60), async {
+            let owner = nostr::Keys::generate();
+            let agent = nostr::Keys::generate();
+            let owner_hex = owner.public_key().to_hex();
+            let agent_hex = agent.public_key().to_hex();
+            let agent_identity =
+                crate::project::AgentIdentity::new(&agent.public_key()).expect("identity");
+
+            let mut state = BgState::new();
+            let (tx, mut rx) = mpsc::channel(16);
+            let mut discovered = crate::project::DiscoveredRepositories::new();
+            let mut enrolments = crate::project::ProjectEnrolments::new();
+            let mut queue = crate::queue::EventQueue::new(crate::config::DedupMode::Queue);
+            let humans = std::collections::BTreeSet::new();
+            let externals = std::collections::BTreeSet::new();
+
+            macro_rules! dispatch_all {
+                () => {{
+                    let mut last = crate::ProjectDispatched::Ignored;
+                    for ev in drain(&mut rx) {
+                        if let BuzzEvent::Project(p) = ev {
+                            let mut d = crate::ProjectDispatch {
+                                identity: crate::project::ProjectIdentity {
+                                    agent: &agent_identity,
+                                    agent_owner: Some(&owner_hex),
+                                    approved_humans: &humans,
+                                    approved_external_agents: &externals,
+                                },
+                                discovered: &mut discovered,
+                                enrolments: &mut enrolments,
+                                queue: &mut queue,
+                            };
+                            last = crate::handle_project_event(&mut d, &p);
+                        }
+                    }
+                    last
+                }};
+            }
+
+            // ── relay bytes in ──────────────────────────────────────────────
+            let (mut ws, _server) = test_ws_pair().await;
+            let discovery_id = crate::project::discovery_sub_id();
+            assert_eq!(
+                send_project_subscribe(&mut ws, &mut state, &discovery_id, discovery_identity())
+                    .await,
+                ProjectSendOutcome::Sent
+            );
+
+            let announcement = EventBuilder::new(
+                nostr::Kind::Custom(buzz_core::kind::KIND_GIT_REPO_ANNOUNCEMENT as u16),
+                "",
+            )
+            .tags([nostr::Tag::parse(["d", "e2e-repo"]).expect("d tag")])
+            .sign_with_keys(&owner)
+            .expect("sign");
+            deliver_frame(&mut state, &discovery_id, &announcement, &tx).await;
+            assert_eq!(dispatch_all!(), crate::ProjectDispatched::DiscoveryChanged);
+
+            let filter = crate::project::enrolment_filter(&discovered, &agent_hex, 0)
+                .expect("enrolment filter");
+            let identity = crate::project::ProjectRequestIdentity::from_filters(
+                crate::project::ProjectSubscription::Enrolment,
+                vec![filter],
+            )
+            .expect("bounded");
+            let enrol_id = crate::project::PROJECT_ENROL_SUB_ID.to_string();
+            assert_eq!(
+                send_project_subscribe(&mut ws, &mut state, &enrol_id, identity).await,
+                ProjectSendOutcome::Sent
+            );
+
+            let coordinate = format!("30617:{owner_hex}:e2e-repo");
+            let body = "the pipeline drops frames after reconnect";
+            let root = EventBuilder::new(
+                nostr::Kind::Custom(buzz_core::kind::KIND_GIT_ISSUE as u16),
+                body,
+            )
+            .tags([
+                nostr::Tag::parse(["a", &coordinate]).expect("a tag"),
+                nostr::Tag::parse(["p", &agent_hex]).expect("p tag"),
+            ])
+            .sign_with_keys(&owner)
+            .expect("sign");
+            deliver_frame(&mut state, &enrol_id, &root, &tx).await;
+
+            let route_key = match dispatch_all!() {
+                crate::ProjectDispatched::Queued { key, queued, .. } => {
+                    assert!(queued, "the root must enter the queue");
+                    key
+                }
+                other => panic!("expected a queued turn, got {other:?}"),
+            };
+
+            // ── the batch the pool claims is the batch the queue produced ────
+            let batch = queue.flush_next().expect("the queued turn flushes");
+            assert_eq!(batch.channel_id, route_key, "flushed under the root key");
+            assert!(
+                batch.project_origin().is_some(),
+                "the flushed batch carries its project origin"
+            );
+
+            // ── a stub agent that speaks just enough ACP ─────────────────────
+            let capture =
+                std::env::temp_dir().join(format!("buzz-acp-e2e-{}.json", Uuid::new_v4()));
+            let _ = std::fs::remove_file(&capture);
+            let stub = format!(
+                r#"
+import sys, json
+cap = open({path:?}, "w")
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    msg = json.loads(line)
+    method = msg.get("method")
+    if method == "session/prompt":
+        cap.write(json.dumps(msg["params"]) + "\n")
+        cap.flush()
+    if "id" not in msg:
+        continue
+    if method == "initialize":
+        result = {{"protocolVersion": 2, "agentCapabilities": {{}},
+                   "agentInfo": {{"name": "buzz-acp-test-stub", "version": "1"}}}}
+    elif method == "session/new":
+        result = {{"sessionId": "project-test-session"}}
+    elif method == "session/prompt":
+        result = {{"stopReason": "end_turn"}}
+    else:
+        result = {{}}
+    sys.stdout.write(json.dumps({{"jsonrpc": "2.0", "id": msg["id"], "result": result}}) + "\n")
+    sys.stdout.flush()
+"#,
+                path = capture.to_string_lossy()
+            );
+            let acp =
+                crate::acp::AcpClient::spawn("python3", &["-c".to_string(), stub], &[], false)
+                    .await
+                    .expect("spawn stub");
+            let mut pool = crate::pool::AgentPool::from_slots(vec![Some(
+                crate::pool::OwnedAgent::for_test(acp),
+            )]);
+
+            // ── the ordinary claim, by root key ──────────────────────────────
+            let claimed = pool
+                .try_claim(Some(route_key))
+                .expect("the pool claims the root-key batch");
+            let (result_tx, mut result_rx) = tokio::sync::mpsc::unbounded_channel();
+            crate::pool::run_prompt_task(
+                claimed,
+                Some(batch),
+                None,
+                std::sync::Arc::new(crate::pool::PromptContext::for_test()),
+                result_tx,
+                None,
+                "e2e-turn".to_string(),
+            )
+            .await;
+
+            let result = result_rx.try_recv().expect("the turn produced a result");
+            assert!(
+                matches!(result.outcome, crate::pool::PromptOutcome::Ok(_)),
+                "the turn must succeed"
+            );
+            assert!(
+                matches!(result.source, crate::pool::PromptSource::Channel(k) if k == route_key),
+                "the turn is attributed to the root's UUIDv5"
+            );
+            pool.return_agent(result.agent);
+            assert!(
+                pool.try_claim(None).is_some(),
+                "the agent slot is returned cleanly and claimable again"
+            );
+
+            // ── what the child was actually told ─────────────────────────────
+            let captured = std::fs::read_to_string(&capture).expect("the stub captured a prompt");
+            let _ = std::fs::remove_file(&capture);
+            assert_eq!(
+                captured.lines().count(),
+                1,
+                "exactly one session/prompt reached the child"
+            );
+            let params: serde_json::Value =
+                serde_json::from_str(captured.trim()).expect("valid prompt params");
+            let text: String = params["prompt"]
+                .as_array()
+                .expect("prompt blocks")
+                .iter()
+                .filter_map(|b| b["text"].as_str())
+                .collect();
+
+            assert!(text.contains(&coordinate), "no repository coordinate");
+            assert!(text.contains(&root.id.to_hex()), "no root event id");
+            assert!(text.contains("issue"), "no issue/PR classification");
+            assert!(text.contains("buzz issues comment"), "no reply command");
+            assert!(
+                text.contains(body),
+                "the triggering event's content is missing"
+            );
+
+            assert!(
+                !text.contains(&format!("Channel: {route_key}")),
+                "the route key is presented as a channel"
+            );
+            assert!(
+                !text.contains("messages send"),
+                "the prompt offers the channel reply command"
+            );
+            assert!(
+                !text.contains("[Context]"),
+                "the prompt carries synthetic channel metadata"
+            );
+        })
+        .await
+        .expect("the end-to-end scenario must not hang");
+    }
+
     /// The flag-off control: no project REQ bytes at all.
     #[test]
     fn the_flag_off_control_writes_no_project_req_bytes() {

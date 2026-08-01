@@ -553,6 +553,67 @@ pub struct PromptContext {
     pub relay_url: String,
 }
 
+#[cfg(test)]
+impl PromptContext {
+    /// A context with every outward dependency pointed at a dead address.
+    ///
+    /// Shared across modules so the end-to-end project test in `relay` can
+    /// drive `run_prompt_task` without rebuilding it. Nothing here is reachable
+    /// in a production build.
+    pub(crate) fn for_test() -> Self {
+        use crate::relay::RestClient;
+        let agent_keys = nostr::Keys::generate();
+        let dead = || RestClient {
+            http: reqwest::Client::new(),
+            base_url: "http://127.0.0.1:0".to_string(),
+            keys: agent_keys.clone(),
+            auth_tag_json: None,
+        };
+        Self {
+            mcp_servers: vec![],
+            initial_message: None,
+            idle_timeout: Duration::from_secs(30),
+            max_turn_duration: Duration::from_secs(60),
+            turn_liveness_interval: Duration::ZERO,
+            dedup_mode: DedupMode::Queue,
+            system_prompt: None,
+            session_title: None,
+            team_instructions: None,
+            heartbeat_prompt: None,
+            base_prompt: None,
+            cwd: ".".to_string(),
+            rest_client: dead(),
+            channel_info: ChannelInfoResolver::new(std::collections::HashMap::new(), dead()),
+            context_message_limit: 0,
+            max_turns_per_session: 0,
+            permission_mode: PermissionMode::Default,
+            agent_keys: agent_keys.clone(),
+            agent_owner_pubkey: None,
+            memory_enabled: false,
+            harness_name: "buzz-acp-test-stub".to_string(),
+            relay_url: "ws://127.0.0.1:0".to_string(),
+        }
+    }
+}
+
+#[cfg(test)]
+impl OwnedAgent {
+    /// Wrap a spawned client as slot 0 with default session state.
+    pub(crate) fn for_test(acp: crate::acp::AcpClient) -> Self {
+        Self {
+            index: 0,
+            acp,
+            state: SessionState::default(),
+            model_capabilities: None,
+            desired_model: None,
+            model_overridden: false,
+            agent_name: "buzz-acp-test-stub".into(),
+            goose_system_prompt_supported: None,
+            protocol_version: 2,
+        }
+    }
+}
+
 impl AgentPool {
     /// Create a pool from pre-indexed slots (may contain None for failed startups).
     ///
@@ -6262,146 +6323,6 @@ mod tests {
         assert_ne!(
             turn_json["totalTokens"], derived_sum,
             "total_tokens must never equal input+output when provider omitted it"
-        );
-    }
-
-    /// **The literal wake.** A queued project batch is claimed from the
-    /// ordinary pool by its root key, and the project prompt reaches a real
-    /// ACP process over the real protocol.
-    ///
-    /// The agent is a stub that speaks just enough ACP — `initialize`,
-    /// `session/new`, `session/prompt` — and writes the prompt it received to a
-    /// file. What is asserted is the content of that file: not what the
-    /// formatter returns, but what the process was actually told.
-    ///
-    /// A helper calling `format_prompt` directly would prove formatting. This
-    /// goes through `pool.try_claim` and `run_prompt_task`, so it proves waking.
-    #[tokio::test]
-    async fn a_queued_project_turn_reaches_a_real_acp_process_as_a_project_prompt() {
-        let captured =
-            std::env::temp_dir().join(format!("buzz-acp-project-prompt-{}.txt", Uuid::new_v4()));
-        let _ = std::fs::remove_file(&captured);
-
-        // Minimal ACP agent: answers the three requests the pool makes and
-        // records the prompt it was given.
-        let stub = format!(
-            r#"
-import sys, json
-out = open({path:?}, "w")
-for line in sys.stdin:
-    line = line.strip()
-    if not line:
-        continue
-    msg = json.loads(line)
-    method = msg.get("method")
-    if method == "session/prompt":
-        for block in msg["params"].get("prompt", []):
-            out.write(block.get("text", ""))
-        out.flush()
-    if "id" not in msg:
-        continue
-    if method == "initialize":
-        result = {{"protocolVersion": 2}}
-    elif method == "session/new":
-        result = {{"sessionId": "stub-session"}}
-    elif method == "session/prompt":
-        result = {{"stopReason": "end_turn"}}
-    else:
-        result = {{}}
-    sys.stdout.write(json.dumps({{"jsonrpc": "2.0", "id": msg["id"], "result": result}}) + "\n")
-    sys.stdout.flush()
-"#,
-            path = captured.to_string_lossy()
-        );
-
-        let acp = AcpClient::spawn("python3", &["-c".to_string(), stub], &[], false)
-            .await
-            .expect("spawn stub acp agent");
-
-        let mut pool = AgentPool::from_slots(vec![Some(OwnedAgent {
-            index: 0,
-            acp,
-            state: SessionState::default(),
-            model_capabilities: None,
-            desired_model: None,
-            model_overridden: false,
-            agent_name: "stub".into(),
-            goose_system_prompt_supported: None,
-            protocol_version: 2,
-        })]);
-
-        // A project batch: route key is the UUIDv5 of the root, and the origin
-        // travels on the event exactly as dispatch puts it there.
-        let owner = "a".repeat(64);
-        let root = "b".repeat(64);
-        let coordinate = format!("30617:{owner}:wake-repo");
-        let origin = crate::project::ProjectOrigin::for_test(&coordinate, &root, false);
-        let route_key = Uuid::new_v4();
-        let event = EventBuilder::new(
-            Kind::Custom(buzz_core::kind::KIND_GIT_ISSUE as u16),
-            "wake up",
-        )
-        .sign_with_keys(&Keys::generate())
-        .expect("sign");
-        let batch = FlushBatch {
-            channel_id: route_key,
-            events: vec![crate::queue::BatchEvent {
-                event,
-                prompt_tag: "@mention".into(),
-                received_at: std::time::Instant::now(),
-                project: Some(origin),
-            }],
-            cancelled_events: vec![],
-            cancel_reason: None,
-        };
-
-        // The ordinary pool claim, by root key. Nothing project-specific here —
-        // that is the point: a project turn is claimed the way any turn is.
-        let agent = pool
-            .try_claim(Some(route_key))
-            .expect("the pool claims a root-key batch");
-
-        let (result_tx, mut result_rx) = mpsc::unbounded_channel();
-        let ctx = Arc::new(make_prompt_context_no_owner());
-        run_prompt_task(
-            agent,
-            Some(batch),
-            None,
-            ctx,
-            result_tx,
-            None,
-            "wake-turn".to_string(),
-        )
-        .await;
-
-        let outcome = result_rx.try_recv().expect("the turn produced a result");
-        assert!(
-            matches!(outcome.source, PromptSource::Channel(k) if k == route_key),
-            "the turn is attributed to the root key it was queued under"
-        );
-
-        let prompt = std::fs::read_to_string(&captured).expect("the stub recorded a prompt");
-        let _ = std::fs::remove_file(&captured);
-
-        assert!(
-            prompt.contains("[Project]"),
-            "the process received no project framing:\n{prompt}"
-        );
-        assert!(
-            prompt.contains(&coordinate),
-            "the process was not told which repository"
-        );
-        assert!(
-            prompt.contains(&root),
-            "the process was not told which root"
-        );
-        assert!(
-            prompt.contains("buzz issues comment"),
-            "the process was not given a way to reply"
-        );
-        assert!(
-            !prompt.contains(&route_key.to_string()),
-            "the process was told its route key was a channel"
         );
     }
 
