@@ -2045,6 +2045,72 @@ impl EnrolmentCandidate {
     }
 }
 
+/// Where a queued project event came from, carried beside the UUIDv5 queue key.
+///
+/// The queue key is a `Uuid` because project events reuse the channel-keyed
+/// queue and session machinery. That reuse is deliberate, but it leaves the key
+/// unable to say what it names: a UUIDv5 derived from a root is
+/// indistinguishable from a real channel UUID by inspection. This type is the
+/// thing that says so, and it travels with the event rather than being looked
+/// up later — a lookup would have to consult something channel-shaped to
+/// resolve a key that names no channel, which is exactly the confusion being
+/// avoided.
+///
+/// **No string constructor.** Both routes take an already-validated source:
+/// [`EnrolmentCandidate`], which only [`validate_enrolment_candidate`]
+/// produces, or a stored [`Enrolment`], which only [`ProjectEnrolments::enrol`]
+/// writes. A `ProjectOrigin` therefore cannot describe a repository binding
+/// that was never validated.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ProjectOrigin {
+    coordinate: String,
+    root: String,
+    is_pull_request: bool,
+}
+
+impl ProjectOrigin {
+    /// From the candidate that just enrolled or reactivated the root.
+    pub(crate) fn from_candidate(candidate: &EnrolmentCandidate) -> Self {
+        Self {
+            coordinate: candidate.coordinate().to_string(),
+            root: candidate.root().to_string(),
+            is_pull_request: candidate.is_pull_request(),
+        }
+    }
+
+    /// From the binding already stored for an enrolled root — the continuation
+    /// case, where no fresh candidate exists because the event is a comment
+    /// rather than a root.
+    pub(crate) fn from_enrolment(root: &str, enrolment: &Enrolment) -> Self {
+        Self {
+            coordinate: enrolment.coordinate.clone(),
+            root: root.to_string(),
+            is_pull_request: enrolment.is_pull_request,
+        }
+    }
+
+    pub(crate) fn coordinate(&self) -> &str {
+        &self.coordinate
+    }
+
+    pub(crate) fn root(&self) -> &str {
+        &self.root
+    }
+
+    pub(crate) fn is_pull_request(&self) -> bool {
+        self.is_pull_request
+    }
+
+    /// How the class reads in a prompt.
+    pub(crate) fn class_noun(&self) -> &'static str {
+        if self.is_pull_request {
+            "pull request"
+        } else {
+            "issue"
+        }
+    }
+}
+
 /// Validate a root event as an enrolment candidate. **Fails closed.**
 ///
 /// Every condition below has to hold, and any one of them failing yields

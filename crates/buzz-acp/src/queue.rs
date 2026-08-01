@@ -49,6 +49,14 @@ pub struct QueuedEvent {
     pub received_at: Instant,
     /// Tag identifying which rule (or mode) matched this event.
     pub prompt_tag: String,
+    /// Set when `channel_id` is a project route key rather than a channel UUID.
+    ///
+    /// `None` for every channel event, which is what keeps the channel path
+    /// byte-for-byte unchanged. When present it carries the validated
+    /// repository binding, so the prompt path can frame a project root without
+    /// resolving the key against anything channel-shaped — the key names no
+    /// channel and that lookup would fail into a fail-closed default.
+    pub project: Option<crate::project::ProjectOrigin>,
 }
 
 /// A single event inside a [`FlushBatch`].
@@ -57,6 +65,17 @@ pub struct BatchEvent {
     pub event: Event,
     pub prompt_tag: String,
     pub received_at: Instant,
+    /// Carried through the batch for the same reason as `prompt_tag`: both
+    /// requeue paths rebuild a [`QueuedEvent`] from a `BatchEvent`, so anything
+    /// not held here is silently lost on the first failed flush. A project
+    /// event that lost its origin would re-enter the queue indistinguishable
+    /// from a channel event under a UUID that names no channel.
+    ///
+    /// Per event rather than per route, matching `prompt_tag`. Every event
+    /// under one route key derives this from the same enrolment, and
+    /// [`crate::project::ProjectEnrolments::enrol`] refuses a binding change
+    /// outright, so the copies cannot legitimately diverge.
+    pub project: Option<crate::project::ProjectOrigin>,
 }
 
 /// Why a batch's prior turn was cancelled — controls how `format_prompt`
@@ -341,6 +360,7 @@ impl EventQueue {
                 event: qe.event,
                 prompt_tag: qe.prompt_tag,
                 received_at: qe.received_at,
+                project: qe.project,
             })
             .collect();
         // Relay replay delivers stored events newest-first (`ORDER BY
@@ -480,6 +500,7 @@ impl EventQueue {
                 event: be.event,
                 prompt_tag: be.prompt_tag,
                 received_at: be.received_at, // preserve original timestamp (#46)
+                project: be.project,
             });
         }
         // Enforce per-channel cap: trim oldest (back) events if requeue pushed
@@ -515,6 +536,7 @@ impl EventQueue {
                 event: be.event,
                 prompt_tag: be.prompt_tag,
                 received_at: be.received_at,
+                project: be.project,
             });
         }
         // Enforce per-channel cap: trim newest (back) events if over limit.
@@ -1647,6 +1669,7 @@ mod tests {
             event: make_event(content),
             received_at: Instant::now(),
             prompt_tag: "test".into(),
+            project: None,
         }
     }
 
@@ -1657,6 +1680,7 @@ mod tests {
             event: make_event(content),
             received_at: Instant::now() - age,
             prompt_tag: "test".into(),
+            project: None,
         }
     }
 
@@ -1677,6 +1701,7 @@ mod tests {
             event,
             received_at: Instant::now(),
             prompt_tag: "test".into(),
+            project: None,
         }
     }
 
@@ -1872,6 +1897,7 @@ mod tests {
                 event,
                 prompt_tag: "@mention".into(),
                 received_at: Instant::now(),
+                project: None,
             }],
             cancelled_events: vec![],
             cancel_reason: None,
@@ -1902,11 +1928,13 @@ mod tests {
                 event: make_event("the new message"),
                 prompt_tag: "@mention".into(),
                 received_at: Instant::now(),
+                project: None,
             }],
             cancelled_events: vec![BatchEvent {
                 event: make_event("the original task"),
                 prompt_tag: "@mention".into(),
                 received_at: Instant::now(),
+                project: None,
             }],
             cancel_reason: reason,
         }
@@ -2034,17 +2062,20 @@ mod tests {
                     event: make_event("new one"),
                     prompt_tag: "@mention".into(),
                     received_at: Instant::now(),
+                    project: None,
                 },
                 BatchEvent {
                     event: make_event("new two"),
                     prompt_tag: "@mention".into(),
                     received_at: Instant::now(),
+                    project: None,
                 },
             ],
             cancelled_events: vec![BatchEvent {
                 event: make_event("original"),
                 prompt_tag: "@mention".into(),
                 received_at: Instant::now(),
+                project: None,
             }],
             cancel_reason: Some(CancelReason::Steer),
         };
@@ -2090,11 +2121,13 @@ mod tests {
                 event: steering,
                 prompt_tag: "@mention".into(),
                 received_at: Instant::now(),
+                project: None,
             }],
             cancelled_events: vec![BatchEvent {
                 event: original,
                 prompt_tag: "@mention".into(),
                 received_at: Instant::now(),
+                project: None,
             }],
             cancel_reason: Some(CancelReason::Steer),
         };
@@ -2183,16 +2216,19 @@ mod tests {
                     event: e1,
                     prompt_tag: "tag-a".into(),
                     received_at: Instant::now(),
+                    project: None,
                 },
                 BatchEvent {
                     event: e2,
                     prompt_tag: "tag-b".into(),
                     received_at: Instant::now(),
+                    project: None,
                 },
                 BatchEvent {
                     event: e3,
                     prompt_tag: "tag-c".into(),
                     received_at: Instant::now(),
+                    project: None,
                 },
             ],
             cancelled_events: vec![],
@@ -2222,6 +2258,7 @@ mod tests {
                 event,
                 prompt_tag: "test".into(),
                 received_at: Instant::now(),
+                project: None,
             }],
             cancelled_events: vec![],
             cancel_reason: None,
@@ -2245,6 +2282,7 @@ mod tests {
                 event,
                 prompt_tag: "test".into(),
                 received_at: Instant::now(),
+                project: None,
             }],
             cancelled_events: vec![],
             cancel_reason: None,
@@ -2277,6 +2315,7 @@ mod tests {
                 event,
                 prompt_tag: "test".into(),
                 received_at: Instant::now(),
+                project: None,
             }],
             cancelled_events: vec![],
             cancel_reason: None,
@@ -2307,6 +2346,7 @@ mod tests {
                 event,
                 prompt_tag: "test".into(),
                 received_at: Instant::now(),
+                project: None,
             }],
             cancelled_events: vec![],
             cancel_reason: None,
@@ -2334,6 +2374,7 @@ mod tests {
                 event,
                 prompt_tag: "test".into(),
                 received_at: Instant::now(),
+                project: None,
             }],
             cancelled_events: vec![],
             cancel_reason: None,
@@ -2358,6 +2399,7 @@ mod tests {
                 event,
                 prompt_tag: "test".into(),
                 received_at: Instant::now(),
+                project: None,
             }],
             cancelled_events: vec![],
             cancel_reason: None,
@@ -2414,6 +2456,7 @@ mod tests {
                 event,
                 prompt_tag: "test".into(),
                 received_at: Instant::now(),
+                project: None,
             }],
             cancelled_events: vec![],
             cancel_reason: None,
@@ -2452,6 +2495,7 @@ mod tests {
                 event,
                 prompt_tag: "test".into(),
                 received_at: Instant::now(),
+                project: None,
             }],
             cancelled_events: vec![],
             cancel_reason: None,
@@ -2681,6 +2725,7 @@ mod tests {
             event: make_event("old-msg"),
             received_at: old_time,
             prompt_tag: "test".into(),
+            project: None,
         });
 
         let batch = q.flush_next().expect("flush");
@@ -2969,6 +3014,7 @@ mod tests {
                 event,
                 prompt_tag: "test".into(),
                 received_at: Instant::now(),
+                project: None,
             }],
             cancelled_events: vec![],
             cancel_reason: None,
@@ -3000,6 +3046,7 @@ mod tests {
                 event,
                 prompt_tag: "dm".into(),
                 received_at: Instant::now(),
+                project: None,
             }],
             cancelled_events: vec![],
             cancel_reason: None,
@@ -3038,6 +3085,7 @@ mod tests {
                 event,
                 prompt_tag: "@mention".into(),
                 received_at: Instant::now(),
+                project: None,
             }],
             cancelled_events: vec![],
             cancel_reason: None,
@@ -3066,6 +3114,7 @@ mod tests {
                 event,
                 prompt_tag: "@mention".into(),
                 received_at: Instant::now(),
+                project: None,
             }],
             cancelled_events: vec![],
             cancel_reason: None,
@@ -3110,6 +3159,7 @@ mod tests {
                 event,
                 prompt_tag: "dm".into(),
                 received_at: Instant::now(),
+                project: None,
             }],
             cancelled_events: vec![],
             cancel_reason: None,
@@ -3159,6 +3209,7 @@ mod tests {
                 event,
                 prompt_tag: "@mention".into(),
                 received_at: Instant::now(),
+                project: None,
             }],
             cancelled_events: vec![],
             cancel_reason: None,
@@ -3366,6 +3417,7 @@ mod tests {
                 event,
                 prompt_tag: "dm".into(),
                 received_at: Instant::now(),
+                project: None,
             }],
             cancelled_events: vec![],
             cancel_reason: None,
@@ -3423,6 +3475,7 @@ mod tests {
                 event,
                 prompt_tag: "dm".into(),
                 received_at: Instant::now(),
+                project: None,
             }],
             cancelled_events: vec![],
             cancel_reason: None,
@@ -3463,6 +3516,7 @@ mod tests {
                 event,
                 prompt_tag: "test".into(),
                 received_at: Instant::now(),
+                project: None,
             }],
             cancelled_events: vec![],
             cancel_reason: None,
@@ -3487,6 +3541,7 @@ mod tests {
                 event,
                 prompt_tag: "test".into(),
                 received_at: Instant::now(),
+                project: None,
             }],
             cancelled_events: vec![],
             cancel_reason: None,
@@ -3510,6 +3565,7 @@ mod tests {
                 event,
                 prompt_tag: "test".into(),
                 received_at: Instant::now(),
+                project: None,
             }],
             cancelled_events: vec![],
             cancel_reason: None,
@@ -3876,6 +3932,7 @@ mod tests {
                 event,
                 prompt_tag: "@mention".into(),
                 received_at: Instant::now(),
+                project: None,
             }],
             cancelled_events: vec![],
             cancel_reason: None,
@@ -3918,6 +3975,7 @@ mod tests {
                 event,
                 prompt_tag: "@mention".into(),
                 received_at: Instant::now(),
+                project: None,
             }],
             cancelled_events: vec![],
             cancel_reason: None,
@@ -3952,6 +4010,7 @@ mod tests {
                 event,
                 prompt_tag: "test".into(),
                 received_at: Instant::now(),
+                project: None,
             }],
             cancelled_events: vec![],
             cancel_reason: None,
@@ -3981,6 +4040,7 @@ mod tests {
                 event,
                 prompt_tag: "test".into(),
                 received_at: Instant::now(),
+                project: None,
             }],
             cancelled_events: vec![],
             cancel_reason: None,
@@ -4023,6 +4083,7 @@ mod tests {
                 event,
                 prompt_tag: "@mention".into(),
                 received_at: Instant::now(),
+                project: None,
             }],
             cancelled_events: vec![],
             cancel_reason: None,
@@ -4059,6 +4120,7 @@ mod tests {
                 event,
                 prompt_tag: "@mention".into(),
                 received_at: Instant::now(),
+                project: None,
             }],
             cancelled_events: vec![],
             cancel_reason: None,
@@ -4095,11 +4157,13 @@ mod tests {
                     event: plain,
                     prompt_tag: "test".into(),
                     received_at: Instant::now(),
+                    project: None,
                 },
                 BatchEvent {
                     event: threaded,
                     prompt_tag: "@mention".into(),
                     received_at: Instant::now(),
+                    project: None,
                 },
             ],
             cancelled_events: vec![],
@@ -4132,11 +4196,13 @@ mod tests {
                     event: threaded,
                     prompt_tag: "@mention".into(),
                     received_at: Instant::now(),
+                    project: None,
                 },
                 BatchEvent {
                     event: plain,
                     prompt_tag: "test".into(),
                     received_at: Instant::now(),
+                    project: None,
                 },
             ],
             cancelled_events: vec![],
@@ -4164,6 +4230,7 @@ mod tests {
                 event: make_event(content),
                 prompt_tag: "test".into(),
                 received_at: Instant::now(),
+                project: None,
             }],
             cancelled_events: vec![],
             cancel_reason: None,
@@ -4241,6 +4308,7 @@ mod tests {
             event: make_event("another message"),
             prompt_tag: "test".into(),
             received_at: Instant::now(),
+            project: None,
         });
         assert_eq!(slash_command_for_batch(&multi, &[]), None);
 
@@ -4250,6 +4318,7 @@ mod tests {
             event: make_event("interrupted"),
             prompt_tag: "test".into(),
             received_at: Instant::now(),
+            project: None,
         });
         assert_eq!(slash_command_for_batch(&cancelled, &[]), None);
 
@@ -4458,6 +4527,7 @@ mod tests {
                 event: make_event("hi"),
                 prompt_tag: "test".into(),
                 received_at: Instant::now(),
+                project: None,
             }],
             cancelled_events: vec![],
             cancel_reason: None,
@@ -4487,6 +4557,7 @@ mod tests {
                 event: make_event("hi"),
                 prompt_tag: "test".into(),
                 received_at: Instant::now(),
+                project: None,
             }],
             cancelled_events: vec![],
             cancel_reason: None,
@@ -4515,6 +4586,7 @@ mod tests {
                 event: make_event("hi"),
                 prompt_tag: "test".into(),
                 received_at: Instant::now(),
+                project: None,
             }],
             cancelled_events: vec![],
             cancel_reason: None,

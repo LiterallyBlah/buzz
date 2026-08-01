@@ -2246,6 +2246,9 @@ async fn tokio_main() -> Result<()> {
                                 event: buzz_event.event,
                                 received_at: std::time::Instant::now(),
                                 prompt_tag,
+                                // Channel events are never project-routed; the project
+                                // branch has its own queue insertion.
+                                project: None,
                             });
                             // 👀 — immediate "seen" reaction, only if the event
                             // was actually queued (not dropped by DedupMode::Drop).
@@ -3034,6 +3037,10 @@ fn try_native_steer(
         event,
         prompt_tag: prompt_tag.clone(),
         received_at: std::time::Instant::now(),
+        // Native steer is reached only from the channel arm, which never
+        // carries a project origin. A project mid-turn signal would need this
+        // populated; Phase A does not route one here.
+        project: None,
     };
     let event_block = queue::format_event_block(channel_id, None, &be, None);
     let body = format!("{header}\n\n[Buzz event: {prompt_tag}]\n{event_block}\n\n{closing}");
@@ -5925,6 +5932,7 @@ mod error_outcome_emission_tests {
                     event,
                     prompt_tag: "test".into(),
                     received_at: std::time::Instant::now(),
+                    project: None,
                 }],
                 cancelled_events: vec![],
                 cancel_reason: None,
@@ -6031,6 +6039,7 @@ mod error_outcome_emission_tests {
                     event,
                     prompt_tag: "test".into(),
                     received_at: std::time::Instant::now(),
+                    project: None,
                 }],
                 cancelled_events: vec![],
                 cancel_reason: None,
@@ -6149,6 +6158,7 @@ mod error_outcome_emission_tests {
                     .unwrap(),
                 prompt_tag: "test".into(),
                 received_at: std::time::Instant::now(),
+                project: None,
             }],
             cancelled_events: vec![],
             cancel_reason: None,
@@ -6242,6 +6252,7 @@ mod error_outcome_emission_tests {
                     .unwrap(),
                 prompt_tag: "test".into(),
                 received_at: std::time::Instant::now(),
+                project: None,
             }],
             cancelled_events: vec![],
             cancel_reason: None,
@@ -6320,6 +6331,7 @@ mod error_outcome_emission_tests {
                 event: original_event.clone(),
                 prompt_tag: "test".into(),
                 received_at: std::time::Instant::now(),
+                project: None,
             }],
             cancelled_events: vec![],
             cancel_reason: Some(CancelReason::Steer),
@@ -6349,6 +6361,7 @@ mod error_outcome_emission_tests {
             event: new_event.clone(),
             received_at: std::time::Instant::now(),
             prompt_tag: "test".into(),
+            project: None,
         });
         let config = test_config();
         let mut heartbeat_in_flight = false;
@@ -6641,6 +6654,7 @@ mod error_outcome_emission_tests {
                 event,
                 prompt_tag: "test".into(),
                 received_at: std::time::Instant::now(),
+                project: None,
             }],
             cancelled_events: vec![],
             cancel_reason: None,
@@ -6726,6 +6740,7 @@ mod error_outcome_emission_tests {
                 event,
                 prompt_tag: "test".into(),
                 received_at: std::time::Instant::now(),
+                project: None,
             }],
             cancelled_events: vec![],
             cancel_reason: None,
