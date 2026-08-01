@@ -7794,6 +7794,147 @@ mod tests {
         );
     }
 
+    /// Every refusal, entered as relay bytes on a real registration.
+    ///
+    /// The refusals were already asserted at dispatch level. What this adds is
+    /// the production entry: each event is admitted by the relay's own frame
+    /// handling on the exact id an enrolment REQ registered, so nothing here
+    /// can pass because a test built a convenient classification.
+    ///
+    /// Each case asserts the queue is untouched — a refusal that still spent a
+    /// queue slot would be a refusal in name only.
+    #[tokio::test]
+    async fn refused_project_events_reach_the_queue_as_nothing() {
+        let owner = nostr::Keys::generate();
+        let stranger = nostr::Keys::generate();
+        let agent = nostr::Keys::generate();
+        let owner_hex = owner.public_key().to_hex();
+        let agent_hex = agent.public_key().to_hex();
+        let agent_identity =
+            crate::project::AgentIdentity::new(&agent.public_key()).expect("identity");
+
+        let mut state = BgState::new();
+        let (tx, mut rx) = mpsc::channel(32);
+        let mut discovered = crate::project::DiscoveredRepositories::new();
+        let mut enrolments = crate::project::ProjectEnrolments::new();
+        let mut queue = crate::queue::EventQueue::new(crate::config::DedupMode::Queue);
+        let humans = std::collections::BTreeSet::new();
+        let externals = std::collections::BTreeSet::new();
+
+        macro_rules! dispatch {
+            ($ev:expr) => {{
+                let mut d = crate::ProjectDispatch {
+                    identity: crate::project::ProjectIdentity {
+                        agent: &agent_identity,
+                        agent_owner: Some(&owner_hex),
+                        approved_humans: &humans,
+                        approved_external_agents: &externals,
+                    },
+                    discovered: &mut discovered,
+                    enrolments: &mut enrolments,
+                    queue: &mut queue,
+                };
+                crate::handle_project_event(&mut d, $ev)
+            }};
+        }
+
+        // Two repositories are discovered: the owner's, and a stranger's.
+        // Announcing a repository is open to anyone — it grants no authority
+        // over this agent, which is the first refusal below.
+        let discovery_id = open_discovery(&mut state).await;
+        for (keys, d) in [(&owner, "ours"), (&stranger, "theirs")] {
+            let ann = EventBuilder::new(
+                nostr::Kind::Custom(buzz_core::kind::KIND_GIT_REPO_ANNOUNCEMENT as u16),
+                "",
+            )
+            .tags([nostr::Tag::parse(["d", d]).expect("d tag")])
+            .sign_with_keys(keys)
+            .expect("sign announcement");
+            deliver_frame(&mut state, &discovery_id, &ann, &tx).await;
+            for ev in drain(&mut rx) {
+                if let BuzzEvent::Project(p) = ev {
+                    dispatch!(&p);
+                }
+            }
+        }
+
+        let filter =
+            crate::project::enrolment_filter(&discovered, &agent_hex, 0).expect("enrolment filter");
+        let identity = crate::project::ProjectRequestIdentity::from_filters(
+            crate::project::ProjectSubscription::Enrolment,
+            vec![filter],
+        )
+        .expect("bounded");
+        let enrol_id = crate::project::PROJECT_ENROL_SUB_ID.to_string();
+        let (mut ws, _server) = test_ws_pair().await;
+        assert_eq!(
+            send_project_subscribe(&mut ws, &mut state, &enrol_id, identity).await,
+            ProjectSendOutcome::Sent
+        );
+
+        let root_named = |signer: &nostr::Keys, coord: &str, p: &str| {
+            EventBuilder::new(
+                nostr::Kind::Custom(buzz_core::kind::KIND_GIT_ISSUE as u16),
+                "look at this",
+            )
+            .tags([
+                nostr::Tag::parse(["a", coord]).expect("a tag"),
+                nostr::Tag::parse(["p", p]).expect("p tag"),
+            ])
+            .sign_with_keys(signer)
+            .expect("sign")
+        };
+
+        let stranger_coord = format!("30617:{}:theirs", stranger.public_key().to_hex());
+        let owner_coord = format!("30617:{owner_hex}:ours");
+
+        let cases: Vec<(&str, Event)> = vec![
+            // Announcing a repository is not authority over this agent. A
+            // stranger who owns a repo and names the agent still cannot invoke
+            // it — invocation authority comes from the agent's owner.
+            (
+                "an untrusted repository owner cannot invoke the agent",
+                root_named(&stranger, &stranger_coord, &agent_hex),
+            ),
+            // The `a` tag names a coordinate the signer does not own. The
+            // binding is validated against the announcement's signer, not the
+            // claim.
+            (
+                "a forged coordinate binding cannot enrol",
+                root_named(&stranger, &owner_coord, &agent_hex),
+            ),
+            // The agent's own root. Suppressed by author classification
+            // regardless of how it is addressed.
+            (
+                "a self-authored root cannot wake",
+                root_named(&agent, &owner_coord, &agent_hex),
+            ),
+        ];
+
+        for (why, event) in cases {
+            deliver_frame(&mut state, &enrol_id, &event, &tx).await;
+            let delivered = drain(&mut rx);
+            // Some refusals happen at admission and never reach dispatch at
+            // all; those that do must refuse there. Either way the queue is
+            // the thing that must stay empty.
+            for ev in delivered {
+                if let BuzzEvent::Project(p) = ev {
+                    let outcome = dispatch!(&p);
+                    assert_eq!(outcome, crate::ProjectDispatched::Ignored, "{why}");
+                }
+            }
+            assert_eq!(
+                queue.pending_channels(),
+                0,
+                "{why}: a refusal spent a queue slot"
+            );
+            assert!(
+                enrolments.all_roots().is_empty(),
+                "{why}: a refusal enrolled a root"
+            );
+        }
+    }
+
     /// The flag-off control: no project REQ bytes at all.
     #[test]
     fn the_flag_off_control_writes_no_project_req_bytes() {
