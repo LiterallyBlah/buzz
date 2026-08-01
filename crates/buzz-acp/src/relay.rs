@@ -123,7 +123,7 @@ use serde_json::{json, Value};
 use tokio::sync::mpsc;
 use tokio::time::timeout;
 use tokio_tungstenite::{connect_async, tungstenite::Message, MaybeTlsStream, WebSocketStream};
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use crate::config::ChannelFilter;
@@ -438,11 +438,23 @@ impl RestClient {
 
 /// Events the harness cares about.
 #[derive(Debug, Clone)]
-pub struct BuzzEvent {
-    /// Which channel this event belongs to.
-    pub channel_id: Uuid,
-    /// The underlying Nostr event.
-    pub event: Event,
+pub enum BuzzEvent {
+    /// An event delivered on a channel subscription.
+    Channel {
+        /// Which channel this event belongs to.
+        channel_id: Uuid,
+        /// The underlying Nostr event.
+        event: Event,
+    },
+    /// An event delivered on a project subscription.
+    ///
+    /// The witness is carried across the runtime boundary rather than unwrapped
+    /// back into a raw `Event` on the way out of the relay task. Verifying here
+    /// and handing on a bare event would put the project trust boundary back on
+    /// convention one function later — the whole point of the witness is that
+    /// `lib.rs` cannot classify authority for something unverified, because it
+    /// has nothing unverified to classify.
+    Project(crate::project::ProjectEvent),
 }
 
 /// Errors from relay operations.
@@ -533,6 +545,15 @@ enum RelayCommand {
     PublishEvent { event: Box<Event> },
     /// Floor `since` for membership notification replay; events before startup are never re-delivered.
     SetStartupWatermark { ts: u64 },
+    /// Open a project REQ under `sub_id`, registering it in lockstep.
+    ///
+    /// `filters` is the REQ's whole filter list, ORed, in wire order. Empty
+    /// opens nothing — see [`HarnessRelay::subscribe_project`].
+    SubscribeProject {
+        sub_id: String,
+        subscription: crate::project::ProjectSubscription,
+        filters: Vec<Value>,
+    },
 }
 
 type WsStream = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
@@ -894,6 +915,35 @@ impl HarnessRelay {
             .map_err(|_| RelayError::ConnectionClosed)
     }
 
+    /// Open a project REQ under `sub_id` carrying `filters`, ORed.
+    ///
+    /// The class recorded here is what every inbound frame on this id will be
+    /// classified as — the id's spelling carries no authority. Registration
+    /// happens in lockstep with the write, so a failed send leaves nothing
+    /// answerable.
+    ///
+    /// A `Vec` because a NIP-01 REQ carries one *or more* filters and this
+    /// crate's own watched-root builder returns two — a lowercase `#e` branch
+    /// for comments and an uppercase `#E` branch for pull-request revisions.
+    /// An empty vector opens nothing: `["REQ", id]` is an unbounded request,
+    /// not an empty one, so a builder that produced no filters must produce no
+    /// REQ.
+    pub async fn subscribe_project(
+        &self,
+        sub_id: &str,
+        subscription: crate::project::ProjectSubscription,
+        filters: Vec<Value>,
+    ) -> Result<(), RelayError> {
+        self.cmd_tx
+            .send(RelayCommand::SubscribeProject {
+                sub_id: sub_id.to_string(),
+                subscription,
+                filters,
+            })
+            .await
+            .map_err(|_| RelayError::ConnectionClosed)
+    }
+
     /// Reconnect after connection loss. Instructs the background task to
     /// re-authenticate and resubscribe to all previously active channels.
     pub async fn reconnect(&mut self) -> Result<(), RelayError> {
@@ -933,6 +983,37 @@ impl Drop for HarnessRelay {
             handle.abort();
         }
     }
+}
+
+/// What [`send_project_subscribe`] did.
+///
+/// Replaces a `bool` that conflated a locally refused command with a dead
+/// socket. The caller treated every `false` as "reconnect", so a metadata
+/// conflict tore down the connection — and the fresh-connection path then
+/// replayed intent, opening on a clean registry the very metadata the live
+/// registry had just refused. Authority substitution had moved from the map to
+/// the reconnect boundary rather than being closed.
+///
+/// **Only `WriteFailed` may trigger a reconnect.**
+#[derive(Debug, PartialEq)]
+enum ProjectSendOutcome {
+    /// Registered and written.
+    Sent,
+    /// Already live under identical metadata; no second REQ was emitted.
+    AlreadyOpen,
+    /// The live registry refused. The socket is fine; our bookkeeping is not.
+    MetadataConflict,
+    /// The incarnation space is spent. No REQ was written and none ever will
+    /// be — distinct from a conflict, which is about *this* id and could in
+    /// principle clear, and from a write failure, which is about the socket.
+    ///
+    /// Separate so diagnostics do not report a terminal, process-wide state as
+    /// a per-request ownership disagreement.
+    Exhausted,
+    /// The write failed, so nothing was registered — installation happens only
+    /// after a successful write, leaving nothing to undo. Durable intent
+    /// survives.
+    WriteFailed,
 }
 
 /// Two-generation dedup set with bounded memory.
@@ -991,7 +1072,10 @@ struct BgState {
     active_subscriptions: HashMap<Uuid, String>,
     /// Most recent `created_at` timestamp seen per channel (for `since` filter).
     last_seen: HashMap<Uuid, u64>,
-    /// Two-generation dedup set of event IDs seen.
+    /// Two-generation dedup set of event IDs seen on the **channel** surface —
+    /// ordinary channel events and membership notifications.
+    ///
+    /// Deliberately does not cover project events; see [`BgState::project_seen_ids`].
     seen_ids: TwoGenDedup,
     /// Per-channel filter used on subscribe (for resubscribe after reconnect).
     active_filters: HashMap<Uuid, ChannelFilter>,
@@ -1064,6 +1148,65 @@ struct BgState {
     /// A single failed channel REQ is parked here instead of aborting the whole
     /// reconnect. Drained by the main loop. Flushed on each reconnect attempt.
     resubscribe_retry: HashSet<Uuid>,
+    /// Oldest dropped project-event timestamp, subscription-scoped.
+    ///
+    /// Deliberately not per-root: the watched-root REQ is a single
+    /// subscription covering many roots, so the replay floor belongs to the
+    /// subscription. Root-specific historical reconstruction is a separate
+    /// mechanism with its own floor.
+    project_dropped_since: Option<u64>,
+    /// Two-generation dedup set for the **project** surface, separate from
+    /// [`BgState::seen_ids`].
+    ///
+    /// One event can legitimately be deliverable on both surfaces: an event
+    /// carrying an `h` tag and a root `e` tag matches both a channel REQ and
+    /// the watched-root REQ. Sharing one set made whichever surface arrived
+    /// first spend the id, and the other then saw a duplicate and delivered
+    /// nothing.
+    ///
+    /// That was a suppression primitive, not merely a lost copy. Project
+    /// classification is by subscription id, so anything that can name a
+    /// project sub-id — the relay itself, first of all — could push a
+    /// *genuine, correctly signed* channel event under `wr:` and burn its
+    /// channel slot before the channel REQ delivered it. Verifying before
+    /// deduping stops a **forgery** from spending a real id; it does nothing
+    /// about a real event replayed on the wrong surface. Splitting the sets
+    /// does, because the two surfaces no longer share the resource being
+    /// spent.
+    ///
+    /// Deliberately one set for all project subscriptions rather than one per
+    /// subscription. A watched-root REQ replacement overlaps its predecessor
+    /// on purpose, so the same event arrives under two generations' sub-ids,
+    /// and a per-subscription set would call the second copy new.
+    project_seen_ids: TwoGenDedup,
+    /// Project REQs this agent has opened and not closed.
+    ///
+    /// The admission gate for every inbound project frame. An id that is not
+    /// in here has no class, and an unclassified frame is not verified,
+    /// deduplicated or delivered.
+    /// The single owner of project request state: durable intent, live
+    /// registrations, and this connection's relay refusals.
+    ///
+    /// One owner rather than three fields updated in sequence — every gap
+    /// between those updates was a way for them to disagree.
+    project_requests: crate::project::ProjectRequests,
+    /// The root reconstructions in progress, and the destination of every
+    /// admitted catch-up frame and boundary.
+    ///
+    /// **Beside the registry, not across a channel from it.** A page is bound
+    /// by `open_history_page` the moment its REQ reaches the socket, so whatever
+    /// holds pages has to be able to call the registry directly; an owner in
+    /// the run loop could only issue a collector, send it here, and wait for
+    /// the bound page to come back — a response channel, for a decision that
+    /// has already been made by the time it returns.
+    ///
+    /// Routing here also means an admitted frame never crosses the event
+    /// channel. It cannot be dropped under backpressure, so a page cannot be
+    /// left one row short of what the relay sent — and a short page is how a
+    /// reconstruction concludes it has reached the end of history.
+    ///
+    /// Empty in production: nothing enrols a root yet.
+    reconstructions: crate::project::ProjectReconstructions,
     /// Current position in the exponential backoff ladder.
     ///
     /// Persisted across calls to `wait_for_reconnect` so a flapping link stays at
@@ -1095,6 +1238,10 @@ impl BgState {
             observer_in_flight: VecDeque::new(),
             gated_observer_dropped: 0,
             resubscribe_retry: HashSet::new(),
+            project_dropped_since: None,
+            project_seen_ids: TwoGenDedup::new(SEEN_ID_LIMIT),
+            project_requests: crate::project::ProjectRequests::new(),
+            reconstructions: crate::project::ProjectReconstructions::new(),
             backoff_step: 0,
         }
     }
@@ -1222,6 +1369,22 @@ impl BgState {
         }
     }
 
+    /// The socket that owned every project registration is gone.
+    ///
+    /// One operation, not two calls a caller has to remember to pair, because
+    /// they are one fact: a registration and the page it opened belong to the
+    /// same dead connection. Retiring the registry alone leaves a page nothing
+    /// can ever complete — no boundary can be minted for it — while
+    /// `pages_wanted` skips a stream that holds one, so that root stops asking
+    /// for history in silence. Releasing the pages alone leaves ids the
+    /// replacement connection would answer without having asked.
+    ///
+    /// Durable intent is untouched; it is what re-opens these requests.
+    fn retire_project_connection(&mut self) {
+        self.project_requests.clear_connection();
+        self.reconstructions.disconnected();
+    }
+
     fn track_observer_in_flight(&mut self, event: Box<Event>) {
         if self.observer_in_flight.len() >= GATED_OBSERVER_QUEUE_CAP {
             self.observer_in_flight.pop_front();
@@ -1277,6 +1440,33 @@ fn apply_command_to_state(state: &mut BgState, cmd: RelayCommand) {
         RelayCommand::Unsubscribe { channel_id } => {
             state.active_subscriptions.remove(&channel_id);
             state.clear_channel_state(&channel_id);
+        }
+        RelayCommand::SubscribeProject {
+            sub_id,
+            subscription,
+            filters,
+        } => {
+            // Offline: record the intent only — nothing becomes answerable
+            // until a REQ is actually written for it. Fail-closed all the same,
+            // because a conflicting command accepted while disconnected would
+            // be opened verbatim by the next connection's replay.
+            let Some(identity) =
+                crate::project::ProjectRequestIdentity::from_filters(subscription, filters)
+            else {
+                // Recording this as intent would replay a filterless REQ onto
+                // the next connection, which asks the relay for everything.
+                warn!(sub_id, "refusing a project subscription with no filters");
+                return;
+            };
+            if let crate::project::IntentAdmission::Conflict { held } =
+                state.project_requests.record_intent(&sub_id, identity)
+            {
+                warn!(
+                    sub_id,
+                    ?held,
+                    "refusing conflicting project intent while disconnected — keeping the original"
+                );
+            }
         }
         RelayCommand::SubscribeMembership => {
             state.membership_sub_active = true;
@@ -1438,6 +1628,34 @@ async fn execute_connected_command(
             }
             state.clear_channel_state(&channel_id);
             true
+        }
+        RelayCommand::SubscribeProject {
+            sub_id,
+            subscription,
+            filters,
+        } => {
+            // Intent and registration are decided together, in one operation
+            // that either fully succeeds or records nothing. Admitting intent
+            // first and consulting the registry second left a refused identity
+            // sitting in intent, and the next reconnect installed it.
+            let Some(identity) =
+                crate::project::ProjectRequestIdentity::from_filters(subscription, filters)
+            else {
+                // Nothing written, nothing registered, and the socket is fine —
+                // a filterless REQ asks the relay for everything.
+                warn!(sub_id, "refusing a project subscription with no filters");
+                return true;
+            };
+            match send_project_subscribe(ws, state, &sub_id, identity).await {
+                ProjectSendOutcome::Sent | ProjectSendOutcome::AlreadyOpen => true,
+                // The socket is fine; our own bookkeeping disagreed. Tearing
+                // the connection down here is what let a refusal be replayed
+                // into effect on the next one.
+                ProjectSendOutcome::MetadataConflict => true,
+                // Terminal, but not a transport failure — the socket stays.
+                ProjectSendOutcome::Exhausted => true,
+                ProjectSendOutcome::WriteFailed => false,
+            }
         }
         RelayCommand::SubscribeMembership => {
             state.membership_sub_active = true;
@@ -2088,6 +2306,36 @@ async fn handle_ws_message(
                             Err(mpsc::error::TrySendError::Closed(_)) => return false,
                         }
                     } else if subscription_id == MEMBERSHIP_NOTIF_SUB_ID {
+                        // Shape gate first, before anything with a side effect.
+                        //
+                        // `send_membership_subscribe` asks for exactly these two
+                        // kinds, so anything else arriving here is a relay off
+                        // its own contract. Accepting it was a watermark
+                        // poisoning path, not a cosmetic one: a wrong-kind event
+                        // advanced `membership_last_seen`, and reconnect uses
+                        // that value directly as the membership REQ's `since`
+                        // (`resubscribe_after_reconnect`, and the rate-limit
+                        // drain). One signed event with a far-future timestamp
+                        // therefore moved the watermark past legitimate
+                        // membership notifications and they were never replayed
+                        // — the agent silently keeps acting on stale membership.
+                        //
+                        // Refusing here costs the frame nothing it is entitled
+                        // to: the event is not deduped, so its own channel
+                        // subscription still delivers it normally.
+                        let kind_u32 = event.kind.as_u16() as u32;
+                        if !matches!(
+                            kind_u32,
+                            KIND_MEMBER_ADDED_NOTIFICATION | KIND_MEMBER_REMOVED_NOTIFICATION
+                        ) {
+                            warn!(
+                                kind = kind_u32,
+                                event_id = %event.id.to_hex(),
+                                "non-membership kind on the membership subscription — refusing without \
+                                 spending dedup or watermarks"
+                            );
+                            return true;
+                        }
                         // Membership notification — extract channel UUID from h tag.
                         let channel_uuid = match extract_h_tag_uuid(&event) {
                             Some(uuid) => uuid,
@@ -2112,7 +2360,7 @@ async fn handle_ws_message(
                             return true;
                         }
                         let ts = event.created_at.as_secs();
-                        let buzz_event = BuzzEvent {
+                        let buzz_event = BuzzEvent::Channel {
                             channel_id: channel_uuid,
                             event: *event,
                         };
@@ -2149,11 +2397,236 @@ async fn handle_ws_message(
                             }
                             Err(mpsc::error::TrySendError::Closed(_)) => return false,
                         }
+                    } else if let Some(admission) =
+                        state.project_requests.admit_frame(&subscription_id)
+                    {
+                        // A frame on a catch-up leaves here first, and by a
+                        // different route: to the page its own request opened,
+                        // without crossing the event channel at all. Its page
+                        // counts what the relay returned in order to tell a
+                        // saturated page from an exhausted one, so the steps
+                        // below — which drop a frame at every failed check —
+                        // would silently shorten it. Every admitted frame
+                        // reaches the page; what varies is whether it arrives
+                        // as a row or as a reason the page cannot be trusted.
+                        if let crate::project::ProjectSubscription::RootCatchUp { root, .. } =
+                            admission.subscription()
+                        {
+                            let expected = root.clone();
+                            route_catch_up_frame(state, admission, expected, *event).await;
+                            return true;
+                        }
+                        let source = admission.subscription().clone();
+
+                        // Project dispatch. The step order below is the whole
+                        // security property, so it is written out rather than
+                        // left to reading order:
+                        //
+                        //   1. matched against a request we actually opened,
+                        //      and classified from *our* record of it;
+                        //   2. id + signature verified;
+                        //   3. source-specific admissibility;
+                        //   4. only then dedup.
+                        //
+                        // Step 1 used to be `classify_subscription`, which read
+                        // the class out of the relay's own string. `proj-roots-7`
+                        // *was* generation 7 because it said so. The registry
+                        // makes the id a lookup key: an id we never opened has
+                        // no class, and the class a frame is handled under now
+                        // comes from what we wrote down rather than from what
+                        // arrived.
+                        //
+                        // Verification precedes dedup because an invalid event
+                        // must not spend the id of a genuine one that has not
+                        // arrived yet — that would let a malicious relay
+                        // suppress a real event by pre-sending a forgery
+                        // claiming its id.
+                        //
+                        // Verification is awaited inline rather than spawned.
+                        // The Schnorr check hands off to `spawn_blocking`
+                        // internally, so the runtime is not blocked, and
+                        // awaiting here means hostile project traffic can slow
+                        // this loop but cannot fan out unbounded blocking jobs.
+                        let verified =
+                            match crate::project::VerifiedProjectEvent::verify(*event).await {
+                                Ok(v) => v,
+                                Err(e) => {
+                                    warn!(
+                                        sub_id = %subscription_id,
+                                        "project event failed verification — dropping: {e}"
+                                    );
+                                    return true;
+                                }
+                            };
+
+                        // Does it match the question this request asked?
+                        //
+                        // Before the route is derived and before the dedup slot
+                        // is spent, because both of those treat the event as
+                        // ours. A relay decides what to put under a
+                        // subscription id; the filter is the only record of
+                        // what was *requested*, and until this check existed a
+                        // correctly signed event for a root this agent never
+                        // watched was delivered as a routed event on the
+                        // watched subscription — and spent the shared project
+                        // dedup slot doing it, which would then suppress the
+                        // same event's legitimate delivery elsewhere.
+                        //
+                        // Catch-up frames do not come through here: their page
+                        // must *count* what the relay returned, so a frame it
+                        // will not accept is delivered as a reason the page is
+                        // untrustworthy rather than dropped.
+                        if !admission.admits(verified.event()) {
+                            warn!(
+                                sub_id = %subscription_id,
+                                kind = verified.kind(),
+                                "project event does not match the filter this request sent — dropping"
+                            );
+                            return true;
+                        }
+
+                        let event_id_hex = verified.id();
+                        let ts = verified.event().created_at.as_secs();
+
+                        // Source-specific admissibility **before** the dedup
+                        // slot is spent.
+                        //
+                        // The earlier order — verify, dedup, then decide
+                        // admissibility — left a suppression primitive inside
+                        // the project namespace, one narrower than the
+                        // cross-surface one but the same shape: an event that
+                        // this source was never entitled to carry still spent
+                        // the id, and the delivery that *was* entitled then saw
+                        // a duplicate. A genuine announcement pushed under a
+                        // watched id burned discovery; a genuine root pushed
+                        // under discovery burned enrolment; an event for root B
+                        // under root-A's catch-up burned its real rooted
+                        // delivery.
+                        //
+                        // The comment that used to sit here claimed deduping
+                        // later would force a fresh Schnorr check on every
+                        // replay. That was wrong: verification already runs
+                        // unconditionally above, so dedup never gated it and
+                        // moving dedup down costs no signature work at all.
+                        let project_event = match &source {
+                            // An announcement has no root. Sending it through
+                            // route derivation would drop it via a path that
+                            // looks like it handled it.
+                            crate::project::ProjectSubscription::Discovery => {
+                                // The full announcement shape, not just the
+                                // kind. A kind check alone let a malformed
+                                // `30617` — no `d`, an empty `d`, two `d`s —
+                                // spend a dedup slot here and be rejected much
+                                // later, inside the state it was trying to
+                                // enter. `prove` is the single place that
+                                // parses `d`, and its failure is this frame's
+                                // failure.
+                                let Some(announcement) =
+                                    crate::project::VerifiedAnnouncement::prove(verified)
+                                else {
+                                    debug!(
+                                        sub_id = %subscription_id,
+                                        "not a well-formed repository announcement — dropping"
+                                    );
+                                    return true;
+                                };
+                                crate::project::ProjectEvent::Discovery { announcement }
+                            }
+                            other => {
+                                let Some(route) = crate::project::ProjectRoute::derive(&verified)
+                                else {
+                                    debug!(
+                                        sub_id = %subscription_id,
+                                        kind = verified.kind(),
+                                        "project event resolves to no root — dropping"
+                                    );
+                                    return true;
+                                };
+
+                                // The catch-up root check that used to sit here
+                                // has moved to `route_catch_up_frame`, which
+                                // is the only path a catch-up frame now takes.
+                                // It could not stay: the answer to "the relay
+                                // returned a different root" is not `return
+                                // true`. Dropping the frame leaves the page one
+                                // row short of what the relay actually sent, and
+                                // a short page is how a reconstruction decides
+                                // it has reached the end of history.
+                                crate::project::ProjectEvent::Routed {
+                                    source: other.clone(),
+                                    route,
+                                    event: verified,
+                                }
+                            }
+                        };
+
+                        // Only now is the id spent, and against
+                        // `project_seen_ids` rather than the channel set —
+                        // spending a channel id from here would let a project
+                        // sub-id suppress a legitimate channel delivery.
+                        //
+                        // One set for every *live* project source, and no longer
+                        // for catch-up replay, which never reaches here. Sharing
+                        // a dedup domain across the two was not merely untidy:
+                        // an event already delivered on the watched-root REQ
+                        // would be suppressed as a duplicate on a history page,
+                        // and the page — which counts rows to decide whether it
+                        // is saturated — would read short by exactly the number
+                        // of events the agent had already seen live.
+                        if !state.project_seen_ids.insert(event_id_hex.clone()) {
+                            debug!(event_id = %event_id_hex, "duplicate project event — skipping");
+                            return true;
+                        }
+
+                        match event_tx.try_send(Some(BuzzEvent::Project(project_event))) {
+                            Ok(()) => {}
+                            Err(mpsc::error::TrySendError::Full(_)) => {
+                                // Same contract as the channel path: release the
+                                // dedup slot so replay can re-deliver, and record
+                                // the drop so the replay window covers it.
+                                //
+                                // The dropped timestamp is subscription-scoped,
+                                // not per-root. Per-root dropped state was the
+                                // arrangement already rejected for REQ
+                                // replacement: the watched-root REQ is one
+                                // subscription over many roots, so a per-root
+                                // floor cannot express when *this subscription*
+                                // must replay from.
+                                // Only the project slot is released, and only
+                                // the project replay floor moves. Touching
+                                // `seen_ids` or `channel_dropped_since` here
+                                // would let project pressure rewind a channel's
+                                // replay window and re-deliver channel events
+                                // the agent already handled.
+                                state.project_seen_ids.remove(&event_id_hex);
+                                state.project_dropped_since =
+                                    Some(state.project_dropped_since.map_or(ts, |d| d.min(ts)));
+                                state.proactive_resubscribe_needed = true;
+                                warn!(
+                                    ts,
+                                    "project event dropped (backpressure) — proactive resubscribe queued"
+                                );
+                            }
+                            Err(mpsc::error::TrySendError::Closed(_)) => return false,
+                        }
+                    } else if subscription_id.starts_with(crate::project::PROJECT_SUB_ID_PREFIX) {
+                        // A project-shaped id that matched no open request.
+                        //
+                        // The prefix test decides only what to *say* about the
+                        // frame and stops it falling through to channel
+                        // parsing; it never grants admission. Admission comes
+                        // from the registry above and nowhere else, which is
+                        // why an id we closed reaches this arm rather than the
+                        // one it used to work in.
+                        warn!(
+                            sub_id = %subscription_id,
+                            "unsolicited frame on a project subscription this agent did not open — dropping"
+                        );
                     } else if let Some(channel_id) = channel_id_from_sub_id(&subscription_id) {
                         let ts = event.created_at.as_secs();
                         let event_id_hex = event.id.to_hex();
                         if state.record_event(channel_id, &event) {
-                            let buzz_event = BuzzEvent {
+                            let buzz_event = BuzzEvent::Channel {
                                 channel_id,
                                 event: *event,
                             };
@@ -2201,7 +2674,39 @@ async fn handle_ws_message(
                     }
                 }
                 RelayMessage::Eose { subscription_id } => {
-                    debug!("EOSE for subscription {subscription_id}");
+                    // A project EOSE becomes a witness only if we hold a live
+                    // registration for that exact id. An EOSE for a request we
+                    // never sent, or have already closed, is a relay assertion
+                    // rather than evidence about our own backlog — and a
+                    // completion claim resting on it would be resting on the
+                    // relay's word.
+                    //
+                    // Nothing else here mints one. A timeout, `CLOSED`,
+                    // `NOTICE` or reconnect never reaches this arm, so none of
+                    // them can produce an end-of-backlog boundary.
+                    //
+                    // The boundary goes nowhere near the event channel. It is
+                    // consumed where it is minted, in one uninterrupted step:
+                    // minting retires a one-shot catch-up registration, and the
+                    // page it bounds is completed immediately after, with no
+                    // await between. Nothing else can observe the interval, so
+                    // there is no interval in which the registry and the page
+                    // owner disagree about whether that request is current.
+                    if let Some(witness) = state
+                        .project_requests
+                        .witness_end_of_stored_events(&subscription_id)
+                    {
+                        debug!(sub_id = %subscription_id, "project EOSE");
+
+                        // `None` is the ordinary case for discovery, enrolment
+                        // and watched requests: they keep delivering after their
+                        // backlog drains, so their boundary retires no page.
+                        if let Some(advance) = state.reconstructions.complete(&witness) {
+                            debug!(sub_id = %subscription_id, ?advance, "history page completed");
+                        }
+                    } else {
+                        debug!("EOSE for subscription {subscription_id}");
+                    }
                 }
                 RelayMessage::Notice { message } => {
                     // Fix 4: NOTICE at warn level.
@@ -2224,6 +2729,82 @@ async fn handle_ws_message(
                     subscription_id,
                     message,
                 } => {
+                    // A CLOSED is evidence about a request we actually sent on
+                    // *this* connection, and it is authenticated the same way
+                    // an EVENT is: by an exact live registration. Durable
+                    // intent is not evidence — it says what we want, not what
+                    // we asked. Gating on intent let relay text mutate
+                    // suspension state for an id that had never been sent, so
+                    // an unsolicited CLOSED could suppress a request before it
+                    // was ever made.
+                    //
+                    // Minted *before* the refusal, because a refusal removes the
+                    // registration and the proof is what names it. A page in
+                    // flight under this request has to learn its request is
+                    // gone: no boundary can ever follow a CLOSED, so a page left
+                    // attached keeps its stream out of `pages_wanted` forever —
+                    // a reconstruction stalled in silence by one relay message.
+                    let lost = state
+                        .project_requests
+                        .admit_frame(&subscription_id)
+                        .filter(|a| {
+                            matches!(
+                                a.subscription(),
+                                crate::project::ProjectSubscription::RootCatchUp { .. }
+                            )
+                        });
+                    if state
+                        .project_requests
+                        .refuse_live(&subscription_id, &message)
+                        .is_some()
+                    {
+                        if let Some(lost) = lost {
+                            let routing = state.reconstructions.observe(lost.catch_up(
+                                crate::project::CatchUpOutcome::RequestLost(
+                                    "relay closed the request",
+                                ),
+                            ));
+                            debug!(
+                                sub_id = %subscription_id,
+                                ?routing,
+                                "history page released by a closed request"
+                            );
+                        }
+                        // Registration closed; durable intent kept. An earlier
+                        // version dropped the intent too, on the reasoning that
+                        // re-asking a refused question would loop. That was
+                        // wrong in the direction that matters: discovery intent
+                        // derives from `project_routing_enabled`, so one CLOSED
+                        // would have let the relay revoke a local configuration
+                        // decision and keep it revoked across every later
+                        // healthy connection.
+                        //
+                        // The loop is avoided by where the retry lives instead:
+                        // the suspension excludes it from replay on this
+                        // connection, and is cleared only when the connection
+                        // is replaced.
+                        warn!(
+                            sub_id = %subscription_id,
+                            "project subscription refused by relay — unanswerable until the next \
+                             connection, intent retained: {message}"
+                        );
+                        return true;
+                    }
+
+                    // Project-shaped, but not a request that is live here. It
+                    // may be stale, unsolicited, or invented. Ignore it rather
+                    // than letting it fall through to the generic CLOSED
+                    // handling below, which reads "restricted" as an auth
+                    // failure and drops the socket — that would hand any peer
+                    // able to name a `proj-` id a way to disconnect us.
+                    if subscription_id.starts_with(crate::project::PROJECT_SUB_ID_PREFIX) {
+                        debug!(
+                            sub_id = %subscription_id,
+                            "CLOSED for a project id with no live request — ignoring: {message}"
+                        );
+                        return true;
+                    }
+
                     // A per-channel membership denial means THIS channel is
                     // forbidden, not the whole connection. Drop just this
                     // channel's subscription and keep the socket — otherwise the
@@ -2466,6 +3047,51 @@ async fn process_handshake_buffer(
     true
 }
 
+/// Install a replacement socket and hand it the frames it already buffered.
+///
+/// **The order is the point.** `do_connect` returns a live socket plus whatever
+/// arrived on it during the handshake, and those frames are handled by the
+/// ordinary dispatch — which authenticates a project frame against whatever is
+/// live in the registry. Until the dead connection's registrations are gone,
+/// "live" still means *its* registrations, so an `EOSE` buffered by the
+/// replacement could mint a boundary for a request the replacement never sent
+/// and complete a page opened on a socket that no longer exists. The same
+/// window admits an `EVENT` into that page and lets a `CLOSED` record a refusal
+/// of a request nobody asked this connection.
+///
+/// Retiring inside this function rather than at its two call sites is
+/// deliberate: a rule that says "clear before you process" is only true while
+/// every caller remembers, and there is no way to observe from outside that one
+/// of them did not.
+#[allow(clippy::too_many_arguments)]
+async fn install_replacement_connection(
+    ws: &mut WsStream,
+    replacement: WsStream,
+    handshake_buffer: std::collections::VecDeque<RelayMessage>,
+    event_tx: &mpsc::Sender<Option<BuzzEvent>>,
+    observer_control_tx: &mpsc::Sender<Event>,
+    state: &mut BgState,
+    keys: &Keys,
+    relay_url: &str,
+    agent_pubkey_hex: &str,
+    auth_tag: Option<&nostr::Tag>,
+) -> bool {
+    state.retire_project_connection();
+    *ws = replacement;
+    process_handshake_buffer(
+        ws,
+        handshake_buffer,
+        event_tx,
+        observer_control_tx,
+        state,
+        keys,
+        relay_url,
+        agent_pubkey_hex,
+        auth_tag,
+    )
+    .await
+}
+
 /// Outcome of [`resubscribe_after_reconnect`].
 enum ResubscribeResult {
     /// All subscriptions restored (or parked for drain recovery).
@@ -2512,6 +3138,62 @@ async fn resubscribe_after_reconnect(
         // shared admission counter survives socket replacement.
         state.rate_limited_pending.clear();
         state.resubscribe_retry.clear();
+
+        // The project registrations and pages that belonged to the dead socket
+        // are **not** retired here. They are retired by
+        // `install_replacement_connection`, before the replacement's own
+        // handshake buffer is handled — which is strictly earlier than this
+        // function runs. Doing it here as well would be harmless and would also
+        // be the second place that has to agree with the first.
+    }
+
+    // Re-ask for what local policy wants, registering only as each REQ is
+    // successfully written.
+    //
+    // `replayable()` excludes requests this connection has already refused, so
+    // a *proactive* resubscribe on the existing socket does not quietly retry
+    // something the relay just said no to. A fresh connection has had its
+    // suspensions cleared, so everything intended is offered once.
+    //
+    // Only discovery exists today. When watched and catch-up requests arrive
+    // this loop needs the pacing and shutdown-awareness the channel burst above
+    // has, and it does not have it yet.
+    for (sub_id, identity) in state.project_requests.replayable() {
+        match send_project_subscribe(ws, state, &sub_id, identity).await {
+            ProjectSendOutcome::Sent | ProjectSendOutcome::AlreadyOpen => {}
+            ProjectSendOutcome::WriteFailed => {
+                // Do not carry on and report a healthy connection. Intent is
+                // retained but inactive, and there may be no later reconnect to
+                // notice — project routing would be silently dead on a
+                // connection everything else considers fine.
+                //
+                // No deferred commands have been collected at this point in the
+                // sequence, so there is no command intent to retain.
+                warn!(
+                    sub_id,
+                    "project resubscribe write failed — retrying the connection"
+                );
+                return ResubscribeResult::RetryConnection;
+            }
+            ProjectSendOutcome::MetadataConflict => {
+                warn!(
+                    sub_id,
+                    "project resubscribe hit a request-ownership conflict — internal invariant \
+                     failure, original authority retained"
+                );
+            }
+            ProjectSendOutcome::Exhausted => {
+                // Not a conflict and not a dead socket. Reporting it as either
+                // would send someone looking for a disagreement or a network
+                // fault that does not exist. The connection is healthy; this
+                // process simply cannot open project requests any more.
+                error!(
+                    sub_id,
+                    "project resubscribe refused — incarnation space exhausted; project routing \
+                     is permanently degraded for this process"
+                );
+            }
+        }
     }
 
     let mut deferred_commands = VecDeque::new();
@@ -2936,10 +3618,10 @@ async fn try_autonomous_reconnect(
         );
         match do_connect(relay_url, keys, auth_tag).await {
             Ok((new_ws, handshake_buffer)) => {
-                *ws = new_ws;
                 info!("autonomous reconnect succeeded (attempt {})", attempt + 1);
-                let handshake_ok = process_handshake_buffer(
+                let handshake_ok = install_replacement_connection(
                     ws,
+                    new_ws,
                     handshake_buffer,
                     event_tx,
                     observer_control_tx,
@@ -3074,10 +3756,10 @@ async fn wait_for_reconnect(
         info!("attempting relay reconnect to {relay_url}…");
         match do_connect(relay_url, keys, auth_tag).await {
             Ok((new_ws, handshake_buffer)) => {
-                *ws = new_ws;
                 info!("relay reconnected to {relay_url}");
-                let handshake_ok = process_handshake_buffer(
+                let handshake_ok = install_replacement_connection(
                     ws,
+                    new_ws,
                     handshake_buffer,
                     event_tx,
                     observer_control_tx,
@@ -3235,8 +3917,118 @@ async fn send_subscribe(
     }
 }
 
-/// Send a NIP-01 REQ for membership notifications (kind:44100+44101, global, #p=[agent_pubkey]).
-/// Returns `true` if the REQ was successfully written to the WebSocket.
+/// Send a project REQ and register it in the same step.
+///
+/// **Preflight, write, then install.** The registry is what makes an inbound
+/// project frame admissible, so nothing may be registered until the REQ has
+/// actually reached the socket. `open_request` decides admissibility first,
+/// performs the concrete write, and only then installs an already-live
+/// registration.
+///
+/// An earlier version reserved first and rolled back on failure, arguing that
+/// send-then-register could drop the first frames of a subscription we really
+/// did open. That argument was wrong in a way worth recording, because it is
+/// the tempting one: an async write has a third exit besides `Ok` and `Err` —
+/// it can be **dropped while suspended**. A pre-await reservation therefore
+/// survives cancellation with nothing able to promote or remove it, holding
+/// the subscription id hostage so that root silently never reconstructs.
+///
+/// The frame-loss risk it was guarding against is not real here: this task
+/// owns the socket and the registry together and holds `&mut` across both, so
+/// no inbound frame is processed between the write returning and the
+/// registration being installed.
+///
+/// Outcomes are obeyed, not just logged:
+///
+/// - `Sent` — the REQ is on the wire and the registration is live;
+/// - `AlreadyLive` — this exact request is live; **do not** send another REQ
+///   under its id. A second REQ could replace the relay's subscription while
+///   leaving the old request's EOSE indistinguishable from the new one's;
+/// - `Conflict` — refuse, having recorded nothing at all, and say what is
+///   actually live;
+/// - `Exhausted` — refuse permanently. The incarnation space is spent, so no
+///   project request can be opened again by this process;
+/// - `WriteFailed` — nothing was registered. Durable intent survives, because
+///   the intent is still what we want; the write is what failed.
+///
+/// `identity` carries the filter rather than this function building one: the
+/// registry serialises the REQ from it, so the bytes on the wire cannot differ
+/// from the question that was registered.
+async fn send_project_subscribe(
+    ws: &mut WsStream,
+    state: &mut BgState,
+    sub_id: &str,
+    identity: crate::project::ProjectRequestIdentity,
+) -> ProjectSendOutcome {
+    // The registry performs the write, against the socket itself. It is handed
+    // the live `WsStream` rather than a closure: a closure returning
+    // `Result<(), E>` could be `|_| async { Ok(()) }`, which manufactures send
+    // authority with no socket in sight. The registry also serialises the REQ
+    // from the registration's own filter, so this function no longer chooses
+    // the bytes that go on the wire.
+    let outcome = state
+        .project_requests
+        .open_request(ws, sub_id, identity)
+        .await;
+
+    match outcome {
+        crate::project::OpenOutcome::Sent => {
+            debug!(sub_id, "project REQ sent and registered");
+            ProjectSendOutcome::Sent
+        }
+        crate::project::OpenOutcome::AlreadyLive => {
+            debug!(
+                sub_id,
+                "project request already live — not re-sending its REQ"
+            );
+            ProjectSendOutcome::AlreadyOpen
+        }
+        crate::project::OpenOutcome::Exhausted => {
+            // Terminal and local: no REQ is written, the socket is fine, and
+            // no further project request can ever be opened by this process.
+            // Logged at error because unlike a conflict it will not resolve —
+            // every later attempt returns here.
+            error!(
+                sub_id,
+                "project request incarnations exhausted — refusing to reuse one; no further \
+                 project subscription can be opened"
+            );
+            ProjectSendOutcome::Exhausted
+        }
+        crate::project::OpenOutcome::Conflict { held } => {
+            warn!(
+                sub_id,
+                ?held,
+                "refusing project request: this id is owned by a different request — \
+                 nothing recorded"
+            );
+            ProjectSendOutcome::MetadataConflict
+        }
+        crate::project::OpenOutcome::WriteFailed(e) => {
+            // Nothing was registered — installation happens only after a
+            // successful write, so there is nothing to undo. Other project
+            // requests are untouched and still answerable.
+            warn!(
+                sub_id,
+                "failed to send project REQ — nothing registered: {e}"
+            );
+            ProjectSendOutcome::WriteFailed
+        }
+        crate::project::OpenOutcome::NotOpenableHere => {
+            // A catch-up reached the generic sender. Its wire id has to name
+            // one transport attempt, and only `open_history_page` mints those,
+            // so this is a caller mistake rather than a relay condition —
+            // reported as a conflict because that is what it is: an id this
+            // path may not claim.
+            error!(
+                sub_id,
+                "a root catch-up cannot be opened through the generic sender"
+            );
+            ProjectSendOutcome::MetadataConflict
+        }
+    }
+}
+
 async fn send_membership_subscribe(
     ws: &mut WsStream,
     agent_pubkey_hex: &str,
@@ -3498,6 +4290,73 @@ fn channel_id_from_sub_id(sub_id: &str) -> Option<Uuid> {
     sub_id
         .strip_prefix("ch-")
         .and_then(|s| s.parse::<Uuid>().ok())
+}
+
+/// Route one frame admitted by a live root catch-up request to its page.
+///
+/// **Every admitted frame reaches the page**, and that is the whole difference
+/// from the live-surface path above. A history page counts what the relay
+/// returned under its `limit` in order to distinguish a saturated page — there
+/// is more history, ask again from further back — from an exhausted one. A
+/// frame this agent refuses and discards here does not cost one event: it makes
+/// the page read short, and a short page is how a reconstruction concludes it
+/// has reached the end of history. So a frame that cannot be a row arrives as a
+/// reason the page is untrustworthy instead.
+///
+/// Nothing crosses the event channel, so nothing here can be lost to
+/// backpressure. That is not a convenience: `try_send` has a `Full` arm, and a
+/// page that never learns a frame arrived is short by exactly that many rows,
+/// with no way to tell afterwards.
+///
+/// Nothing here is deduplicated either. The live surfaces share one
+/// `project_seen_ids` set, and putting page rows through it would suppress
+/// exactly those events the agent had already been delivered live — shortening
+/// the page for the second time, by the same mechanism, for a different reason.
+async fn route_catch_up_frame(
+    state: &mut BgState,
+    admission: crate::project::FrameAdmission,
+    expected_root: String,
+    event: Event,
+) {
+    use crate::project::CatchUpOutcome;
+
+    let sub_id = admission.sub_id().to_string();
+
+    // Verification stays ahead of everything, exactly as on the live path. What
+    // differs is the consequence: an unverifiable frame is not silently gone,
+    // it is a hole the page must account for.
+    let outcome = match crate::project::VerifiedProjectEvent::verify(event).await {
+        Err(e) => {
+            warn!(sub_id = %sub_id, "history page frame failed verification: {e}");
+            CatchUpOutcome::Unusable("frame failed verification")
+        }
+        Ok(verified) => match crate::project::ProjectRoute::derive(&verified) {
+            None => {
+                debug!(sub_id = %sub_id, kind = verified.kind(), "history page frame resolves to no root");
+                CatchUpOutcome::Unusable("frame resolves to no root")
+            }
+            // A relay filter is candidate selection, not authority: a catch-up
+            // that answers with a different root is not answering the question
+            // that was asked, and the root compared against is the one recorded
+            // when the REQ was sent.
+            Some(route) if route.root() != expected_root => {
+                warn!(
+                    expected = %expected_root,
+                    got = %route.root(),
+                    "history page frame names another root"
+                );
+                CatchUpOutcome::Unusable("frame names another root")
+            }
+            Some(_) => CatchUpOutcome::Row(Box::new(verified)),
+        },
+    };
+
+    // `NotOurs` is the ordinary case in production today: nothing enrols a root,
+    // so no reconstruction holds a page under any id. It stops being routine
+    // exactly when enrolment lands, which is why it is logged rather than
+    // counted as an anomaly now.
+    let routing = state.reconstructions.observe(admission.catch_up(outcome));
+    debug!(sub_id = %sub_id, ?routing, "catch-up frame routed");
 }
 
 /// Per-channel CLOSED denials: the channel is forbidden but the connection is
@@ -4007,6 +4866,7 @@ async fn wait_for_any_ok(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use buzz_core::kind::KIND_GIT_REPO_ANNOUNCEMENT;
 
     #[test]
     fn relay_ws_to_http_plain() {
@@ -4931,6 +5791,2871 @@ mod tests {
         assert!(
             state.seen_ids.insert(event_id_hex),
             "after backpressure removal, replay must be accepted"
+        );
+    }
+
+    // ── Project dedup is separate from channel dedup ─────────────────────────
+
+    /// One event that is legitimately deliverable on both surfaces: an `h` tag
+    /// puts it on a channel REQ, and an `e`-root tag routes it on the
+    /// watched-root REQ.
+    fn mixed_surface_event(keys: &nostr::Keys, channel_id: Uuid, root: &str, ts: u64) -> Event {
+        EventBuilder::new(nostr::Kind::TextNote, "on both surfaces")
+            .custom_created_at(nostr::Timestamp::from(ts))
+            .tags([
+                nostr::Tag::parse(vec!["h".to_string(), channel_id.to_string()]).expect("h tag"),
+                nostr::Tag::parse(vec![
+                    "e".to_string(),
+                    root.to_string(),
+                    String::new(),
+                    "root".to_string(),
+                ])
+                .expect("e tag"),
+            ])
+            .sign_with_keys(keys)
+            .expect("signing should succeed")
+    }
+
+    fn test_root_id() -> String {
+        "a".repeat(64)
+    }
+
+    /// Push one EVENT frame through the production dispatch path.
+    ///
+    /// These tests are about *which dedup set the real code spends*, so poking
+    /// `BgState` by hand would assert nothing — the simulation would be the
+    /// thing under test. This goes through `handle_ws_message`.
+    async fn deliver_frame(
+        state: &mut BgState,
+        sub_id: &str,
+        event: &Event,
+        event_tx: &mpsc::Sender<Option<BuzzEvent>>,
+    ) {
+        let (mut ws, _server) = test_ws_pair().await;
+        let (observer_tx, _observer_rx) = mpsc::channel(8);
+        let keys = nostr::Keys::generate();
+        let text = serde_json::to_string(&json!(["EVENT", sub_id, event])).expect("encode frame");
+        let keep_going = handle_ws_message(
+            Message::Text(text.into()),
+            &mut ws,
+            event_tx,
+            &observer_tx,
+            state,
+            &keys,
+            "ws://test",
+            &keys.public_key().to_hex(),
+            None,
+        )
+        .await;
+        assert!(keep_going, "dispatch must not signal connection loss");
+    }
+
+    /// Open a project request the way production must: recorded before any
+    /// frame for it is accepted. Returns the subscription id to deliver on.
+    ///
+    /// Every project test now goes through one of these. That is not
+    /// ceremony — before the registry, these tests delivered on ids nobody had
+    /// asked for and the dispatch accepted them, which was precisely the
+    /// defect.
+    /// Open a request the way production does — through `send_project_subscribe`
+    /// against a real socket.
+    ///
+    /// These helpers used to call `reserve()` directly, which left the
+    /// registration in a state production never produces: recorded but never
+    /// written. Inbound frames were then delivered against it as though the
+    /// relay had been asked. Going through the transport is the point — a
+    /// helper that can fabricate "sent" is a helper that proves nothing about
+    /// what the relay was actually told.
+    async fn open_sent(
+        state: &mut BgState,
+        id: &str,
+        identity: crate::project::ProjectRequestIdentity,
+    ) -> String {
+        let (mut ws, _server) = test_ws_pair().await;
+        assert_eq!(
+            send_project_subscribe(&mut ws, state, id, identity).await,
+            ProjectSendOutcome::Sent
+        );
+        id.to_string()
+    }
+
+    /// The enrolment state behind a watched-root REQ: `(root, is_pull_request)`.
+    fn watched_enrolments(roots: &[(&str, bool)]) -> crate::project::ProjectEnrolments {
+        let mut enrolments = crate::project::ProjectEnrolments::new();
+        for (root, is_pull_request) in roots {
+            let coordinate = format!("30617:{}:repo", "1".repeat(64));
+            enrolments
+                .enrol(&crate::project::EnrolmentCandidate::for_test(
+                    root,
+                    &coordinate,
+                    &"1".repeat(64),
+                    *is_pull_request,
+                ))
+                .expect("a fresh root enrols");
+        }
+        enrolments
+    }
+
+    /// The watched identity for `roots`, **from the production builder**.
+    ///
+    /// It used to hand-rebuild one comments/`#e` filter. That looked equivalent
+    /// — same kinds accessor, same root-tag accessor — and it was not: the real
+    /// builder returns *two* filters, because a comment points at its root with
+    /// lowercase `e` and a pull-request revision with uppercase `E`. The
+    /// approximation therefore tested a single-filter request nobody sends, and
+    /// hid that the identity could not represent a two-filter one at all.
+    ///
+    /// `since` is a parameter for the same reason the rest of it is derived: a
+    /// window the fixture invents is a window production never asked for.
+    fn watched_identity(
+        generation: u64,
+        roots: &[(&str, bool)],
+        since: u64,
+    ) -> crate::project::ProjectRequestIdentity {
+        crate::project::ProjectRequestIdentity::from_filters(
+            crate::project::ProjectSubscription::Watched { generation },
+            crate::project::watched_roots_filters(&watched_enrolments(roots), since),
+        )
+        .expect("an enrolled root yields at least one filter")
+    }
+
+    async fn open_watched(state: &mut BgState, generation: u64) -> String {
+        open_watched_for(state, generation, &[&test_root_id()]).await
+    }
+
+    async fn open_watched_for(state: &mut BgState, generation: u64, roots: &[&str]) -> String {
+        let issues: Vec<(&str, bool)> = roots.iter().map(|r| (*r, false)).collect();
+        let id = crate::project::watched_sub_id(generation);
+        open_sent(state, &id, watched_identity(generation, &issues, 0)).await
+    }
+
+    async fn open_discovery(state: &mut BgState) -> String {
+        let id = crate::project::discovery_sub_id();
+        open_sent(state, &id, discovery_identity()).await
+    }
+
+    /// open → REQ on the wire → observe → EOSE → completion.
+    ///
+    /// Every link composed at once, over a real socket, because each of them
+    /// being individually correct is exactly the property that kept holding
+    /// while the whole was wrong. It also checks the bytes actually written:
+    /// the REQ the relay receives must carry the id the registry minted and the
+    /// filter the page's own parameters imply, or the request and the page are
+    /// talking about different subscriptions.
+    ///
+    /// The dispatch-side link — a raw `["EVENT", id, e]` frame reaching this
+    /// page — is composed separately in
+    /// `a_page_fills_from_the_wire_and_completes_at_its_own_boundary`.
+    #[tokio::test]
+    async fn a_catch_up_page_completes_end_to_end_over_a_real_socket() {
+        use crate::project::{HistoryStream, PageOutcome};
+
+        let mut state = BgState::new();
+        let (mut ws, mut server) = test_ws_pair().await;
+
+        let root = "c".repeat(64);
+        let cutoff = 1_000u64;
+        let limit = 4usize;
+        let filter = crate::project::catch_up_filter(&root, HistoryStream::Comments, cutoff, limit);
+
+        let mut cursor = crate::project::HistoryCursor::new(
+            &root,
+            HistoryStream::Comments,
+            cutoff,
+            limit,
+            1_000,
+        );
+        let mut page = match state
+            .project_requests
+            .open_history_page(&mut ws, cursor.begin_request())
+            .await
+        {
+            crate::project::PageOpen::Opened(page) => page,
+            other => panic!("a real socket must open a page: {other:?}"),
+        };
+        let sub_id = page.sub_id().to_string();
+        assert!(
+            sub_id.contains(&root),
+            "the id names the root it asks about: {sub_id}"
+        );
+        assert!(
+            sub_id.len() <= 256,
+            "and fits this relay's advertised limit: {}",
+            sub_id.len()
+        );
+
+        // The relay's view of what we asked.
+        //
+        // Bounded: without the timeout, an implementation that returned
+        // `Opened` *without* writing would hang here rather than fail, which is
+        // a worse outcome than a red test and hides the defect behind a stuck
+        // suite. Found by mutating the open to skip its own write.
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(5), server.next())
+            .await
+            .expect("a REQ must reach the socket — an opened page without a write is the defect")
+            .expect("a REQ frame must arrive")
+            .expect("frame is readable");
+        let parsed: Value =
+            serde_json::from_str(frame.to_text().expect("REQ is text")).expect("REQ is JSON");
+        assert_eq!(parsed[0], json!("REQ"));
+        assert_eq!(
+            parsed[1],
+            json!(sub_id),
+            "the id on the wire is the one the page was installed under"
+        );
+        assert_eq!(
+            parsed[2], filter,
+            "and the filter is the one this page's parameters imply"
+        );
+
+        let keys = nostr::Keys::generate();
+        let comment = EventBuilder::new(nostr::Kind::TextNote, "a comment")
+            .custom_created_at(nostr::Timestamp::from(900))
+            .tags([nostr::Tag::parse(vec![
+                "e".to_string(),
+                root.clone(),
+                String::new(),
+                "root".to_string(),
+            ])
+            .expect("e tag")])
+            .sign_with_keys(&keys)
+            .expect("sign");
+        page.observe(
+            crate::project::VerifiedProjectEvent::verify(comment)
+                .await
+                .expect("test rows are signed"),
+        );
+
+        let witness = state
+            .project_requests
+            .witness_end_of_stored_events(&sub_id)
+            .expect("a sent registration mints its boundary");
+
+        match cursor.complete(&witness, page) {
+            PageOutcome::Complete(stream) => {
+                assert_eq!(stream.len(), 1, "the observed row survives to completion");
+                assert_eq!(stream.root(), root);
+                assert_eq!(stream.cutoff(), cutoff);
+            }
+            other => panic!("expected Complete, got {other:?}"),
+        }
+    }
+
+    fn drain(rx: &mut mpsc::Receiver<Option<BuzzEvent>>) -> Vec<BuzzEvent> {
+        let mut out = Vec::new();
+        while let Ok(Some(event)) = rx.try_recv() {
+            out.push(event);
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn a_project_event_does_not_spend_the_channel_dedup_slot() {
+        // The suppression primitive this closes: project classification is by
+        // subscription id, so anything that can name `proj-roots-N` — the
+        // relay first of all — could push a genuine channel event on the
+        // project surface and burn its channel dedup slot. The channel REQ
+        // would then deliver nothing, and the agent would never see a message
+        // addressed to it. Verifying before deduping does not help here; the
+        // event is real, it is just being replayed on the wrong surface.
+        let mut state = BgState::new();
+        let (tx, mut rx) = mpsc::channel(16);
+        let keys = nostr::Keys::generate();
+        let channel_id = Uuid::new_v4();
+        let event = mixed_surface_event(&keys, channel_id, &test_root_id(), 1_000);
+
+        let watched = open_watched(&mut state, 0).await;
+        deliver_frame(&mut state, &watched, &event, &tx).await;
+        deliver_frame(&mut state, &channel_sub_id(channel_id), &event, &tx).await;
+
+        let delivered = drain(&mut rx);
+        assert_eq!(delivered.len(), 2, "both surfaces deliver: {delivered:?}");
+        assert!(
+            matches!(delivered[0], BuzzEvent::Project(_)),
+            "project surface first: {:?}",
+            delivered[0]
+        );
+        assert!(
+            matches!(delivered[1], BuzzEvent::Channel { .. }),
+            "the channel delivery must survive the project one: {:?}",
+            delivered[1]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_channel_event_does_not_spend_the_project_dedup_slot() {
+        // The same separation in the other direction. A channel event that
+        // also names a root must still reach project routing, or enrolment
+        // would silently miss whatever the channel REQ happened to see first.
+        let mut state = BgState::new();
+        let (tx, mut rx) = mpsc::channel(16);
+        let keys = nostr::Keys::generate();
+        let channel_id = Uuid::new_v4();
+        let event = mixed_surface_event(&keys, channel_id, &test_root_id(), 1_000);
+
+        deliver_frame(&mut state, &channel_sub_id(channel_id), &event, &tx).await;
+        let watched = open_watched(&mut state, 0).await;
+        deliver_frame(&mut state, &watched, &event, &tx).await;
+
+        let delivered = drain(&mut rx);
+        assert_eq!(delivered.len(), 2, "both surfaces deliver: {delivered:?}");
+        assert!(matches!(delivered[0], BuzzEvent::Channel { .. }));
+        assert!(matches!(delivered[1], BuzzEvent::Project(_)));
+    }
+
+    #[tokio::test]
+    async fn overlapping_watched_generations_share_one_project_dedup_set() {
+        // A watched-root REQ replacement deliberately overlaps its
+        // predecessor, so the same event arrives under two generations' ids.
+        // One set across all project subscriptions folds that to one delivery;
+        // a per-subscription set would call the second copy new and route the
+        // event twice.
+        let mut state = BgState::new();
+        let (tx, mut rx) = mpsc::channel(16);
+        let keys = nostr::Keys::generate();
+        let event = mixed_surface_event(&keys, Uuid::new_v4(), &test_root_id(), 1_000);
+
+        let gen1 = open_watched(&mut state, 1).await;
+        let gen2 = open_watched(&mut state, 2).await;
+        deliver_frame(&mut state, &gen1, &event, &tx).await;
+        deliver_frame(&mut state, &gen2, &event, &tx).await;
+
+        assert_eq!(
+            drain(&mut rx).len(),
+            1,
+            "the generation overlap must fold to one delivery"
+        );
+    }
+
+    #[tokio::test]
+    async fn project_backpressure_releases_only_the_project_slot() {
+        // The order is the point. The channel surface delivers the event
+        // first and legitimately spends its channel slot. Only then does the
+        // project surface drop a copy under backpressure.
+        //
+        // With one shared set, that drop's `remove` released the *channel's*
+        // slot — so the next reconnect replay re-delivered, as new, a message
+        // the agent had already answered. Releasing a slot is only safe when
+        // the surface releasing it is the surface that spent it.
+        let mut state = BgState::new();
+        let (tx, mut rx) = mpsc::channel(4);
+        let keys = nostr::Keys::generate();
+        let channel_id = Uuid::new_v4();
+        let event = mixed_surface_event(&keys, channel_id, &test_root_id(), 1_000);
+        let id = event.id.to_hex();
+
+        deliver_frame(&mut state, &channel_sub_id(channel_id), &event, &tx).await;
+        assert_eq!(drain(&mut rx).len(), 1, "the channel delivery lands");
+        assert!(state.seen_ids.contains(&id), "and spends the channel slot");
+
+        // Now wedge the queue and drop a project copy of the same event.
+        while tx.try_send(None).is_ok() {}
+        let watched = open_watched(&mut state, 0).await;
+        deliver_frame(&mut state, &watched, &event, &tx).await;
+
+        assert!(
+            state.seen_ids.contains(&id),
+            "the channel slot survives a project drop — otherwise reconnect \
+             replays an already-handled message as new"
+        );
+        assert_eq!(
+            state.project_dropped_since,
+            Some(1_000),
+            "the project replay floor covers the drop"
+        );
+        assert!(
+            !state.project_seen_ids.contains(&id),
+            "and the project slot is released so project replay re-delivers"
+        );
+        assert!(
+            state.channel_dropped_since.is_empty(),
+            "project pressure must not rewind a channel's replay window"
+        );
+
+        // The channel replay is still deduped: the agent does not see it twice.
+        while rx.try_recv().is_ok() {}
+        deliver_frame(&mut state, &channel_sub_id(channel_id), &event, &tx).await;
+        assert!(
+            drain(&mut rx).is_empty(),
+            "a channel replay after a project drop must stay deduplicated"
+        );
+    }
+
+    // ── The request lifecycle is owned by the transport ──────────────────────
+
+    fn test_filter() -> Value {
+        json!({ "kinds": [KIND_GIT_REPO_ANNOUNCEMENT] })
+    }
+
+    fn identity(
+        subscription: crate::project::ProjectSubscription,
+        filter: Value,
+    ) -> crate::project::ProjectRequestIdentity {
+        crate::project::ProjectRequestIdentity::new(subscription, filter)
+            .expect("test filters constrain events")
+    }
+
+    fn discovery_identity() -> crate::project::ProjectRequestIdentity {
+        identity(
+            crate::project::ProjectSubscription::Discovery,
+            test_filter(),
+        )
+    }
+
+    /// Feed one non-EVENT frame through the production handler.
+    async fn deliver_control_frame(state: &mut BgState, frame: Value) -> bool {
+        let (mut ws, _server) = test_ws_pair().await;
+        let (tx, _rx) = mpsc::channel(16);
+        let (observer_tx, _observer_rx) = mpsc::channel(8);
+        let keys = nostr::Keys::generate();
+        let text = serde_json::to_string(&frame).expect("encode");
+        handle_ws_message(
+            Message::Text(text.into()),
+            &mut ws,
+            &tx,
+            &observer_tx,
+            state,
+            &keys,
+            "ws://test",
+            &keys.public_key().to_hex(),
+            None,
+        )
+        .await
+    }
+
+    /// Replace the connection onto `replacement`, the way production does.
+    ///
+    /// `install_replacement_connection` first, then the resubscribe. Tests used
+    /// to call the resubscribe directly, which started them one step *after*
+    /// the transition most of them depend on — and that gap is where a
+    /// replacement connection answering the dead one's requests went unnoticed
+    /// through a whole review round.
+    ///
+    /// The dead socket is created here rather than taken from the caller: what
+    /// it is does not matter, only that there was one and that what belonged to
+    /// it is retired before anything the replacement carries is handled.
+    async fn reconnect_onto(state: &mut BgState, replacement: WsStream) -> ResubscribeResult {
+        let (mut dead, _dead_server) = test_ws_pair().await;
+        let (_cmd_tx, mut cmd_rx) = mpsc::channel(4);
+        let agent = nostr::Keys::generate().public_key().to_hex();
+        assert!(
+            install_replacement_with(state, &mut dead, replacement, VecDeque::new()).await,
+            "an empty handshake buffer carries no drop signal"
+        );
+        // `dead` now holds the replacement — production reassigns the same
+        // variable for the same reason.
+        resubscribe_after_reconnect(&mut dead, &mut cmd_rx, state, &agent, true).await
+    }
+
+    /// Install `replacement` over `ws`, handing it `buffer` as the frames it
+    /// received during its own handshake.
+    ///
+    /// The production entry point, called with what `do_connect` would have
+    /// returned. Nothing here reorders or pre-filters the buffer: the whole
+    /// question is what the ordinary dispatch does with those frames, and when.
+    async fn install_replacement_with(
+        state: &mut BgState,
+        ws: &mut WsStream,
+        replacement: WsStream,
+        buffer: VecDeque<RelayMessage>,
+    ) -> bool {
+        let (event_tx, _event_rx) = mpsc::channel(16);
+        let (observer_tx, _observer_rx) = mpsc::channel(8);
+        let keys = nostr::Keys::generate();
+        let agent = keys.public_key().to_hex();
+        install_replacement_connection(
+            ws,
+            replacement,
+            buffer,
+            &event_tx,
+            &observer_tx,
+            state,
+            &keys,
+            "ws://test",
+            &agent,
+            None,
+        )
+        .await
+    }
+
+    /// A proactive resubscribe on the socket that is already connected.
+    async fn resubscribe_on_same_socket(
+        state: &mut BgState,
+        ws: &mut WsStream,
+    ) -> ResubscribeResult {
+        let (_cmd_tx, mut cmd_rx) = mpsc::channel(4);
+        let agent = nostr::Keys::generate().public_key().to_hex();
+        resubscribe_after_reconnect(ws, &mut cmd_rx, state, &agent, false).await
+    }
+
+    #[tokio::test]
+    async fn a_sent_project_req_is_registered_in_the_same_step() {
+        let (mut ws, mut server) = test_ws_pair().await;
+        let mut state = BgState::new();
+        let sub_id = crate::project::discovery_sub_id();
+
+        assert_eq!(
+            send_project_subscribe(&mut ws, &mut state, &sub_id, discovery_identity()).await,
+            ProjectSendOutcome::Sent
+        );
+
+        let frame = next_test_frame(&mut server).await;
+        assert_eq!(frame[0], "REQ");
+        assert_eq!(frame[1], sub_id.as_str());
+        assert!(state.project_requests.match_frame(&sub_id).is_some());
+    }
+
+    #[tokio::test]
+    async fn a_failed_write_registers_nothing_and_disturbs_no_other_request() {
+        // The window this closes: registered-but-never-asked. An id we hold a
+        // record for, but never actually put on the wire, would answer frames
+        // for a question we never posed.
+        //
+        // Named for what happens rather than for how: there is no reservation
+        // and no rollback. A failed write installs nothing, because
+        // installation only happens after the write returns.
+        let (mut ws, server) = test_ws_pair().await;
+        let mut state = BgState::new();
+
+        let survivor = crate::project::watched_sub_id(0);
+        assert_eq!(
+            send_project_subscribe(
+                &mut ws,
+                &mut state,
+                &survivor,
+                identity(
+                    crate::project::ProjectSubscription::Watched { generation: 0 },
+                    test_filter(),
+                ),
+            )
+            .await,
+            ProjectSendOutcome::Sent
+        );
+
+        drop(server);
+        let _ = ws.close(None).await;
+        let doomed = crate::project::discovery_sub_id();
+        assert_eq!(
+            send_project_subscribe(&mut ws, &mut state, &doomed, discovery_identity()).await,
+            ProjectSendOutcome::WriteFailed
+        );
+
+        assert!(
+            state.project_requests.match_frame(&doomed).is_none(),
+            "a failed send must leave nothing answerable"
+        );
+        assert!(
+            state.project_requests.intent(&doomed).is_some(),
+            "but the intent survives — the write failed, not the wish"
+        );
+        assert!(
+            state.project_requests.match_frame(&survivor).is_some(),
+            "and another live request is undisturbed"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_already_open_request_does_not_emit_a_second_req() {
+        // `AlreadyLive` is not permission to re-send. A second REQ under a live
+        // id could replace the relay's subscription while leaving the old
+        // request's EOSE indistinguishable from the new one's.
+        let (mut ws, mut server) = test_ws_pair().await;
+        let mut state = BgState::new();
+        let sub_id = crate::project::discovery_sub_id();
+
+        for expected in [ProjectSendOutcome::Sent, ProjectSendOutcome::AlreadyOpen] {
+            assert_eq!(
+                send_project_subscribe(&mut ws, &mut state, &sub_id, discovery_identity()).await,
+                expected
+            );
+        }
+
+        assert_eq!(next_test_frame(&mut server).await[0], "REQ");
+        assert!(
+            timeout(Duration::from_millis(200), server.next())
+                .await
+                .is_err(),
+            "exactly one REQ reached the wire"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_conflicting_send_records_nothing_and_cannot_be_installed_by_a_reconnect() {
+        // The trapdoor: an earlier arrangement admitted intent first and asked
+        // the registry second, so a refused identity stayed in intent and the
+        // next reconnect installed it. Asserting "the socket stayed up" and
+        // "the live class is unchanged" did not catch that — the residue was in
+        // the map neither assertion looked at.
+        let (mut ws, mut server) = test_ws_pair().await;
+        let mut state = BgState::new();
+        let sub_id = crate::project::discovery_sub_id();
+
+        assert_eq!(
+            send_project_subscribe(&mut ws, &mut state, &sub_id, discovery_identity()).await,
+            ProjectSendOutcome::Sent
+        );
+        assert_eq!(next_test_frame(&mut server).await[0], "REQ");
+
+        let usurper = identity(
+            crate::project::ProjectSubscription::Watched { generation: 9 },
+            json!({ "kinds": [1] }),
+        );
+        assert_eq!(
+            send_project_subscribe(&mut ws, &mut state, &sub_id, usurper.clone()).await,
+            ProjectSendOutcome::MetadataConflict
+        );
+        assert!(
+            timeout(Duration::from_millis(200), server.next())
+                .await
+                .is_err(),
+            "no REQ is emitted"
+        );
+        assert_eq!(
+            state.project_requests.intent(&sub_id),
+            Some(&discovery_identity()),
+            "the attempted identity is not retained as intent"
+        );
+
+        // The decisive part: a fresh connection must reopen the ORIGINAL.
+        let (ws2, mut server2) = test_ws_pair().await;
+        assert!(matches!(
+            reconnect_onto(&mut state, ws2).await,
+            ResubscribeResult::Ok
+        ));
+        assert_eq!(next_test_frame(&mut server2).await[1], sub_id.as_str());
+        assert_eq!(
+            state.project_requests.match_frame(&sub_id),
+            Some(&crate::project::ProjectSubscription::Discovery),
+            "the refused identity must not arrive via the reconnect path"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_send_differing_only_in_filter_conflicts_and_the_original_filter_survives() {
+        // When the live registry stored only the class it answered "already
+        // live" here: no REQ, and the other filter left behind as what the next
+        // connection would ask for. Same class, different question.
+        let (mut ws, mut server) = test_ws_pair().await;
+        let mut state = BgState::new();
+        let sub_id = crate::project::discovery_sub_id();
+
+        assert_eq!(
+            send_project_subscribe(&mut ws, &mut state, &sub_id, discovery_identity()).await,
+            ProjectSendOutcome::Sent
+        );
+        assert_eq!(next_test_frame(&mut server).await[0], "REQ");
+
+        let other_filter = identity(
+            crate::project::ProjectSubscription::Discovery,
+            json!({ "kinds": [KIND_GIT_REPO_ANNOUNCEMENT], "authors": ["deadbeef"] }),
+        );
+        assert_eq!(
+            send_project_subscribe(&mut ws, &mut state, &sub_id, other_filter).await,
+            ProjectSendOutcome::MetadataConflict,
+            "a different filter is a different request, not an idempotent repeat"
+        );
+
+        let (ws2, mut server2) = test_ws_pair().await;
+        assert!(matches!(
+            reconnect_onto(&mut state, ws2).await,
+            ResubscribeResult::Ok
+        ));
+        let replayed = next_test_frame(&mut server2).await;
+        assert_eq!(
+            replayed[2],
+            test_filter(),
+            "filter A survives the reconnect"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_relay_closed_suspends_the_request_without_deleting_local_policy() {
+        // A relay refusal is transport evidence, not authority over local
+        // configuration. Discovery intent derives from
+        // `project_routing_enabled`, so letting one CLOSED delete it would let
+        // the relay revoke an operator's decision and keep it revoked across
+        // every later healthy connection.
+        let mut state = BgState::new();
+        let (tx, mut rx) = mpsc::channel(16);
+        let keys = nostr::Keys::generate();
+
+        // 1. open and send discovery.
+        let (mut ws, mut server) = test_ws_pair().await;
+        let sub_id = crate::project::discovery_sub_id();
+        assert_eq!(
+            send_project_subscribe(&mut ws, &mut state, &sub_id, discovery_identity()).await,
+            ProjectSendOutcome::Sent
+        );
+        assert_eq!(next_test_frame(&mut server).await[0], "REQ");
+
+        // 2. receive CLOSED.
+        assert!(
+            deliver_control_frame(
+                &mut state,
+                json!(["CLOSED", sub_id, "restricted: not permitted"]),
+            )
+            .await,
+            "a project CLOSED must not tear down the socket"
+        );
+
+        // 3. the id is immediately unanswerable.
+        assert!(state.project_requests.match_frame(&sub_id).is_none());
+        let event = announcement(&keys, 1_000);
+        deliver_frame(&mut state, &sub_id, &event, &tx).await;
+        assert!(drain(&mut rx).is_empty());
+
+        // 4. intent remains, and the refusal is recorded rather than silent.
+        assert!(state.project_requests.intent(&sub_id).is_some());
+        assert_eq!(
+            state.project_requests.suspension(&sub_id),
+            Some("restricted: not permitted")
+        );
+
+        // 7. no retry on the connection that refused — including through a
+        //    *proactive* resubscribe on the existing socket, which is the path
+        //    that made "no immediate retry" an insufficient assertion.
+        assert!(matches!(
+            resubscribe_on_same_socket(&mut state, &mut ws).await,
+            ResubscribeResult::Ok
+        ));
+        assert!(
+            timeout(Duration::from_millis(200), server.next())
+                .await
+                .is_err(),
+            "a proactive resubscribe must not re-send what this connection refused"
+        );
+        assert!(state.project_requests.match_frame(&sub_id).is_none());
+        assert_eq!(
+            state.project_requests.suspension(&sub_id),
+            Some("restricted: not permitted"),
+            "and the suspension is still in force"
+        );
+
+        // 5 & 6. a fresh connection asks once more and registers it again.
+        let (ws2, mut server2) = test_ws_pair().await;
+        assert!(matches!(
+            reconnect_onto(&mut state, ws2).await,
+            ResubscribeResult::Ok
+        ));
+        let frame = next_test_frame(&mut server2).await;
+        assert_eq!(frame[0], "REQ");
+        assert_eq!(frame[1], sub_id.as_str());
+        assert!(state.project_requests.match_frame(&sub_id).is_some());
+        assert_eq!(state.project_requests.suspension(&sub_id), None);
+    }
+
+    #[tokio::test]
+    async fn an_unsolicited_closed_cannot_suspend_a_request_that_was_never_sent() {
+        // `CLOSED` must be authenticated by an exact live registration, exactly
+        // as EVENT provenance is. Gating on durable intent instead let relay
+        // text mutate suspension state for an id that had never been asked —
+        // the relay could suppress a request before it was ever made.
+        let mut state = BgState::new();
+        let sub_id = crate::project::discovery_sub_id();
+        assert_eq!(
+            state
+                .project_requests
+                .record_intent(&sub_id, discovery_identity()),
+            crate::project::IntentAdmission::Recorded
+        );
+
+        assert!(
+            deliver_control_frame(&mut state, json!(["CLOSED", sub_id, "restricted: nope"])).await
+        );
+
+        assert_eq!(
+            state.project_requests.suspension(&sub_id),
+            None,
+            "an id that was never live cannot be suspended by relay text"
+        );
+        assert_eq!(
+            state.project_requests.intent(&sub_id),
+            Some(&discovery_identity()),
+            "and local policy is untouched"
+        );
+
+        // The proof it matters: the next connection still asks.
+        let (ws, mut server) = test_ws_pair().await;
+        assert!(matches!(
+            reconnect_onto(&mut state, ws).await,
+            ResubscribeResult::Ok
+        ));
+        assert_eq!(next_test_frame(&mut server).await[1], sub_id.as_str());
+    }
+
+    #[tokio::test]
+    async fn a_failed_project_replay_retries_the_connection_instead_of_stranding_intent() {
+        // Continuing past a failed replay would report a healthy connection on
+        // which project routing is silently dead, with intent retained but
+        // inactive and possibly no later reconnect to notice.
+        let mut state = BgState::new();
+        let sub_id = crate::project::discovery_sub_id();
+        state
+            .project_requests
+            .record_intent(&sub_id, discovery_identity());
+
+        let (mut ws, server) = test_ws_pair().await;
+        drop(server);
+        let _ = ws.close(None).await;
+
+        assert!(
+            matches!(
+                reconnect_onto(&mut state, ws).await,
+                ResubscribeResult::RetryConnection
+            ),
+            "a failed project replay must not be reported as a healthy connection"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_fresh_connection_clears_registrations_but_keeps_intent() {
+        // `BgState` outlives the socket. Without clearing, a new connection
+        // would answer ids registered against the dead one before their
+        // replacement REQs had been sent — and the ids are deterministic, so
+        // that is easy to hit rather than exotic.
+        let (mut ws, mut server) = test_ws_pair().await;
+        let mut state = BgState::new();
+        let sub_id = crate::project::watched_sub_id(0);
+        send_project_subscribe(
+            &mut ws,
+            &mut state,
+            &sub_id,
+            identity(
+                crate::project::ProjectSubscription::Watched { generation: 0 },
+                test_filter(),
+            ),
+        )
+        .await;
+        assert_eq!(next_test_frame(&mut server).await[0], "REQ");
+
+        state.project_requests.clear_connection();
+
+        assert!(
+            state.project_requests.match_frame(&sub_id).is_none(),
+            "the dead connection's registration is gone"
+        );
+        assert!(
+            state.project_requests.intent(&sub_id).is_some(),
+            "but what we want subscribed survives, to be re-asked"
+        );
+    }
+
+    /// Did an EOSE for `sub_id` mint a boundary?
+    ///
+    /// A boundary no longer leaves the relay task, so there is no delivery to
+    /// count. What it does instead is exactly two things — retire a one-shot
+    /// catch-up registration and complete the page that registration opened —
+    /// and both are asserted here. There is nothing weaker available: a
+    /// persistent request's boundary changes no state at all, which is why the
+    /// tests below reconstruct a root instead of opening discovery.
+    ///
+    /// Both facts are returned rather than reduced to one, because the
+    /// disagreement between them is itself a defect: a registration retired
+    /// without its page completing, or a page completed while its registration
+    /// stayed answerable, is precisely the state where the registry and the
+    /// page owner no longer describe the same request.
+    #[derive(Debug, PartialEq, Eq)]
+    struct EoseOutcome {
+        /// Is a registration still live under that id?
+        still_live: bool,
+        /// Does the reconstruction now hold a finished stream?
+        page_finished: bool,
+    }
+
+    async fn eose_outcome(
+        state: &mut BgState,
+        root: &str,
+        sub_id: &str,
+        tx: &mpsc::Sender<Option<BuzzEvent>>,
+    ) -> EoseOutcome {
+        assert!(
+            deliver_control_frame_to(state, json!(["EOSE", sub_id]), tx).await,
+            "dispatch must not signal connection loss"
+        );
+        EoseOutcome {
+            still_live: state.project_requests.match_frame(sub_id).is_some(),
+            page_finished: !state
+                .reconstructions
+                .get(root)
+                .expect("the root is still tracked")
+                .finished_streams()
+                .is_empty(),
+        }
+    }
+
+    /// Feed a control frame with a caller-supplied event channel.
+    async fn deliver_control_frame_to(
+        state: &mut BgState,
+        frame: Value,
+        tx: &mpsc::Sender<Option<BuzzEvent>>,
+    ) -> bool {
+        let (mut ws, _server) = test_ws_pair().await;
+        let (observer_tx, _observer_rx) = mpsc::channel(8);
+        let keys = nostr::Keys::generate();
+        let text = serde_json::to_string(&frame).expect("encode");
+        handle_ws_message(
+            Message::Text(text.into()),
+            &mut ws,
+            tx,
+            &observer_tx,
+            state,
+            &keys,
+            "ws://test",
+            &keys.public_key().to_hex(),
+            None,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn an_eose_on_a_live_project_request_produces_a_witness() {
+        let mut state = BgState::new();
+        let (tx, _rx) = mpsc::channel(16);
+        let (bound, _keys) = proven_issue_root().await;
+        let root = bound.binding().root().to_string();
+        let sub_id = bind_page_under(&mut state, &bound).await;
+
+        assert_eq!(
+            eose_outcome(&mut state, &root, &sub_id, &tx).await,
+            EoseOutcome {
+                still_live: false,
+                page_finished: true
+            },
+            "a live request's backlog boundary is evidence, and answering the \
+             one question a catch-up asked ends it"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_eose_for_a_request_this_agent_never_sent_produces_no_witness() {
+        // The property that makes the witness worth anything. Without it, any
+        // peer able to name a `proj-` id could assert that our backlog was
+        // complete — and a completion claim resting on that is resting on the
+        // relay's word.
+        let mut state = BgState::new();
+        let (tx, _rx) = mpsc::channel(16);
+        let (bound, _keys) = proven_issue_root().await;
+        let root = bound.binding().root().to_string();
+        let sub_id = bind_page_under(&mut state, &bound).await;
+
+        for id in [
+            crate::project::discovery_sub_id(),
+            crate::project::watched_sub_id(0),
+            // Catch-up shaped, and nobody minted it: the registry is the
+            // only thing that names a page, so this is exactly what an
+            // invented one looks like.
+            format!("proj-catchup-c-{}-1", test_root_id()),
+            "proj-unknown".to_string(),
+        ] {
+            assert_eq!(
+                eose_outcome(&mut state, &root, &id, &tx).await,
+                EoseOutcome {
+                    still_live: false,
+                    page_finished: false
+                },
+                "{id} was never opened, so it is nothing and completes nothing"
+            );
+        }
+
+        // The page it could not complete is still there to be completed.
+        assert_eq!(
+            eose_outcome(&mut state, &root, &sub_id, &tx).await,
+            EoseOutcome {
+                still_live: false,
+                page_finished: true
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn an_eose_witness_names_the_request_it_was_asked_about() {
+        // Found by mutation: the "never sent" test above once had *nothing*
+        // live, so an implementation that fell back to whichever request
+        // happened to be open would pass it. Here a catch-up is live and the
+        // EOSE names a watched id that was never opened — a witness of any kind
+        // is wrong, and one naming the catch-up would complete a page on the
+        // strength of a boundary that belongs to no request at all.
+        let mut state = BgState::new();
+        let (tx, _rx) = mpsc::channel(16);
+        let (bound, _keys) = proven_issue_root().await;
+        let root = bound.binding().root().to_string();
+        let live = bind_page_under(&mut state, &bound).await;
+        let never_opened = crate::project::watched_sub_id(0);
+        assert_ne!(live, never_opened);
+
+        assert_eq!(
+            eose_outcome(&mut state, &root, &never_opened, &tx).await,
+            EoseOutcome {
+                still_live: false,
+                page_finished: false
+            },
+            "an unopened id must not borrow a live request's boundary"
+        );
+        assert!(
+            state.project_requests.match_frame(&live).is_some(),
+            "and must not retire it either"
+        );
+
+        // And the live request's own EOSE still names itself.
+        assert_eq!(
+            eose_outcome(&mut state, &root, &live, &tx).await,
+            EoseOutcome {
+                still_live: false,
+                page_finished: true
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn a_closed_request_stops_being_able_to_witness_an_eose() {
+        // A relay that refuses a request and then announces its backlog is
+        // complete must not be believed about the request it just declined.
+        let mut state = BgState::new();
+        let (tx, _rx) = mpsc::channel(16);
+        let (bound, _keys) = proven_issue_root().await;
+        let root = bound.binding().root().to_string();
+        let sub_id = bind_page_under(&mut state, &bound).await;
+
+        assert!(
+            deliver_control_frame_to(
+                &mut state,
+                json!(["CLOSED", sub_id, "restricted: nope"]),
+                &tx,
+            )
+            .await
+        );
+        assert_eq!(
+            eose_outcome(&mut state, &root, &sub_id, &tx).await,
+            EoseOutcome {
+                still_live: false,
+                page_finished: false
+            },
+            "the refused request has no backlog boundary left to give"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_fresh_connection_invalidates_an_earlier_requests_eose() {
+        // Witnesses are connection-scoped because registrations are. An EOSE
+        // arriving for the dead connection's id, before its replacement REQ has
+        // been written, is not evidence about the new connection's backlog.
+        let mut state = BgState::new();
+        let (tx, _rx) = mpsc::channel(16);
+        let (bound, _keys) = proven_issue_root().await;
+        let root = bound.binding().root().to_string();
+        let sub_id = bind_page_under(&mut state, &bound).await;
+
+        state.retire_project_connection();
+        assert_eq!(
+            eose_outcome(&mut state, &root, &sub_id, &tx).await,
+            EoseOutcome {
+                still_live: false,
+                page_finished: false
+            },
+            "the request that EOSE refers to no longer exists"
+        );
+
+        // Once a replacement page is genuinely opened, EOSE means something
+        // again — under the replacement's own name, and with nobody closing
+        // anything by hand.
+        let sub_id = open_page_under(&mut state, &root).await;
+        assert_eq!(
+            eose_outcome(&mut state, &root, &sub_id, &tx).await,
+            EoseOutcome {
+                still_live: false,
+                page_finished: true
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn notices_and_closed_frames_never_mint_a_witness() {
+        // Only an EOSE frame on a live request is a boundary. Anything else
+        // arriving about that request — a NOTICE, a CLOSED — must produce
+        // none, or "the backlog drained" becomes inferrable from noise.
+        let mut state = BgState::new();
+        let (tx, _rx) = mpsc::channel(16);
+        let (bound, _keys) = proven_issue_root().await;
+        let root = bound.binding().root().to_string();
+        let sub_id = bind_page_under(&mut state, &bound).await;
+
+        assert!(
+            deliver_control_frame_to(&mut state, json!(["NOTICE", "something happened"]), &tx)
+                .await
+        );
+        assert!(
+            state.project_requests.match_frame(&sub_id).is_some()
+                && state
+                    .reconstructions
+                    .get(&root)
+                    .expect("tracked")
+                    .finished_streams()
+                    .is_empty(),
+            "a NOTICE is not a boundary"
+        );
+
+        assert!(deliver_control_frame_to(&mut state, json!(["CLOSED", sub_id, "done"]), &tx).await);
+        assert!(
+            state
+                .reconstructions
+                .get(&root)
+                .expect("tracked")
+                .finished_streams()
+                .is_empty(),
+            "a CLOSED is not a boundary"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_exhausted_incarnation_space_writes_nothing_and_keeps_the_socket() {
+        // Terminal, local, and none of the other three things it could be
+        // mistaken for. Previously this surfaced as `MetadataConflict`, which
+        // made the reconnect path report a request-ownership disagreement that
+        // did not exist — a diagnostic pointing at the wrong subsystem.
+        let (mut ws, mut server) = test_ws_pair().await;
+        let mut state = BgState::new();
+        let agent = nostr::Keys::generate().public_key().to_hex();
+        let sub_id = crate::project::discovery_sub_id();
+
+        // Spend the space.
+        state.project_requests.force_next_incarnation(u64::MAX);
+        let burner = crate::project::watched_sub_id(0);
+        assert_eq!(
+            send_project_subscribe(
+                &mut ws,
+                &mut state,
+                &burner,
+                identity(
+                    crate::project::ProjectSubscription::Watched { generation: 0 },
+                    test_filter(),
+                ),
+            )
+            .await,
+            ProjectSendOutcome::Sent
+        );
+        assert_eq!(next_test_frame(&mut server).await[0], "REQ");
+
+        // Now nothing further can be opened.
+        assert_eq!(
+            send_project_subscribe(&mut ws, &mut state, &sub_id, discovery_identity()).await,
+            ProjectSendOutcome::Exhausted,
+            "reported as itself, not as a conflict"
+        );
+        assert!(
+            timeout(Duration::from_millis(200), server.next())
+                .await
+                .is_err(),
+            "no wire frame"
+        );
+        assert!(
+            state.project_requests.match_frame(&sub_id).is_none(),
+            "no live registration"
+        );
+
+        // The command path keeps the socket: this is not a transport failure.
+        assert!(
+            execute_connected_command(
+                &mut ws,
+                &mut state,
+                &agent,
+                RelayCommand::SubscribeProject {
+                    sub_id: sub_id.clone(),
+                    subscription: crate::project::ProjectSubscription::Discovery,
+                    filters: vec![test_filter()],
+                },
+            )
+            .await,
+            "exhaustion must not be reported as a dead socket"
+        );
+
+        // And the request opened before exhaustion still works.
+        assert!(state.project_requests.match_frame(&burner).is_some());
+    }
+
+    // Deleted 2026-08-01: `a_consumer_can_name_and_store_the_incarnation_it_opened_under`.
+    //
+    // Its premise was that a reconstruction driver stores the incarnation it
+    // opened under and compares a later boundary against it. That is the
+    // caller-holds-authority design, rejected twice in review; the test existed
+    // to prove the rejected shape was expressible. Completion now decides via
+    // `OpenedHistoryPage::verdict_for`, and the property that matters — a
+    // predecessor's boundary cannot complete the replacement — is covered by
+    // the `predecessor_witness_*` falsifiers in `project.rs`.
+
+    // Deleted 2026-08-01: `a_dropped_eose_leaves_no_boundary_and_no_synthetic_replay_floor`.
+    //
+    // It covered the full-channel branch of the boundary's delivery to the run
+    // loop. That delivery is gone — a boundary is a capability the run loop
+    // could not use, and it is now consumed where it is minted — so there is no
+    // queue to wedge and no drop to reason about. What survives of its subject
+    // is `a_persistent_requests_boundary_retires_nothing`, which holds the
+    // "still live afterwards" half against the class it is actually true for.
+
+    #[tokio::test]
+    async fn a_persistent_requests_boundary_retires_nothing() {
+        // The other half of the one-shot rule. Discovery, enrolment and watched
+        // subscriptions keep delivering after their stored backlog drains, so
+        // retiring them on EOSE would silently stop routing at the moment a
+        // backlog ended — the failure being avoided is the mirror image of the
+        // one that made catch-up retirement necessary.
+        let mut state = BgState::new();
+        let (tx, _rx) = mpsc::channel(16);
+        let discovery = open_discovery(&mut state).await;
+        let watched = open_watched(&mut state, 0).await;
+
+        for id in [&discovery, &watched] {
+            assert!(deliver_control_frame_to(&mut state, json!(["EOSE", id]), &tx).await);
+            assert!(
+                state.project_requests.match_frame(id).is_some(),
+                "{id} still has live traffic to deliver"
+            );
+        }
+
+        assert_eq!(
+            state.project_dropped_since, None,
+            "and an EOSE contributes nothing to a replay floor measured in event timestamps"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_eose_leaves_a_persistent_project_request_answerable() {
+        // EOSE means end of *stored* events, not end of subscription. Removing
+        // discovery/enrolment/watched on EOSE would silently stop live routing
+        // the moment the backlog drained.
+        let mut state = BgState::new();
+        let (tx, mut rx) = mpsc::channel(16);
+        let keys = nostr::Keys::generate();
+        let sub_id = open_discovery(&mut state).await;
+
+        assert!(deliver_control_frame(&mut state, json!(["EOSE", sub_id])).await);
+
+        assert!(state.project_requests.match_frame(&sub_id).is_some());
+        let event = announcement(&keys, 1_000);
+        deliver_frame(&mut state, &sub_id, &event, &tx).await;
+        assert_eq!(
+            drain(&mut rx).len(),
+            1,
+            "still delivering after end of stored events"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_conflicting_subscribe_command_keeps_the_socket_and_sends_nothing() {
+        // `true` here means "the connection is fine". Returning `false` for a
+        // metadata conflict let a locally refused command tear down a healthy
+        // connection — and the reconnect then replayed the refusal into effect.
+        let (mut ws, mut server) = test_ws_pair().await;
+        let mut state = BgState::new();
+        let agent = nostr::Keys::generate().public_key().to_hex();
+        let sub_id = crate::project::discovery_sub_id();
+
+        assert!(
+            execute_connected_command(
+                &mut ws,
+                &mut state,
+                &agent,
+                RelayCommand::SubscribeProject {
+                    sub_id: sub_id.clone(),
+                    subscription: crate::project::ProjectSubscription::Discovery,
+                    filters: vec![test_filter()],
+                },
+            )
+            .await
+        );
+        assert_eq!(next_test_frame(&mut server).await[1], sub_id.as_str());
+
+        assert!(
+            execute_connected_command(
+                &mut ws,
+                &mut state,
+                &agent,
+                RelayCommand::SubscribeProject {
+                    sub_id: sub_id.clone(),
+                    subscription: crate::project::ProjectSubscription::Watched { generation: 9 },
+                    filters: vec![json!({ "kinds": [1] })],
+                },
+            )
+            .await,
+            "a locally refused command must not be reported as a dead socket"
+        );
+        assert!(
+            timeout(Duration::from_millis(200), server.next())
+                .await
+                .is_err(),
+            "and must emit no REQ"
+        );
+        assert_eq!(
+            state.project_requests.intent(&sub_id),
+            Some(&discovery_identity())
+        );
+    }
+
+    /// A subscribe command that constrains nothing opens nothing, on either
+    /// side of the connection.
+    ///
+    /// Three shapes, one failure. `["REQ", id]`, `["REQ", id, {}]` and
+    /// `["REQ", id, {"limit": 500}]` are not narrower requests than a filtered
+    /// one — they are unbounded, and each would install a registration that
+    /// admitted every event the relay chose to send under that id. The empty
+    /// *vector* was refused when the filter list arrived; the other two were
+    /// not, because "the collection is non-empty" is not the same claim as
+    /// "the request selects something".
+    ///
+    /// `watched_roots_filters` returns an empty vector when nothing is enrolled,
+    /// so the first is reachable from the builder rather than only from a
+    /// mistake.
+    ///
+    /// The disconnected half matters just as much: intent recorded there is
+    /// replayed verbatim by the next connection, so an unbounded intent sends
+    /// the unbounded REQ later rather than now. That is the leg the reconnect
+    /// assertion below covers.
+    #[tokio::test]
+    async fn a_subscribe_command_that_constrains_nothing_opens_nothing() {
+        let sub_id = crate::project::watched_sub_id(0);
+        let watched = crate::project::ProjectSubscription::Watched { generation: 0 };
+
+        for filters in [Vec::new(), vec![json!({})], vec![json!({ "limit": 500 })]] {
+            // ---- Disconnected: no durable intent, so no later replay. ------
+            let mut disconnected = BgState::new();
+            apply_command_to_state(
+                &mut disconnected,
+                RelayCommand::SubscribeProject {
+                    sub_id: sub_id.clone(),
+                    subscription: watched.clone(),
+                    filters: filters.clone(),
+                },
+            );
+            assert_eq!(
+                disconnected.project_requests.intent(&sub_id),
+                None,
+                "{filters:?}: no intent"
+            );
+            assert!(
+                disconnected.project_requests.replayable().is_empty(),
+                "{filters:?}: and nothing for a reconnect to re-ask"
+            );
+
+            // ---- Connected: no bytes, no registration, no authority. -------
+            let (mut ws, mut server) = test_ws_pair().await;
+            let mut state = BgState::new();
+            let agent = nostr::Keys::generate().public_key().to_hex();
+            assert!(
+                execute_connected_command(
+                    &mut ws,
+                    &mut state,
+                    &agent,
+                    RelayCommand::SubscribeProject {
+                        sub_id: sub_id.clone(),
+                        subscription: watched.clone(),
+                        filters: filters.clone(),
+                    },
+                )
+                .await,
+                "{filters:?}: refusing to ask for everything is not a transport failure"
+            );
+            assert!(
+                timeout(Duration::from_millis(200), server.next())
+                    .await
+                    .is_err(),
+                "{filters:?}: writes no REQ"
+            );
+            assert!(
+                state.project_requests.match_frame(&sub_id).is_none(),
+                "{filters:?}: registers nothing"
+            );
+            assert!(
+                state.project_requests.admit_frame(&sub_id).is_none(),
+                "{filters:?}: and admits no frame under that id"
+            );
+            assert_eq!(
+                state.project_requests.intent(&sub_id),
+                None,
+                "{filters:?}: no intent"
+            );
+            assert!(
+                state.project_requests.replayable().is_empty(),
+                "{filters:?}: and a reconnect re-asks nothing"
+            );
+        }
+    }
+
+    #[test]
+    fn a_disconnected_conflicting_command_keeps_the_first_intent() {
+        // Intent recorded while disconnected is replayed verbatim by the next
+        // connection, so admitting a conflict here is admitting it everywhere.
+        let mut state = BgState::new();
+        let sub_id = crate::project::discovery_sub_id();
+        for cmd in [
+            RelayCommand::SubscribeProject {
+                sub_id: sub_id.clone(),
+                subscription: crate::project::ProjectSubscription::Discovery,
+                filters: vec![test_filter()],
+            },
+            RelayCommand::SubscribeProject {
+                sub_id: sub_id.clone(),
+                subscription: crate::project::ProjectSubscription::Watched { generation: 4 },
+                filters: vec![json!({ "kinds": [1] })],
+            },
+        ] {
+            apply_command_to_state(&mut state, cmd);
+        }
+
+        assert_eq!(
+            state.project_requests.intent(&sub_id),
+            Some(&discovery_identity())
+        );
+    }
+
+    // ── Only requests this agent opened are answerable ───────────────────────
+
+    #[tokio::test]
+    async fn a_frame_on_a_project_id_this_agent_never_opened_is_refused() {
+        // Every one of these ids used to work. `classify_subscription` parsed
+        // the class out of the relay's own string, so a relay could deliver
+        // under `proj-roots-7` and be believed — no REQ of ours required.
+        //
+        // Refusal must be total: no delivery, no dedup spend, no verification
+        // side effects. Nothing here is registered, so nothing is answerable.
+        //
+        // Both event shapes, deliberately. A rooted event is what a `Watched`
+        // or `RootCatchUp` misclassification would admit; an announcement is
+        // what a `Discovery` misclassification would admit. Testing only one
+        // shape lets the *other* source's admissibility gate catch the frame
+        // and look like the registry did it — I found that by mutating the
+        // registry to fall back to `Discovery` and watching this test pass
+        // anyway.
+        let keys = nostr::Keys::generate();
+        let rooted = mixed_surface_event(&keys, Uuid::new_v4(), &test_root_id(), 1_000);
+        let announced = announcement(&keys, 1_000);
+
+        for id in [
+            crate::project::watched_sub_id(0),
+            crate::project::watched_sub_id(7),
+            crate::project::discovery_sub_id(),
+            // Catch-up shaped, and nobody minted it: the registry is the
+            // only thing that names a page, so this is exactly what an
+            // invented one looks like.
+            format!("proj-catchup-c-{}-1", test_root_id()),
+            crate::project::PROJECT_ENROL_SUB_ID.to_string(),
+            "proj-unknown".to_string(),
+        ] {
+            for event in [&rooted, &announced] {
+                let mut state = BgState::new();
+                let (tx, mut rx) = mpsc::channel(16);
+
+                deliver_frame(&mut state, &id, event, &tx).await;
+
+                let eid = event.id.to_hex();
+                assert!(drain(&mut rx).is_empty(), "{id}/{eid}: no delivery");
+                assert!(
+                    !state.project_seen_ids.contains(&eid),
+                    "{id}/{eid}: no project dedup slot spent"
+                );
+                assert!(
+                    !state.seen_ids.contains(&eid),
+                    "{id}/{eid}: no channel dedup slot spent either"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_closed_project_request_stops_being_answerable() {
+        // The half a parser could never express. A subscription id does not
+        // stop being well-formed when we stop listening, so late frames for a
+        // request we have finished with used to keep working.
+        let mut state = BgState::new();
+        let (tx, mut rx) = mpsc::channel(16);
+        let keys = nostr::Keys::generate();
+        let event_a = mixed_surface_event(&keys, Uuid::new_v4(), &test_root_id(), 1_000);
+        let event_b = mixed_surface_event(&keys, Uuid::new_v4(), &test_root_id(), 1_001);
+
+        let watched = open_watched(&mut state, 0).await;
+        deliver_frame(&mut state, &watched, &event_a, &tx).await;
+        assert_eq!(drain(&mut rx).len(), 1, "open: delivered");
+
+        state.project_requests.close_active(&watched);
+        deliver_frame(&mut state, &watched, &event_b, &tx).await;
+
+        assert!(drain(&mut rx).is_empty(), "closed: not delivered");
+        assert!(
+            !state.project_seen_ids.contains(&event_b.id.to_hex()),
+            "a closed request spends nothing"
+        );
+    }
+
+    // Deleted 2026-08-01: `a_catch_up_is_bound_to_the_root_we_recorded_not_the_one_the_id_spells`.
+    //
+    // It registered a catch-up under an id spelling one root while recording
+    // another, and proved the recorded class decided. That state is no longer
+    // constructible: a catch-up wire id is minted by
+    // `ProjectRequests::open_history_page` from the collector's own root and
+    // stream, and no caller — production or test — can supply one. What the
+    // test guarded against is now unrepresentable rather than merely refused.
+    //
+    // The surviving half of its subject, that a frame naming another root is
+    // not one of this page's rows, is
+    // `a_catch_up_root_mismatch_does_not_burn_the_correct_rooted_delivery`.
+
+    #[tokio::test]
+    async fn a_refused_reopen_leaves_the_original_class_in_force_on_the_wire() {
+        // The registry's unit tests prove the record survives a conflicting
+        // reopen. This proves the *dispatch* still behaves under it, which is
+        // the thing that actually matters — a retained record that nothing
+        // consults would be bookkeeping theatre.
+        //
+        // The classes are chosen so they disagree observably: under
+        // `RootCatchUp { root_a }` an event for root B is not one of the page's
+        // rows, and under `Watched` the same event is delivered to the consumer
+        // as a routed event. So if the reopen had taken effect, the assertions
+        // below would see a delivery and an intact page.
+        /// A catch-up for `bound` under `id`, holding a page, after a
+        /// conflicting reopen to `Watched` has been refused.
+        async fn after_a_refused_reopen(
+            state: &mut BgState,
+            bound: &crate::project::VerifiedBoundRoot,
+        ) -> String {
+            let id = bind_page_under(state, bound).await;
+            let (mut ws, _server) = test_ws_pair().await;
+            assert!(
+                matches!(
+                    state
+                        .project_requests
+                        .open_request(
+                            &mut ws,
+                            &id,
+                            identity(
+                                crate::project::ProjectSubscription::Watched { generation: 0 },
+                                test_filter(),
+                            ),
+                        )
+                        .await,
+                    crate::project::OpenOutcome::Conflict { .. }
+                ),
+                "re-pointing a live id must be refused"
+            );
+            id
+        }
+
+        let mut state = BgState::new();
+        let (tx, mut rx) = mpsc::channel(16);
+        let (bound_a, keys) = proven_issue_root().await;
+        let root_a = bound_a.binding().root().to_string();
+        let root_b = "b".repeat(64);
+
+        let id = after_a_refused_reopen(&mut state, &bound_a).await;
+
+        let for_b = comment_on_root(&keys, &root_b, 900, "another root's event");
+        deliver_frame(&mut state, &id, &for_b, &tx).await;
+        assert!(
+            drain(&mut rx).is_empty(),
+            "under `Watched` this would have been delivered as a routed event"
+        );
+        assert!(
+            !state.project_seen_ids.contains(&for_b.id.to_hex()),
+            "and it spends nothing"
+        );
+        assert!(
+            page_verdict(&mut state, &root_a, &id, &tx).await.is_err(),
+            "still bound to root A's reconstruction, so root B is not one of its rows"
+        );
+
+        // Positive control, on its own connection because the refusal above is
+        // terminal for that reconstruction: the same refused reopen leaves root
+        // A's own events admissible.
+        let mut state = BgState::new();
+        let id = after_a_refused_reopen(&mut state, &bound_a).await;
+        let for_a = comment_on_root(&keys, &root_a, 900, "its own root's event");
+        deliver_frame(&mut state, &id, &for_a, &tx).await;
+        assert_eq!(
+            page_verdict(&mut state, &root_a, &id, &tx).await,
+            Ok(1),
+            "the original request is unharmed by the refused reopen"
+        );
+    }
+
+    // ── The membership subscription accepts only membership kinds ────────────
+
+    fn membership_notification(keys: &nostr::Keys, channel_id: Uuid, kind: u32, ts: u64) -> Event {
+        EventBuilder::new(nostr::Kind::Custom(kind as u16), "membership")
+            .custom_created_at(nostr::Timestamp::from(ts))
+            .tags([
+                nostr::Tag::parse(vec!["h".to_string(), channel_id.to_string()]).expect("h tag"),
+                nostr::Tag::parse(vec!["p".to_string(), keys.public_key().to_hex()])
+                    .expect("p tag"),
+            ])
+            .sign_with_keys(keys)
+            .expect("signing should succeed")
+    }
+
+    #[tokio::test]
+    async fn a_wrong_kind_on_the_membership_subscription_changes_nothing() {
+        // The watermark poisoning path. `membership_last_seen` is used
+        // directly as the membership REQ's `since` on reconnect, so a
+        // wrong-kind event with a far-future timestamp used to push that
+        // watermark past legitimate membership notifications — which were then
+        // never replayed. That is loss, not a widened duplicate window: it
+        // *narrows* the replay window.
+        let mut state = BgState::new();
+        let (tx, mut rx) = mpsc::channel(16);
+        let keys = nostr::Keys::generate();
+        let channel_id = Uuid::new_v4();
+        // A perfectly valid channel message, delivered on the wrong sub.
+        let event = mixed_surface_event(&keys, channel_id, &test_root_id(), 9_999_999);
+        let id = event.id.to_hex();
+
+        deliver_frame(&mut state, MEMBERSHIP_NOTIF_SUB_ID, &event, &tx).await;
+
+        assert!(drain(&mut rx).is_empty(), "no delivery");
+        assert!(
+            !state.seen_ids.contains(&id),
+            "no channel dedup slot consumed"
+        );
+        assert_eq!(
+            state.membership_last_seen, None,
+            "the membership watermark is not poisoned"
+        );
+        assert!(state.last_seen.is_empty(), "no channel watermark moved");
+        assert_eq!(state.membership_dropped_since, None);
+
+        // And the event is still deliverable through its legitimate channel
+        // subscription — refusing it here costs it nothing it is entitled to.
+        deliver_frame(&mut state, &channel_sub_id(channel_id), &event, &tx).await;
+        let delivered = drain(&mut rx);
+        assert_eq!(delivered.len(), 1);
+        assert!(matches!(delivered[0], BuzzEvent::Channel { .. }));
+    }
+
+    #[tokio::test]
+    async fn the_membership_subscription_still_accepts_both_membership_kinds() {
+        // Positive controls, so the gate cannot be "fixed" by refusing
+        // everything.
+        for kind in [
+            KIND_MEMBER_ADDED_NOTIFICATION,
+            KIND_MEMBER_REMOVED_NOTIFICATION,
+        ] {
+            let mut state = BgState::new();
+            let (tx, mut rx) = mpsc::channel(16);
+            let keys = nostr::Keys::generate();
+            let channel_id = Uuid::new_v4();
+            let event = membership_notification(&keys, channel_id, kind, 1_000);
+
+            deliver_frame(&mut state, MEMBERSHIP_NOTIF_SUB_ID, &event, &tx).await;
+
+            let delivered = drain(&mut rx);
+            assert_eq!(delivered.len(), 1, "kind {kind} must still be delivered");
+            match &delivered[0] {
+                BuzzEvent::Channel { channel_id: ch, .. } => assert_eq!(*ch, channel_id),
+                other => panic!("expected a channel delivery for kind {kind}: {other:?}"),
+            }
+            assert_eq!(
+                state.membership_last_seen,
+                Some(1_000),
+                "a genuine membership notification does advance the watermark"
+            );
+        }
+    }
+
+    // ── Project sources validate before spending the dedup slot ──────────────
+
+    fn announcement_with(keys: &nostr::Keys, ts: u64, tags: &[&[&str]]) -> Event {
+        EventBuilder::new(
+            nostr::Kind::Custom(KIND_GIT_REPO_ANNOUNCEMENT as u16),
+            "announcement",
+        )
+        .custom_created_at(nostr::Timestamp::from(ts))
+        .tags(tags.iter().map(|t| {
+            nostr::Tag::parse(t.iter().map(|s| s.to_string()).collect::<Vec<_>>()).expect("tag")
+        }))
+        .sign_with_keys(keys)
+        .expect("signing should succeed")
+    }
+
+    fn announcement(keys: &nostr::Keys, ts: u64) -> Event {
+        announcement_with(keys, ts, &[&["d", "repo"]])
+    }
+
+    #[tokio::test]
+    async fn a_malformed_announcement_is_refused_before_it_spends_anything() {
+        // A kind check alone let these through the discovery boundary and into
+        // `ProjectEvent::Discovery`, where the variant's name claimed more than
+        // its payload could prove. They were rejected much later, inside the
+        // state they were trying to enter, having already spent a dedup slot to
+        // get there.
+        //
+        // Each case must produce no delivery, spend no project dedup slot, and
+        // mutate no repository state. The last of those is structural rather
+        // than asserted here: `DiscoveredRepositories::ingest` now takes a
+        // `VerifiedAnnouncement`, so a frame that never proves one has no route
+        // to the set at all.
+        let keys = nostr::Keys::generate();
+        for (label, tags) in [
+            ("no `d`", vec![vec!["a", "30617:x:y"]]),
+            ("empty `d`", vec![vec!["d", ""]]),
+            ("conflicting `d`", vec![vec!["d", "one"], vec!["d", "two"]]),
+            (
+                "duplicate equal `d`",
+                vec![vec!["d", "same"], vec!["d", "same"]],
+            ),
+        ] {
+            let mut state = BgState::new();
+            let (tx, mut rx) = mpsc::channel(16);
+            let borrowed: Vec<&[&str]> = tags.iter().map(|t| t.as_slice()).collect();
+            let event = announcement_with(&keys, 1_000, &borrowed);
+
+            let discovery = open_discovery(&mut state).await;
+            deliver_frame(&mut state, &discovery, &event, &tx).await;
+
+            assert!(drain(&mut rx).is_empty(), "{label}: no discovery delivery");
+            assert!(
+                !state.project_seen_ids.contains(&event.id.to_hex()),
+                "{label}: no project dedup slot spent"
+            );
+            assert_eq!(state.project_dropped_since, None, "{label}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_well_formed_announcement_still_reaches_discovery_with_its_coordinate() {
+        // Positive control: the gate refuses malformed shapes, not everything.
+        // Ownership comes from the verified signer, so an attacker-supplied `a`
+        // naming someone else's repository changes nothing.
+        let keys = nostr::Keys::generate();
+        let signer = keys.public_key().to_hex();
+        let mut state = BgState::new();
+        let (tx, mut rx) = mpsc::channel(16);
+        let event = announcement_with(
+            &keys,
+            1_000,
+            &[
+                &["d", "my-repo"],
+                &["a", "30617:1111111111111111111111111111111111111111111111111111111111111111:not-mine"],
+            ],
+        );
+
+        let discovery = open_discovery(&mut state).await;
+        deliver_frame(&mut state, &discovery, &event, &tx).await;
+
+        let delivered = drain(&mut rx);
+        assert_eq!(delivered.len(), 1);
+        match &delivered[0] {
+            BuzzEvent::Project(crate::project::ProjectEvent::Discovery { announcement }) => {
+                assert_eq!(
+                    announcement.coordinate(),
+                    format!("30617:{signer}:my-repo"),
+                    "the coordinate comes from the signer, not the announcement's `a`"
+                );
+            }
+            other => panic!("expected a discovery delivery: {other:?}"),
+        }
+        assert!(state.project_seen_ids.contains(&event.id.to_hex()));
+    }
+
+    #[tokio::test]
+    async fn an_announcement_on_a_watched_id_does_not_burn_its_discovery_delivery() {
+        // Suppression inside the project namespace. An announcement has no
+        // root, so route derivation drops it — but the id had already been
+        // spent, and the genuine discovery delivery then saw a duplicate.
+        let mut state = BgState::new();
+        let (tx, mut rx) = mpsc::channel(16);
+        let keys = nostr::Keys::generate();
+        let event = announcement(&keys, 1_000);
+
+        let watched = open_watched(&mut state, 0).await;
+        deliver_frame(&mut state, &watched, &event, &tx).await;
+        assert!(
+            drain(&mut rx).is_empty(),
+            "an announcement is not admissible on a watched subscription"
+        );
+
+        let discovery = open_discovery(&mut state).await;
+        deliver_frame(&mut state, &discovery, &event, &tx).await;
+        let delivered = drain(&mut rx);
+        assert_eq!(delivered.len(), 1, "discovery still receives it");
+        assert!(matches!(
+            delivered[0],
+            BuzzEvent::Project(crate::project::ProjectEvent::Discovery { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_rooted_event_on_the_discovery_id_does_not_burn_its_routed_delivery() {
+        // The mirror case. Discovery carries `30617` and nothing else; without
+        // that gate a rooted event delivered under the discovery id was
+        // accepted *as discovery state* and spent its id doing it.
+        let mut state = BgState::new();
+        let (tx, mut rx) = mpsc::channel(16);
+        let keys = nostr::Keys::generate();
+        let event = mixed_surface_event(&keys, Uuid::new_v4(), &test_root_id(), 1_000);
+
+        let discovery = open_discovery(&mut state).await;
+        deliver_frame(&mut state, &discovery, &event, &tx).await;
+        assert!(
+            drain(&mut rx).is_empty(),
+            "a rooted event is not an announcement"
+        );
+
+        let watched = open_watched(&mut state, 0).await;
+        deliver_frame(&mut state, &watched, &event, &tx).await;
+        let delivered = drain(&mut rx);
+        assert_eq!(delivered.len(), 1, "the routed delivery survives");
+        assert!(matches!(
+            delivered[0],
+            BuzzEvent::Project(crate::project::ProjectEvent::Routed { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_catch_up_root_mismatch_does_not_burn_the_correct_rooted_delivery() {
+        // The catch-up root check already existed, but it ran *after*
+        // insertion, so a mismatched frame still spent the id and the correct
+        // delivery for that event was then suppressed.
+        //
+        // A catch-up now spends no dedup slot at all, which subsumes that: the
+        // shared set is for the live surfaces, and running page rows through it
+        // would suppress exactly the events already delivered live — leaving the
+        // page short by that number and reading it as end-of-history.
+        let mut state = BgState::new();
+        let (tx, mut rx) = mpsc::channel(16);
+        let (bound_a, _) = proven_issue_root().await;
+        let root_a = bound_a.binding().root().to_string();
+        let keys = nostr::Keys::generate();
+        let root_b = test_root_id();
+        let event = mixed_surface_event(&keys, Uuid::new_v4(), &root_b, 1_000);
+
+        let catchup_a = bind_page_under(&mut state, &bound_a).await;
+        deliver_frame(&mut state, &catchup_a, &event, &tx).await;
+        assert!(
+            drain(&mut rx).is_empty(),
+            "the mismatched frame delivers nothing to the consumer"
+        );
+        assert!(
+            page_verdict(&mut state, &root_a, &catchup_a, &tx)
+                .await
+                .is_err(),
+            "root B is not admissible on root A's catch-up"
+        );
+        assert!(
+            !state.project_seen_ids.contains(&event.id.to_hex()),
+            "no catch-up frame spends a live-surface dedup slot"
+        );
+
+        // The correct rooted delivery is still there to be made: the mismatch
+        // burned nothing on the way past. (The boundary above delivers a
+        // `StoredEventsComplete`, which is not what is being counted here.)
+        drain(&mut rx);
+        let watched = open_watched(&mut state, 0).await;
+        deliver_frame(&mut state, &watched, &event, &tx).await;
+        let delivered = drain(&mut rx);
+        assert_eq!(delivered.len(), 1, "the routed delivery survives");
+        assert!(matches!(
+            delivered[0],
+            BuzzEvent::Project(crate::project::ProjectEvent::Routed { .. })
+        ));
+    }
+
+    // ── Piece 3: frames reach the page their own request opened ──────────────
+
+    /// A proven issue root, and the keys that signed it.
+    ///
+    /// Through the real proof: a coordinate in the discovered set, a signed root
+    /// naming it, `VerifiedBoundRoot::prove`. There is no test constructor for a
+    /// bound root and there should not be — it is exactly the thing a
+    /// reconstruction may not start without.
+    async fn proven_issue_root() -> (crate::project::VerifiedBoundRoot, nostr::Keys) {
+        let keys = nostr::Keys::generate();
+        let coordinate = format!("30617:{}:repo", keys.public_key().to_hex());
+        let root = EventBuilder::new(
+            nostr::Kind::Custom(buzz_core::kind::KIND_GIT_ISSUE as u16),
+            "an issue",
+        )
+        .tags([nostr::Tag::parse(vec!["a".to_string(), coordinate.clone()]).expect("a tag")])
+        .sign_with_keys(&keys)
+        .expect("sign");
+        let verified = crate::project::VerifiedProjectEvent::verify(root)
+            .await
+            .expect("a freshly signed root verifies");
+        let known = crate::project::DiscoveredRepositories::for_test([coordinate]);
+        let bound =
+            crate::project::VerifiedBoundRoot::prove(std::slice::from_ref(&verified), &known)
+                .expect("a signed root naming a discovered coordinate proves");
+        (bound, keys)
+    }
+
+    /// A comment on `root`, signed for real.
+    fn comment_on_root(keys: &nostr::Keys, root: &str, ts: u64, body: &str) -> Event {
+        EventBuilder::new(nostr::Kind::TextNote, body)
+            .custom_created_at(nostr::Timestamp::from(ts))
+            .tags([nostr::Tag::parse(vec![
+                "e".to_string(),
+                root.to_string(),
+                String::new(),
+                "root".to_string(),
+            ])
+            .expect("e tag")])
+            .sign_with_keys(keys)
+            .expect("sign")
+    }
+
+    /// An event with arbitrary tags, signed for real.
+    fn tagged_event(keys: &nostr::Keys, kind: u16, ts: u64, tags: &[&[&str]]) -> Event {
+        EventBuilder::new(nostr::Kind::Custom(kind), "body")
+            .custom_created_at(nostr::Timestamp::from(ts))
+            .tags(tags.iter().map(|t| {
+                nostr::Tag::parse(t.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+                    .expect("tag parses")
+            }))
+            .sign_with_keys(keys)
+            .expect("sign")
+    }
+
+    /// Deliver one frame and report whether it reached the consumer — and,
+    /// separately, whether it spent the shared project dedup slot.
+    ///
+    /// Both, because a refusal that still spends the slot is not a refusal: the
+    /// event's legitimate delivery on another surface would then see a
+    /// duplicate and deliver nothing.
+    async fn delivery_and_dedup(
+        state: &mut BgState,
+        sub_id: &str,
+        event: &Event,
+        tx: &mpsc::Sender<Option<BuzzEvent>>,
+        rx: &mut mpsc::Receiver<Option<BuzzEvent>>,
+    ) -> (usize, bool) {
+        deliver_frame(state, sub_id, event, tx).await;
+        (
+            drain(rx).len(),
+            state.project_seen_ids.contains(&event.id.to_hex()),
+        )
+    }
+
+    /// A watched request admits only the roots, kinds and window it asked for.
+    ///
+    /// The relay chooses what to send under a subscription id. Until this
+    /// check, "we opened *something* under this id" was the whole admission
+    /// test for the live surfaces: a correctly signed event for a root this
+    /// agent never watched arrived as a routed event and spent the project
+    /// dedup slot on the way, which would then suppress that same event's
+    /// legitimate delivery on the surface entitled to it.
+    #[tokio::test]
+    async fn a_watched_request_admits_only_what_it_asked_for() {
+        let mut state = BgState::new();
+        let (tx, mut rx) = mpsc::channel(16);
+        let keys = nostr::Keys::generate();
+        let watched_root = test_root_id();
+        let other_root = "b".repeat(64);
+
+        // The real watched request for one issue root, from the production
+        // builder, with the window it would be sent with.
+        let id = crate::project::watched_sub_id(0);
+        open_sent(
+            &mut state,
+            &id,
+            watched_identity(0, &[(&watched_root, false)], 1_000),
+        )
+        .await;
+
+        let comment_kind = crate::project::HistoryStream::Comments.kinds()[0] as u16;
+        let pr_update_kind = crate::project::HistoryStream::PullRequestUpdates.kinds()[0] as u16;
+
+        let refused: [(&str, Event); 4] = [
+            (
+                "a root this agent never watched",
+                tagged_event(
+                    &keys,
+                    comment_kind,
+                    1_000,
+                    &[&["e", &other_root, "", "root"]],
+                ),
+            ),
+            (
+                "a kind this request did not ask for",
+                tagged_event(
+                    &keys,
+                    pr_update_kind,
+                    1_000,
+                    &[&["e", &watched_root, "", "root"]],
+                ),
+            ),
+            (
+                // `#e` and `#E` are different questions: a comment points at
+                // its root with lowercase `e`, a pull-request revision with
+                // uppercase `E`. A matcher that case-folded the tag name would
+                // admit each on the other's filter.
+                "the right root under the wrong reference style",
+                tagged_event(&keys, comment_kind, 1_000, &[&["E", &watched_root]]),
+            ),
+            (
+                "older than the window this request asked for",
+                tagged_event(
+                    &keys,
+                    comment_kind,
+                    999,
+                    &[&["e", &watched_root, "", "root"]],
+                ),
+            ),
+        ];
+
+        for (why, event) in &refused {
+            assert_eq!(
+                delivery_and_dedup(&mut state, &id, event, &tx, &mut rx).await,
+                (0, false),
+                "{why}: must deliver nothing and spend nothing"
+            );
+        }
+
+        // The positive control, so none of the above is passing because the
+        // whole surface is broken.
+        let admissible = tagged_event(
+            &keys,
+            comment_kind,
+            1_000,
+            &[&["e", &watched_root, "", "root"]],
+        );
+        assert_eq!(
+            delivery_and_dedup(&mut state, &id, &admissible, &tx, &mut rx).await,
+            (1, true),
+            "what the request actually asked for is delivered"
+        );
+    }
+
+    /// The watched REQ production builds — two filters — goes on the wire whole
+    /// and admits either branch.
+    ///
+    /// A NIP-01 REQ carries one *or more* filters, ORed, and this is the request
+    /// that uses that: comments and status events point at their root with
+    /// lowercase `e`, a pull-request revision with **uppercase `E`**, and a
+    /// single lowercase filter silently drops every PR revision. The registry
+    /// held one `Value`, so it could not represent this request at all — the
+    /// pair would have serialised as `["REQ", id, [a, b]]` and would have made
+    /// `admits` refuse everything, since the stored value was no longer an
+    /// object. The only thing hiding that was a fixture rebuilding one filter by
+    /// hand.
+    ///
+    /// So this test starts from `watched_roots_filters`, not from JSON: an
+    /// approximation cannot demonstrate an equivalence with the thing it
+    /// approximates.
+    #[tokio::test]
+    async fn the_watched_req_carries_both_reference_styles_and_admits_either() {
+        let issue_root = "a".repeat(64);
+        let pr_root = "b".repeat(64);
+        let roots = [(issue_root.as_str(), false), (pr_root.as_str(), true)];
+        let identity = watched_identity(0, &roots, 0);
+
+        // ---- The bytes, through a concrete paired socket. ------------------
+        //
+        // Compared against `project_req_frames`, which is what the driver will
+        // actually send. Equality of the whole frame, not a spot check on one
+        // key: this is the assertion that would have caught `["REQ", id, [a, b]]`.
+        let mut state = BgState::new();
+        let (mut ws, mut server) = test_ws_pair().await;
+        let id = crate::project::watched_sub_id(0);
+        assert_eq!(
+            send_project_subscribe(&mut ws, &mut state, &id, identity.clone()).await,
+            ProjectSendOutcome::Sent
+        );
+        let written = next_test_frame(&mut server).await;
+
+        let produced = crate::project::project_req_frames(
+            true,
+            &crate::project::DiscoveredRepositories::new(),
+            &watched_enrolments(&roots),
+            &"1".repeat(64),
+            0,
+        );
+        assert_eq!(
+            produced.len(),
+            1,
+            "nothing is discovered, so the watched REQ is the only frame: {produced:?}"
+        );
+        assert_eq!(
+            written, produced[0],
+            "the REQ on the wire must be the frame the builder produces, filter \
+             for filter and in order"
+        );
+        assert_eq!(
+            written.as_array().map(Vec::len),
+            Some(4),
+            "and the two filters ride as separate REQ elements, not as one array"
+        );
+
+        // ---- What it admits, on the same registration. ---------------------
+        let (tx, mut rx) = mpsc::channel(16);
+        let keys = nostr::Keys::generate();
+        let comment_kind = crate::project::HistoryStream::Comments.kinds()[0] as u16;
+        let update_kind = crate::project::HistoryStream::PullRequestUpdates.kinds()[0] as u16;
+
+        // Each reference style on its own branch. Neither would be admitted by
+        // the other's filter, so both are needed to show the OR is real.
+        for (why, event) in [
+            (
+                "a comment on the issue root, lowercase `e`",
+                tagged_event(&keys, comment_kind, 10, &[&["e", &issue_root, "", "root"]]),
+            ),
+            (
+                "a revision on the pull-request root, uppercase `E`",
+                tagged_event(&keys, update_kind, 10, &[&["E", &pr_root]]),
+            ),
+        ] {
+            assert_eq!(
+                delivery_and_dedup(&mut state, &id, &event, &tx, &mut rx).await,
+                (1, true),
+                "{why}: the request asked for this"
+            );
+        }
+
+        // The branches must not lend each other their root list either.
+        //
+        // Chosen so the **filter** is what refuses it: a revision resolves its
+        // root through its uppercase `E`, so this event derives a route and
+        // would be delivered by any earlier step. The comments branch does not
+        // ask for this kind and the revisions branch does not ask for this root,
+        // so no single filter is satisfied — which is what a two-filter REQ
+        // means and what merging the branches into one constraint set would
+        // lose.
+        //
+        // The tag-style crossings hermes-gateway asked for — a comment carrying
+        // only `E`, a revision carrying only `e` — are asserted in
+        // `project::tests::a_request_admits_an_event_matching_any_one_of_its_filters_entirely`
+        // instead. On this path they never reach the filter: route derivation
+        // refuses them first, so asserting them here would pass with the filter
+        // check deleted entirely.
+        let wrong_branch_root = tagged_event(&keys, update_kind, 10, &[&["E", &issue_root]]);
+        assert_eq!(
+            delivery_and_dedup(&mut state, &id, &wrong_branch_root, &tx, &mut rx).await,
+            (0, false),
+            "a revision on a root watched only for comments must deliver nothing \
+             and spend nothing"
+        );
+
+        // ---- And a reconnect re-asks the same question. --------------------
+        //
+        // Byte-for-byte against the frame recorded above, because a replay that
+        // dropped a branch would leave the agent silently blind to one
+        // reference style on every connection after the first — and the suite
+        // would stay green, since the first connection asked correctly.
+        state.project_requests.clear_connection();
+        let (mut replacement, mut replacement_server) = test_ws_pair().await;
+        let replayable = state.project_requests.replayable();
+        assert_eq!(replayable.len(), 1, "one request to re-ask: {replayable:?}");
+        for (sub_id, identity) in replayable {
+            assert_eq!(
+                send_project_subscribe(&mut replacement, &mut state, &sub_id, identity).await,
+                ProjectSendOutcome::Sent
+            );
+        }
+        assert_eq!(
+            next_test_frame(&mut replacement_server).await,
+            written,
+            "the reconnect must re-ask the complete filter set"
+        );
+    }
+
+    /// An enrolment request admits only events naming its project *and* its
+    /// agent.
+    ///
+    /// Built with the production filter, not a hand-written one: this is the
+    /// request that decides which mentions become project work, and a fixture
+    /// that invented its own `#a`/`#p` shape would be checking a question
+    /// nobody asks.
+    #[tokio::test]
+    async fn an_enrolment_request_admits_only_its_project_and_its_agent() {
+        let mut state = BgState::new();
+        let (tx, mut rx) = mpsc::channel(16);
+        let author = nostr::Keys::generate();
+        let agent = nostr::Keys::generate().public_key().to_hex();
+        let stranger = nostr::Keys::generate().public_key().to_hex();
+        let coordinate = format!("30617:{}:repo", author.public_key().to_hex());
+        let other_coordinate = format!("30617:{}:elsewhere", author.public_key().to_hex());
+
+        let discovered = crate::project::DiscoveredRepositories::for_test([coordinate.clone()]);
+        let filter = crate::project::enrolment_filter(&discovered, &agent, 0)
+            .expect("a known coordinate yields a filter");
+        let id = "proj-enrolment-test".to_string();
+        open_sent(
+            &mut state,
+            &id,
+            identity(crate::project::ProjectSubscription::Enrolment, filter),
+        )
+        .await;
+
+        let kind = buzz_core::kind::KIND_TEXT_NOTE as u16;
+        let root = test_root_id();
+        let refused: [(&str, Event); 4] = [
+            (
+                "no agent p-tag at all",
+                tagged_event(
+                    &author,
+                    kind,
+                    10,
+                    &[&["a", &coordinate], &["e", &root, "", "root"]],
+                ),
+            ),
+            (
+                "another agent's p-tag",
+                tagged_event(
+                    &author,
+                    kind,
+                    10,
+                    &[
+                        &["a", &coordinate],
+                        &["p", &stranger],
+                        &["e", &root, "", "root"],
+                    ],
+                ),
+            ),
+            (
+                "no project a-tag at all",
+                tagged_event(
+                    &author,
+                    kind,
+                    10,
+                    &[&["p", &agent], &["e", &root, "", "root"]],
+                ),
+            ),
+            (
+                "another project's a-tag",
+                tagged_event(
+                    &author,
+                    kind,
+                    10,
+                    &[
+                        &["a", &other_coordinate],
+                        &["p", &agent],
+                        &["e", &root, "", "root"],
+                    ],
+                ),
+            ),
+        ];
+
+        for (why, event) in &refused {
+            assert_eq!(
+                delivery_and_dedup(&mut state, &id, event, &tx, &mut rx).await,
+                (0, false),
+                "{why}: must deliver nothing and spend nothing"
+            );
+        }
+
+        let admissible = tagged_event(
+            &author,
+            kind,
+            10,
+            &[
+                &["a", &coordinate],
+                &["p", &agent],
+                &["e", &root, "", "root"],
+            ],
+        );
+        assert_eq!(
+            delivery_and_dedup(&mut state, &id, &admissible, &tx, &mut rx).await,
+            (1, true),
+            "an event naming this project and this agent is what was asked for"
+        );
+    }
+
+    /// A comments page for `bound`, opened the way a driver must and held by
+    /// this connection's reconstructions.
+    ///
+    /// The owner issues the collector; the registry mints the wire id, writes
+    /// the REQ to a real socket, installs the registration and binds the page;
+    /// the owner attaches what comes back. Returns that minted id, because
+    /// nothing else knows it — which is the property blocker 4 bought.
+    async fn bind_page_under(
+        state: &mut BgState,
+        bound: &crate::project::VerifiedBoundRoot,
+    ) -> String {
+        let root = bound.binding().root().to_string();
+        assert!(
+            state
+                .reconstructions
+                .insert(crate::project::RootReconstruction::begin(
+                    bound, 1_000, 4, 1_000
+                )),
+            "one reconstruction per root"
+        );
+        open_page_under(state, &root).await
+    }
+
+    /// Open the next comments page for a root already being reconstructed, and
+    /// return the wire id the registry minted for it.
+    ///
+    /// **The caller cannot choose the id, here or in production.** It used to
+    /// pass one in, which is how a fixture could hand two successive pages the
+    /// same name — the thing that let a delayed frame from the first be stamped
+    /// with the second's authority.
+    ///
+    /// **No `close_active` either.** An earlier version retired whatever was
+    /// live before every page, performing the transition the production EOSE
+    /// path was missing and therefore hiding that it was missing.
+    async fn open_page_under(state: &mut BgState, root: &str) -> String {
+        let collector = state
+            .reconstructions
+            .get(root)
+            .expect("the root is being reconstructed")
+            .begin_page(crate::project::HistoryStream::Comments)
+            .expect("that stream wants a page");
+        let (mut ws, _server) = test_ws_pair().await;
+        let page = match state
+            .project_requests
+            .open_history_page(&mut ws, collector)
+            .await
+        {
+            crate::project::PageOpen::Opened(page) => page,
+            other => panic!("a real socket must open a page: {other:?}"),
+        };
+        let sub_id = page.sub_id().to_string();
+        state
+            .reconstructions
+            .get(root)
+            .expect("still tracked")
+            .attach(page)
+            .map_err(|r| r.error)
+            .expect("attaches");
+        sub_id
+    }
+
+    /// Close the page under `sub_id` with its own genuine boundary and report
+    /// what the reconstruction kept.
+    ///
+    /// `Ok(rows)` when the page completed and retained that many events;
+    /// `Err(reason)` when it could not account for what arrived and the
+    /// reconstruction gave up. The distinction is the whole point: a page that
+    /// silently drops a frame reports `Ok` one row short, and one row short of
+    /// the limit is how a reconstruction decides history is exhausted.
+    async fn page_verdict(
+        state: &mut BgState,
+        root: &str,
+        sub_id: &str,
+        tx: &mpsc::Sender<Option<BuzzEvent>>,
+    ) -> Result<usize, String> {
+        assert!(
+            deliver_control_frame_to(state, json!(["EOSE", sub_id]), tx).await,
+            "dispatch must not signal connection loss"
+        );
+        let recon = state
+            .reconstructions
+            .get(root)
+            .expect("the root is still tracked");
+        match recon.abandoned_reason() {
+            Some(reason) => Err(reason.to_string()),
+            None => Ok(recon.finished_streams().iter().map(|s| s.len()).sum()),
+        }
+    }
+
+    /// The composed Piece 3 path, end to end on real frames.
+    ///
+    /// REQ on a real socket → an `["EVENT", id, e]` frame through
+    /// `handle_ws_message` → routed to the page that exact request opened →
+    /// `["EOSE", id]` finishing that same page.
+    ///
+    /// Before this, the last two steps did not exist: a catch-up frame reached
+    /// the routed arm of `handle_project_event`, which logged and dropped it. A
+    /// page could be opened, bound and attached, and no row ever reached it.
+    #[tokio::test]
+    async fn a_page_fills_from_the_wire_and_completes_at_its_own_boundary() {
+        let mut state = BgState::new();
+        let (tx, mut rx) = mpsc::channel(16);
+        let (bound, keys) = proven_issue_root().await;
+        let root = bound.binding().root().to_string();
+        let sub_id = bind_page_under(&mut state, &bound).await;
+
+        let comment = comment_on_root(&keys, &root, 900, "a comment");
+        deliver_frame(&mut state, &sub_id, &comment, &tx).await;
+
+        assert_eq!(
+            page_verdict(&mut state, &root, &sub_id, &tx).await,
+            Ok(1),
+            "the row that arrived on the wire is the row it retained"
+        );
+        assert!(
+            drain(&mut rx).iter().all(|e| !matches!(
+                e,
+                BuzzEvent::Project(crate::project::ProjectEvent::Routed { .. })
+            )),
+            "and it never escaped as an ordinary routed event"
+        );
+    }
+
+    /// A frame the agent refuses poisons the page instead of shortening it.
+    ///
+    /// The defect this closes is quiet: a page counts what the relay returned
+    /// under its `limit` to tell a saturated page from an exhausted one. The
+    /// dispatch used to drop an unverifiable frame with `return true`, so the
+    /// page never learned one had arrived, read one row short of the limit, and
+    /// declared the history exhausted. One forged frame ended a reconstruction
+    /// early and the result claimed to be complete.
+    #[tokio::test]
+    async fn an_unverifiable_frame_poisons_the_page_instead_of_shortening_it() {
+        let mut state = BgState::new();
+        let (tx, _rx) = mpsc::channel(16);
+        let (bound, keys) = proven_issue_root().await;
+        let root = bound.binding().root().to_string();
+        let sub_id = bind_page_under(&mut state, &bound).await;
+
+        // Re-serialised with mutated content: the id and signature no longer
+        // match, which is what a malicious relay sends.
+        let genuine = comment_on_root(&keys, &root, 900, "a comment");
+        let mut json = serde_json::to_value(&genuine).expect("encode");
+        json["content"] = serde_json::Value::String("tampered".to_string());
+        let forged: Event = serde_json::from_value(json).expect("decode");
+
+        deliver_frame(&mut state, &sub_id, &forged, &tx).await;
+
+        let verdict = page_verdict(&mut state, &root, &sub_id, &tx).await;
+        assert!(
+            verdict.is_err(),
+            "a page that received a frame it cannot account for must not complete: {verdict:?}"
+        );
+        assert!(
+            state
+                .reconstructions
+                .get(&root)
+                .expect("still tracked")
+                .finished_streams()
+                .is_empty(),
+            "and must claim no exhausted history"
+        );
+    }
+
+    /// A row already delivered on a live surface still counts on the page.
+    ///
+    /// Catch-up rows used to share `project_seen_ids` with discovery, enrolment
+    /// and watched traffic. An event the agent had already been handed live was
+    /// therefore suppressed as a duplicate on the history page — shortening the
+    /// page by exactly the number of events it had already seen, which is the
+    /// same false end-of-history by a different route.
+    #[tokio::test]
+    async fn a_row_already_delivered_live_still_reaches_the_page() {
+        let mut state = BgState::new();
+        let (tx, mut rx) = mpsc::channel(16);
+        let (bound, keys) = proven_issue_root().await;
+        let root = bound.binding().root().to_string();
+        let comment = comment_on_root(&keys, &root, 900, "seen live first");
+
+        // Live first: this spends the shared dedup slot. The watched request
+        // has to actually be watching this root, or the frame is refused before
+        // it can spend anything — which is the point of the check, not a way
+        // around setting the fixture up properly.
+        let watched = open_watched_for(&mut state, 0, &[&root]).await;
+        deliver_frame(&mut state, &watched, &comment, &tx).await;
+        assert_eq!(drain(&mut rx).len(), 1, "the live delivery happens");
+        assert!(state.project_seen_ids.contains(&comment.id.to_hex()));
+
+        let sub_id = bind_page_under(&mut state, &bound).await;
+
+        deliver_frame(&mut state, &sub_id, &comment, &tx).await;
+        assert_eq!(
+            page_verdict(&mut state, &root, &sub_id, &tx).await,
+            Ok(1),
+            "the page keeps the row the live surface had already spent"
+        );
+    }
+
+    /// A `CLOSED` releases the page instead of stalling its stream forever.
+    ///
+    /// No boundary can follow a `CLOSED` — the registration is gone, and
+    /// `witness_end_of_stored_events` needs a live one — so a page left attached
+    /// can never complete. `pages_wanted` skips a stream holding a page, so the
+    /// stream would never ask again either: one relay message, and that root
+    /// stops reconstructing in silence.
+    #[tokio::test]
+    async fn a_closed_request_releases_its_page_rather_than_stalling_the_stream() {
+        let mut state = BgState::new();
+        let (tx, _rx) = mpsc::channel(16);
+        let (bound, _keys) = proven_issue_root().await;
+        let root = bound.binding().root().to_string();
+        let sub_id = bind_page_under(&mut state, &bound).await;
+        assert!(
+            state
+                .reconstructions
+                .get(&root)
+                .expect("tracked")
+                .pages_wanted()
+                .is_empty(),
+            "the stream holds a page, so it wants none"
+        );
+
+        assert!(
+            deliver_control_frame_to(
+                &mut state,
+                json!(["CLOSED", sub_id, "error: rate-limited"]),
+                &tx
+            )
+            .await,
+            "a project CLOSED must not drop the socket"
+        );
+
+        let recon = state
+            .reconstructions
+            .get(&root)
+            .expect("the root is still tracked");
+        assert!(
+            recon.abandoned_reason().is_none(),
+            "a closed request is not a corrupt page — nothing is wrong with what it received"
+        );
+        assert_eq!(
+            recon.pages_wanted(),
+            vec![(crate::project::HistoryStream::Comments, 1_000, 4)],
+            "the stream asks again, from the bound it already had"
+        );
+    }
+
+    /// A reconnect releases the pages the dead connection opened.
+    ///
+    /// The same silence as a `CLOSED`, from the routine event rather than the
+    /// rare one. `clear_connection` retires every registration the old socket
+    /// held, so no boundary can ever be minted for a page opened under one; a
+    /// reconstruction that was not told keeps the page, and `pages_wanted` skips
+    /// a stream that holds one. That root would stop asking for history on an
+    /// otherwise healthy connection, with nothing logged and nothing failed.
+    #[tokio::test]
+    async fn a_reconnect_releases_the_pages_the_dead_connection_opened() {
+        let mut state = BgState::new();
+        let (tx, _rx) = mpsc::channel(16);
+        let (bound, _keys) = proven_issue_root().await;
+        let root = bound.binding().root().to_string();
+        let sub_id = bind_page_under(&mut state, &bound).await;
+
+        // The production reconnect path, on a fresh connection.
+        let (ws, _server) = test_ws_pair().await;
+        assert!(matches!(
+            reconnect_onto(&mut state, ws).await,
+            ResubscribeResult::Ok
+        ));
+
+        let recon = state
+            .reconstructions
+            .get(&root)
+            .expect("the root is still tracked");
+        assert!(
+            recon.abandoned_reason().is_none(),
+            "a reconnect is not a corrupt page"
+        );
+        assert_eq!(
+            recon.pages_wanted(),
+            vec![(crate::project::HistoryStream::Comments, 1_000, 4)],
+            "the stream asks again, from the bound it already had"
+        );
+        assert!(
+            state.project_requests.match_frame(&sub_id).is_none(),
+            "and the registration that opened it is gone, so nothing can complete it"
+        );
+
+        // The page really is unusable now: its own boundary cannot even be
+        // minted, so releasing it is the only thing that keeps the stream alive.
+        assert!(
+            deliver_control_frame_to(&mut state, json!(["EOSE", sub_id]), &tx).await,
+            "dispatch must not signal connection loss"
+        );
+        assert!(state
+            .reconstructions
+            .get(&root)
+            .expect("tracked")
+            .finished_streams()
+            .is_empty());
+    }
+
+    /// A completed catch-up answers nothing further.
+    ///
+    /// Its boundary retired it, so the id it used stops being a way in. Each of
+    /// these was reachable while the registration outlived its own answer: a
+    /// second `EOSE` minting a second boundary, an `EVENT` still admitted into a
+    /// page that had already been completed, and a `CLOSED` recording a refusal
+    /// of a request that was over — which would then suspend the *next* page's
+    /// replay for a reason belonging to the previous one.
+    #[tokio::test]
+    async fn a_completed_catch_up_answers_nothing_further() {
+        let mut state = BgState::new();
+        let (tx, mut rx) = mpsc::channel(16);
+        let (bound, keys) = proven_issue_root().await;
+        let root = bound.binding().root().to_string();
+        let sub_id = bind_page_under(&mut state, &bound).await;
+
+        let first = comment_on_root(&keys, &root, 900, "the one row");
+        deliver_frame(&mut state, &sub_id, &first, &tx).await;
+        assert_eq!(
+            page_verdict(&mut state, &root, &sub_id, &tx).await,
+            Ok(1),
+            "a short page is an exhausted stream"
+        );
+        assert!(
+            state.project_requests.match_frame(&sub_id).is_none(),
+            "and the request that asked is retired by its own answer"
+        );
+
+        // A second boundary for the same id.
+        assert_eq!(
+            eose_outcome(&mut state, &root, &sub_id, &tx).await,
+            EoseOutcome {
+                still_live: false,
+                page_finished: true
+            },
+            "a duplicate EOSE changes nothing — there is no request left to answer"
+        );
+
+        // A late row on the same id.
+        let late = comment_on_root(&keys, &root, 899, "after the end");
+        deliver_frame(&mut state, &sub_id, &late, &tx).await;
+        let recon = state
+            .reconstructions
+            .get(&root)
+            .expect("the root is still tracked");
+        assert!(
+            recon.abandoned_reason().is_none(),
+            "an unadmitted frame is not a contradiction — it never reached the owner"
+        );
+        assert_eq!(
+            recon
+                .finished_streams()
+                .iter()
+                .map(|s| s.len())
+                .sum::<usize>(),
+            1,
+            "and it is not in the history the completed page retained"
+        );
+        assert!(
+            !state.project_seen_ids.contains(&late.id.to_hex()),
+            "nor was it laundered onto a live surface"
+        );
+        assert!(drain(&mut rx).is_empty());
+
+        // A `CLOSED` for the same id.
+        assert!(
+            deliver_control_frame_to(
+                &mut state,
+                json!(["CLOSED", sub_id, "error: rate-limited"]),
+                &tx
+            )
+            .await
+        );
+        assert_eq!(
+            state.project_requests.suspension(&sub_id),
+            None,
+            "a request that already ended cannot be refused, and a refusal \
+             recorded here would suspend the next page for the previous one's sake"
+        );
+    }
+
+    /// A retired page's raw frames cannot act on the page that replaced it.
+    ///
+    /// The reviewer's sequence, at the wire: page A opens, is answered and
+    /// retired, page B opens; then A's `EVENT`, `EOSE` and `CLOSED` arrive
+    /// late. Under a deterministic catch-up id all three named whatever was
+    /// live — B — and were stamped with B's authority before any comparison
+    /// could tell them apart. The `EOSE` was the dangerous one: it finished B
+    /// as an empty page, which reads as "this history is exhausted".
+    ///
+    /// Raw frames, not pre-minted proofs: the defect was in the minting, so a
+    /// test that started from an admission or a witness would have started
+    /// after it.
+    #[tokio::test]
+    async fn a_retired_pages_raw_frames_cannot_act_on_its_successor() {
+        let mut state = BgState::new();
+        let (tx, mut rx) = mpsc::channel(16);
+        let (bound, keys) = proven_issue_root().await;
+        let root = bound.binding().root().to_string();
+
+        // Page A: saturated, so the stream continues rather than finishing.
+        let page_a = bind_page_under(&mut state, &bound).await;
+        for (i, ts) in [900u64, 899, 898, 897].iter().enumerate() {
+            let row = comment_on_root(&keys, &root, *ts, &format!("page one row {i}"));
+            deliver_frame(&mut state, &page_a, &row, &tx).await;
+        }
+        assert!(deliver_control_frame_to(&mut state, json!(["EOSE", page_a]), &tx).await);
+
+        // Page B. Under a name of its own — but that is asserted at the *end*,
+        // deliberately. Two attempts sharing one name is the mechanism of the
+        // defect, so checking it here would make this test report "the ids are
+        // equal" and stop, in place of the outcome the ids exist to prevent.
+        let page_b = open_page_under(&mut state, &root).await;
+        let _ = drain(&mut rx);
+
+        // Now A's stragglers, all three kinds, all naming A.
+        let straggler = comment_on_root(&keys, &root, 896, "late from page one");
+        deliver_frame(&mut state, &page_a, &straggler, &tx).await;
+        assert!(deliver_control_frame_to(&mut state, json!(["EOSE", page_a]), &tx).await);
+        assert!(
+            deliver_control_frame_to(
+                &mut state,
+                json!(["CLOSED", page_a, "error: rate-limited"]),
+                &tx
+            )
+            .await
+        );
+
+        let recon = state
+            .reconstructions
+            .get(&root)
+            .expect("the root is still tracked");
+        assert!(
+            recon.finished_streams().is_empty(),
+            "the predecessor's boundary must not finish the page that replaced it"
+        );
+        assert!(
+            recon.abandoned_reason().is_none(),
+            "and a late straggler is not a reason to abandon a root"
+        );
+        assert!(
+            recon.pages_wanted().is_empty(),
+            "page B is still in flight, so the stream is not asking for another"
+        );
+        assert_eq!(
+            state.project_requests.suspension(&page_a),
+            None,
+            "and a CLOSED for a request that already ended records no refusal"
+        );
+        assert!(
+            !state.project_seen_ids.contains(&straggler.id.to_hex()),
+            "nor does the straggler spend a live-surface dedup slot"
+        );
+
+        // B's own frames still work, so none of the above passed by breaking
+        // the page it was protecting.
+        let wanted_until = 897;
+        let row = comment_on_root(&keys, &root, wanted_until, "page two row");
+        deliver_frame(&mut state, &page_b, &row, &tx).await;
+        assert_eq!(
+            page_verdict(&mut state, &root, &page_b, &tx).await,
+            Ok(5),
+            "page two takes its own rows and completes on its own boundary"
+        );
+
+        // And the mechanism, last: everything above holds because the two
+        // attempts never shared a name.
+        assert_ne!(page_a, page_b, "one page, one wire id");
+    }
+
+    /// The next page opens with no out-of-band cleanup, under a name of its own.
+    ///
+    /// Two transitions in one sequence, and each used to be missing. Page one's
+    /// boundary must retire page one's registration: while the old entry
+    /// survived, opening page two had to be preceded by a hand-written
+    /// `close_active`, which every fixture here performed — which is exactly how
+    /// the missing transition stayed invisible. And page two must not re-register
+    /// page one's name, because a page's id is what admits its frames.
+    #[tokio::test]
+    async fn the_next_page_opens_clean_and_under_its_own_name() {
+        let mut state = BgState::new();
+        let (tx, _rx) = mpsc::channel(16);
+        let (bound, keys) = proven_issue_root().await;
+        let root = bound.binding().root().to_string();
+        let sub_id = bind_page_under(&mut state, &bound).await;
+
+        // Saturate page one: four rows against a limit of four, so the stream
+        // continues rather than finishing.
+        for (i, ts) in [900u64, 899, 898, 897].iter().enumerate() {
+            let row = comment_on_root(&keys, &root, *ts, &format!("page one row {i}"));
+            deliver_frame(&mut state, &sub_id, &row, &tx).await;
+        }
+        assert!(
+            deliver_control_frame_to(&mut state, json!(["EOSE", sub_id]), &tx).await,
+            "dispatch must not signal connection loss"
+        );
+        assert!(
+            state.project_requests.match_frame(&sub_id).is_none(),
+            "the boundary retired page one's registration"
+        );
+
+        let wanted = state
+            .reconstructions
+            .get(&root)
+            .expect("tracked")
+            .pages_wanted();
+        assert_eq!(wanted.len(), 1, "the stream wants another page: {wanted:?}");
+        let (_, next_until, _) = wanted[0];
+        assert!(
+            next_until < 1_000,
+            "and from an advanced bound: {next_until}"
+        );
+
+        // No `close_active` anywhere in here, and page two gets a name of its
+        // own rather than inheriting page one's.
+        let second = open_page_under(&mut state, &root).await;
+        assert_ne!(second, sub_id, "one page, one wire id");
+        let row = comment_on_root(&keys, &root, next_until, "page two row");
+        deliver_frame(&mut state, &second, &row, &tx).await;
+        assert_eq!(
+            page_verdict(&mut state, &root, &second, &tx).await,
+            Ok(5),
+            "page two completes the stream, and the history is both pages'"
+        );
+    }
+
+    /// Frames the replacement connection buffered cannot act on the dead
+    /// connection's page.
+    ///
+    /// The window this closes: `do_connect` returns a socket *plus* whatever
+    /// arrived on it during the handshake, and those frames go through the
+    /// ordinary dispatch, which authenticates a project frame against whatever
+    /// the registry says is live. While the dead connection's registrations were
+    /// still there, "live" meant *its* registrations — so a `["EOSE", id]` the
+    /// replacement happened to carry could mint a boundary for a request the
+    /// replacement never sent and complete a page opened on a socket that no
+    /// longer exists. An `EVENT` in the same buffer would have been filed into
+    /// that page as a row, and a `CLOSED` recorded as its refusal.
+    ///
+    /// All three are in one buffer here because the fix is not three fixes: it
+    /// is the order of two lines, and any frame the dispatch can authenticate
+    /// is in scope.
+    #[tokio::test]
+    async fn a_replacement_connections_buffered_frames_cannot_act_on_the_dead_page() {
+        let mut state = BgState::new();
+        let (bound, keys) = proven_issue_root().await;
+        let root = bound.binding().root().to_string();
+        let sub_id = bind_page_under(&mut state, &bound).await;
+
+        let row = comment_on_root(&keys, &root, 900, "buffered by the new socket");
+        let buffered = VecDeque::from(vec![
+            RelayMessage::Event {
+                subscription_id: sub_id.clone(),
+                event: Box::new(row.clone()),
+            },
+            RelayMessage::Eose {
+                subscription_id: sub_id.clone(),
+            },
+            RelayMessage::Closed {
+                subscription_id: sub_id.clone(),
+                message: "error: whatever".to_string(),
+            },
+        ]);
+
+        let (mut dead, _dead_server) = test_ws_pair().await;
+        let (replacement, _server) = test_ws_pair().await;
+        assert!(
+            install_replacement_with(&mut state, &mut dead, replacement, buffered).await,
+            "none of these frames is a reason to drop the new connection"
+        );
+
+        let recon = state
+            .reconstructions
+            .get(&root)
+            .expect("the root is still tracked");
+        assert!(
+            recon.finished_streams().is_empty(),
+            "the dead connection's page must not have been completed by a boundary \
+             the replacement carried"
+        );
+        assert!(
+            recon.abandoned_reason().is_none(),
+            "and nothing about a routine reconnect is a contradiction"
+        );
+        assert_eq!(
+            recon.pages_wanted(),
+            vec![(crate::project::HistoryStream::Comments, 1_000, 4)],
+            "the page was released, so the stream asks again from its own bound"
+        );
+        assert!(
+            state.project_requests.match_frame(&sub_id).is_none(),
+            "and the registration those frames named is gone before any of them ran"
+        );
+        assert_eq!(
+            state.project_requests.suspension(&sub_id),
+            None,
+            "a CLOSED for a request this connection never sent records no refusal"
+        );
+        assert!(
+            !state.project_seen_ids.contains(&row.id.to_hex()),
+            "and the buffered EVENT was not admitted on any surface"
         );
     }
 

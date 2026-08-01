@@ -43,7 +43,7 @@ use pool::{
 };
 use pool_lifecycle::PoolLifecycle;
 use queue::{CancelReason, EventQueue, FlushBatch, QueuedEvent, ThreadTags};
-use relay::{HarnessRelay, RelayEventPublisher};
+use relay::{BuzzEvent, HarnessRelay, RelayEventPublisher};
 use tokio::sync::{mpsc, watch};
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
@@ -1360,6 +1360,31 @@ async fn tokio_main() -> Result<()> {
         .map_err(|e| anyhow::anyhow!("membership notification subscribe error: {e}"))?;
     tracing::info!("subscribed to membership notifications");
 
+    // Repository discovery, behind the flag. This is the one project
+    // subscription that depends on no prior state — `kind:30617` announcements
+    // are what *produces* the discovered set, so it can be opened at startup.
+    // Enrolment and watched-root REQs derive their filters from discovery and
+    // enrolment state, so they belong to the driver, not here.
+    //
+    // The class passed here is what every inbound frame on this id will be
+    // classified as; the id's spelling carries no authority. Registration
+    // happens in lockstep with the write inside the relay task.
+    if config.project_routing_enabled {
+        let sub_id = project::discovery_sub_id();
+        let filters =
+            vec![serde_json::json!({ "kinds": [buzz_core::kind::KIND_GIT_REPO_ANNOUNCEMENT] })];
+        if let Err(e) = relay
+            .subscribe_project(&sub_id, project::ProjectSubscription::Discovery, filters)
+            .await
+        {
+            tracing::warn!("repository discovery subscribe error: {e}");
+        } else {
+            tracing::info!(sub_id, "subscribed to repository announcements");
+        }
+    } else {
+        tracing::debug!("project routing disabled — no project subscriptions opened");
+    }
+
     let presence_publisher = relay.event_publisher();
     let presence_keys = config.keys.clone();
 
@@ -1685,6 +1710,16 @@ async fn tokio_main() -> Result<()> {
     // CIRCUIT_BREAKER_WINDOW on each respawn attempt. The Vec is indexed by
     // agent slot index, so it must be sized to the configured pool capacity
     // (not the live count, which may be smaller after partial startup).
+    // Repositories this agent has actually discovered, from signature-verified
+    // announcements. Owned by the run loop rather than reconstructed per event,
+    // because it is the set enrolment validates against: a root may only enrol
+    // on a repository whose announcement we saw, and whose coordinate came from
+    // that announcement's signer.
+    //
+    // Empty and unused while `project_routing_enabled` is false — nothing
+    // subscribes to discovery, so nothing ingests.
+    let mut discovered_repositories = project::DiscoveredRepositories::new();
+
     let mut crash_history: Vec<SlotCircuit> = (0..config.agents as usize)
         .map(|_| SlotCircuit {
             crash_times: Vec::new(),
@@ -1905,7 +1940,18 @@ async fn tokio_main() -> Result<()> {
                 buzz_event = relay.next_event() => {
                     let _ = result_rx; // end split borrow before relay handling
                     match buzz_event {
-                        Some(buzz_event) => {
+                        Some(BuzzEvent::Project(project_event)) => {
+                            // Project dispatch. Deliberately separate from the
+                            // channel arm rather than folded into it: the
+                            // channel path resolves `is_dm_channel` against a
+                            // real channel UUID, and a project route key names
+                            // no channel, so that lookup would fail and its
+                            // fail-closed default would silently reinterpret
+                            // every project event as DM policy.
+                            handle_project_event(&mut discovered_repositories, &project_event);
+                        }
+                        Some(BuzzEvent::Channel { channel_id, event }) => {
+                            let buzz_event = ChannelEvent { channel_id, event };
                             let kind_u32 = buzz_event.event.kind.as_u16() as u32;
 
                             if kind_u32 == KIND_MEMBER_ADDED_NOTIFICATION
@@ -2722,6 +2768,145 @@ async fn tokio_main() -> Result<()> {
 
     tracing::info!("buzz-acp stopped");
     Ok(())
+}
+
+/// Should a refusal be reported at all?
+///
+/// The transition always is — degradation must be visible. After that, only
+/// powers of two, so a stream of refusals produces a logarithmic number of
+/// records instead of one each.
+///
+/// An earlier version logged every subsequent refusal at `debug` and called
+/// that bounded. It is not: a log level is a filter, not a rate limiter, and
+/// turning diagnostics on to investigate the very flood in question would have
+/// reopened the amplifier at exactly the wrong moment.
+///
+/// Split out as a pure function so the caller's behaviour is testable. Proving
+/// the outcome type distinguishes transitions says nothing about whether the
+/// caller acts on that distinction.
+fn should_report_refusal(degradation: project::Degradation, refused_total: u64) -> bool {
+    match degradation {
+        project::Degradation::BecameDegraded => true,
+        project::Degradation::AlreadyDegraded => refused_total.is_power_of_two(),
+    }
+}
+
+/// Project dispatch entry point.
+///
+/// **Discovery is ingested; routed events are still dropped.**
+///
+/// Ingesting an announcement grants no **authority**: it adds a coordinate to a
+/// set and nothing else — no session woken, no model turn, no invocation right.
+/// The coordinate is derived from the announcement's *signer*, so a flood of
+/// valid announcements cannot make anyone an owner they are not, and enrolment
+/// still has to match a root's own signed `a` against the set.
+///
+/// It is **not** free, though. An earlier version of this comment said the
+/// worst case was "a set containing repositories nobody cares about", which
+/// treated valid hostile input as harmless because it lacked authority. The
+/// allocator is less philosophical: the discovery REQ is global, so every
+/// distinct announcement anyone publishes is a real coordinate held in memory.
+/// That is bounded by [`project::DISCOVERY_CEILING`], which refuses rather than
+/// evicts and marks the set permanently incomplete when it trips.
+///
+/// The set is **not durable**. It lives in this run loop and is gone on
+/// restart. That is deliberate — the plan rejects a second authoritative local
+/// database — but it means restart recovery is relay-derived reconstruction,
+/// which does not exist yet: there is no paginated discovery reconstruction and
+/// no recovery for announcements dropped under backpressure.
+///
+/// **Neither catch-up frames nor end-of-backlog boundaries arrive here.** Both
+/// are handled in the relay task, beside the registry that admitted them and
+/// the reconstructions that hold pages. This arm used to receive catch-up frames
+/// as ordinary routed events and drop them, leaving the page short with nothing
+/// to say so; it also used to receive the boundary itself, as a capability this
+/// side could not use and did not consume.
+///
+/// Routed events remain dropped, and that asymmetry is the point. Delivering
+/// one means deciding who may invoke this agent, and the async authority gate
+/// is not built. Dropping is the only correct behaviour in the interim.
+///
+/// Still a work-in-progress state that must not be committed.
+fn handle_project_event(
+    discovered: &mut project::DiscoveredRepositories,
+    project_event: &project::ProjectEvent,
+) {
+    match project_event {
+        project::ProjectEvent::Discovery { announcement } => {
+            match discovered.ingest(announcement) {
+                project::Discovered::Added(coordinate) => {
+                    tracing::info!(
+                        coordinate,
+                        known = discovered.len(),
+                        "discovered repository"
+                    );
+                }
+                project::Discovered::AlreadyKnown(coordinate) => {
+                    tracing::debug!(coordinate, "repository already discovered");
+                }
+                project::Discovered::Refused {
+                    because,
+                    degradation,
+                } => {
+                    // Visible and fail-closed, but said **once**.
+                    //
+                    // The first version logged the refused coordinate at
+                    // `warn` on every refusal. That bounded the heap and left
+                    // the log unbounded, with the publisher choosing the
+                    // contents of both — a coordinate carries an
+                    // attacker-chosen `d` of arbitrary size. The refusal
+                    // outcome deliberately carries no coordinate, so there is
+                    // nothing here to leak even by accident; what is reported
+                    // is the reason, the ceilings, and a running count.
+                    let refused_total = discovered.refused_count();
+                    if !should_report_refusal(degradation, refused_total) {
+                        return;
+                    }
+                    match degradation {
+                        project::Degradation::BecameDegraded => tracing::warn!(
+                            ?because,
+                            count_ceiling = project::DISCOVERY_CEILING,
+                            byte_ceiling = project::DISCOVERY_RETAINED_BYTES,
+                            retained = discovered.len(),
+                            retained_bytes = discovered.retained_bytes(),
+                            "repository discovery is now refusing announcements — the discovered \
+                             set is permanently incomplete and must not be treated as a complete \
+                             enrolment filter"
+                        ),
+                        project::Degradation::AlreadyDegraded => tracing::debug!(
+                            ?because,
+                            refused_total,
+                            "repository discovery is still refusing announcements"
+                        ),
+                    }
+                }
+            }
+        }
+        project::ProjectEvent::Routed {
+            source,
+            route,
+            event,
+        } => {
+            tracing::debug!(
+                ?source,
+                route = %route.key(),
+                root = %route.root(),
+                kind = event.kind(),
+                "project event received before the authority gate is wired — dropping"
+            );
+        }
+    }
+}
+
+/// A channel event destructured out of [`relay::BuzzEvent`].
+///
+/// The main loop's channel path predates the route enum and reads
+/// `buzz_event.channel_id` / `buzz_event.event` in three dozen places. Rebinding
+/// into this shape keeps that body untouched, so the enum split is a routing
+/// change rather than a rewrite of working delivery logic.
+struct ChannelEvent {
+    channel_id: uuid::Uuid,
+    event: nostr::Event,
 }
 
 #[derive(PartialEq)]
@@ -3605,6 +3790,189 @@ fn dispatch_heartbeat(
     );
     *heartbeat_in_flight = true;
     tracing::info!(agent = agent_index, "heartbeat_fired");
+}
+
+#[cfg(test)]
+mod project_discovery_ingestion_tests {
+    use super::*;
+    use nostr::{EventBuilder, Keys};
+
+    async fn proven_announcement(keys: &Keys, identifier: &str) -> project::VerifiedAnnouncement {
+        let event = EventBuilder::new(
+            nostr::Kind::Custom(buzz_core::kind::KIND_GIT_REPO_ANNOUNCEMENT as u16),
+            "announcement",
+        )
+        .tags([nostr::Tag::parse(vec!["d".to_string(), identifier.to_string()]).expect("d tag")])
+        .sign_with_keys(keys)
+        .expect("sign");
+        project::VerifiedAnnouncement::prove(
+            project::VerifiedProjectEvent::verify(event)
+                .await
+                .expect("valid"),
+        )
+        .expect("well-formed")
+    }
+
+    #[tokio::test]
+    async fn a_discovered_announcement_enters_the_run_loops_repository_set() {
+        // Previously this arm logged and dropped, so the discovery REQ was
+        // transport with no destination — every announcement was fetched and
+        // thrown away.
+        let keys = Keys::generate();
+        let signer = keys.public_key().to_hex();
+        let mut discovered = project::DiscoveredRepositories::new();
+        assert!(discovered.is_empty());
+
+        handle_project_event(
+            &mut discovered,
+            &project::ProjectEvent::Discovery {
+                announcement: proven_announcement(&keys, "my-repo").await,
+            },
+        );
+
+        assert_eq!(discovered.len(), 1);
+        assert!(discovered.contains(&format!("30617:{signer}:my-repo")));
+    }
+
+    #[tokio::test]
+    async fn ingesting_the_same_announcement_twice_adds_one_repository() {
+        let keys = Keys::generate();
+        let mut discovered = project::DiscoveredRepositories::new();
+        for _ in 0..2 {
+            handle_project_event(
+                &mut discovered,
+                &project::ProjectEvent::Discovery {
+                    announcement: proven_announcement(&keys, "my-repo").await,
+                },
+            );
+        }
+        assert_eq!(discovered.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn discovery_admits_a_repository_without_granting_anyone_authority() {
+        // The reason ingesting is safe while the authority gate is unbuilt:
+        // it adds a coordinate and nothing else. A stranger who announces a
+        // repository gets it into the set — and enrolment still requires a
+        // root whose own signed `a` names that exact coordinate, so an
+        // unrelated root does not become enrollable.
+        let stranger = Keys::generate();
+        let mut discovered = project::DiscoveredRepositories::new();
+        handle_project_event(
+            &mut discovered,
+            &project::ProjectEvent::Discovery {
+                announcement: proven_announcement(&stranger, "theirs").await,
+            },
+        );
+
+        let unrelated = EventBuilder::new(
+            nostr::Kind::Custom(buzz_core::kind::KIND_GIT_ISSUE as u16),
+            "an issue naming a repository nobody announced",
+        )
+        .tags([nostr::Tag::parse(vec![
+            "a".to_string(),
+            format!("30617:{}:not-announced", stranger.public_key().to_hex()),
+        ])
+        .expect("a tag")])
+        .sign_with_keys(&Keys::generate())
+        .expect("sign");
+        let verified = project::VerifiedProjectEvent::verify(unrelated)
+            .await
+            .expect("valid");
+
+        assert!(
+            project::validate_enrolment_candidate(&verified, &discovered).is_none(),
+            "a discovered repository is not a licence to enrol on a different coordinate"
+        );
+    }
+
+    #[test]
+    fn refusal_reporting_is_logarithmic_not_per_event() {
+        // The gap hermes-gateway named: the mutation tests proved the *outcome*
+        // distinguishes the transition, and said nothing about whether the
+        // caller acts on it. This tests the caller's rule directly.
+        assert!(
+            should_report_refusal(project::Degradation::BecameDegraded, 1),
+            "degradation must always be visible when it happens"
+        );
+
+        // After that, powers of two only.
+        for total in [2u64, 4, 8, 16, 1024] {
+            assert!(
+                should_report_refusal(project::Degradation::AlreadyDegraded, total),
+                "{total} is a power of two"
+            );
+        }
+        for total in [3u64, 5, 6, 7, 9, 1023, 1025] {
+            assert!(
+                !should_report_refusal(project::Degradation::AlreadyDegraded, total),
+                "{total} is not"
+            );
+        }
+    }
+
+    #[test]
+    fn a_flood_of_refusals_produces_a_handful_of_records() {
+        // The property that matters is the shape, not the individual answers.
+        // A hostile stream must not be able to make the log grow with it —
+        // which is exactly what `debug` per refusal did, since a log level
+        // filters output rather than bounding it, and enabling diagnostics to
+        // investigate a flood would have reopened the amplifier.
+        let flood = 1_000_000u64;
+        let reported = (1..=flood)
+            .filter(|&n| {
+                let degradation = if n == 1 {
+                    project::Degradation::BecameDegraded
+                } else {
+                    project::Degradation::AlreadyDegraded
+                };
+                should_report_refusal(degradation, n)
+            })
+            .count();
+
+        assert!(
+            reported <= 21,
+            "a million refusals produced {reported} records"
+        );
+        assert!(reported >= 2, "but degradation is not silent either");
+    }
+
+    #[tokio::test]
+    async fn a_routed_project_event_is_still_dropped() {
+        // The asymmetry is deliberate: delivering a routed event means deciding
+        // who may invoke this agent, and that gate does not exist yet.
+        let keys = Keys::generate();
+        let mut discovered = project::DiscoveredRepositories::new();
+        let root = "a".repeat(64);
+        let event = EventBuilder::new(nostr::Kind::TextNote, "comment")
+            .tags([nostr::Tag::parse(vec![
+                "e".to_string(),
+                root.clone(),
+                String::new(),
+                "root".to_string(),
+            ])
+            .expect("e tag")])
+            .sign_with_keys(&keys)
+            .expect("sign");
+        let verified = project::VerifiedProjectEvent::verify(event)
+            .await
+            .expect("valid");
+        let route = project::ProjectRoute::derive(&verified).expect("routes");
+
+        handle_project_event(
+            &mut discovered,
+            &project::ProjectEvent::Routed {
+                source: project::ProjectSubscription::Watched { generation: 0 },
+                route,
+                event: verified,
+            },
+        );
+
+        assert!(
+            discovered.is_empty(),
+            "a routed event must not mutate discovery state"
+        );
+    }
 }
 
 #[cfg(test)]

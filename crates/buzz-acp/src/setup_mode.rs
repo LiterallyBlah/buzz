@@ -299,6 +299,13 @@ impl SetupPayload {
 
 // ── setup listener ────────────────────────────────────────────────────────────
 
+/// A channel event destructured out of [`crate::relay::BuzzEvent`], so the
+/// setup-mode body keeps reading `buzz_event.channel_id` / `.event`.
+struct SetupChannelEvent {
+    channel_id: uuid::Uuid,
+    event: nostr::Event,
+}
+
 /// Run the setup-mode event loop.
 ///
 /// Connects to the relay, subscribes to channels, and responds to @mentions
@@ -396,6 +403,22 @@ pub(crate) async fn run_setup_listener(config: Config, payload: SetupPayload) ->
                 break;
             }
             continue;
+        };
+
+        // Setup mode listens for an owner setup payload on channels. It has no
+        // pool, no queue and no project state, so a project event has nothing
+        // to act on here — and project routing cannot even be enabled while a
+        // setup payload is pending.
+        let crate::relay::BuzzEvent::Channel {
+            channel_id: buzz_channel_id,
+            event: buzz_nostr_event,
+        } = buzz_event
+        else {
+            continue;
+        };
+        let buzz_event = SetupChannelEvent {
+            channel_id: buzz_channel_id,
+            event: buzz_nostr_event,
         };
 
         let kind_u32 = buzz_event.event.kind.as_u16() as u32;
@@ -562,7 +585,7 @@ fn mentions_rule(kinds: Vec<u32>) -> filter::SubscriptionRule {
 /// teardown — there is no pool.
 async fn handle_setup_membership(
     relay: &mut HarnessRelay,
-    buzz_event: &crate::relay::BuzzEvent,
+    buzz_event: &SetupChannelEvent,
     config: &Config,
     rules: &[filter::SubscriptionRule],
     _initial_channel_ids: &[Uuid],

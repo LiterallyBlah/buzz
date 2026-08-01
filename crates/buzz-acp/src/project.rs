@@ -6,17 +6,23 @@
 //! UUIDv5 so every downstream mechanism (session isolation, queueing, dedup,
 //! turn counts, backpressure, cancellation) keeps working untouched.
 //!
-//! Everything in this module is pure and inert: nothing here opens a
-//! subscription or fires a turn. It is the shared vocabulary that the project
-//! REQ/dispatch work builds on, and — critically — that the Hermes Buzz adapter
-//! must reimplement byte-for-byte. Where a rule is a cross-runtime invariant it
-//! is called out as such.
+//! **No longer inert.** An earlier version of this note said nothing here
+//! opened a subscription or fired a turn, and that only the tests called into
+//! the module. Production now uses it: `ProjectRequests` owns the relay's
+//! project request lifecycle, `VerifiedProjectEvent` and `VerifiedAnnouncement`
+//! gate inbound frames, and the run loop ingests discovery through
+//! `DiscoveredRepositories`. What is still inert is the *authority* vocabulary —
+//! enrolment, lifecycle and invocation classification — which has no production
+//! caller yet.
+//!
+//! It remains the shared vocabulary that the Hermes Buzz adapter must
+//! reimplement byte-for-byte. Where a rule is a cross-runtime invariant it is
+//! called out as such.
 
-// The subscription and dispatch work that consumes these lands in the next
-// change; until it does, only the tests below call into the module. Landing the
-// vocabulary first is deliberate — the Hermes adapter has to agree with these
-// exact rules, and pinning them under test is what makes that agreement
-// checkable rather than aspirational.
+// Narrow this as the driver consumes each primitive. A module-wide allowance
+// hides exactly the question worth asking — whether a piece said to have landed
+// has any production caller — so it is a debt, not a decision. Removing it
+// entirely needs the authority and reconstruction drivers, which do not exist.
 #![allow(dead_code)]
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -48,27 +54,1363 @@ pub(crate) const PROJECT_SUB_ID_PREFIX: &str = "proj-";
 /// agent on a known project.
 pub(crate) const PROJECT_ENROL_SUB_ID: &str = "proj-enrol";
 
-/// Subscription id for the watched-root REQ (`#e` / `#E`): follow-up traffic on
-/// roots this agent is already enrolled in, whether active or dormant.
-pub(crate) const PROJECT_ROOTS_SUB_ID: &str = "proj-roots";
+/// Subscription id prefix for watched-root REQ generations. The generation
+/// suffix is what lets a replacement run overlapping with its predecessor.
+pub(crate) const PROJECT_ROOTS_SUB_ID: &str = "proj-roots-0";
 
-/// Does this subscription id belong to the project dispatch branch?
+/// Which project subscription an id names.
 ///
-/// The counterpart of `channel_id_from_sub_id`: project REQs carry no channel
-/// UUID, so the sub id only selects the branch. The route key is then derived
-/// from the event's own root reference, not from the subscription.
-pub(crate) fn is_project_sub_id(sub_id: &str) -> bool {
-    sub_id.starts_with(PROJECT_SUB_ID_PREFIX)
+/// A parsed class rather than a `starts_with("proj-")` test. The prefix check
+/// was fine with two subscriptions and stops being fine the moment discovery,
+/// enrolment, watched generations and root catch-up share it: an unrecognised
+/// `proj-…` would slide into whichever branch happened to be first. Unknown ids
+/// are refused rather than guessed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ProjectSubscription {
+    /// `kind:30617` announcements. Produces discovery state, **not** a root
+    /// route — an announcement has no root and must never be pushed through
+    /// [`ProjectRoute::derive`] to be quietly dropped.
+    Discovery,
+    /// `#a` + `#p`: events that tag this agent on a known project.
+    Enrolment,
+    /// `#e` / `#E` over enrolled roots, one generation per REQ replacement.
+    Watched { generation: u64 },
+    /// Historical reconstruction for one newly enrolled root.
+    ///
+    /// The full root id is carried in the id, not a prefix, so the arriving
+    /// route can be bound to it exactly. That makes the id 77 characters;
+    /// this relay advertises `MAX_SUB_ID_LENGTH = 256`
+    /// (`buzz-relay/src/protocol.rs:9`), so it is accepted. NIP-01's
+    /// conventional cap is 64, so a stricter relay would reject it.
+    ///
+    /// Truncating the root is **not** the answer if that day comes — it would
+    /// turn an exact binding into a prefix comparison. Carry a short opaque
+    /// token (or a UUIDv5) in the id and keep an internal exact
+    /// `token -> full root` map, so `route.root() == expected_full_root`
+    /// still holds.
+    RootCatchUp {
+        root: String,
+        /// Which exhaustible stream this catch-up is for.
+        ///
+        /// A pull request requires two, and they are different questions with
+        /// different filters. Without this the registry sees one class per
+        /// root, so opening the second stream conflicts with the first — the
+        /// owner could enumerate both and the registry could open neither.
+        stream: HistoryStream,
+    },
 }
 
-/// Canonicalise a root event id for hashing: 64 hex characters, nothing else.
+pub(crate) use requests::{
+    AuthorityVerdict, CatchUpFrame, CatchUpOutcome, EndOfStoredEvents, FrameAdmission,
+    IntentAdmission, OpenOutcome, OpenedHistoryPage, ProjectRequestIdentity, ProjectRequests,
+};
+
+/// Named by the tests that open pages, and by the reconstruction driver when it
+/// lands — nothing in production opens one yet. Scoped to this one export
+/// rather than allowed module-wide, so a genuinely dead export still surfaces.
+#[allow(unused_imports)]
+pub(crate) use requests::PageOpen;
+
+/// The socket a project REQ can actually be written to.
 ///
-/// **Cross-runtime invariant.** The hashed input is the *lowercase* hex id.
-/// Accepting an uppercase id and hashing it as-is would produce a second,
-/// silently different route key for the same root. Case folding is the only
-/// normalisation performed: whitespace padding is rejected rather than trimmed,
-/// because trimming coerces malformed input into a plausible-looking session
-/// and the contract here is fail-closed.
+/// **Sealed on purpose.** The previous version took a caller-supplied
+/// `FnOnce(String) -> Future<Output = Result<(), E>>`, which is `confirm_sent`
+/// with a callback wrapped around it: any crate caller could pass
+/// `|_| async { Ok(()) }` and manufacture send authority without a socket
+/// existing. A generic success-returning callback is not provenance.
+///
+/// `Sealed` is private to this module and implemented for exactly one foreign
+/// type — the live WebSocket sink — so there is no way for sibling code, a test
+/// helper or a future refactor to introduce a second implementation. Injecting
+/// a fake at *this* boundary would be injecting "the write succeeded" at the
+/// authority boundary, which is the thing being prevented; a test that wants a
+/// controllable socket injects a real paired one at the transport layer.
+pub(crate) trait ProjectReqSink: sealed::Sealed {
+    /// Write one already-serialised REQ frame.
+    ///
+    /// Takes finished text, never the filter: the registry serialises the REQ
+    /// from the registration's own identity, so a caller cannot register one
+    /// question and transmit another.
+    fn write_project_req(
+        &mut self,
+        text: String,
+    ) -> impl std::future::Future<Output = Result<(), String>>;
+}
+
+mod sealed {
+    /// Private supertrait. Nothing outside this module can name it, so nothing
+    /// outside can implement [`super::ProjectReqSink`].
+    pub trait Sealed {}
+}
+
+impl sealed::Sealed
+    for tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>
+{
+}
+
+impl ProjectReqSink
+    for tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>
+{
+    async fn write_project_req(&mut self, text: String) -> Result<(), String> {
+        use futures_util::SinkExt;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(PROJECT_REQ_SEND_TIMEOUT_SECS),
+            self.send(tokio_tungstenite::tungstenite::Message::Text(text.into())),
+        )
+        .await
+        .map_err(|_| "timed out writing project REQ".to_string())?
+        .map_err(|e| format!("failed to write project REQ: {e}"))
+    }
+}
+
+/// Matches `WS_SEND_TIMEOUT_SECS` in `relay.rs`; duplicated rather than
+/// exported because this module now owns the write and should not depend on
+/// the relay module for a bound on its own operation.
+const PROJECT_REQ_SEND_TIMEOUT_SECS: u64 = 10;
+
+/// The registry of project REQs this agent has actually sent and not closed.
+///
+/// In a private module so `live` cannot be reached around: the whole value of
+/// this type is that the only way a subscription id becomes acceptable is
+/// `open_request` writing its REQ and *then* installing it.
+mod requests {
+    use super::{
+        catch_up_filter, HistoryPageCollector, HistoryStream, ProjectReqSink, ProjectSubscription,
+        ProposalDomain, VerifiedProjectEvent,
+    };
+    use serde_json::{json, Value};
+    use std::collections::hash_map::Entry;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    /// The complete identity of one project request: what class, and what
+    /// question — all of it.
+    ///
+    /// The filters belong here, not only in the caller's bookkeeping. When the
+    /// live registry stored `ProjectSubscription` alone it could not tell
+    /// `Discovery` with filter A from `Discovery` with filter B, so a command
+    /// carrying a different filter came back `AlreadyOpen` — no REQ sent, and
+    /// filter B left behind as what the next connection would ask for.
+    ///
+    /// **A NIP-01 REQ carries one *or more* filters, ORed.** This held a single
+    /// `Value`, which could not represent the request this crate's own builder
+    /// produces: [`super::watched_roots_filters`] returns two filters, because
+    /// a comment points at its root with lowercase `e` and a pull-request
+    /// revision with uppercase `E`, and a single lowercase filter silently drops
+    /// every PR revision. Handing that pair over as a JSON array would have
+    /// serialised `["REQ", id, [a, b]]` — not the `["REQ", id, a, b]` the
+    /// protocol asks for — and would have made [`Self::admits`] refuse every
+    /// event, since the stored value was no longer an object. Only the fixture's
+    /// hand-rebuilt single filter kept that hidden.
+    ///
+    /// **Every filter it holds constrains something.** An earlier revision made
+    /// only the *collection* non-empty — the head filter is a field of its own
+    /// rather than `filters[0]` — and called that a structural invariant. It was
+    /// not: `["REQ", id, {}]` has a filter and is exactly as unbounded as
+    /// `["REQ", id]`, because a filter's constraints are ANDed and an empty
+    /// conjunction is satisfied by everything. `{"limit": 500}` is the same
+    /// shape with one key, since a limit bounds how many rows the relay returns
+    /// rather than which events qualify. Both would have installed live
+    /// authority that admitted every event on the relay, and both are refused
+    /// at construction — see [`constrains_events`].
+    ///
+    /// So construction is fallible and *every* route through it is. There is no
+    /// second door: an infallible `new` for the single-filter case would be a
+    /// constructor that skips the check, which is the shape this type exists to
+    /// remove.
+    #[derive(Debug, Clone, PartialEq)]
+    pub(crate) struct ProjectRequestIdentity {
+        subscription: ProjectSubscription,
+        filter: Value,
+        /// Further OR branches, in the order they go on the wire. Empty for
+        /// every request that asks one question.
+        alternatives: Vec<Value>,
+    }
+
+    impl ProjectRequestIdentity {
+        /// A request that asks exactly one question.
+        ///
+        /// `None` when that question constrains nothing; see
+        /// [`Self::from_filters`], which this is.
+        pub(crate) fn new(subscription: ProjectSubscription, filter: Value) -> Option<Self> {
+            Self::from_filters(subscription, vec![filter])
+        }
+
+        /// A request built from a filter list, in wire order.
+        ///
+        /// `None` for an empty list, and `None` for any filter that constrains
+        /// no event. Both are the same failure: `["REQ", id]`, `["REQ", id, {}]`
+        /// and `["REQ", id, {"limit": 500}]` are not narrower requests than a
+        /// filtered one, they are unbounded ones. A caller whose builder produced
+        /// nothing must send no REQ, not a REQ that matches everything — see
+        /// [`super::watched_roots_filters`], which returns an empty vector when
+        /// nothing is enrolled.
+        ///
+        /// The whole list is checked before anything is built, so a single bad
+        /// branch refuses the request rather than silently widening it: one
+        /// unbounded filter among several would admit everything through the OR
+        /// regardless of how narrow its siblings were.
+        pub(crate) fn from_filters(
+            subscription: ProjectSubscription,
+            filters: Vec<Value>,
+        ) -> Option<Self> {
+            if !filters.iter().all(constrains_events) {
+                return None;
+            }
+            let mut filters = filters.into_iter();
+            let filter = filters.next()?;
+            Some(Self {
+                subscription,
+                filter,
+                alternatives: filters.collect(),
+            })
+        }
+
+        pub(crate) fn subscription(&self) -> &ProjectSubscription {
+            &self.subscription
+        }
+
+        /// Every filter this request carries, in wire order. Never empty.
+        pub(crate) fn filters(&self) -> impl Iterator<Item = &Value> {
+            std::iter::once(&self.filter).chain(self.alternatives.iter())
+        }
+
+        /// The REQ frame for this request under `sub_id`.
+        ///
+        /// The one place REQ bytes are shaped, so the frame that goes on the
+        /// wire and the filters that admit its answers cannot describe different
+        /// requests. Both openers serialise this; neither builds an array of
+        /// its own.
+        pub(crate) fn req_frame(&self, sub_id: &str) -> Value {
+            let mut frame = vec![json!("REQ"), json!(sub_id)];
+            frame.extend(self.filters().cloned());
+            Value::Array(frame)
+        }
+
+        /// Does this event match the question this request actually asked?
+        ///
+        /// A relay chooses what to send under a subscription id; the filters are
+        /// the only statement of what was *requested*. Without this check the
+        /// live path admitted anything correctly signed that resolved to some
+        /// root — so a relay could deliver an event for a root this agent never
+        /// watched, on the watched subscription, and it would be promoted to a
+        /// routed event and spend the project dedup slot on the way. "The class
+        /// we recorded decides the handling" was already true; what the class
+        /// did not decide was whether the event belongs to the request at all.
+        ///
+        /// **OR across filters, AND within one**, which is NIP-01's rule and
+        /// therefore the relay's: an event satisfying *any one* filter is one
+        /// the relay was entitled to send, and satisfying a filter means
+        /// satisfying all of its constraints. Anything looser would admit an
+        /// event that matched the kinds of one branch and the tags of another —
+        /// a request this agent never sent.
+        ///
+        /// **Fail closed on anything unrecognised.** A key this does not
+        /// understand returns `false` rather than being skipped: the filters
+        /// here are built by this crate, so an unknown key means the two have
+        /// drifted, and a matcher that ignores what it cannot check would
+        /// silently widen every request that grew a constraint.
+        pub(crate) fn admits(&self, event: &nostr::Event) -> bool {
+            self.filters().any(|filter| filter_admits(filter, event))
+        }
+    }
+
+    /// Does this filter narrow the set of events a relay may return under it?
+    ///
+    /// The question is not "is it non-empty" but "does anything in it *select*".
+    /// A filter's constraints are ANDed, so an empty object is an empty
+    /// conjunction — satisfied by every event, which is why `["REQ", id, {}]`
+    /// and `["REQ", id]` ask the relay for exactly the same thing.
+    ///
+    /// `limit` is excluded for the same reason it is accepted by
+    /// [`constraint_admits`] without inspecting the event: it bounds how many
+    /// rows the relay returns, not which events qualify. A filter holding only a
+    /// limit is a request for the most recent `n` events on the relay.
+    ///
+    /// Anything that is not a JSON object refuses too. A `Value::Array` here
+    /// would be the two-filters-in-one-element mistake, and a string or a number
+    /// is not a filter at all.
+    fn constrains_events(filter: &Value) -> bool {
+        filter
+            .as_object()
+            .is_some_and(|constraints| constraints.keys().any(|key| key != "limit"))
+    }
+
+    /// One whole filter against one event: every constraint in it, or nothing.
+    fn filter_admits(filter: &Value, event: &nostr::Event) -> bool {
+        let Some(constraints) = filter.as_object() else {
+            return false;
+        };
+        constraints
+            .iter()
+            .all(|(key, value)| constraint_admits(key, value, event))
+    }
+
+    /// One filter key against one event. `false` unless it is understood *and*
+    /// satisfied.
+    fn constraint_admits(key: &str, value: &Value, event: &nostr::Event) -> bool {
+        match key {
+            "kinds" => value.as_array().is_some_and(|kinds| {
+                let kind = u64::from(event.kind.as_u16());
+                kinds.iter().any(|k| k.as_u64() == Some(kind))
+            }),
+            "authors" => {
+                let author = event.pubkey.to_hex();
+                string_list(value).is_some_and(|authors| authors.contains(&author.as_str()))
+            }
+            "ids" => {
+                let id = event.id.to_hex();
+                string_list(value).is_some_and(|ids| ids.contains(&id.as_str()))
+            }
+            "since" => value
+                .as_u64()
+                .is_some_and(|since| event.created_at.as_secs() >= since),
+            "until" => value
+                .as_u64()
+                .is_some_and(|until| event.created_at.as_secs() <= until),
+            // A bound on how many rows the relay may return, not a statement
+            // about any one of them. The page counts what arrives itself.
+            "limit" => value.as_u64().is_some(),
+            // `#e` and `#E` are different questions — a comment points at its
+            // root with lowercase `e`, a pull-request revision with uppercase
+            // `E` — so the tag name is compared exactly, never case-folded.
+            tag if tag.len() == 2
+                && tag.starts_with('#')
+                && tag.as_bytes()[1].is_ascii_alphabetic() =>
+            {
+                let name = &tag[1..];
+                let Some(wanted) = string_list(value) else {
+                    return false;
+                };
+                event.tags.iter().any(|t| {
+                    let parts = t.as_slice();
+                    parts.len() >= 2 && parts[0] == name && wanted.contains(&parts[1].as_str())
+                })
+            }
+            _ => false,
+        }
+    }
+
+    /// A JSON array of strings, or `None` — including for an array holding
+    /// anything else, which is a filter this code did not write.
+    fn string_list(value: &Value) -> Option<Vec<&str>> {
+        value
+            .as_array()?
+            .iter()
+            .map(|v| v.as_str())
+            .collect::<Option<Vec<&str>>>()
+    }
+
+    /// Which *instance* of a request this is.
+    ///
+    /// A persistent request's subscription id is deterministic and its filter
+    /// is reused, so the same request re-sent on a new connection is
+    /// indistinguishable from its predecessor by description alone. This is the
+    /// part that is never reused: a fresh number on every registration,
+    /// monotonic for the life of the process. A catch-up's wire id carries one
+    /// of these numbers, which is what stops two page attempts sharing a name —
+    /// but the number is the identity in both cases, and the id never is.
+    ///
+    /// It exists so a boundary can be attributed to the request that actually
+    /// received it. Without it, an EOSE minted on a connection that then died
+    /// is interchangeable with one from the replacement request — and the
+    /// replacement is precisely the one that had to recover whatever the relay
+    /// held while the connection was down.
+    ///
+    /// "Never reused" is enforced, not asserted. The counter is `checked_add`
+    /// and the space is finite, so exhaustion is a state
+    /// (`OpenOutcome::Exhausted`) rather than a wrap. A wrapping counter
+    /// would silently hand a future request the authority of an ancient one,
+    /// which is the precise failure this type exists to prevent — and it would
+    /// do so only in release builds, where a debug panic could not warn
+    /// anyone.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+    pub(crate) struct RequestIncarnation(u64);
+
+    /// A collector proven to belong to one live catch-up registration.
+    ///
+    /// Fields are private to this module and there is no constructor besides
+    /// [`ProjectRequests::open_history_page`]. Holding one is therefore
+    /// evidence that a REQ was genuinely sent for exactly these page
+    /// parameters, under a wire id minted for that one attempt — which is what
+    /// makes a later completion claim checkable rather than merely asserted.
+    #[derive(Debug)]
+    pub(crate) struct OpenedHistoryPage {
+        authority: Arc<RegistrationAuthority>,
+        sub_id: String,
+        collector: HistoryPageCollector,
+    }
+
+    impl OpenedHistoryPage {
+        pub(crate) fn sub_id(&self) -> &str {
+            &self.sub_id
+        }
+
+        pub(crate) fn incarnation(&self) -> RequestIncarnation {
+            self.authority.incarnation
+        }
+
+        /// The upper time bound this page was opened against.
+        pub(crate) fn until(&self) -> u64 {
+            self.collector.until()
+        }
+
+        /// Which root and stream this page collects for.
+        ///
+        /// Read-only, and derived from the collector the registry bound. An
+        /// owner holding several streams must *derive* which one a page belongs
+        /// to rather than be told: an `attach(stream, page)` signature would put
+        /// the caller back in the position of asserting a fact about authority
+        /// it does not establish.
+        pub(crate) fn root(&self) -> &str {
+            self.collector.root()
+        }
+
+        pub(crate) fn stream(&self) -> HistoryStream {
+            self.collector.stream()
+        }
+
+        pub(crate) fn effective_limit(&self) -> usize {
+            self.collector.effective_limit()
+        }
+
+        pub(crate) fn generation(&self) -> u64 {
+            self.collector.generation()
+        }
+
+        pub(crate) fn proposal_domain(&self) -> &Arc<ProposalDomain> {
+            self.collector.proposal_domain()
+        }
+
+        /// Feed one verified row that arrived on this page's subscription.
+        ///
+        /// Observation lives here, not on the bare collector, because the real
+        /// order of events is: write the REQ, install the registration, open a
+        /// page against it, *then* receive. A collector
+        /// that could be filled first and bound afterwards would let arbitrary
+        /// rows be laundered into a registration that had not yet been made
+        /// when they arrived.
+        pub(crate) fn observe(&mut self, verified: VerifiedProjectEvent) {
+            self.collector.observe(verified);
+        }
+
+        /// Record a frame that arrived on this page but cannot be one of its
+        /// rows.
+        ///
+        /// It still counts: the relay sent it under this request's limit, so
+        /// leaving it out would make a saturated page read as exhausted.
+        pub(crate) fn observe_unusable(&mut self, reason: &str) {
+            self.collector.observe_malformed(reason);
+        }
+
+        /// Consume the binding and yield the collector back.
+        ///
+        /// Unpacking *destroys* the proof rather than manufacturing one, so
+        /// this is not a forgery route: whatever a caller does with the
+        /// collector afterwards, completing a page still requires a fresh
+        /// `OpenedHistoryPage`, and only the registry mints those — one per
+        /// registration.
+        pub(crate) fn into_collector(self) -> HistoryPageCollector {
+            self.collector
+        }
+
+        /// How this page's authority relates to a boundary's.
+        pub(crate) fn verdict_for(&self, witness: &EndOfStoredEvents) -> AuthorityVerdict {
+            self.authority.verdict_for(
+                &witness.authority,
+                self.asks_the_same_as(witness.subscription()),
+            )
+        }
+
+        /// How this page's authority relates to the registration that admitted
+        /// a frame.
+        ///
+        /// The same three-way answer [`Self::verdict_for`] gives a boundary,
+        /// because it is the same question: did *this* request produce this, or
+        /// an instance of it that has since been replaced?
+        pub(crate) fn verdict_for_frame(&self, admission: &FrameAdmission) -> AuthorityVerdict {
+            self.authority.verdict_for(
+                &admission.authority,
+                self.asks_the_same_as(admission.subscription()),
+            )
+        }
+
+        /// Is that request asking this page's own question — same root, same
+        /// stream — whichever attempt it was?
+        fn asks_the_same_as(&self, subscription: &ProjectSubscription) -> bool {
+            matches!(
+                subscription,
+                ProjectSubscription::RootCatchUp { root, stream }
+                    if root == self.collector.root() && *stream == self.collector.stream()
+            )
+        }
+    }
+
+    /// What one attempt to open a history page did.
+    ///
+    /// Replaces the binding-error enum. Those variants — not live, already
+    /// bound, not a catch-up, wrong root, wrong page parameters — all described
+    /// ways a caller-supplied registration and a caller-supplied collector
+    /// could disagree. [`ProjectRequests::open_history_page`] derives the
+    /// registration *from* the collector under an id it mints itself, so there
+    /// are no longer two halves to disagree.
+    #[derive(Debug)]
+    pub(crate) enum PageOpen {
+        /// The REQ reached the socket, the registration is installed under a
+        /// wire id no other attempt will ever wear, and the page is bound to it.
+        Opened(OpenedHistoryPage),
+        /// The collector had already observed something. Rows that arrived
+        /// before the registration existed cannot belong to it.
+        NotPristine,
+        /// The filter this page's own parameters imply constrains no event, so
+        /// the REQ would have asked the relay for everything. Nothing burned,
+        /// nothing written, nothing installed.
+        ///
+        /// Unreachable from `catch_up_filter`, which always names kinds and a
+        /// root tag — the arm exists because identity construction is fallible
+        /// for every caller, and an `expect` here would be this operation
+        /// asserting a fact about a function it does not own.
+        UnboundedFilter,
+        /// The incarnation space is spent. Nothing written, nothing installed.
+        Exhausted,
+        /// The write failed. Nothing installed; the burned token stays burned.
+        WriteFailed(String),
+    }
+
+    /// A capability naming exactly one registration.
+    ///
+    /// **Identity is the allocation, never the contents.** The previous version
+    /// compared `(sub_id, incarnation)` — two public-looking numbers — and two
+    /// independently constructed registries both start counting at zero, so a
+    /// boundary minted by one could complete a page opened by the other. Numbers
+    /// drawn from separate domains cannot express "the same request instance".
+    ///
+    /// `registry` exists so that a *failed* identity check can still be
+    /// classified: same registry and an older incarnation is a predecessor,
+    /// anything else is a contradiction.
+    #[derive(Debug)]
+    pub(crate) struct RegistrationAuthority {
+        registry: Arc<RegistryEpoch>,
+        incarnation: RequestIncarnation,
+    }
+
+    impl RegistrationAuthority {
+        /// `same_question` is whether the other side asked about the same root
+        /// and stream — *not* whether it wore the same subscription id.
+        ///
+        /// It used to be the id. That was a proxy for "the same request,
+        /// re-sent", and it only worked while a catch-up's id was reused by
+        /// every page of a stream in turn. Now the id names one transport
+        /// attempt, so two instances of the same request never share one and
+        /// comparing ids would classify every predecessor as a contradiction —
+        /// turning an ordinary late boundary into an abandoned root. The
+        /// question the request asked is what survives re-sending.
+        fn verdict_for(
+            &self,
+            other: &Arc<RegistrationAuthority>,
+            same_question: bool,
+        ) -> AuthorityVerdict {
+            if std::ptr::eq(self as *const _, Arc::as_ptr(other)) {
+                return AuthorityVerdict::SameRegistration;
+            }
+            // Only a boundary from this same registry, about this same
+            // question, from a strictly *earlier* instance, is an ordinary late
+            // predecessor. A later instance offered to an older page is an
+            // impossible owner transition, another question is the owner having
+            // crossed two pages over, and a foreign registry is not comparable
+            // at all.
+            if Arc::ptr_eq(&self.registry, &other.registry)
+                && same_question
+                && other.incarnation < self.incarnation
+            {
+                AuthorityVerdict::Predecessor
+            } else {
+                AuthorityVerdict::Contradiction
+            }
+        }
+    }
+
+    /// Distinguishes one registry's allocations from another's.
+    #[derive(Debug, Default)]
+    pub(crate) struct RegistryEpoch;
+
+    /// How a boundary relates to the page it was offered to.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum AuthorityVerdict {
+        /// Same registration instance. The boundary may complete the page.
+        SameRegistration,
+        /// A strictly earlier instance of the same request. Ordinary reconnect
+        /// traffic: refuse, but leave the page usable.
+        Predecessor,
+        /// Anything else — another request, another registry, or a *later*
+        /// instance offered to an older page.
+        Contradiction,
+    }
+
+    /// One live registration.
+    ///
+    /// There is no `bound` flag. It used to record whether this registration
+    /// had already handed out its page, because binding was a second operation
+    /// a caller invoked against an id it chose. [`ProjectRequests::open_history_page`]
+    /// mints the id, installs the registration and binds the page in one
+    /// operation, so a registration that exists has already handed out its one
+    /// page and a flag saying so answers a question nobody can ask. Keeping it
+    /// would have been worse than useless: a field named `bound` that nothing
+    /// reads reads as a guard that is still enforced.
+    #[derive(Debug)]
+    struct LiveRegistration {
+        identity: ProjectRequestIdentity,
+        authority: Arc<RegistrationAuthority>,
+    }
+
+    /// What `ProjectRequests::open_request` decided.
+    ///
+    /// `Sent` means the REQ reached the socket and the registration was then
+    /// installed. Nothing else in the crate can produce it: there is no
+    /// reservation to promote and no flag to set.
+    #[derive(Debug, PartialEq)]
+    pub(crate) enum OpenOutcome {
+        /// Registered **and** written to the socket. The only state in which a
+        /// page may be bound or a boundary minted.
+        Sent,
+        /// This exact request is already live; no second REQ was written.
+        AlreadyLive,
+        /// Refused — this id belongs to a different request. Nothing recorded.
+        Conflict { held: Box<ProjectRequestIdentity> },
+        /// The incarnation space is spent. No REQ written, nothing recorded.
+        Exhausted,
+        /// The write failed, so nothing was registered — there is no
+        /// reservation to undo. Durable intent survives, because the intent is
+        /// still what we want; the write is what failed.
+        WriteFailed(String),
+        /// A catch-up cannot be opened here: its wire id has to name one
+        /// transport attempt, and only [`ProjectRequests::open_history_page`]
+        /// mints those. Nothing written, nothing recorded.
+        NotOpenableHere,
+    }
+
+    /// What [`ProjectRequests::record_intent`] decided.
+    #[derive(Debug, PartialEq)]
+    pub(crate) enum IntentAdmission {
+        Recorded,
+        AlreadyIntended,
+        Conflict { held: Box<ProjectRequestIdentity> },
+    }
+
+    /// Proof that the relay reported end-of-stored-events for a request this
+    /// agent actually has open on this connection.
+    ///
+    /// **Not constructible outside this module**, and inside it only by
+    /// [`ProjectRequests::witness_end_of_stored_events`], which requires a live
+    /// registration. That is the whole point: EOSE is the boundary a
+    /// completion claim would rest on, and an EOSE nobody can trace to a
+    /// request we sent is a relay assertion rather than evidence.
+    ///
+    /// What it claims is narrow — *this* request, on *this* connection,
+    /// received an EOSE frame. It does not claim the pages that preceded it
+    /// were retained, ordered, or complete; the cursor owns that, and a
+    /// timeout, `CLOSED`, `NOTICE` or reconnect produces no witness at all
+    /// because none of them reach this function.
+    #[derive(Debug, Clone)]
+    pub(crate) struct EndOfStoredEvents {
+        sub_id: String,
+        identity: ProjectRequestIdentity,
+        /// The capability of the exact registration that received this
+        /// boundary. Compared by allocation, so it cannot be reproduced by a
+        /// different registry that happens to have reached the same count.
+        authority: Arc<RegistrationAuthority>,
+    }
+
+    /// Two boundaries are the same boundary only if they name the same
+    /// registration.
+    ///
+    /// Deliberately *not* derived. A structural comparison would call two
+    /// witnesses equal whenever their id and filter matched — which is exactly
+    /// the request-*description* equality this type exists to replace.
+    impl PartialEq for EndOfStoredEvents {
+        fn eq(&self, other: &Self) -> bool {
+            Arc::ptr_eq(&self.authority, &other.authority)
+        }
+    }
+
+    impl EndOfStoredEvents {
+        pub(crate) fn sub_id(&self) -> &str {
+            &self.sub_id
+        }
+
+        pub(crate) fn subscription(&self) -> &ProjectSubscription {
+            self.identity.subscription()
+        }
+
+        /// Which registration received this boundary.
+        ///
+        /// Deliberately reachable by a consumer rather than kept inside the
+        /// producer. A generation the reconstruction owner cannot see would
+        /// decorate the problem rather than solve it: the owner is the thing
+        /// that has to refuse a boundary belonging to a predecessor request.
+        pub(crate) fn incarnation(&self) -> RequestIncarnation {
+            self.authority.incarnation
+        }
+    }
+
+    /// Proof that a frame arrived under a request this agent actually has open
+    /// on this connection.
+    ///
+    /// The EVENT counterpart of [`EndOfStoredEvents`], minted only by
+    /// [`ProjectRequests::admit_frame`] and for the same reason: a subscription
+    /// id is a string the relay chose to echo back, so admitting a frame on the
+    /// strength of its spelling is admitting it on the relay's word.
+    ///
+    /// What it adds beyond "we opened something under this id" is *which*
+    /// registration. Everything else in this crate that routes by id alone was
+    /// safe because its ids are one-per-request for the life of a connection;
+    /// a catch-up's is not, because pagination re-asks under the same id.
+    #[derive(Debug)]
+    pub(crate) struct FrameAdmission {
+        sub_id: String,
+        identity: ProjectRequestIdentity,
+        authority: Arc<RegistrationAuthority>,
+    }
+
+    impl FrameAdmission {
+        pub(crate) fn sub_id(&self) -> &str {
+            &self.sub_id
+        }
+
+        /// The class **we** recorded for this request, never one inferred from
+        /// what arrived.
+        pub(crate) fn subscription(&self) -> &ProjectSubscription {
+            self.identity.subscription()
+        }
+
+        /// Does this event match the filter the admitting request sent?
+        ///
+        /// See [`ProjectRequestIdentity::admits`]. Reached through the
+        /// admission rather than the registry so the filter consulted is the
+        /// one belonging to the registration that admitted *this* frame, not
+        /// whatever is live under the same id by the time the question is
+        /// asked.
+        pub(crate) fn admits(&self, event: &nostr::Event) -> bool {
+            self.identity.admits(event)
+        }
+
+        /// Turn this admission into the frame's disposition on a catch-up page.
+        ///
+        /// Consuming, so one admitted frame produces exactly one delivery. A
+        /// reusable admission would be a licence to feed any number of rows
+        /// into a page on the strength of a single genuine frame — and a page's
+        /// row count is precisely what decides whether its history is
+        /// exhausted.
+        pub(crate) fn catch_up(self, outcome: CatchUpOutcome) -> CatchUpFrame {
+            CatchUpFrame {
+                admission: self,
+                outcome,
+            }
+        }
+    }
+
+    /// One frame that arrived on a live root catch-up request.
+    ///
+    /// **Every** admitted catch-up frame becomes one of these, including the
+    /// ones that cannot become rows. A page counts what the relay returned in
+    /// order to tell a saturated page from an exhausted one, so a frame the
+    /// relay sent and this agent discarded before the page saw it does not lose
+    /// one event — it makes the page read short, which ends the reconstruction
+    /// early and calls the result complete.
+    #[derive(Debug)]
+    pub(crate) struct CatchUpFrame {
+        admission: FrameAdmission,
+        outcome: CatchUpOutcome,
+    }
+
+    /// What a catch-up frame turned out to be.
+    #[derive(Debug)]
+    pub(crate) enum CatchUpOutcome {
+        /// A verified event for the root this request asked about.
+        ///
+        /// Boxed only for size: an event dwarfs the two `&'static str` arms, and
+        /// every frame this agent refuses would otherwise carry an event's worth
+        /// of unused stack.
+        Row(Box<VerifiedProjectEvent>),
+        /// The frame arrived on this request but cannot be one of its rows —
+        /// it did not verify, resolves to no root, or names a root this request
+        /// did not ask about.
+        ///
+        /// Carried rather than dropped so the page is poisoned instead of left
+        /// short. The reason is this agent's own words about its own check; it
+        /// never contains relay- or publisher-supplied text.
+        Unusable(&'static str),
+        /// The request ended without a boundary — `CLOSED`, refused, or torn
+        /// down.
+        ///
+        /// The page is **released**, not poisoned. Nothing is wrong with the
+        /// rows it did receive; what is missing is any way to prove there were
+        /// no more, and the answer to that is to ask again from the same bound.
+        /// Without this the page stays in flight forever: `pages_wanted` skips
+        /// a stream that holds one, so a request the relay closed would stall
+        /// its stream in silence rather than retry it.
+        RequestLost(&'static str),
+    }
+
+    impl CatchUpFrame {
+        pub(crate) fn sub_id(&self) -> &str {
+            self.admission.sub_id()
+        }
+
+        pub(crate) fn subscription(&self) -> &ProjectSubscription {
+            self.admission.subscription()
+        }
+
+        /// Split into the disposition and the authority that admitted it.
+        ///
+        /// Private to the crate's routing seam: the page owner needs both, and
+        /// handing out the parts separately is what lets it check the authority
+        /// *before* absorbing the row.
+        pub(crate) fn into_parts(self) -> (FrameAdmission, CatchUpOutcome) {
+            (self.admission, self.outcome)
+        }
+    }
+
+    /// The single owner of project request state.
+    ///
+    /// **One owner, not three maps.** Durable intent, live registrations and
+    /// relay suspensions were previously separate fields that callers updated
+    /// in sequence, and every gap between those updates was a way for them to
+    /// disagree: intent recorded before the registry refused, so a refusal was
+    /// undone by the next connection's replay; a registry that could not see
+    /// filters, so filter drift entered intent through an `AlreadyOpen`. Two
+    /// private maps are perfectly capable of disagreeing with each other.
+    ///
+    /// The three now move together, behind operations that either fully
+    /// succeed or change nothing:
+    ///
+    /// - `intent` is local policy. It outlives connections and only local
+    ///   action removes it.
+    /// - `live` is what has actually been asked on *this* connection. It is
+    ///   what admits an inbound frame, and it is cleared on disconnect.
+    /// - `suspended` records relay refusals for this connection, so a refused
+    ///   request is not re-sent on the connection that refused it.
+    #[derive(Debug, Default)]
+    pub(crate) struct ProjectRequests {
+        intent: HashMap<String, ProjectRequestIdentity>,
+        live: HashMap<String, LiveRegistration>,
+        suspended: HashMap<String, String>,
+        /// This registry's own allocation, stamped into every authority it
+        /// mints so another registry's proofs can never be mistaken for its.
+        epoch: Arc<RegistryEpoch>,
+        /// Next incarnation to hand out. Only ever increases.
+        next_incarnation: u64,
+        /// Set once the incarnation space is spent. Never cleared.
+        ///
+        /// Deliberately survives [`Self::clear_connection`]: a reconnect must
+        /// not restore the ability to mint authority the process has already
+        /// spent.
+        incarnations_exhausted: bool,
+    }
+
+    impl ProjectRequests {
+        pub(crate) fn new() -> Self {
+            Self::default()
+        }
+
+        /// Record durable intent without registering anything.
+        ///
+        /// For commands that arrive while disconnected. Fail-closed against
+        /// both maps, since intent recorded now is replayed verbatim later.
+        pub(crate) fn record_intent(
+            &mut self,
+            sub_id: &str,
+            identity: ProjectRequestIdentity,
+        ) -> IntentAdmission {
+            if let Some(live) = self.live.get(sub_id) {
+                if live.identity != identity {
+                    return IntentAdmission::Conflict {
+                        held: Box::new(live.identity.clone()),
+                    };
+                }
+            }
+            match self.intent.entry(sub_id.to_string()) {
+                Entry::Vacant(slot) => {
+                    slot.insert(identity);
+                    IntentAdmission::Recorded
+                }
+                Entry::Occupied(slot) if *slot.get() == identity => {
+                    IntentAdmission::AlreadyIntended
+                }
+                Entry::Occupied(slot) => IntentAdmission::Conflict {
+                    held: Box::new(slot.get().clone()),
+                },
+            }
+        }
+
+        /// The class we recorded for this id, if it is live **on this
+        /// connection**.
+        ///
+        /// An inspection, not an admission route: it hands back a description,
+        /// never a capability, and production admits inbound frames through
+        /// [`Self::admit_frame`]. It survives so tests can assert what is live
+        /// without minting a proof in order to find out.
+        #[cfg(test)]
+        pub(crate) fn match_frame(&self, sub_id: &str) -> Option<&ProjectSubscription> {
+            self.live
+                .get(sub_id)
+                .map(|live| live.identity.subscription())
+        }
+
+        /// Admit one inbound frame against an exact live registration.
+        ///
+        /// `None` is the unsolicited-frame check: an id we did not send on this
+        /// connection, or have since closed, admits nothing, and the frame must
+        /// not be verified, deduplicated or delivered.
+        ///
+        /// The proof names the **registration**, not the id — two defences,
+        /// deliberately, because the id used to be the only one and it was not
+        /// enough. A catch-up paginated under one deterministic id, so page two
+        /// was a new registration wearing page one's name; this lookup found
+        /// page two and stamped page one's straggler with page two's authority
+        /// before any comparison could tell them apart, filing events from
+        /// outside a page's own bound into the history that page claims to have
+        /// proven. [`Self::open_history_page`] now mints an id no second
+        /// attempt will ever wear, so a straggler for a retired page finds
+        /// nothing live and this returns `None`. The proof still carries the
+        /// allocation rather than the string, so everything downstream compares
+        /// registrations — and a later change to how ids are derived cannot
+        /// quietly reintroduce the aliasing.
+        pub(crate) fn admit_frame(&self, sub_id: &str) -> Option<FrameAdmission> {
+            let live = self.live.get(sub_id)?;
+            Some(FrameAdmission {
+                sub_id: sub_id.to_string(),
+                identity: live.identity.clone(),
+                authority: Arc::clone(&live.authority),
+            })
+        }
+
+        /// Refuse a **live** request, in one operation.
+        ///
+        /// `None` means nothing was live under this id — and nothing changed:
+        /// no suspension recorded, no intent touched.
+        ///
+        /// One method rather than `close_active` then `suspend`, because the
+        /// invariant is "only a request we actually sent on this connection can
+        /// be refused", and a two-step ceremony makes that true only for as
+        /// long as every caller performs both steps, in order, against the same
+        /// id. `CLOSED` is authenticated by an exact live registration exactly
+        /// as an EVENT is; durable intent says what we want, not what we asked,
+        /// so it can authenticate nothing.
+        ///
+        /// Raw suspension insertion is deliberately not exposed. There is no
+        /// way to suspend an id that was not live.
+        pub(crate) fn refuse_live(
+            &mut self,
+            sub_id: &str,
+            reason: &str,
+        ) -> Option<ProjectRequestIdentity> {
+            let refused = self.live.remove(sub_id)?.identity;
+            self.suspended
+                .insert(sub_id.to_string(), reason.to_string());
+            Some(refused)
+        }
+
+        /// Mint an [`EndOfStoredEvents`] for a live request, **retiring the
+        /// request if its class is one-shot**.
+        ///
+        /// `None` when nothing is live under this id — an EOSE for a request we
+        /// did not send, or have already closed, is not evidence about
+        /// anything. Authenticated exactly as `CLOSED` and `EVENT` are: by an
+        /// exact live registration, never by the id's spelling.
+        ///
+        /// **A catch-up asked one question and has now been answered.** Its
+        /// registration is removed here, in the same operation that mints the
+        /// boundary, because the two facts are one fact: an earlier version
+        /// left the entry live and left the registry disagreeing with the page
+        /// owner about whether that request was still current. Everything
+        /// downstream of that disagreement was reachable — a later EVENT still
+        /// admitted into a completed page, a second EOSE minting a second
+        /// boundary, and, while catch-up ids were still deterministic, the next
+        /// page conflicting with its predecessor's entry unless some caller
+        /// remembered to close it by hand. A separate `retire_after_eose` would
+        /// have been that caller, and forgetting it is exactly the failure being
+        /// closed.
+        ///
+        /// Persistent classes are untouched. Discovery, enrolment and watched
+        /// subscriptions keep delivering after their stored backlog drains, so
+        /// their boundary retires nothing.
+        pub(crate) fn witness_end_of_stored_events(
+            &mut self,
+            sub_id: &str,
+        ) -> Option<EndOfStoredEvents> {
+            // Every live entry is a sent entry: `open_request` inserts only
+            // after its write returned, so there is no unsent state to reject.
+            let live = self.live.get(sub_id)?;
+            let one_shot = matches!(
+                live.identity.subscription(),
+                ProjectSubscription::RootCatchUp { .. }
+            );
+            let witness = EndOfStoredEvents {
+                sub_id: sub_id.to_string(),
+                identity: live.identity.clone(),
+                authority: Arc::clone(&live.authority),
+            };
+            if one_shot {
+                self.live.remove(sub_id);
+            }
+            Some(witness)
+        }
+
+        /// Is `witness` the boundary of whatever is live under its id **now**?
+        ///
+        /// An inspection: it reads, it never mints, and it answers with a
+        /// `bool` rather than a capability. It has to be one. The test helper
+        /// it replaces asked this question by minting a second boundary and
+        /// comparing — which, now that minting retires a one-shot request,
+        /// would change the answer by asking it.
+        #[cfg(test)]
+        pub(crate) fn is_live_boundary(&self, witness: &EndOfStoredEvents) -> bool {
+            self.live
+                .get(witness.sub_id())
+                .is_some_and(|live| Arc::ptr_eq(&live.authority, &witness.authority))
+        }
+
+        /// The incarnation of whatever is live under `sub_id`.
+        ///
+        /// Test-only, and deliberately never a production accessor: an
+        /// incarnation a caller can read is an incarnation a caller can relay,
+        /// which is the shape this tranche removed. Reading one to assert that
+        /// instances are distinct and increasing is a different act from
+        /// carrying one as authority — and the assertions that do it are about
+        /// this type's own ordering guarantee.
+        #[cfg(test)]
+        pub(crate) fn live_incarnation(&self, sub_id: &str) -> Option<RequestIncarnation> {
+            self.live.get(sub_id).map(|live| live.authority.incarnation)
+        }
+
+        /// Open one history page: mint its wire id, write its REQ, install the
+        /// registration, bind the page. One operation, no caller-supplied id.
+        ///
+        /// **The wire id names this attempt and no other.** A catch-up
+        /// paginates, so the deterministic `proj-catchup-{stream}-{root}` was
+        /// worn by every page of a stream in turn — and a frame is admitted by
+        /// looking up whatever is live under the id it carries. A delayed frame
+        /// from page one therefore arrived, found page two, and was stamped
+        /// with *page two's* authority before any allocation comparison could
+        /// run: the predecessor check compared a registration against itself.
+        /// For a boundary that was fatal — page one's late EOSE finished page
+        /// two as an empty page, which reads as "this history is exhausted".
+        ///
+        /// The attempt token is burned before the write, because the id must
+        /// carry it. That is a departure from `open_request`, which takes its
+        /// incarnation only after the write returns; the reason it is safe is
+        /// that a burned token grants nothing. It is not a reservation, nothing
+        /// can be promoted, and a cancelled or failed attempt simply leaves a
+        /// number nobody will use again — while a retry gets a genuinely
+        /// different id, which is the property being bought.
+        ///
+        /// **No caller-supplied identity either.** The class and filter are
+        /// derived from the collector, so the registration cannot describe a
+        /// different question from the page bound to it. That replaces the old
+        /// binding checks — wrong root, wrong stream, wrong bound, wrong limit —
+        /// which existed only because the caller supplied both halves and they
+        /// could disagree.
+        ///
+        /// Durable intent is deliberately **not** recorded. A catch-up filter
+        /// carries a page bound that moves: pagination walks `until` backwards,
+        /// so the second page of a stream is a different question from the
+        /// first. Recording it would make `replayable()` re-ask, after a
+        /// reconnect, for a page the cursor has already walked past. A
+        /// reconstruction is replayed by its owner re-deriving the bound from
+        /// its own advanced cursor — see `RootReconstruction::disconnected` and
+        /// `pages_wanted`.
+        pub(crate) async fn open_history_page<S: ProjectReqSink>(
+            &mut self,
+            sink: &mut S,
+            collector: HistoryPageCollector,
+        ) -> PageOpen {
+            // Rows that arrived before this registration existed cannot belong
+            // to it. Without this a collector could be filled first and
+            // laundered into the registration opened afterwards.
+            if !collector.is_pristine() {
+                return PageOpen::NotPristine;
+            }
+            // The identity is built — and can be refused — *before* a token is
+            // burned, so a page whose own filter would ask the relay for
+            // everything costs the incarnation space nothing. `ProjectRequests`
+            // has one constructor for identities and it is fallible for every
+            // caller, this one included: an infallible route for "we built this
+            // filter ourselves, it must be fine" is the check-skipping door the
+            // type exists to close, and `catch_up_filter` being correct today is
+            // not the same fact as this operation refusing an incorrect one.
+            let Some(identity) = ProjectRequestIdentity::new(
+                ProjectSubscription::RootCatchUp {
+                    root: collector.root().to_string(),
+                    stream: collector.stream(),
+                },
+                catch_up_filter(
+                    collector.root(),
+                    collector.stream(),
+                    collector.until(),
+                    collector.effective_limit(),
+                ),
+            ) else {
+                return PageOpen::UnboundedFilter;
+            };
+            let Some(incarnation) = self.burn_incarnation() else {
+                return PageOpen::Exhausted;
+            };
+            let sub_id = Self::catch_up_wire_id(collector.root(), collector.stream(), incarnation);
+            let text = match serde_json::to_string(&identity.req_frame(&sub_id)) {
+                Ok(text) => text,
+                Err(e) => return PageOpen::WriteFailed(format!("serialize: {e}")),
+            };
+
+            // ---- The only await in this operation. -------------------------
+            if let Err(e) = sink.write_project_req(text).await {
+                return PageOpen::WriteFailed(e);
+            }
+
+            // ---- Install, already sent, and bind in the same breath. -------
+            let authority = Arc::new(RegistrationAuthority {
+                registry: Arc::clone(&self.epoch),
+                incarnation,
+            });
+            self.live.insert(
+                sub_id.clone(),
+                LiveRegistration {
+                    identity,
+                    authority: Arc::clone(&authority),
+                },
+            );
+            PageOpen::Opened(OpenedHistoryPage {
+                authority,
+                sub_id,
+                collector,
+            })
+        }
+
+        /// The wire id for one catch-up transport attempt.
+        ///
+        /// **Not deterministic, on purpose.** The id used to be
+        /// `proj-catchup-{stream}-{root}` and nothing else, so every page of a
+        /// stream wore it in turn — and since a frame is admitted by looking up
+        /// whatever is live under the id it carries, a delayed frame from page
+        /// one was handed page two's authority before any comparison could tell
+        /// them apart. The trailing incarnation is what makes the id name a
+        /// *registration* rather than a question.
+        ///
+        /// Root and stream stay in it because they cost nothing and make relay
+        /// logs legible; they are not what the id is trusted for. Nothing parses
+        /// this string — the class is read from what this agent recorded when it
+        /// sent the REQ. At 79 characters plus the incarnation it stays well
+        /// inside the 256 this relay advertises
+        /// (`buzz-relay/src/protocol.rs:9`).
+        fn catch_up_wire_id(
+            root: &str,
+            stream: HistoryStream,
+            incarnation: RequestIncarnation,
+        ) -> String {
+            let marker = match stream {
+                HistoryStream::Comments => "c",
+                HistoryStream::PullRequestUpdates => "u",
+            };
+            format!(
+                "{}catchup-{marker}-{root}-{}",
+                super::PROJECT_SUB_ID_PREFIX,
+                incarnation.0
+            )
+        }
+
+        /// Take the next incarnation, or `None` once the space is spent.
+        ///
+        /// The one allocator. `checked_add` and a sticky flag, because a
+        /// wrapping counter would hand a future request the authority of an
+        /// ancient one — in release builds only, where no debug panic could
+        /// warn anyone.
+        fn burn_incarnation(&mut self) -> Option<RequestIncarnation> {
+            if self.incarnations_exhausted {
+                return None;
+            }
+            let taken = RequestIncarnation(self.next_incarnation);
+            match self.next_incarnation.checked_add(1) {
+                Some(next) => self.next_incarnation = next,
+                None => self.incarnations_exhausted = true,
+            }
+            Some(taken)
+        }
+
+        /// Decide, write the REQ, then install the registration.
+        ///
+        /// **The registry writes.** There is no `confirm_sent(&str)`, and no
+        /// caller-supplied closure either: a generic
+        /// `FnOnce(..) -> Result<(), E>` is the same lever with an `async`
+        /// wrapper, because `|_| async { Ok(()) }` manufactures success without
+        /// a socket. `sink` is a [`ProjectReqSink`], which is sealed and
+        /// implemented only for the live WebSocket, so possessing one *is* the
+        /// evidence a socket exists.
+        ///
+        /// The REQ is serialised here from `identity.filter()`, so the write
+        /// cannot carry a different question from the one registered — the
+        /// caller no longer supplies the bytes at all.
+        ///
+        /// **Not for catch-ups.** They go through [`Self::open_history_page`],
+        /// which mints their wire id. Refusing here is what makes that the only
+        /// route: an id a caller chose could be worn by two page attempts in
+        /// turn, and a frame is admitted by looking up whichever registration is
+        /// live under the id it carries.
+        pub(crate) async fn open_request<S: ProjectReqSink>(
+            &mut self,
+            sink: &mut S,
+            sub_id: &str,
+            identity: ProjectRequestIdentity,
+        ) -> OpenOutcome {
+            if matches!(
+                identity.subscription,
+                ProjectSubscription::RootCatchUp { .. }
+            ) {
+                return OpenOutcome::NotOpenableHere;
+            }
+
+            // ---- Preflight. Nothing enters `live`. -------------------------
+            //
+            // An async operation has three exits, not two: `Ok`, `Err`, and
+            // *dropped while suspended*. The previous shape reserved before
+            // awaiting, so a cancelled future left a live-but-unsent entry that
+            // nothing could ever promote — the id was held hostage and that
+            // root would silently never reconstruct. Rather than handle
+            // cancellation, this removes the state it could strand: no
+            // registration exists until the write has already returned.
+            if let Some(live) = self.live.get(sub_id) {
+                return if live.identity == identity {
+                    OpenOutcome::AlreadyLive
+                } else {
+                    OpenOutcome::Conflict {
+                        held: Box::new(live.identity.clone()),
+                    }
+                };
+            }
+            if let Some(intended) = self.intent.get(sub_id) {
+                if *intended != identity {
+                    return OpenOutcome::Conflict {
+                        held: Box::new(intended.clone()),
+                    };
+                }
+            }
+            if self.incarnations_exhausted {
+                return OpenOutcome::Exhausted;
+            }
+            let text = match serde_json::to_string(&identity.req_frame(sub_id)) {
+                Ok(text) => text,
+                Err(e) => return OpenOutcome::WriteFailed(format!("serialize: {e}")),
+            };
+
+            // Durable intent is the one thing recorded before the write,
+            // because it must outlive a failed one — the intent is still what
+            // we want; the write is what failed. It confers no authority.
+            self.intent.insert(sub_id.to_string(), identity.clone());
+
+            // ---- The only await in this operation. -------------------------
+            if let Err(e) = sink.write_project_req(text).await {
+                return OpenOutcome::WriteFailed(e);
+            }
+
+            // ---- Install, already sent. ------------------------------------
+            //
+            // The incarnation is taken *here*, after the write returned, so a
+            // cancelled open consumes nothing and a retry is a genuinely new
+            // authority — which matters because a cancelled write may have
+            // reached the relay anyway. A page cannot do the same: its id has
+            // to carry the token, so `open_history_page` burns one first and
+            // relies on a burned token conferring nothing.
+            let Some(incarnation) = self.burn_incarnation() else {
+                return OpenOutcome::Exhausted;
+            };
+            self.live.insert(
+                sub_id.to_string(),
+                LiveRegistration {
+                    identity,
+                    authority: Arc::new(RegistrationAuthority {
+                        registry: Arc::clone(&self.epoch),
+                        incarnation,
+                    }),
+                },
+            );
+            OpenOutcome::Sent
+        }
+
+        /// Close a live registration **without** suspending it.
+        ///
+        /// For local decisions — a watched hand-off retiring its predecessor —
+        /// as distinct from a relay refusal, which must go through
+        /// [`Self::refuse_live`].
+        pub(crate) fn close_active(&mut self, sub_id: &str) -> Option<ProjectRequestIdentity> {
+            self.live.remove(sub_id).map(|live| live.identity)
+        }
+
+        pub(crate) fn suspension(&self, sub_id: &str) -> Option<&str> {
+            self.suspended.get(sub_id).map(String::as_str)
+        }
+
+        /// Forget everything belonging to a connection: registrations and the
+        /// refusals that connection issued. Durable intent is untouched.
+        ///
+        /// A relay may deny service while connected; the denial must not
+        /// outlive the connection that issued it, and a registration certainly
+        /// must not — `BgState` outlives the socket, so a fresh connection
+        /// would otherwise answer ids whose replacement REQs were never sent.
+        pub(crate) fn clear_connection(&mut self) {
+            self.live.clear();
+            self.suspended.clear();
+        }
+
+        /// What to (re-)send, in deterministic order.
+        ///
+        /// On an existing connection, suspended requests are skipped: the
+        /// relay already refused them here, and a proactive resubscribe must
+        /// not quietly retry on the connection that said no. A fresh
+        /// connection has had its suspensions cleared, so everything intended
+        /// is offered once.
+        pub(crate) fn replayable(&self) -> Vec<(String, ProjectRequestIdentity)> {
+            let mut out: Vec<(String, ProjectRequestIdentity)> = self
+                .intent
+                .iter()
+                .filter(|(id, _)| !self.suspended.contains_key(*id))
+                .map(|(id, identity)| (id.clone(), identity.clone()))
+                .collect();
+            out.sort_by(|a, b| a.0.cmp(&b.0));
+            out
+        }
+
+        pub(crate) fn intent(&self, sub_id: &str) -> Option<&ProjectRequestIdentity> {
+            self.intent.get(sub_id)
+        }
+
+        pub(crate) fn live_len(&self) -> usize {
+            self.live.len()
+        }
+
+        #[cfg(test)]
+        pub(crate) fn intent_len(&self) -> usize {
+            self.intent.len()
+        }
+
+        /// Test-only: wind the incarnation counter near its ceiling.
+        ///
+        /// Exhaustion needs 2^64 registrations to reach honestly, which is not
+        /// a test anyone can run. Not available in production builds, where
+        /// setting this would be a way to *cause* the reuse it guards against.
+        #[cfg(test)]
+        pub(crate) fn force_next_incarnation(&mut self, next: u64) {
+            self.next_incarnation = next;
+        }
+    }
+}
+
+pub(crate) fn discovery_sub_id() -> String {
+    format!("{PROJECT_SUB_ID_PREFIX}discovery")
+}
+
+pub(crate) fn watched_sub_id(generation: u64) -> String {
+    format!("{PROJECT_SUB_ID_PREFIX}roots-{generation}")
+}
+
 fn canonical_root_id(raw: &str) -> Option<String> {
     if raw.len() != 64 || !raw.bytes().all(|b| b.is_ascii_hexdigit()) {
         return None;
@@ -88,15 +1430,23 @@ pub(crate) fn project_route_key(root_event_id: &str) -> Option<Uuid> {
 
 // ── Root extraction ───────────────────────────────────────────────────────────
 
-/// Which root event a project event belongs to.
+/// Which root event a project event belongs to. **Strict.**
 ///
-/// A root announces itself (`1621`/`1618` are their own root). Comments and
-/// status events reference it with lowercase `e`; **PR updates use uppercase
-/// `E`** (`crates/buzz-sdk/src/builders.rs:1444`). A lowercase-only lookup
-/// silently drops every PR revision, which is the whole reason this is one
-/// function rather than an inline tag scan at each call site.
+/// This began life as a parser helper where "first plausible match" was a
+/// reasonable convenience. [`ProjectRoute`] turned its result into the
+/// authoritative session key, which changed what a wrong answer costs: a signed
+/// event carrying two conflicting root markers would be routed by tag order,
+/// letting an author decide which conversation their event joins by shuffling
+/// tags. Ambiguity is now refused rather than resolved.
 ///
-/// `tags` is the event's raw tag list; `event_id` its own id; `kind` its kind.
+/// | Kind | Root |
+/// |---|---|
+/// | `1621` / `1618` | its own verified event id |
+/// | `1619` | exactly one valid uppercase `E` |
+/// | `1`, `1630`-`1633` | exactly one valid `e` marked `root`, or — only when no `root` marker is present at all — exactly one valid unmarked `e` |
+///
+/// A malformed marked root is **not** rescued by a valid fallback: an event
+/// that says "my root is `<garbage>`" is malformed, not a legacy event.
 pub(crate) fn root_event_id<T, S>(kind: u32, event_id: &str, tags: &[T]) -> Option<String>
 where
     T: AsRef<[S]>,
@@ -104,47 +1454,106 @@ where
 {
     match kind {
         KIND_GIT_ISSUE | KIND_GIT_PULL_REQUEST => canonical_root_id(event_id),
-        KIND_GIT_PR_UPDATE => first_ref(tags, "E"),
+        KIND_GIT_PR_UPDATE => sole_reference(tags, "E"),
         KIND_TEXT_NOTE
         | KIND_GIT_STATUS_OPEN
         | KIND_GIT_STATUS_MERGED
         | KIND_GIT_STATUS_CLOSED
-        | KIND_GIT_STATUS_DRAFT => first_ref(tags, "e"),
+        | KIND_GIT_STATUS_DRAFT => sole_reference(tags, "e"),
         _ => None,
     }
 }
 
-/// First usable value for `name`, preferring an explicit `"root"` marker.
+/// The one unambiguous root reference named `name`, or `None`.
 ///
-/// Both comment and status builders emit `["e", root, "", "root"]`, and status
-/// events may carry a second `["e", revision, "", "reply"]`
-/// (`builders.rs:1230-1234`). Taking the first `e` happens to work today only
-/// because the root is written first; honouring the marker means a reordered or
-/// reply-carrying event still resolves to the root rather than to a revision.
-fn first_ref<T, S>(tags: &[T], name: &str) -> Option<String>
+/// A `reply` marker on a *separate* tag is fine and ignored — status events
+/// legitimately carry `["e", root, "", "root"]` plus
+/// `["e", revision, "", "reply"]` (`builders.rs:1230-1234`). What is refused is
+/// not knowing which tag is the root.
+fn sole_reference<T, S>(tags: &[T], name: &str) -> Option<String>
 where
     T: AsRef<[S]>,
     S: AsRef<str>,
 {
-    let matching = || {
-        tags.iter().filter_map(|t| {
-            let t = t.as_ref();
-            let key = t.first()?.as_ref();
-            (key == name).then_some(t)
-        })
-    };
+    let named: Vec<&[S]> = tags
+        .iter()
+        .map(|t| t.as_ref())
+        .filter(|t| t.first().map(|k| k.as_ref()) == Some(name))
+        .collect();
 
-    let marked = matching()
-        .find(|t| t.get(3).map(|m| m.as_ref()) == Some("root"))
-        .and_then(|t| t.get(1))
-        .and_then(|v| canonical_root_id(v.as_ref()));
-    if marked.is_some() {
-        return marked;
+    let marked: Vec<&&[S]> = named
+        .iter()
+        .filter(|t| t.get(3).map(|m| m.as_ref()) == Some("root"))
+        .collect();
+
+    if !marked.is_empty() {
+        // An explicit marker is a claim about which tag is the root. Two of
+        // them is a contradiction, and a malformed one is malformed — neither
+        // is an invitation to go looking for something better.
+        if marked.len() > 1 {
+            return None;
+        }
+        return marked[0].get(1).and_then(|v| canonical_root_id(v.as_ref()));
     }
 
-    matching()
-        .filter_map(|t| t.get(1))
-        .find_map(|v| canonical_root_id(v.as_ref()))
+    // No marker anywhere: legacy shape. Tolerated only when there is exactly
+    // one unmarked candidate, so there is nothing to choose between.
+    let unmarked: Vec<&&[S]> = named
+        .iter()
+        .filter(|t| match t.get(3) {
+            None => true,
+            Some(m) => m.as_ref().is_empty(),
+        })
+        .collect();
+
+    if unmarked.len() != 1 {
+        return None;
+    }
+    unmarked[0]
+        .get(1)
+        .and_then(|v| canonical_root_id(v.as_ref()))
+}
+
+// ── Coordinate claims ─────────────────────────────────────────────────────────
+
+/// What an event says about its repository coordinate.
+///
+/// Three states, not two, because the authority rules treat them differently:
+/// lifecycle events may legitimately omit `a` (`GitStatusMeta.repo` is
+/// `Option`), but **no** class may carry a malformed or duplicated one. An
+/// `Option<String>` collapsed "said nothing" together with "said something
+/// incoherent", which would have let a malformed lifecycle event through on the
+/// strength of a rule written for genuine absence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CoordinateClaim {
+    /// No `a` tag at all.
+    Absent,
+    /// Exactly one non-empty `a`. An unauthenticated claim, preserved verbatim.
+    Unique(String),
+    /// Value-less, empty, or more than one. Never acceptable.
+    Invalid,
+}
+
+/// Classify an event's `a` tags.
+pub(crate) fn coordinate_claim<T, S>(tags: &[T]) -> CoordinateClaim
+where
+    T: AsRef<[S]>,
+    S: AsRef<str>,
+{
+    let named: Vec<&[S]> = tags
+        .iter()
+        .map(|t| t.as_ref())
+        .filter(|t| t.first().map(|k| k.as_ref()) == Some("a"))
+        .collect();
+
+    match named.len() {
+        0 => CoordinateClaim::Absent,
+        1 => match named[0].get(1).map(|v| v.as_ref()) {
+            Some(v) if !v.is_empty() => CoordinateClaim::Unique(v.to_string()),
+            _ => CoordinateClaim::Invalid,
+        },
+        _ => CoordinateClaim::Invalid,
+    }
 }
 
 /// Repo owner pubkey from an `a` coordinate (`<kind>:<owner>:<identifier>`).
@@ -178,32 +1587,364 @@ pub(crate) fn normalise_coordinate(coordinate: &str) -> Option<String> {
     Some(format!("{kind}:{owner}:{identifier}"))
 }
 
+// ── Verified repository announcements ────────────────────────────────────────
+
+pub(crate) use announcement::VerifiedAnnouncement;
+
+/// The announcement proof, in a private module so its constructor is genuinely
+/// the only one.
+///
+/// Module-level privacy would not be enough here: `project.rs` is one module,
+/// so a private-field struct declared at file scope can still be built by
+/// struct literal anywhere in this file, tests included. `mod history` already
+/// sets the precedent for putting a proof somewhere its invariants cannot be
+/// stepped around by a neighbour.
+mod announcement {
+    use super::{canonical_root_id, sole_value, VerifiedProjectEvent, KIND_GIT_REPO_ANNOUNCEMENT};
+
+    /// A verified event that really is a well-formed repository announcement.
+    ///
+    /// Previously the relay checked `kind == 30617` and built
+    /// `ProjectEvent::Discovery` from the bare verified event, while the *shape*
+    /// of the announcement — exactly one non-empty `d` — was only established
+    /// later, inside `DiscoveredRepositories::ingest`. Two things followed from
+    /// that gap. A malformed `30617` spent a project dedup slot on its way to
+    /// being rejected downstream; and a variant named `Discovery` carried
+    /// something its type did not oblige to be an announcement at all, so
+    /// source admissibility and state admission could quietly disagree.
+    ///
+    /// The coordinate is computed once, here, from data the signature covers.
+    /// Nothing downstream parses `d` a second time.
+    #[derive(Debug, Clone)]
+    pub(crate) struct VerifiedAnnouncement {
+        event: VerifiedProjectEvent,
+        coordinate: String,
+    }
+
+    impl VerifiedAnnouncement {
+        /// Prove an announcement, or refuse.
+        ///
+        /// `None` for the wrong kind, a missing `d`, an empty `d`, or more than
+        /// one `d` — including two that agree, because "two tags that happen to
+        /// match" and "one tag" are different claims and only one of them is
+        /// unambiguous.
+        ///
+        /// The owner is the **signer**, never the announcement's own `a`. A
+        /// valid signature attests that the signer wrote the event; it says
+        /// nothing about whether its contents are honest, so an `a` naming
+        /// someone else's repository is attacker-chosen data inside an
+        /// otherwise authentic event. Deriving the owner from the signer is
+        /// what makes the coordinate unspoofable: you cannot announce a
+        /// repository you do not hold the key for.
+        pub(crate) fn prove(event: VerifiedProjectEvent) -> Option<Self> {
+            if event.kind() != KIND_GIT_REPO_ANNOUNCEMENT {
+                return None;
+            }
+            let owner = canonical_root_id(&event.author())?;
+            let identifier = sole_value(&event.tag_vecs(), "d")?;
+            let coordinate = format!("{KIND_GIT_REPO_ANNOUNCEMENT}:{owner}:{identifier}");
+            Some(Self { event, coordinate })
+        }
+
+        /// The coordinate this announcement establishes, already normalised.
+        pub(crate) fn coordinate(&self) -> &str {
+            &self.coordinate
+        }
+
+        pub(crate) fn event(&self) -> &VerifiedProjectEvent {
+            &self.event
+        }
+    }
+}
+
 // ── Discovered repositories ───────────────────────────────────────────────────
 
 /// Repository coordinates this agent has actually discovered.
 ///
-/// **Opaque on purpose.** The backing set is private and there is no production
-/// insertion method yet, so no caller can assemble a plausible-looking
-/// coordinate and hand it to [`validate_enrolment_candidate`] to get a
-/// "validated" candidate back. Private fields on the candidate stop
+/// **Opaque on purpose.** The backing set is private and the only way to add to
+/// it is by ingesting a signature-verified announcement, so no caller can
+/// assemble a plausible-looking coordinate and hand it to
+/// [`validate_enrolment_candidate`] to get a "validated" candidate back. Private fields on the candidate stop
 /// struct-literal forgery; this stops validator-assisted forgery, which is the
 /// same hole reached one step earlier.
 ///
-/// The production ingestion path arrives with the discovery slice and will
-/// derive each coordinate from a signature-verified `kind:30617` event — the
-/// kind, the **signer's** pubkey as owner, and one non-empty `d` tag as
-/// identifier. An announcement's own `a` claim is never trusted: it is
-/// attacker-chosen data inside an otherwise authentic event.
+/// The only way in is [`Self::ingest`], which takes a [`VerifiedAnnouncement`]
+/// and derives the coordinate from the kind, the **signer's** pubkey, and one
+/// non-empty `d` tag. An announcement's own `a` claim is never read.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct DiscoveredRepositories {
     coordinates: BTreeSet<String>,
+    /// Bytes of every coordinate currently retained.
+    ///
+    /// Maintained on insertion only. Duplicates cost nothing and must not be
+    /// charged, or ordinary repeat traffic on the live REQ would inflate this
+    /// until a ceiling tripped on no new data at all.
+    retained_bytes: usize,
+    /// Set once any ceiling refuses a coordinate. Never cleared.
+    ///
+    /// See [`DiscoveredRepositories::has_overflowed`].
+    overflowed: bool,
+    /// How many announcements have been refused. Bounded state, not a log.
+    refused: u64,
+}
+
+/// How many distinct repository coordinates this agent will hold.
+///
+/// Deliberately high: tripping it should mean something is wrong, not that a
+/// busy relay is busy. The discovery REQ is global (`kinds: [30617]`), so the
+/// bound exists because *anyone* can announce a repository, and every valid
+/// announcement is a real allocation regardless of whether the agent has any
+/// interest in it.
+pub(crate) const DISCOVERY_CEILING: usize = 10_000;
+
+/// Longest single coordinate, in bytes.
+///
+/// A coordinate is `30617:<64 hex>:<d>` — 71 bytes of fixed structure plus an
+/// identifier with no length rule of its own. The relay in this repository
+/// accepts 512 KiB frames by default and the ACP's WebSocket client takes
+/// `connect_async` defaults, so "non-empty" is the only limit the announcement
+/// shape imposes, and that is not a limit.
+pub(crate) const DISCOVERY_COORDINATE_BYTES: usize = 512;
+
+/// Total bytes of retained coordinates.
+///
+/// A cardinality bound is not a resource bound. Ten thousand attacker-chosen
+/// identifiers at [`DISCOVERY_COORDINATE_BYTES`] each is ~5 MB under the count
+/// ceiling alone, and nothing about the number 10,000 says so. Ordinary
+/// coordinates run around 80 bytes, so real traffic reaches the count ceiling
+/// first (~13,000 would be needed to reach this one); this exists for the case
+/// where the identifiers are chosen to be large.
+pub(crate) const DISCOVERY_RETAINED_BYTES: usize = 1024 * 1024;
+
+/// Why a coordinate was refused.
+///
+/// Refusal is **resource admission**, distinct from validity. Everything
+/// reaching [`DiscoveredRepositories::ingest`] has already proved its id,
+/// signature, kind and `d` shape — a refused announcement is a genuine one this
+/// agent has no room for, and reporting it as malformed would be a lie about
+/// the publisher.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RefusedBecause {
+    /// The set already holds [`DISCOVERY_CEILING`] coordinates.
+    Cardinality,
+    /// This one coordinate exceeds [`DISCOVERY_COORDINATE_BYTES`].
+    CoordinateTooLarge,
+    /// Admitting it would exceed [`DISCOVERY_RETAINED_BYTES`].
+    RetainedBytes,
+}
+
+/// Whether a refusal was the moment the set became degraded.
+///
+/// Separated so a caller can speak once. Every announcement after the first
+/// refusal is also a refusal, and a caller that logged each would have traded
+/// an unbounded heap for an unbounded log — with the publisher choosing the
+/// contents of both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Degradation {
+    BecameDegraded,
+    AlreadyDegraded,
+}
+
+/// What [`DiscoveredRepositories::ingest`] did with an announcement.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Discovered {
+    /// A coordinate this agent had not seen before.
+    Added(String),
+    /// Already known. The set is unchanged.
+    AlreadyKnown(String),
+    /// Refused. **Nothing was evicted.**
+    ///
+    /// Carries no coordinate, deliberately: the refused value is
+    /// attacker-chosen and unbounded, and handing it to a caller is handing it
+    /// to a log line. A caller may report the reason and whether this refusal
+    /// was the transition into degradation.
+    Refused {
+        because: RefusedBecause,
+        degradation: Degradation,
+    },
+}
+
+/// A project event whose id hash and Schnorr signature have been checked.
+///
+/// **The project trust boundary, as a type.** Every project decision reads
+/// `event.pubkey`: which human is authorised, who owns the repository, who
+/// authored the root, whether a peer is a trusted sibling. `parse_relay_message`
+/// deserialises inbound events **without verifying anything**
+/// (`relay.rs:3561`), so an unverified project event means a malicious or
+/// compromised relay can forge an authorised human's comment, an owner's close,
+/// or a root author's reopen — and can also spend a durable dedup slot under
+/// the id of a genuine event that has not arrived yet.
+///
+/// Scoping verification to repository announcements, as I first did, would have
+/// left every one of those open. The relay we happen to talk to does verify at
+/// ingestion; making that the project authority boundary would be trusting an
+/// operational accident.
+///
+/// This deliberately does **not** change verification for channel traffic,
+/// which is a separate behavioural and performance decision.
+#[derive(Debug, Clone)]
+pub(crate) struct VerifiedProjectEvent {
+    event: nostr::Event,
+}
+
+/// Why a project event could not be verified.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum VerifyError {
+    #[error("event failed verification: {0}")]
+    Invalid(#[from] buzz_core::error::VerificationError),
+    #[error("verification task failed: {0}")]
+    TaskJoin(#[from] tokio::task::JoinError),
+}
+
+impl VerifiedProjectEvent {
+    /// Verify an event, off the async runtime.
+    ///
+    /// Owned rather than borrowed, and async rather than sync, both on purpose.
+    /// The Schnorr check is CPU-bound and `buzz_core::verify_event` requires a
+    /// `spawn_blocking` hand-off; doing that inside the constructor means no
+    /// caller can get it wrong by not reading a comment. Owning the event is
+    /// what makes the hand-off possible at all — a borrow cannot cross into
+    /// `spawn_blocking`.
+    pub(crate) async fn verify(event: nostr::Event) -> Result<Self, VerifyError> {
+        let event = tokio::task::spawn_blocking(move || match buzz_core::verify_event(&event) {
+            Ok(()) => Ok(event),
+            Err(e) => Err(e),
+        })
+        .await??;
+        Ok(Self { event })
+    }
+
+    pub(crate) fn event(&self) -> &nostr::Event {
+        &self.event
+    }
+
+    pub(crate) fn kind(&self) -> u32 {
+        self.event.kind.as_u16() as u32
+    }
+
+    /// Author pubkey, lowercase hex. Safe to use for authority decisions
+    /// precisely because this type exists.
+    pub(crate) fn author(&self) -> String {
+        self.event.pubkey.to_hex()
+    }
+
+    pub(crate) fn id(&self) -> String {
+        self.event.id.to_hex()
+    }
+
+    /// Tags as plain string vectors, for the pure helpers in this module.
+    pub(crate) fn tag_vecs(&self) -> Vec<Vec<String>> {
+        self.event
+            .tags
+            .iter()
+            .map(|t| t.as_slice().to_vec())
+            .collect()
+    }
 }
 
 impl DiscoveredRepositories {
-    /// An agent that has discovered nothing yet. The only production
-    /// constructor until ingestion lands.
+    /// An agent that has discovered nothing yet.
     pub(crate) fn new() -> Self {
         Self::default()
+    }
+
+    /// Ingest a proven repository announcement.
+    ///
+    /// Infallible, and that is the point: every way this could have failed is
+    /// now a way [`VerifiedAnnouncement::prove`] refuses to exist. It used to
+    /// take a bare [`VerifiedProjectEvent`] and re-derive the coordinate — kind
+    /// check, signer, sole `d` — which meant the *caller* had already decided
+    /// the event was admissible on weaker grounds than this function then
+    /// applied. Those two judgements could disagree, and did.
+    ///
+    /// The coordinate is not recomputed here. It was built once, at the proof
+    /// boundary, from data the signature covers: the kind, the **signer's**
+    /// pubkey, and exactly one non-empty `d`. The announcement's own `a` is
+    /// never read, on either side of the boundary.
+    pub(crate) fn ingest(&mut self, announcement: &VerifiedAnnouncement) -> Discovered {
+        let coordinate = announcement.coordinate();
+
+        // Duplicates first, and before any accounting: a repeat costs nothing
+        // and must not be charged, or ordinary live-REQ traffic would inflate
+        // the byte total until a ceiling tripped on no new data at all.
+        if self.coordinates.contains(coordinate) {
+            return Discovered::AlreadyKnown(coordinate.to_string());
+        }
+
+        let bytes = coordinate.len();
+        let because = if bytes > DISCOVERY_COORDINATE_BYTES {
+            Some(RefusedBecause::CoordinateTooLarge)
+        } else if self.coordinates.len() >= DISCOVERY_CEILING {
+            Some(RefusedBecause::Cardinality)
+        } else if self
+            .retained_bytes
+            .checked_add(bytes)
+            .is_none_or(|total| total > DISCOVERY_RETAINED_BYTES)
+        {
+            // Checked, so an implausible total wrapping around becomes a
+            // refusal rather than a suddenly roomy set.
+            Some(RefusedBecause::RetainedBytes)
+        } else {
+            None
+        };
+
+        if let Some(because) = because {
+            // Refuse and remember. The alternative — evict something to make
+            // room — would trade a resource bound for silent authority-state
+            // amnesia: a repository would vanish while the set still looked
+            // whole, an enrolment that used to be valid would stop being so,
+            // and nothing anywhere would say why.
+            let degradation = if self.overflowed {
+                Degradation::AlreadyDegraded
+            } else {
+                Degradation::BecameDegraded
+            };
+            self.overflowed = true;
+            self.refused = self.refused.saturating_add(1);
+            return Discovered::Refused {
+                because,
+                degradation,
+            };
+        }
+
+        self.retained_bytes += bytes;
+        let coordinate = coordinate.to_string();
+        self.coordinates.insert(coordinate.clone());
+        Discovered::Added(coordinate)
+    }
+
+    /// Has any ceiling refused an announcement?
+    ///
+    /// Deliberately **not** `is_complete`. That name would be read as "this
+    /// set holds every repository that exists", which it cannot know: it would
+    /// answer `true` on an empty set, mid-page, after a single capped 1,000-row
+    /// relay page, and after queue loss. A future enrolment opener reads a
+    /// name, not a doc comment, and would have treated "the local ceiling has
+    /// not tripped" as "the repository universe is known".
+    ///
+    /// Reconstruction completeness is a different, unbuilt property: completed
+    /// pagination, an exact request incarnation, an immutable cutoff, a genuine
+    /// EOSE, no resource refusal, and no unrecovered backpressure loss. When
+    /// the driver can derive that, it can expose it. This reports the one fact
+    /// this type owns.
+    ///
+    /// Never returns to `false`: the refused announcements are gone and the set
+    /// has no way to learn what it missed.
+    pub(crate) fn has_overflowed(&self) -> bool {
+        self.overflowed
+    }
+
+    /// How many announcements have been refused.
+    ///
+    /// Bounded state a caller can report periodically, rather than logging
+    /// every refusal as it happens.
+    pub(crate) fn refused_count(&self) -> u64 {
+        self.refused
+    }
+
+    /// Bytes of coordinate currently retained.
+    pub(crate) fn retained_bytes(&self) -> usize {
+        self.retained_bytes
     }
 
     pub(crate) fn contains(&self, coordinate: &str) -> bool {
@@ -232,8 +1973,12 @@ impl DiscoveredRepositories {
         I: IntoIterator<Item = S>,
         S: Into<String>,
     {
+        let coordinates: BTreeSet<String> = coordinates.into_iter().map(Into::into).collect();
         Self {
-            coordinates: coordinates.into_iter().map(Into::into).collect(),
+            retained_bytes: coordinates.iter().map(String::len).sum(),
+            coordinates,
+            overflowed: false,
+            refused: 0,
         }
     }
 }
@@ -255,6 +2000,12 @@ pub(crate) struct EnrolmentCandidate {
     root: String,
     /// The discovered coordinate, byte-identical to the announced one.
     coordinate: String,
+    /// Repository owner, extracted once at validation.
+    ///
+    /// Carried rather than reparsed by consumers: a validated `30617`
+    /// coordinate necessarily names an owner, and re-deriving it downstream
+    /// gives that proof a second chance to come back as `None`.
+    owner: String,
     /// `true` for a `1618` pull-request root, `false` for a `1621` issue.
     is_pull_request: bool,
 }
@@ -268,8 +2019,29 @@ impl EnrolmentCandidate {
         &self.coordinate
     }
 
+    pub(crate) fn owner(&self) -> &str {
+        &self.owner
+    }
+
     pub(crate) fn is_pull_request(&self) -> bool {
         self.is_pull_request
+    }
+
+    /// Test-only construction. Not available in production builds, where the
+    /// validator is the sole route.
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        root: &str,
+        coordinate: &str,
+        owner: &str,
+        is_pull_request: bool,
+    ) -> Self {
+        Self {
+            root: root.to_string(),
+            coordinate: coordinate.to_string(),
+            owner: owner.to_string(),
+            is_pull_request,
+        }
     }
 }
 
@@ -292,29 +2064,49 @@ impl EnrolmentCandidate {
 /// matching on a *parsed* form would quietly make a non-canonical coordinate
 /// equivalent to the canonical discovered one behind the validator's back.
 /// Parsing stays available for diagnostics; it does not widen acceptance.
-pub(crate) fn validate_enrolment_candidate<T, S>(
-    kind: u32,
-    event_id: &str,
-    tags: &[T],
+/// Validate a verified root event as an enrolment candidate. **Fails closed.**
+///
+/// Takes the one witness and reads kind, id and tags from it. The previous
+/// signature accepted those three decomposed and caller-selected, which meant a
+/// caller could take a genuine verified root, reuse its id and kind, and supply
+/// tags naming a *different* discovered repository — private fields on the
+/// result do not help when the constructor accepts assembled evidence.
+///
+/// Every condition must hold:
+///
+/// - the kind is `1621` or `1618` — nothing else is a root;
+/// - the id is a real 64-char hex event id;
+/// - the event carries **exactly one** `a` tag. Zero is unroutable; two is
+///   ambiguous, and first-wins would let a forged root smuggle a known
+///   coordinate past the gate while a second tag says otherwise;
+/// - that `a` value is **byte-identical** to a coordinate this agent actually
+///   discovered from a `kind:30617` announcement.
+///
+/// The last point is string equality on purpose. `a` is an unauthenticated
+/// claim, so the discovered set is the only authority — and matching a *parsed*
+/// form would quietly make a non-canonical coordinate equivalent to the
+/// canonical discovered one behind the validator's back.
+pub(crate) fn validate_enrolment_candidate(
+    event: &VerifiedProjectEvent,
     discovered: &DiscoveredRepositories,
-) -> Option<EnrolmentCandidate>
-where
-    T: AsRef<[S]>,
-    S: AsRef<str>,
-{
-    let is_pull_request = match kind {
+) -> Option<EnrolmentCandidate> {
+    let is_pull_request = match event.kind() {
         KIND_GIT_ISSUE => false,
         KIND_GIT_PULL_REQUEST => true,
         _ => return None,
     };
-    let root = canonical_root_id(event_id)?;
-    let coordinate = sole_value(tags, "a")?;
+    let root = canonical_root_id(&event.id())?;
+    let coordinate = sole_value(&event.tag_vecs(), "a")?;
     if !discovered.contains(&coordinate) {
         return None;
     }
+    // Membership is checked first, so this parses a coordinate the discovered
+    // set already vouched for; it cannot widen acceptance.
+    let owner = repo_owner_from_coordinate(&coordinate)?;
     Some(EnrolmentCandidate {
         root,
         coordinate,
+        owner,
         is_pull_request,
     })
 }
@@ -352,41 +2144,35 @@ where
     found
 }
 
-/// Does a follow-up event on a watched root carry an acceptable `a`?
+/// Does a follow-up event on a watched root carry an acceptable coordinate?
 ///
-/// The rule is event-class-specific because the builders genuinely differ, and
-/// a blanket "missing is fine" would let a malformed comment into the project
-/// path on the strength of an `#e` match alone:
+/// Consumes a classified [`CoordinateClaim`] rather than re-parsing tags, so
+/// the absent/invalid distinction cannot be lost between the two.
 ///
-/// | Kind | `a` required? |
-/// |---|---|
-/// | `1` comment | yes — `projectIssues.mjs` always emits it |
-/// | `1619` PR update | yes — `builders.rs:1434` always emits it |
-/// | `1630`-`1633` lifecycle | optional — `GitStatusMeta.repo` is `Option` |
+/// | Kind | `Absent` | `Unique` | `Invalid` |
+/// |---|---|---|---|
+/// | `1` comment | reject — `projectIssues.mjs` always emits `a` | must match exactly | reject |
+/// | `1619` PR update | reject — `builders.rs:1434` always emits `a` | must match exactly | reject |
+/// | `1630`-`1633` | accept — root-bound by `e`, and `GitStatusMeta.repo` is `Option` | must match exactly | reject |
 ///
-/// A duplicated `a` is rejected for every class: two coordinates on one event
-/// is ambiguity, not redundancy. When present, the match is byte-identical to
-/// the enrolled coordinate, for the same reason as at enrolment.
-pub(crate) fn follow_up_coordinate_allowed<T, S>(kind: u32, tags: &[T], enrolled: &str) -> bool
-where
-    T: AsRef<[S]>,
-    S: AsRef<str>,
-{
-    let count = tags
-        .iter()
-        .filter(|t| t.as_ref().first().map(|k| k.as_ref()) == Some("a"))
-        .count();
-
-    match count {
-        0 => matches!(
+/// `Invalid` is refused for every class. Two coordinates on one event is
+/// ambiguity, not redundancy, and a value-less tag is malformed rather than
+/// absent.
+pub(crate) fn follow_up_coordinate_allowed(
+    kind: u32,
+    claim: &CoordinateClaim,
+    enrolled: &str,
+) -> bool {
+    match claim {
+        CoordinateClaim::Invalid => false,
+        CoordinateClaim::Unique(c) => c == enrolled,
+        CoordinateClaim::Absent => matches!(
             kind,
             KIND_GIT_STATUS_OPEN
                 | KIND_GIT_STATUS_MERGED
                 | KIND_GIT_STATUS_CLOSED
                 | KIND_GIT_STATUS_DRAFT
         ),
-        1 => sole_value(tags, "a").as_deref() == Some(enrolled),
-        _ => false,
     }
 }
 
@@ -627,14 +2413,8 @@ pub(crate) fn watched_roots_filters(enrolments: &ProjectEnrolments, since: u64) 
     let roots = enrolments.all_roots();
     if !roots.is_empty() {
         filters.push(json!({
-            "kinds": [
-                KIND_TEXT_NOTE,
-                KIND_GIT_STATUS_OPEN,
-                KIND_GIT_STATUS_MERGED,
-                KIND_GIT_STATUS_CLOSED,
-                KIND_GIT_STATUS_DRAFT,
-            ],
-            "#e": roots,
+            "kinds": HistoryStream::Comments.kinds(),
+            HistoryStream::Comments.root_tag(): roots,
             "since": since,
         }));
     }
@@ -642,8 +2422,8 @@ pub(crate) fn watched_roots_filters(enrolments: &ProjectEnrolments, since: u64) 
     let pr_roots = enrolments.pull_request_roots();
     if !pr_roots.is_empty() {
         filters.push(json!({
-            "kinds": [KIND_GIT_PR_UPDATE],
-            "#E": pr_roots,
+            "kinds": HistoryStream::PullRequestUpdates.kinds(),
+            HistoryStream::PullRequestUpdates.root_tag(): pr_roots,
             "since": since,
         }));
     }
@@ -681,6 +2461,98 @@ pub(crate) fn project_req_frames(
         frames.push(Value::Array(frame));
     }
     frames
+}
+
+// ── Route ─────────────────────────────────────────────────────────────────────
+
+/// Where a project event belongs: the root it is about, and the deterministic
+/// session key derived from it.
+///
+/// Constructed only from a [`VerifiedProjectEvent`], so a route cannot be
+/// invented for an event whose author or contents were never checked. The key
+/// is the UUIDv5 of the root, which is what lets project events reuse the
+/// channel-keyed session, queue and dedup machinery untouched.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ProjectRoute {
+    key: Uuid,
+    root: String,
+    claim: CoordinateClaim,
+}
+
+impl ProjectRoute {
+    /// Derive the route for a verified project event.
+    ///
+    /// `None` when the event does not resolve to a project root at all — an
+    /// unrelated kind, or a missing/malformed root reference. An event we
+    /// cannot place is dropped rather than routed somewhere plausible.
+    pub(crate) fn derive(verified: &VerifiedProjectEvent) -> Option<Self> {
+        let tags = verified.tag_vecs();
+        let root = root_event_id(verified.kind(), &verified.id(), &tags)?;
+        let key = project_route_key(&root)?;
+        Some(Self {
+            key,
+            root,
+            claim: coordinate_claim(&tags),
+        })
+    }
+
+    /// The UUIDv5 session/queue key.
+    pub(crate) fn key(&self) -> Uuid {
+        self.key
+    }
+
+    /// Lowercase hex root event id.
+    pub(crate) fn root(&self) -> &str {
+        &self.root
+    }
+
+    /// What this event claims about its repository, classified.
+    ///
+    /// A claim, not an authority: [`follow_up_coordinate_allowed`] decides
+    /// whether it is acceptable against the enrolled coordinate. Returned as a
+    /// [`CoordinateClaim`] so absence and incoherence stay distinguishable all
+    /// the way to the gate.
+    pub(crate) fn coordinate_claim(&self) -> &CoordinateClaim {
+        &self.claim
+    }
+}
+
+/// A verified project event, tagged with where it came from.
+///
+/// Discovery is a separate variant rather than a `Routed` with an empty route:
+/// a `kind:30617` announcement has no root, so pushing it through
+/// [`ProjectRoute::derive`] would correctly yield nothing and then be silently
+/// dropped — the announcement would vanish through a code path that looks like
+/// it handled it.
+///
+/// **Nothing about reconstruction crosses here.** Neither a catch-up frame nor
+/// an end-of-backlog boundary becomes one of these. Both are handled in the
+/// relay task, beside the registry that admitted them: carrying a frame would
+/// put a queue — with a `Full` arm — between a page and the rows it counts, and
+/// a page short by a dropped row reads as the end of history. Carrying a
+/// boundary would put a *cloneable capability* on a queue for a consumer that
+/// holds no page and can do nothing with it.
+#[derive(Debug, Clone)]
+pub(crate) enum ProjectEvent {
+    /// A repository announcement. Feeds [`DiscoveredRepositories::ingest`].
+    ///
+    /// Carries a [`VerifiedAnnouncement`], not a bare verified event, so the
+    /// variant's name and its type agree. Naming a variant `Discovery` while
+    /// its payload was merely "some event that passed a kind check" let a
+    /// malformed `30617` cross this boundary and be rejected somewhere further
+    /// on, having already spent a dedup slot to get there.
+    Discovery { announcement: VerifiedAnnouncement },
+    /// An event about a specific root.
+    ///
+    /// `source` is carried rather than re-inferred downstream. Authority and
+    /// effect differ between a live enrolment mention, a watched continuation
+    /// and a historical reconstruction, and re-deriving that from the event
+    /// shape would be guessing at something already known.
+    Routed {
+        source: ProjectSubscription,
+        route: ProjectRoute,
+        event: VerifiedProjectEvent,
+    },
 }
 
 // ── Event class ───────────────────────────────────────────────────────────────
@@ -741,23 +2613,2042 @@ pub(crate) fn classify_kind(kind: u32) -> KindEffect {
 
 /// May `author` change this root's lifecycle?
 ///
-/// Root author or repo owner only, matching `allowedActorsForRoot`
-/// (`desktop/src/features/projects/projectIssues.mjs:38-45`). An unauthorised
-/// status event is ignored, not merely deprioritised.
+/// Root author or repository owner only, matching `allowedActorsForRoot`
+/// (`desktop/src/features/projects/projectIssues.mjs:38-45`).
+///
+/// **Owner authority comes from the root's immutable binding, never from the
+/// lifecycle event's own `a` tag.** Deriving it from the event conflated two
+/// separate questions and rejected a legitimate case: `GitStatusMeta.repo` is
+/// optional, so an owner-signed close that omits `a` is well-formed — and under
+/// the old signature it produced no owner and was ignored. Whether the event's
+/// own coordinate is acceptable is [`follow_up_coordinate_allowed`]'s job; this
+/// function only asks who signed.
 pub(crate) fn lifecycle_actor_allowed(
     author: &str,
     root_author: &str,
-    root_coordinate: Option<&str>,
+    repository_owner: &str,
 ) -> bool {
     let Some(author) = canonical_root_id(author) else {
         return false;
     };
-    if canonical_root_id(root_author).as_deref() == Some(author.as_str()) {
-        return true;
+    canonical_root_id(root_author).as_deref() == Some(author.as_str())
+        || canonical_root_id(repository_owner).as_deref() == Some(author.as_str())
+}
+
+// ── History pagination ────────────────────────────────────────────────────────
+
+/// Which exact filter a pagination stream covers.
+///
+/// **One cursor per filter, never one per REQ.** NIP-01 applies `limit`
+/// per-filter, so a REQ carrying several filters and deduplicating the results
+/// into one page produces an aggregate count that proves exhaustion for none of
+/// them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum HistoryStream {
+    /// Comments and lifecycle, by lowercase `#e`.
+    Comments,
+    /// PR updates, by uppercase `#E`.
+    PullRequestUpdates,
+}
+
+impl HistoryStream {
+    /// Which tag style points at the root for this stream.
+    ///
+    /// Not interchangeable: comments and status events use lowercase `e`, a PR
+    /// update uses uppercase `E` (`buzz-sdk/src/builders.rs:1444`).
+    pub(crate) fn root_tag(self) -> &'static str {
+        match self {
+            HistoryStream::Comments => "#e",
+            HistoryStream::PullRequestUpdates => "#E",
+        }
     }
-    root_coordinate
-        .and_then(repo_owner_from_coordinate)
-        .is_some_and(|owner| owner == author)
+
+    /// The event kinds this stream carries.
+    ///
+    /// Shared with [`watched_roots_filters`] on purpose. Catch-up and the live
+    /// watched REQ must ask the **same question** over different time ranges —
+    /// if the two lists drifted, reconstruction would silently omit a class of
+    /// event that the live subscription goes on delivering, and the root would
+    /// look healthy while missing history nobody could point at.
+    pub(crate) fn kinds(self) -> &'static [u32] {
+        match self {
+            HistoryStream::Comments => &[
+                KIND_TEXT_NOTE,
+                KIND_GIT_STATUS_OPEN,
+                KIND_GIT_STATUS_MERGED,
+                KIND_GIT_STATUS_CLOSED,
+                KIND_GIT_STATUS_DRAFT,
+            ],
+            HistoryStream::PullRequestUpdates => &[KIND_GIT_PR_UPDATE],
+        }
+    }
+
+    /// Exhaustible streams required for this root class.
+    ///
+    /// The root itself is **not** here. It is a required object proven by
+    /// [`VerifiedBoundRoot`], not an exhaustible query — "the root query is
+    /// exhausted" and "the root exists" are different claims, and an empty
+    /// result satisfies the first while failing the second.
+    pub(crate) fn required_for(is_pull_request: bool) -> &'static [HistoryStream] {
+        if is_pull_request {
+            &[HistoryStream::Comments, HistoryStream::PullRequestUpdates]
+        } else {
+            &[HistoryStream::Comments]
+        }
+    }
+
+    fn admits(self, kind: u32) -> bool {
+        match self {
+            HistoryStream::Comments => matches!(
+                kind,
+                KIND_TEXT_NOTE
+                    | KIND_GIT_STATUS_OPEN
+                    | KIND_GIT_STATUS_MERGED
+                    | KIND_GIT_STATUS_CLOSED
+                    | KIND_GIT_STATUS_DRAFT
+            ),
+            HistoryStream::PullRequestUpdates => kind == KIND_GIT_PR_UPDATE,
+        }
+    }
+}
+
+/// What to do after absorbing one page of history.
+///
+/// Deliberately **not** `PartialEq` any more. Two of these variants now carry
+/// event collections, and comparing whole outcomes by value would silently
+/// compare those collections — a question no caller has, and one that would let
+/// a test claim to check an outcome while really checking rows. Callers
+/// destructure.
+#[derive(Debug)]
+pub(crate) enum PageOutcome {
+    /// Request another page.
+    Continue { until: u64, limit: usize },
+    /// This stream is exhausted through the cutoff, and here are the rows it
+    /// retained along the way.
+    ///
+    /// Success carries the history rather than a count. Before this, pagination
+    /// proved progress and produced nothing: the cursor recorded ids in a `seen`
+    /// set purely to detect repeats and dropped every event, so a caller that
+    /// paginated a root to exhaustion held no rows at the end of it.
+    ///
+    /// There is no route to a [`RetainedStream`] that does not pass through this
+    /// variant, and no route through this variant that does not carry one.
+    Complete(RetainedStream),
+    /// An authentic boundary from a **previous incarnation** of this same
+    /// request arrived. The page is untouched and handed straight back.
+    ///
+    /// This is not corruption, and treating it as corruption would be a
+    /// self-inflicted outage: the adversary model explicitly permits a
+    /// predecessor's EOSE to be queued, the connection to be replaced, the page
+    /// to be reopened, and the old boundary to be consumed late. It happens on
+    /// an ordinary reconnect.
+    ///
+    /// So the predecessor must not *complete* the replacement — its boundary
+    /// says nothing about what the relay held while the connection was down,
+    /// and only the replacement could have recovered it — but it must not
+    /// poison the replacement either. The page comes back so the replacement's
+    /// own witness can still complete it.
+    ///
+    /// The distinction this variant exists to carry: **stale evidence is
+    /// refused; contradictory state is degraded.**
+    Stale { page: OpenedHistoryPage },
+    /// Completeness could not be proven. The root is degraded, not healthy.
+    ///
+    /// `rows` are strictly diagnostic — see [`DiagnosticRows`].
+    Degraded {
+        reason: String,
+        rows: DiagnosticRows,
+    },
+}
+
+/// The one shape a root catch-up REQ filter may take.
+///
+/// Single-sourced because [`ProjectRequests::open_history_page`] builds the
+/// registered filter from the collector's own page parameters, and the live
+/// admission check compares arriving events against that same JSON. If the
+/// sender and the admitter each built it themselves they would drift, and the
+/// check would decay into "both sides produced something filter-shaped".
+pub(crate) fn catch_up_filter(
+    root: &str,
+    stream: HistoryStream,
+    until: u64,
+    effective_limit: usize,
+) -> Value {
+    json!({
+        "kinds": stream.kinds(),
+        stream.root_tag(): [root],
+        "until": until,
+        "limit": effective_limit,
+    })
+}
+
+// Consumed by the reconstruction driver, which is the next change.
+#[allow(unused_imports)]
+pub(crate) use history::{
+    merge::{merge_completed_streams, OrderedRetainedRows},
+    DiagnosticRow, DiagnosticRows, EoseHistoryPage, HistoryCursor, HistoryPageCollector,
+    ProposalDomain, RetainedStream,
+};
+
+/// Pagination internals, in a private module so the proof types are genuinely
+/// exclusive rather than merely documented as such.
+///
+/// The previous version's collector was `pub(crate)` with a method named
+/// `finish_at_eose` and a comment saying it was only called after EOSE. A name
+/// is not an enforcement mechanism: any caller could build an empty collector
+/// and get a page whose zero `raw_count` read as `Complete`. Here the
+/// constructor, the collector-to-page transition and the page's fields are all
+/// private to this module, and the only route in is
+/// [`HistoryCursor::propose_request`] — whose collector, in turn, only counts
+/// once [`HistoryCursor::commit_request`] accepts it from the cursor that
+/// stamped it.
+mod history {
+    use super::{
+        AuthorityVerdict, EndOfStoredEvents, HistoryStream, OpenedHistoryPage, PageOutcome,
+        VerifiedProjectEvent,
+    };
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+
+    /// Immutable identity of one page request.
+    ///
+    /// Binds root, stream, cutoff, effective limit and generation, so a page
+    /// cannot be absorbed by a cursor that did not ask for it — a Comments page
+    /// answering a PR-update cursor, a page for root A answering root B, or a
+    /// page built under a different limit.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct HistoryPageRequest {
+        generation: u64,
+        root: String,
+        stream: HistoryStream,
+        until: u64,
+        effective_limit: usize,
+    }
+
+    /// A page collected through a genuine EOSE with its integrity intact.
+    #[derive(Debug)]
+    pub(crate) struct EoseHistoryPage {
+        request: HistoryPageRequest,
+        raw_count: usize,
+        events: Vec<VerifiedProjectEvent>,
+    }
+
+    impl EoseHistoryPage {
+        pub(crate) fn events(&self) -> &[VerifiedProjectEvent] {
+            &self.events
+        }
+    }
+
+    /// A page that reached the end of its request with integrity already lost.
+    ///
+    /// Carries the rows that looked valid before the poisoning, because they are
+    /// genuinely useful when diagnosing *why* a root degraded. They travel in a
+    /// plain `Vec` and end up in [`DiagnosticRows`]; there is no function from
+    /// either into [`RetainedStream`], so the diagnostic path cannot become a
+    /// history path by anyone's convenience.
+    struct PoisonedPage {
+        reason: String,
+        rows: Vec<VerifiedProjectEvent>,
+    }
+
+    /// Verified rows retained across every page of one stream.
+    ///
+    /// Deliberately **not** named `CompleteHistory` or `VerifiedHistory`. EOSE
+    /// provenance is still forgeable, so this type carries no claim that the
+    /// pages it accumulated were bounded by a genuine, request-bound end of
+    /// stored events. It claims exactly this much: every row was verified,
+    /// belongs to this root and this stream, was no newer than the page that
+    /// asked for it, was paginated from `cutoff`, and the cursor's own
+    /// exhaustion rule was satisfied. Readiness stays the driver's to declare,
+    /// and remains blocked.
+    ///
+    /// Not `Clone`, on purpose: a stream is yielded once, and a duplicate would
+    /// be a second copy of history that could be merged twice.
+    ///
+    /// It has no production method that reads its rows. The only code that
+    /// touches `events` is [`merge`], a child module, which reaches the private
+    /// field directly. A crate caller therefore cannot lift rows out of a
+    /// completed stream and route them past the merge's checks.
+    #[derive(Debug)]
+    pub(crate) struct RetainedStream {
+        root: String,
+        stream: HistoryStream,
+        /// The immutable snapshot boundary this stream was paginated from.
+        ///
+        /// Separate from the cursor's moving `until`, which is where pagination
+        /// has reached. Two streams of one root that completed from different
+        /// cutoffs describe two different snapshots, and merging them yields a
+        /// coherent-looking history missing everything between the two.
+        cutoff: u64,
+        events: Vec<VerifiedProjectEvent>,
+    }
+
+    impl RetainedStream {
+        pub(crate) fn root(&self) -> &str {
+            &self.root
+        }
+
+        pub(crate) fn stream(&self) -> HistoryStream {
+            self.stream
+        }
+
+        pub(crate) fn cutoff(&self) -> u64 {
+            self.cutoff
+        }
+
+        pub(crate) fn len(&self) -> usize {
+            self.events.len()
+        }
+
+        pub(crate) fn is_empty(&self) -> bool {
+            self.events.is_empty()
+        }
+
+        /// Test-only row access, for asserting retention and ordering.
+        ///
+        /// Not available in production builds, where the only reader is the
+        /// merge — which is the whole point of the type.
+        #[cfg(test)]
+        pub(crate) fn events(&self) -> &[VerifiedProjectEvent] {
+            &self.events
+        }
+    }
+
+    /// One row's identifying metadata, with no witness attached.
+    ///
+    /// What a degraded cursor may say about what it saw. Enough to diagnose a
+    /// failure — which ids, of which kinds, at which times — and not enough to
+    /// replay anything, because it is not a [`VerifiedProjectEvent`] and no
+    /// authority function will accept it.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub(crate) struct DiagnosticRow {
+        pub(crate) id: String,
+        pub(crate) kind: u32,
+        pub(crate) created_at: u64,
+    }
+
+    /// What a cursor that failed may report. **Diagnostics only.**
+    ///
+    /// A distinct type from [`RetainedStream`] so the difference is enforced
+    /// rather than remembered, and — since the previous version of this type was
+    /// only *named* diagnostic — it no longer holds anything replayable to hand
+    /// out. It exposed `rows(&self) -> &[VerifiedProjectEvent]` crate-wide, and
+    /// `VerifiedProjectEvent` is `Clone`, so any caller could take the witnesses
+    /// and feed them to a fold directly. Being unable to build a
+    /// `RetainedStream` never stopped that; it only stopped one route.
+    ///
+    /// Production sees [`DiagnosticRow`] metadata. Raw witnesses are dropped at
+    /// the boundary rather than gated behind `#[cfg(test)]`, because nothing —
+    /// test or otherwise — has a use for them that is not replay.
+    ///
+    /// These rows are not "most of the history". A poisoned page means some row
+    /// occupied a slot under the relay's limit and then failed a check, which is
+    /// exactly the situation in which what is missing cannot be enumerated.
+    #[derive(Debug)]
+    pub(crate) struct DiagnosticRows {
+        rows: Vec<DiagnosticRow>,
+    }
+
+    impl DiagnosticRows {
+        fn empty() -> Self {
+            Self { rows: Vec::new() }
+        }
+
+        fn describe(events: impl IntoIterator<Item = VerifiedProjectEvent>) -> Self {
+            Self {
+                rows: events
+                    .into_iter()
+                    .map(|e| DiagnosticRow {
+                        id: e.id(),
+                        kind: e.kind(),
+                        created_at: e.event().created_at.as_secs(),
+                    })
+                    .collect(),
+            }
+        }
+
+        pub(crate) fn len(&self) -> usize {
+            self.rows.len()
+        }
+
+        pub(crate) fn is_empty(&self) -> bool {
+            self.rows.is_empty()
+        }
+
+        pub(crate) fn rows(&self) -> &[DiagnosticRow] {
+            &self.rows
+        }
+    }
+
+    /// Identifies the cursor that stamped a proposal.
+    ///
+    /// Empty on purpose: identity is the **allocation**, compared with
+    /// `Arc::ptr_eq`. The previous version authenticated a proposal by its
+    /// generation number, and an independently constructed cursor with the
+    /// same root, stream, cutoff, bound and limit stamps the same number — so
+    /// a throwaway cursor could commit the reconstruction's. This is the same
+    /// correction as `RegistrationAuthority` in Piece 1, one layer down.
+    #[derive(Debug)]
+    pub(crate) struct ProposalDomain;
+
+    /// Collects one request's frames and decides whether a witness may exist.
+    ///
+    /// The collector owns integrity rather than trusting its caller: it sees
+    /// every frame on its subscription, counts it toward `raw_count`, and
+    /// verifies and shape-checks it here. A bad row that vanished before being
+    /// counted would leave a short page that falsely reads as end-of-history,
+    /// because that row still consumed a slot under the relay's limit.
+    #[derive(Debug)]
+    pub(crate) struct HistoryPageCollector {
+        request: HistoryPageRequest,
+        /// The cursor this collector was stamped by.
+        domain: Arc<ProposalDomain>,
+        raw_count: usize,
+        events: Vec<VerifiedProjectEvent>,
+        integrity_lost: Option<String>,
+    }
+
+    impl HistoryPageCollector {
+        /// Read-only view of the page parameters this collector was opened for.
+        ///
+        /// Exposed so `ProjectRequests::open_history_page` can build the REQ
+        /// from them. Reading a request's own parameters is not the forgery
+        /// risk — *constructing* authority is, and that stays inside the
+        /// registry.
+        pub(crate) fn root(&self) -> &str {
+            &self.request.root
+        }
+
+        pub(crate) fn stream(&self) -> HistoryStream {
+            self.request.stream
+        }
+
+        pub(crate) fn until(&self) -> u64 {
+            self.request.until
+        }
+
+        pub(crate) fn effective_limit(&self) -> usize {
+            self.request.effective_limit
+        }
+
+        /// Which proposal this collector was stamped for.
+        ///
+        /// Sequence data only. On its own it proves nothing — an unrelated
+        /// cursor with the same descriptive state stamps the same number — so
+        /// [`HistoryCursor::commit_request`] checks the proposal *domain*
+        /// alongside it.
+        pub(crate) fn generation(&self) -> u64 {
+            self.request.generation
+        }
+
+        /// Which cursor stamped this collector.
+        pub(crate) fn proposal_domain(&self) -> &Arc<ProposalDomain> {
+            &self.domain
+        }
+
+        /// Has this collector observed nothing at all yet?
+        ///
+        /// Checked at binding. A collector that already holds rows was filled
+        /// before the registration it is being attached to existed, so those
+        /// rows cannot have arrived on that subscription.
+        pub(crate) fn is_pristine(&self) -> bool {
+            self.raw_count == 0 && self.events.is_empty() && self.integrity_lost.is_none()
+        }
+
+        /// Feed one verified row from this request's subscription.
+        ///
+        /// Takes a [`VerifiedProjectEvent`] rather than a bare event because
+        /// the relay dispatch has already verified it, and a second verifier
+        /// here would be a second place that has to agree with the first. What
+        /// remains are the *page* checks — stream, bound and root — which are
+        /// about the question this request asked, not about the signature.
+        pub(crate) fn observe(&mut self, verified: VerifiedProjectEvent) {
+            self.raw_count += 1;
+
+            if !self.request.stream.admits(verified.kind()) {
+                let kind = verified.kind();
+                let stream = self.request.stream;
+                return self.poison(format!("kind {kind} does not belong to {stream:?}"));
+            }
+            if verified.event().created_at.as_secs() > self.request.until {
+                let until = self.request.until;
+                return self.poison(format!("event newer than the requested until={until}"));
+            }
+            match super::root_event_id(verified.kind(), &verified.id(), &verified.tag_vecs()) {
+                Some(root) if root == self.request.root => self.events.push(verified),
+                Some(other) => self.poison(format!("event belongs to root {other}, not this one")),
+                None => self.poison("event resolves to no root".to_string()),
+            }
+        }
+
+        /// A frame that could not even be parsed as an event.
+        pub(crate) fn observe_malformed(&mut self, reason: impl Into<String>) {
+            self.raw_count += 1;
+            self.poison(reason);
+        }
+
+        /// The request ended without EOSE — `CLOSED`, timeout, reconnect,
+        /// NOTICE. Consumes the collector so no witness can follow.
+        pub(crate) fn abandon(self) {}
+
+        fn poison(&mut self, reason: impl Into<String>) {
+            if self.integrity_lost.is_none() {
+                self.integrity_lost = Some(reason.into());
+            }
+        }
+
+        /// Private: only [`HistoryCursor::complete`] calls it, on a genuine
+        /// EOSE.
+        fn finish_at_eose(self) -> Result<EoseHistoryPage, PoisonedPage> {
+            if let Some(reason) = self.integrity_lost {
+                // The rows that passed their checks before the poisoning still
+                // exist, and throwing them away made every degradation equally
+                // uninformative. They come back as diagnostics, never as page
+                // events: this arm cannot construct an `EoseHistoryPage`.
+                return Err(PoisonedPage {
+                    reason,
+                    rows: self.events,
+                });
+            }
+            Ok(EoseHistoryPage {
+                request: self.request,
+                raw_count: self.raw_count,
+                events: self.events,
+            })
+        }
+    }
+
+    /// What a cursor is allowed to do next.
+    #[derive(Debug)]
+    enum CursorState {
+        /// Still paginating.
+        Open,
+        /// Already yielded its [`RetainedStream`]. The accumulator is empty and
+        /// no further page may be absorbed — a second `Complete` would be a
+        /// second copy of the same history.
+        Finished,
+        /// Permanently degraded, holding the first reason.
+        ///
+        /// Sticky by design. A short page arriving after integrity was lost
+        /// looks exactly like exhaustion, so allowing one to be absorbed would
+        /// let any stream rehabilitate itself simply by being asked once more.
+        Degraded(String),
+    }
+
+    /// Paginates one stream backwards through a fixed cutoff, retaining what it
+    /// accepts.
+    ///
+    /// `until` moves to the oldest timestamp **inclusively** — `oldest - 1`
+    /// would drop the rest of that second — so the boundary cohort is delivered
+    /// again on the next page and folds by id, and a page consisting entirely of
+    /// one timestamp grows the page rather than moving the cursor, because such
+    /// a cohort may be truncated.
+    ///
+    /// Not `Clone`: a copy would share a generation with the original and could
+    /// absorb the same page a second time, which is the movable-proof hazard in
+    /// a different costume.
+    #[derive(Debug)]
+    pub(crate) struct HistoryCursor {
+        root: String,
+        stream: HistoryStream,
+        /// The snapshot boundary this cursor was opened against. Immutable.
+        ///
+        /// Kept apart from `until` because they answer different questions:
+        /// `cutoff` is which snapshot this stream belongs to, `until` is how far
+        /// back it has paginated. Storing only the latter left nothing for a
+        /// merge to check, so two streams of one root could complete from two
+        /// different snapshots and merge without complaint.
+        cutoff: u64,
+        until: u64,
+        limit: usize,
+        relay_max_limit: usize,
+        generation: u64,
+        /// This cursor's proposal domain, stamped into every collector it
+        /// issues so another cursor's cannot be committed here.
+        domain: Arc<ProposalDomain>,
+        /// Set once the generation space is spent. Never cleared: a wrapped
+        /// generation would let a superseded page match a later request, which
+        /// is the failure the generation exists to prevent.
+        generations_exhausted: bool,
+        /// Accepted rows, keyed by `(created_at, event_id)`.
+        ///
+        /// That key is injective with `event_id` alone: a verified event's id is
+        /// the hash of its canonical contents, `created_at` among them
+        /// (`buzz-core/src/verification.rs:11-25`), so two entries cannot share
+        /// an id and differ in key. Duplicates therefore still fold exactly
+        /// once, while the ordered map hands back `(created_at, event_id)` order
+        /// for free rather than by a sort someone has to remember to run.
+        retained: BTreeMap<(u64, String), VerifiedProjectEvent>,
+        state: CursorState,
+    }
+
+    impl HistoryCursor {
+        pub(crate) fn new(
+            root: &str,
+            stream: HistoryStream,
+            cutoff: u64,
+            initial_limit: usize,
+            relay_max_limit: usize,
+        ) -> Self {
+            let relay_max_limit = relay_max_limit.max(1);
+            Self {
+                root: root.to_string(),
+                stream,
+                cutoff,
+                until: cutoff,
+                limit: initial_limit.clamp(1, relay_max_limit),
+                relay_max_limit,
+                generation: 0,
+                domain: Arc::new(ProposalDomain),
+                generations_exhausted: false,
+                retained: BTreeMap::new(),
+                state: CursorState::Open,
+            }
+        }
+
+        pub(crate) fn stream(&self) -> HistoryStream {
+            self.stream
+        }
+
+        pub(crate) fn cutoff(&self) -> u64 {
+            self.cutoff
+        }
+
+        pub(crate) fn until(&self) -> u64 {
+            self.until
+        }
+
+        /// The limit to request, already clamped to the relay ceiling so the
+        /// page witness can be compared against a number the relay will apply.
+        pub(crate) fn limit(&self) -> usize {
+            self.limit
+        }
+
+        /// How many distinct rows are currently held.
+        ///
+        /// Zero once the stream has been yielded or drained into diagnostics —
+        /// this counts what the cursor still holds, not what it ever saw.
+        pub(crate) fn retained_count(&self) -> usize {
+            self.retained.len()
+        }
+
+        /// The reason this cursor is permanently degraded, if it is.
+        pub(crate) fn degraded_reason(&self) -> Option<&str> {
+            match &self.state {
+                CursorState::Degraded(reason) => Some(reason),
+                _ => None,
+            }
+        }
+
+        /// Open a collector bound to this cursor's current request. The only
+        /// route to a page witness.
+        ///
+        /// A closed cursor may still hand one out; [`Self::complete`] is the
+        /// single gate, so there is one place where "may this page count?" is
+        /// decided rather than two that could disagree.
+        /// Stamp and immediately commit. Test-only convenience.
+        ///
+        /// Production issues through [`Self::propose_request`] so that a second
+        /// issue before transport cannot supersede the first.
+        #[cfg(test)]
+        pub(crate) fn begin_request(&mut self) -> HistoryPageCollector {
+            let collector = self
+                .propose_request()
+                .expect("generation space is not exhausted in tests");
+            assert!(self.commit_request(collector.generation(), collector.proposal_domain()));
+            collector
+        }
+
+        /// Stamp a collector for the *next* request **without advancing**.
+        ///
+        /// Idempotent: calling it twice yields two collectors carrying the same
+        /// generation and domain, so issuing a second cannot invalidate a first
+        /// still on its way to the socket. The generation moves only when a
+        /// page is accepted — see [`Self::commit_request`].
+        ///
+        /// The alternative shape, remembering "one is outstanding", would be a
+        /// flag living across the transport `await`; a cancelled or
+        /// indeterminate write would then strand the stream with an
+        /// outstanding proposal nothing could clear.
+        ///
+        /// `None` once the generation space is spent. Fails closed rather than
+        /// wrapping, for the same reason registration incarnations do: a reused
+        /// generation lets a superseded page match a later request.
+        pub(crate) fn propose_request(&self) -> Option<HistoryPageCollector> {
+            if self.generations_exhausted {
+                return None;
+            }
+            let next = self.generation.checked_add(1)?;
+            Some(self.collector_for(next))
+        }
+
+        /// Advance to the proposed generation, if this cursor stamped it.
+        ///
+        /// Checks the proposal **domain** as well as the number. An unrelated
+        /// cursor with identical root, stream, cutoff, bound and limit stamps
+        /// the same generation, so the number alone authenticates nothing.
+        pub(crate) fn commit_request(
+            &mut self,
+            generation: u64,
+            domain: &Arc<ProposalDomain>,
+        ) -> bool {
+            if !Arc::ptr_eq(&self.domain, domain) {
+                return false;
+            }
+            if self.generations_exhausted || generation != self.generation + 1 {
+                return false;
+            }
+            self.generation = generation;
+            if self.generation == u64::MAX {
+                self.generations_exhausted = true;
+            }
+            true
+        }
+
+        fn collector_for(&self, generation: u64) -> HistoryPageCollector {
+            HistoryPageCollector {
+                request: HistoryPageRequest {
+                    generation,
+                    root: self.root.clone(),
+                    stream: self.stream,
+                    until: self.until,
+                    effective_limit: self.limit,
+                },
+                domain: Arc::clone(&self.domain),
+                raw_count: 0,
+                events: Vec::new(),
+                integrity_lost: None,
+            }
+        }
+
+        #[cfg(test)]
+        pub(crate) fn force_generation(&mut self, generation: u64) {
+            self.generation = generation;
+        }
+
+        /// Close a request at EOSE and absorb the resulting page.
+        ///
+        /// Both arguments are proofs, not descriptions. `witness` is minted only
+        /// by `ProjectRequests::witness_end_of_stored_events` against a live
+        /// registration, and `opened` only by
+        /// `ProjectRequests::open_history_page` — so a collector that never
+        /// rode a REQ, a `CLOSED`, a refusal and a timeout are all unable to
+        /// reach this function at all, rather than being rejected once inside
+        /// it.
+        ///
+        /// What remains checkable here is whether the two proofs name the
+        /// *same registration*, which [`OpenedHistoryPage::verdict_for`]
+        /// decides by comparing capabilities rather than numbers:
+        ///
+        /// - [`AuthorityVerdict::Predecessor`] — a strictly earlier instance of
+        ///   this same request in this same registry. Ordinary reconnect
+        ///   traffic: [`PageOutcome::Stale`], page returned, cursor untouched.
+        /// - [`AuthorityVerdict::Contradiction`] — another request, another
+        ///   registry, or a *later* instance offered to an older page. None of
+        ///   those can happen without the owner being confused, so the cursor
+        ///   degrades permanently.
+        pub(crate) fn complete(
+            &mut self,
+            witness: &EndOfStoredEvents,
+            opened: OpenedHistoryPage,
+        ) -> PageOutcome {
+            let verdict = opened.verdict_for(witness);
+
+            // A predecessor's boundary must leave the cursor exactly as it
+            // found it, whatever state that is — so this is settled before
+            // anything below can mutate.
+            if verdict == AuthorityVerdict::Predecessor {
+                return PageOutcome::Stale { page: opened };
+            }
+
+            if let Some(reason) = self.closed_reason() {
+                // The collector's rows are dropped rather than reported. A
+                // cursor that has already finished or already failed must gain
+                // nothing at all from a later page — including a set of rows
+                // that would make the failure look partially recovered.
+                //
+                // This sits above the contradiction check for the same reason.
+                // Degrading here would flip a `Finished` cursor whose rows were
+                // already handed to the merge, and would replace an existing
+                // degradation's reason with a later symptom — the first
+                // recorded cause is the true one.
+                return PageOutcome::Degraded {
+                    reason,
+                    rows: DiagnosticRows::empty(),
+                };
+            }
+
+            if verdict == AuthorityVerdict::Contradiction {
+                return self.degrade(
+                    format!(
+                        "end-of-stored-events for `{}` offered to a page opened as `{}`, \
+                         and it is not an earlier instance of that request",
+                        witness.sub_id(),
+                        opened.sub_id()
+                    ),
+                    Vec::new(),
+                );
+            }
+
+            let collector = opened.into_collector();
+            match collector.finish_at_eose() {
+                Ok(page) => self.absorb(page),
+                Err(poisoned) => self.degrade(poisoned.reason, poisoned.rows),
+            }
+        }
+
+        fn closed_reason(&self) -> Option<String> {
+            match &self.state {
+                CursorState::Open => None,
+                CursorState::Finished => Some(
+                    "stream already yielded its retained rows; it cannot absorb another page"
+                        .to_string(),
+                ),
+                CursorState::Degraded(reason) => {
+                    Some(format!("cursor is permanently degraded: {reason}"))
+                }
+            }
+        }
+
+        fn absorb(&mut self, page: EoseHistoryPage) -> PageOutcome {
+            let EoseHistoryPage {
+                request: r,
+                raw_count,
+                events,
+            } = page;
+
+            if r.generation != self.generation
+                || r.root != self.root
+                || r.stream != self.stream
+                || r.until != self.until
+                || r.effective_limit != self.limit
+            {
+                // Permanent, not a soft rejection. A cursor cannot tell its own
+                // driver's superseded request apart from a page arriving from
+                // somewhere else, and the correct way to drop a request that was
+                // superseded is `HistoryPageCollector::abandon`, which never
+                // reaches this function.
+                return self.degrade(
+                    "history page does not match this cursor's outstanding request".to_string(),
+                    events,
+                );
+            }
+
+            let mut fresh = 0usize;
+            let mut oldest: Option<u64> = None;
+            let mut newest: Option<u64> = None;
+            for event in events {
+                let created_at = event.event().created_at.as_secs();
+                oldest = Some(oldest.map_or(created_at, |o| o.min(created_at)));
+                newest = Some(newest.map_or(created_at, |n| n.max(created_at)));
+                let id = event.id();
+                if self.retained.insert((created_at, id), event).is_none() {
+                    fresh += 1;
+                }
+            }
+
+            // Judged on rows the relay returned against the limit it applied —
+            // never on what we asked for, never on the post-filter count, and
+            // never on how many of them were new. An inclusive boundary cohort
+            // arrives again on the next page and folds to nothing fresh while
+            // still consuming the relay's slots.
+            if raw_count < r.effective_limit {
+                return self.finish();
+            }
+
+            let Some(oldest) = oldest else {
+                return self.degrade(
+                    "saturated page contained no usable events".to_string(),
+                    Vec::new(),
+                );
+            };
+            let newest = newest.unwrap_or(oldest);
+
+            if oldest == newest {
+                if self.limit >= self.relay_max_limit {
+                    let ceiling = self.relay_max_limit;
+                    return self.degrade(
+                        format!(
+                            "timestamp {oldest} saturated the effective page ceiling {ceiling}; cannot prove the cohort is complete"
+                        ),
+                        Vec::new(),
+                    );
+                }
+                self.limit = self.limit.saturating_mul(4).min(self.relay_max_limit);
+                return PageOutcome::Continue {
+                    until: self.until,
+                    limit: self.limit,
+                };
+            }
+
+            // Unreached by any page this API can produce, and deliberately kept
+            // rather than tested. Two invariants exclude it together: the
+            // collector refuses rows newer than the request's `until`, and
+            // `until` only ever moves to a page's oldest stamp, so the only
+            // already-retained rows a later page may legally repeat are those
+            // sitting exactly at `until` — a single-timestamp cohort, handled
+            // above. It guards the invariants, not an observed case; a fixture
+            // for it would have to violate one of them and would then be
+            // testing a shape the collector cannot deliver.
+            if fresh == 0 {
+                let until = self.until;
+                return self.degrade(
+                    format!(
+                        "saturated page at until={until} returned no new events; pagination cannot advance"
+                    ),
+                    Vec::new(),
+                );
+            }
+
+            self.until = oldest;
+            PageOutcome::Continue {
+                until: self.until,
+                limit: self.limit,
+            }
+        }
+
+        /// Close the stream and hand over what it retained.
+        fn finish(&mut self) -> PageOutcome {
+            self.state = CursorState::Finished;
+            PageOutcome::Complete(RetainedStream {
+                root: self.root.clone(),
+                stream: self.stream,
+                cutoff: self.cutoff,
+                events: std::mem::take(&mut self.retained).into_values().collect(),
+            })
+        }
+
+        /// Fail permanently, draining the accumulator into diagnostics.
+        ///
+        /// Draining is the point. If a degraded cursor kept its rows, the rows
+        /// and the failure would sit side by side and some later caller would
+        /// reach for the former; emptying it means the only thing that survives
+        /// a failure is a [`DiagnosticRows`], which nothing can turn into
+        /// history.
+        ///
+        /// `extra` carries rows that never made it into the accumulator —
+        /// the valid-looking part of a poisoned page, or a page rejected for
+        /// answering a request this cursor did not make.
+        fn degrade(&mut self, reason: String, extra: Vec<VerifiedProjectEvent>) -> PageOutcome {
+            let mut rows = std::mem::take(&mut self.retained);
+            for event in extra {
+                let key = (event.event().created_at.as_secs(), event.id());
+                rows.entry(key).or_insert(event);
+            }
+            self.state = CursorState::Degraded(reason.clone());
+            PageOutcome::Degraded {
+                reason,
+                // The witnesses are described and dropped here. Nothing beyond
+                // this line ever holds a verified event that failed its page.
+                rows: DiagnosticRows::describe(rows.into_values()),
+            }
+        }
+    }
+
+    /// The merge, in a child module so [`merge::OrderedRetainedRows`] has
+    /// exactly one constructor and [`RetainedStream`] needs no row accessor at
+    /// all.
+    ///
+    /// A child module can read its ancestors' private fields, so this reaches
+    /// `RetainedStream.events` directly. That is the point: a crate-visible
+    /// `into_events` would have let any caller lift rows out of a completed
+    /// stream and hand them onward without the checks below ever running.
+    pub(crate) mod merge {
+        use super::super::{HistoryStream, VerifiedBoundRoot, VerifiedProjectEvent};
+        use super::RetainedStream;
+
+        /// Rows from every required stream of one snapshot, in reconstruction
+        /// order.
+        ///
+        /// The narrow claim, and no wider: exactly the required streams, one
+        /// root, one cutoff, root first, deterministic order thereafter. It does
+        /// **not** claim EOSE completeness and does **not** claim the root is
+        /// ready — matching cutoffs prove snapshot coherence, not that either
+        /// stream saw everything within it.
+        ///
+        /// It exists so the eventual reconstruction fold can demand a value that
+        /// has been through [`merge_completed_streams`], rather than a
+        /// `Vec<VerifiedProjectEvent>` that anything at all can produce. There is
+        /// deliberately no `into_rows`: adding one would restore the very
+        /// laundering path this type is here to close.
+        #[derive(Debug)]
+        pub(crate) struct OrderedRetainedRows {
+            root: String,
+            cutoff: u64,
+            rows: Vec<VerifiedProjectEvent>,
+        }
+
+        impl OrderedRetainedRows {
+            pub(crate) fn root(&self) -> &str {
+                &self.root
+            }
+
+            pub(crate) fn cutoff(&self) -> u64 {
+                self.cutoff
+            }
+
+            pub(crate) fn rows(&self) -> &[VerifiedProjectEvent] {
+                &self.rows
+            }
+
+            pub(crate) fn len(&self) -> usize {
+                self.rows.len()
+            }
+
+            pub(crate) fn is_empty(&self) -> bool {
+                self.rows.is_empty()
+            }
+        }
+
+        /// Merge independently completed streams of one snapshot.
+        ///
+        /// **Completion is gated by the type system rather than by a comment.** A
+        /// [`RetainedStream`] exists only inside `PageOutcome::Complete`, so
+        /// there is no way to pass this function a stream that is still
+        /// paginating, one that degraded, or one a caller assembled.
+        ///
+        /// Refuses outright rather than merging partially when:
+        ///
+        /// - the streams present are not exactly those
+        ///   [`HistoryStream::required_for`] names for this root's class. A
+        ///   `1618` root merged from its comments alone would otherwise yield a
+        ///   well-ordered, entirely plausible history with every revision
+        ///   missing;
+        /// - a stream appears twice, which would duplicate each of its rows;
+        /// - a stream was paginated for some other root;
+        /// - a stream was paginated from a different cutoff than the
+        ///   reconstruction selected. Two streams that each completed, from
+        ///   `1_000` and from `500`, describe two snapshots; merging them loses
+        ///   everything one of them never asked for and says nothing about it.
+        ///   Checked for single-stream issue roots too, so the driver can prove
+        ///   the stream belongs to the snapshot it chose rather than to an
+        ///   earlier one it has forgotten.
+        ///
+        /// Ordering is root first by rule, then `(created_at, event_id)`. The
+        /// root leads because it is the root, not because it is oldest — a relay
+        /// may hand back a comment bearing an earlier `created_at` than the issue
+        /// it answers, and a reconstruction opening with that comment would fold
+        /// participants and lifecycle in an order that never happened. Ties break
+        /// on id so two events in the same second have one order rather than
+        /// whichever the merge happened to visit first.
+        pub(crate) fn merge_completed_streams(
+            root: &VerifiedBoundRoot,
+            expected_cutoff: u64,
+            streams: Vec<RetainedStream>,
+        ) -> Result<OrderedRetainedRows, String> {
+            let mut expected =
+                HistoryStream::required_for(root.binding().is_pull_request()).to_vec();
+            expected.sort();
+            let mut present: Vec<HistoryStream> =
+                streams.iter().map(RetainedStream::stream).collect();
+            present.sort();
+            if present != expected {
+                return Err(format!(
+                    "this root requires exactly {expected:?}; got {present:?}"
+                ));
+            }
+
+            let root_id = root.binding().root();
+            for stream in &streams {
+                if stream.root != root_id {
+                    return Err(format!(
+                        "{:?} was paginated for root {}, not {root_id}",
+                        stream.stream, stream.root
+                    ));
+                }
+                if stream.cutoff != expected_cutoff {
+                    return Err(format!(
+                        "{:?} was paginated from cutoff {}, not the reconstruction's {expected_cutoff}",
+                        stream.stream, stream.cutoff
+                    ));
+                }
+            }
+
+            // No cross-stream duplicate is possible to fold here:
+            // `HistoryStream::admits` partitions the kinds, so a row admitted by
+            // Comments is refused by PullRequestUpdates and the reverse.
+            let mut rows: Vec<VerifiedProjectEvent> =
+                streams.into_iter().flat_map(|s| s.events).collect();
+            rows.sort_by(|a, b| {
+                a.event()
+                    .created_at
+                    .as_secs()
+                    .cmp(&b.event().created_at.as_secs())
+                    .then_with(|| a.id().cmp(&b.id()))
+            });
+
+            let mut ordered = Vec::with_capacity(rows.len() + 1);
+            ordered.push(root.event().clone());
+            ordered.extend(rows);
+            Ok(OrderedRetainedRows {
+                root: root_id.to_string(),
+                cutoff: expected_cutoff,
+                rows: ordered,
+            })
+        }
+    }
+}
+
+/// One root's historical reconstruction: the cutoff, the cursors, and at most
+/// one page in flight per stream.
+///
+/// **Owns the cutoff.** Every stream of one reconstruction must be exhausted
+/// against the *same* upper bound, or the merge is comparing histories that end
+/// at different moments. The cutoff is taken once at construction and there is
+/// no method that changes it.
+///
+/// **Derives, does not accept.** Which stream a page belongs to comes from the
+/// page itself ([`OpenedHistoryPage::stream`]), never from a caller argument.
+/// The same applies to the root. This is the lesson of Piece 1 applied one
+/// layer out: a signature that lets the caller state a fact about authority is
+/// a signature that will eventually be handed the wrong one.
+///
+/// **Claims nothing about readiness.** There is deliberately no
+/// `is_complete()`. Completeness depends on backpressure recovery that does not
+/// exist yet, and an API that could not honestly answer would be answered
+/// optimistically. Callers can see which streams have finished; nothing here
+/// says the reconstruction as a whole is trustworthy.
+#[derive(Debug)]
+pub(crate) struct RootReconstruction {
+    root: String,
+    is_pull_request: bool,
+    /// Immutable for the life of the reconstruction.
+    cutoff: u64,
+    streams: Vec<StreamProgress>,
+    /// Set once, terminal. A reconstruction that has given up says so rather
+    /// than continuing to accept pages.
+    abandoned: Option<String>,
+}
+
+#[derive(Debug)]
+struct StreamProgress {
+    stream: HistoryStream,
+    cursor: HistoryCursor,
+    /// At most one page may be in flight per stream. A second concurrent page
+    /// on one stream would produce two boundaries the cursor could not order.
+    open: Option<OpenedHistoryPage>,
+    /// Set when this stream exhausted its history through the cutoff.
+    retained: Option<RetainedStream>,
+}
+
+/// A refused attachment, **carrying the page back**.
+///
+/// `attach` consumes an [`OpenedHistoryPage`], and binding is one-shot: if a
+/// rejection dropped the page, its registration would stay bound with nothing
+/// able to reach it, and the caller would have no authority to clean up. The
+/// page comes back with the reason so the rejection is recoverable rather than
+/// merely reported.
+#[derive(Debug)]
+pub(crate) struct AttachRejected {
+    pub(crate) error: AttachError,
+    pub(crate) page: OpenedHistoryPage,
+}
+
+/// Why a page could not be attached to this reconstruction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum AttachError {
+    /// The page collects for a different root.
+    WrongRoot,
+    /// This root does not require that stream — a PR update page offered to an
+    /// issue reconstruction, for instance.
+    StreamNotRequired,
+    /// That stream already has a page in flight.
+    AlreadyInFlight,
+    /// The page was opened against a different upper bound than this
+    /// reconstruction's current position for that stream.
+    WrongUntil { expected: u64, found: u64 },
+    /// The page was stamped for a proposal this stream has moved past, or one
+    /// it never issued.
+    Superseded,
+    /// The page was opened with a different page limit than the cursor will
+    /// accept at completion.
+    ///
+    /// The cursor compares the effective limit exactly. Checking only root,
+    /// stream and `until` let a genuine page be held all the way to EOSE and
+    /// *then* degrade the reconstruction — a rejection deferred until the
+    /// point where it costs the most.
+    WrongLimit { expected: usize, found: usize },
+    /// That stream has already finished, or the whole reconstruction was
+    /// abandoned.
+    Closed,
+}
+
+/// What attaching a boundary to a reconstruction produced.
+#[derive(Debug)]
+pub(crate) enum StreamAdvance {
+    /// This stream wants another page, from `until` with `limit`.
+    Continue {
+        stream: HistoryStream,
+        until: u64,
+        limit: usize,
+    },
+    /// This stream is exhausted through the cutoff.
+    Finished { stream: HistoryStream },
+    /// An authentic boundary from an earlier instance of the same request.
+    ///
+    /// Ordinary reconnect traffic. The page stays in flight and the
+    /// reconstruction is untouched — there is nothing for the caller to do and
+    /// nothing handed back, because only this page's own boundary can finish
+    /// it.
+    Stale { stream: HistoryStream },
+    /// This stream failed permanently, and with it the reconstruction.
+    Degraded {
+        stream: HistoryStream,
+        reason: String,
+    },
+}
+
+/// Where an admitted catch-up frame went.
+///
+/// Deliberately not a `bool`. The previous signature answered "did some page
+/// take this?", which cannot distinguish a frame that belongs to nobody here
+/// from one that belongs to a page this reconstruction has already replaced —
+/// and those need opposite handling: the first is somebody else's, the second
+/// must be dropped precisely *because* it looks like ours.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum FrameRouting {
+    /// Absorbed by the page that exact registration opened.
+    Absorbed { stream: HistoryStream },
+    /// That registration is gone, so its page was dropped. The stream wants a
+    /// page again, from the bound it already had.
+    Released { stream: HistoryStream },
+    /// From a strictly earlier instance of the same request. Dropped; the page
+    /// in flight is untouched and still completable by its own boundary.
+    Predecessor { stream: HistoryStream },
+    /// No page this reconstruction holds was opened by that registration.
+    NotOurs,
+    /// The frame names an id this reconstruction holds a page under, but comes
+    /// from a registration that is neither that page's nor a predecessor of it.
+    /// Terminal.
+    Contradiction {
+        stream: HistoryStream,
+        reason: String,
+    },
+}
+
+impl RootReconstruction {
+    /// Begin a reconstruction for a proven root.
+    ///
+    /// Takes [`VerifiedBoundRoot`] rather than a root string so the caller
+    /// cannot start one for a root it has not proven, and so the PR/issue class
+    /// — which decides *which* streams are required — is read from the proof
+    /// rather than passed alongside it.
+    pub(crate) fn begin(
+        root: &VerifiedBoundRoot,
+        cutoff: u64,
+        page_limit: usize,
+        relay_max: usize,
+    ) -> Self {
+        let is_pull_request = root.binding().is_pull_request();
+        let root_id = root.binding().root().to_string();
+        let streams = HistoryStream::required_for(is_pull_request)
+            .iter()
+            .map(|stream| StreamProgress {
+                stream: *stream,
+                cursor: HistoryCursor::new(&root_id, *stream, cutoff, page_limit, relay_max),
+                open: None,
+                retained: None,
+            })
+            .collect();
+        Self {
+            root: root_id,
+            is_pull_request,
+            cutoff,
+            streams,
+            abandoned: None,
+        }
+    }
+
+    pub(crate) fn root(&self) -> &str {
+        &self.root
+    }
+
+    pub(crate) fn cutoff(&self) -> u64 {
+        self.cutoff
+    }
+
+    pub(crate) fn is_pull_request(&self) -> bool {
+        self.is_pull_request
+    }
+
+    pub(crate) fn abandoned_reason(&self) -> Option<&str> {
+        self.abandoned.as_deref()
+    }
+
+    /// The streams still wanting a page, and the bound each must be opened
+    /// against.
+    ///
+    /// A stream appears here only when it has no page in flight, has not
+    /// finished, and the reconstruction is live. The `until` is the cursor's,
+    /// not a caller's choice — pagination walks backwards from the immutable
+    /// cutoff and only the cursor knows how far it has got.
+    pub(crate) fn pages_wanted(&self) -> Vec<(HistoryStream, u64, usize)> {
+        if self.abandoned.is_some() {
+            return Vec::new();
+        }
+        self.streams
+            .iter()
+            .filter(|s| {
+                s.open.is_none() && s.retained.is_none() && s.cursor.degraded_reason().is_none()
+            })
+            .map(|s| (s.stream, s.cursor.until(), s.cursor.limit()))
+            .collect()
+    }
+
+    /// Issue a collector for `stream`, from **this reconstruction's own
+    /// cursor**.
+    ///
+    /// The only route on this type. `pages_wanted` says which streams want a
+    /// page and on what bound; the collector comes from the owned cursor — the
+    /// one whose `complete()` will judge it. The first version of this piece
+    /// advertised requests it could never accept back, and a test helper that
+    /// built a throwaway cursor hid it.
+    ///
+    /// It is **not** the only way a collector can come into existence, and the
+    /// text here used to claim it was. `HistoryCursor::propose_request` is
+    /// reachable, and a cursor built with the same root, stream, cutoff and
+    /// limit stamps the *same* generation — so the number proves nothing. What
+    /// the owned cursor recognises is the private proposal domain it stamps
+    /// into its own collectors, checked by allocation at `attach`.
+    ///
+    /// `None` when that stream cannot take a page: abandoned, not required,
+    /// already in flight, finished, or degraded.
+    pub(crate) fn begin_page(&mut self, stream: HistoryStream) -> Option<HistoryPageCollector> {
+        if self.abandoned.is_some() {
+            return None;
+        }
+        let progress = self.streams.iter_mut().find(|s| s.stream == stream)?;
+        if progress.open.is_some()
+            || progress.retained.is_some()
+            || progress.cursor.degraded_reason().is_some()
+        {
+            return None;
+        }
+        // Proposes without advancing, so issuing twice before either reaches
+        // the socket cannot invalidate the first. The cursor moves only when
+        // `attach` commits the proposal that actually arrived.
+        match progress.cursor.propose_request() {
+            Some(collector) => Some(collector),
+            None => {
+                // Generation space spent. Abandon rather than return `None`
+                // forever: a stream that can never issue another page while
+                // `pages_wanted` keeps advertising it is a spin, which is only
+                // a quieter failure than wrapping.
+                self.abandon(format!(
+                    "{stream:?}: page generation space exhausted; no further page can be \
+                     distinguished from a superseded one"
+                ));
+                None
+            }
+        }
+    }
+
+    /// Take ownership of a page opened for one of this root's streams.
+    pub(crate) fn attach(&mut self, page: OpenedHistoryPage) -> Result<(), Box<AttachRejected>> {
+        macro_rules! refuse {
+            ($e:expr) => {
+                return Err(Box::new(AttachRejected { error: $e, page }))
+            };
+        }
+        if self.abandoned.is_some() {
+            refuse!(AttachError::Closed);
+        }
+        if page.root() != self.root {
+            refuse!(AttachError::WrongRoot);
+        }
+        let stream = page.stream();
+        let Some(progress) = self.streams.iter_mut().find(|s| s.stream == stream) else {
+            refuse!(AttachError::StreamNotRequired);
+        };
+        if progress.retained.is_some() || progress.cursor.degraded_reason().is_some() {
+            refuse!(AttachError::Closed);
+        }
+        if progress.open.is_some() {
+            refuse!(AttachError::AlreadyInFlight);
+        }
+        // The *whole* expected request, not a hand-picked subset: the cursor
+        // compares generation, root, stream, `until` and effective limit at
+        // completion, and anything it will reject then should be rejected now.
+        let expected_until = progress.cursor.until();
+        if page.until() != expected_until {
+            refuse!(AttachError::WrongUntil {
+                expected: expected_until,
+                found: page.until(),
+            });
+        }
+        let expected_limit = progress.cursor.limit();
+        if page.effective_limit() != expected_limit {
+            refuse!(AttachError::WrongLimit {
+                expected: expected_limit,
+                found: page.effective_limit(),
+            });
+        }
+        // Commit the exact proposal that arrived. A page stamped for a
+        // proposal this cursor has already moved past — or one it never
+        // stamped — is refused here rather than at EOSE.
+        if !progress
+            .cursor
+            .commit_request(page.generation(), page.proposal_domain())
+        {
+            refuse!(AttachError::Superseded);
+        }
+        progress.open = Some(page);
+        Ok(())
+    }
+
+    /// Which in-flight page was opened under this subscription id, if any.
+    ///
+    /// Destination by **provenance**: matched against the page's own
+    /// `sub_id()`, so neither `observe` nor `complete` takes a caller-supplied
+    /// stream. An untyped stream argument kept aligned by convention is the
+    /// same shape as the authority claims Piece 1 removed — and here it is
+    /// worse, because misdirecting a boundary turns a routing slip into
+    /// terminal contradiction.
+    fn stream_awaiting(&self, sub_id: &str) -> Option<HistoryStream> {
+        self.streams
+            .iter()
+            .find(|s| s.open.as_ref().is_some_and(|p| p.sub_id() == sub_id))
+            .map(|s| s.stream)
+    }
+
+    /// Route one admitted catch-up frame to the page **that request** opened.
+    ///
+    /// The id is not the destination. Under the old deterministic catch-up id
+    /// `sub_id` named a *sequence* of registrations and the page in flight
+    /// belonged to exactly one of them: the relay may still be delivering page
+    /// one's rows when page two's REQ goes out, and matching on the id absorbed
+    /// those stragglers into page two, where they were rows from outside its own
+    /// bound, counted against its own limit. The page then completed and
+    /// asserted a history it never received. An id now names one attempt, so the
+    /// straggler is refused a registration upstream of here — but this stays
+    /// registration-compared rather than id-compared, because a routing rule
+    /// that is only correct while ids happen to be unique is a rule that depends
+    /// on something it does not state.
+    ///
+    /// So the destination is the registration, compared by allocation, and the
+    /// three answers are the same three a boundary gets.
+    pub(crate) fn observe(&mut self, frame: CatchUpFrame) -> FrameRouting {
+        let (admission, outcome) = frame.into_parts();
+        if self.abandoned.is_some() {
+            return FrameRouting::NotOurs;
+        }
+        let Some(stream) = self.stream_awaiting(admission.sub_id()) else {
+            return FrameRouting::NotOurs;
+        };
+        let Some(progress) = self.streams.iter_mut().find(|s| s.stream == stream) else {
+            return FrameRouting::NotOurs;
+        };
+        let Some(page) = progress.open.as_mut() else {
+            return FrameRouting::NotOurs;
+        };
+        match page.verdict_for_frame(&admission) {
+            AuthorityVerdict::SameRegistration => match outcome {
+                CatchUpOutcome::Row(verified) => {
+                    page.observe(*verified);
+                    FrameRouting::Absorbed { stream }
+                }
+                // Counted, and the page loses its integrity claim. Dropping it
+                // silently would leave the page short by exactly the number of
+                // frames this agent refused, which reads as end-of-history.
+                CatchUpOutcome::Unusable(reason) => {
+                    page.observe_unusable(reason);
+                    FrameRouting::Absorbed { stream }
+                }
+                // The page goes away and the stream re-advertises itself. It is
+                // dropped rather than completed: only a genuine boundary from
+                // this same registration may finish a page, and this request no
+                // longer has one to give.
+                CatchUpOutcome::RequestLost(_) => {
+                    progress.open = None;
+                    FrameRouting::Released { stream }
+                }
+            },
+            // Ordinary reconnect traffic: a row of the page this one replaced.
+            // Refused, and the page in flight is untouched — the same treatment
+            // a predecessor's boundary gets.
+            AuthorityVerdict::Predecessor => FrameRouting::Predecessor { stream },
+            // A frame claiming an id this reconstruction holds a page under,
+            // from a registration that is neither that page's nor an earlier
+            // instance of it. Our model of who owns this id is wrong, and a
+            // page whose arrivals cannot be accounted for cannot claim
+            // retention integrity — so this is terminal, exactly as the same
+            // verdict is for a boundary.
+            AuthorityVerdict::Contradiction => {
+                let reason = format!("{stream:?}: frame from a registration this page is not");
+                self.abandon(reason.clone());
+                FrameRouting::Contradiction { stream, reason }
+            }
+        }
+    }
+
+    /// Complete whichever page this boundary belongs to.
+    ///
+    /// The stream is derived from `witness.sub_id()`, so a boundary cannot be
+    /// offered to the wrong stream's page. `None` when no page in flight was
+    /// opened under that id.
+    pub(crate) fn complete(&mut self, witness: &EndOfStoredEvents) -> Option<StreamAdvance> {
+        if self.abandoned.is_some() {
+            return None;
+        }
+        let stream = self.stream_awaiting(witness.sub_id())?;
+        let progress = self.streams.iter_mut().find(|s| s.stream == stream)?;
+        let page = progress.open.take()?;
+        match progress.cursor.complete(witness, page) {
+            PageOutcome::Continue { until, limit } => Some(StreamAdvance::Continue {
+                stream,
+                until,
+                limit,
+            }),
+            PageOutcome::Complete(retained) => {
+                progress.retained = Some(retained);
+                Some(StreamAdvance::Finished { stream })
+            }
+            PageOutcome::Stale { page } => {
+                // Untouched. The page goes back in flight because only this
+                // instance's own boundary may finish it, and the reconstruction
+                // — not the caller — is what holds it meanwhile.
+                progress.open = Some(page);
+                Some(StreamAdvance::Stale { stream })
+            }
+            PageOutcome::Degraded { reason, .. } => {
+                // Terminal for the *reconstruction*, not just this stream. A
+                // root whose history cannot be proven complete on one stream is
+                // not partially trustworthy, and leaving another stream's page
+                // in flight would let it keep absorbing events after the answer
+                // had already become "we do not know".
+                let reason = format!("{stream:?}: {reason}");
+                self.abandon(reason.clone());
+                Some(StreamAdvance::Degraded { stream, reason })
+            }
+        }
+    }
+
+    /// The connection died: every page in flight belonged to it.
+    ///
+    /// Cursors and the cutoff survive, so the reconstruction resumes from where
+    /// it got to — under fresh registrations, since the old ones are gone.
+    pub(crate) fn disconnected(&mut self) {
+        for progress in &mut self.streams {
+            progress.open = None;
+        }
+    }
+
+    /// Give up permanently, with a reason.
+    pub(crate) fn abandon(&mut self, reason: impl Into<String>) {
+        if self.abandoned.is_none() {
+            self.abandoned = Some(reason.into());
+        }
+        self.disconnected();
+    }
+
+    /// Streams that have exhausted their history, for the merge to consume.
+    ///
+    /// Deliberately *not* a readiness check: this says which streams finished,
+    /// not that the reconstruction is trustworthy.
+    pub(crate) fn finished_streams(&self) -> Vec<&RetainedStream> {
+        self.streams
+            .iter()
+            .filter_map(|s| s.retained.as_ref())
+            .collect()
+    }
+
+    /// Test-only: wind one stream's page generation near its ceiling.
+    ///
+    /// Exhaustion needs 2^64 pages to reach honestly, which is not a test
+    /// anyone can run.
+    #[cfg(test)]
+    pub(crate) fn force_stream_generation(&mut self, stream: HistoryStream, generation: u64) {
+        if let Some(progress) = self.streams.iter_mut().find(|s| s.stream == stream) {
+            progress.cursor.force_generation(generation);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn in_flight(&self, stream: HistoryStream) -> bool {
+        self.streams
+            .iter()
+            .any(|s| s.stream == stream && s.open.is_some())
+    }
+}
+
+/// The reconstructions in progress, and the only thing that puts an admitted
+/// catch-up frame in front of a page.
+///
+/// **Dispatch is by provenance, not by content.** Which reconstruction a frame
+/// belongs to comes from the class this agent recorded when it sent the REQ —
+/// `RootCatchUp { root, .. }` — never from the root the arriving event names.
+/// The event's own root is checked too, but as a *disagreement* check: a relay
+/// answering a different question than the one asked poisons the page rather
+/// than redirecting it.
+///
+/// **Holds no scheduling.** It does not decide which roots to reconstruct, does
+/// not open pages, and answers no readiness question. A `Continue` handed back
+/// by a stream is reported to the caller, which is where the next page will be
+/// issued once there is something that issues pages.
+///
+/// **Lives beside the registry**, in the relay task's `BgState`, because a page
+/// is bound by the registry the moment its REQ reaches the socket — an owner
+/// anywhere else could only issue a collector and wait for the bound page to be
+/// sent back. Nothing it holds is reachable from the run loop, and nothing it
+/// routes crosses a queue.
+#[derive(Debug, Default)]
+pub(crate) struct ProjectReconstructions {
+    live: Vec<RootReconstruction>,
+}
+
+impl ProjectReconstructions {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    /// Take ownership of a reconstruction, so frames for its root can reach it.
+    ///
+    /// Refuses a second reconstruction of the same root: two owners for one
+    /// root would both be offered every frame, and the one that did not open
+    /// the page would report `NotOurs` while the other absorbed it — a
+    /// coin-flip that depends on vector order.
+    ///
+    /// No production caller yet. Deciding *which* roots to rebuild is enrolment,
+    /// which is a later piece; until it lands this collection is empty in
+    /// production and every admitted frame routes to `NotOurs`.
+    pub(crate) fn insert(&mut self, reconstruction: RootReconstruction) -> bool {
+        if self.find(reconstruction.root()).is_some() {
+            return false;
+        }
+        self.live.push(reconstruction);
+        true
+    }
+
+    fn find(&mut self, root: &str) -> Option<&mut RootReconstruction> {
+        self.live.iter_mut().find(|r| r.root() == root)
+    }
+
+    /// Route one admitted catch-up frame.
+    ///
+    /// `NotOurs` when no reconstruction is rebuilding that root, or when the
+    /// one that is holds no page from that registration. The caller decides
+    /// what an unowned frame means; absorbing it into whatever page is nearest
+    /// is the thing this type exists to prevent.
+    pub(crate) fn observe(&mut self, frame: CatchUpFrame) -> FrameRouting {
+        let ProjectSubscription::RootCatchUp { root, .. } = frame.subscription() else {
+            return FrameRouting::NotOurs;
+        };
+        let root = root.clone();
+        match self.find(&root) {
+            Some(reconstruction) => reconstruction.observe(frame),
+            None => FrameRouting::NotOurs,
+        }
+    }
+
+    /// Route one end-of-stored-events boundary.
+    ///
+    /// Same provenance rule: the root comes from the class recorded for the
+    /// request the boundary names, so a boundary cannot be steered by anything
+    /// the relay chose.
+    pub(crate) fn complete(&mut self, witness: &EndOfStoredEvents) -> Option<StreamAdvance> {
+        let ProjectSubscription::RootCatchUp { root, .. } = witness.subscription() else {
+            return None;
+        };
+        let root = root.clone();
+        self.find(&root)?.complete(witness)
+    }
+
+    /// The connection died. Every page in flight belonged to it.
+    pub(crate) fn disconnected(&mut self) {
+        for reconstruction in &mut self.live {
+            reconstruction.disconnected();
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn get(&mut self, root: &str) -> Option<&mut RootReconstruction> {
+        self.find(root)
+    }
+}
+
+/// Proof that the required root event exists, is bound to a discovered
+/// repository, and is of the expected class.
+///
+/// **The root is a required object, not an exhaustible stream.** Treating it as
+/// one let an exact-id query returning zero rows satisfy "complete", so
+/// readiness could be reached with no root at all — and therefore no root
+/// author, no repository binding, and no class from which to derive prior
+/// facts.
+#[derive(Debug, Clone)]
+pub(crate) struct VerifiedBoundRoot {
+    event: VerifiedProjectEvent,
+    binding: EnrolmentCandidate,
+}
+
+impl VerifiedBoundRoot {
+    /// Prove a root from exactly one verified candidate event.
+    ///
+    /// Derives the binding internally rather than accepting one, so there is no
+    /// API path that pairs a verified root with an independently selected
+    /// candidate. Fewer movable proofs, fewer opportunities for creative
+    /// assembly.
+    ///
+    /// `None` for zero events, more than one, or a root whose own signed `a`
+    /// does not name a discovered repository.
+    pub(crate) fn prove(
+        candidates: &[VerifiedProjectEvent],
+        discovered: &DiscoveredRepositories,
+    ) -> Option<Self> {
+        let [event] = candidates else {
+            return None;
+        };
+        let binding = validate_enrolment_candidate(event, discovered)?;
+        Some(Self {
+            event: event.clone(),
+            binding,
+        })
+    }
+
+    pub(crate) fn event(&self) -> &VerifiedProjectEvent {
+        &self.event
+    }
+
+    pub(crate) fn binding(&self) -> &EnrolmentCandidate {
+        &self.binding
+    }
+}
+
+// ── Root history ──────────────────────────────────────────────────────────────
+
+/// Whether an event is being processed as reconstructed history or live
+/// traffic.
+///
+/// Answers "may processing this now create a model turn?", **not** "what did
+/// this event mean?". Conflating them was a real defect: suppressing every
+/// replayed bare `p` as inherited meant a root enrolled by an authorised
+/// human's structural `p` was silently forgotten across a restart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProcessingMode {
+    Replay,
+    Live,
+}
+
+/// How much of a root's history has been fetched.
+///
+/// A property of the *snapshot*, separate from [`PriorRootFacts`], which is
+/// relative to one event's position within it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RootHistoryReadiness {
+    Unknown,
+    Reconstructing,
+    Complete,
+    /// Reconstruction failed or tripped its breaker. Degraded, not healthy.
+    Degraded(String),
+}
+
+/// The authority facts holding immediately *before* one event.
+///
+/// Private fields, seeded only from a proven root and folded only through
+/// [`Self::observe`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PriorRootFacts {
+    agent_was_participant: bool,
+    root_author: String,
+    /// Always present: a validated `30617` coordinate necessarily names an
+    /// owner, so an `Option` here would only be a place for that proof to leak
+    /// away.
+    repository_owner: String,
+    lifecycle: RootState,
+}
+
+impl PriorRootFacts {
+    /// Seed the fold from a proven, bound root.
+    ///
+    /// Takes [`VerifiedBoundRoot`] rather than an event plus a coordinate
+    /// string: the witness already establishes the root id, class, exact
+    /// coordinate and discovered binding together.
+    pub(crate) fn seed(root: &VerifiedBoundRoot) -> Self {
+        Self {
+            agent_was_participant: false,
+            root_author: root.event().author(),
+            repository_owner: root.binding().owner().to_string(),
+            lifecycle: RootState::Active,
+        }
+    }
+
+    /// Fold one verified event's participants in, **after** it has been
+    /// evaluated.
+    ///
+    /// Order matters: incorporating first would let the first genuine mention
+    /// see itself already present and classify as inherited.
+    pub(crate) fn observe(&mut self, event: &VerifiedProjectEvent, agent: &AgentIdentity) {
+        if self.agent_was_participant {
+            return;
+        }
+        let hex = agent.hex().to_ascii_lowercase();
+        self.agent_was_participant = event.tag_vecs().iter().any(|t| {
+            t.first().map(String::as_str) == Some("p")
+                && t.get(1).is_some_and(|v| v.eq_ignore_ascii_case(&hex))
+        });
+    }
+
+    /// Apply a lifecycle transition.
+    ///
+    /// Only after the event has passed verification, route and coordinate
+    /// checks, exact root binding, signer authority, and classification
+    /// producing `ApplyLifecycle`. A verified lifecycle event is not
+    /// necessarily an authorised one.
+    pub(crate) fn set_lifecycle(&mut self, lifecycle: RootState) {
+        self.lifecycle = lifecycle;
+    }
+
+    pub(crate) fn lifecycle(&self) -> RootState {
+        self.lifecycle
+    }
+
+    pub(crate) fn root_author(&self) -> &str {
+        &self.root_author
+    }
+
+    pub(crate) fn repository_owner(&self) -> &str {
+        &self.repository_owner
+    }
+
+    pub(crate) fn agent_was_participant(&self) -> bool {
+        self.agent_was_participant
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        agent_was_participant: bool,
+        root_author: &str,
+        repository_owner: &str,
+        lifecycle: RootState,
+    ) -> Self {
+        Self {
+            agent_was_participant,
+            root_author: root_author.to_string(),
+            repository_owner: repository_owner.to_string(),
+            lifecycle,
+        }
+    }
+}
+
+/// Deterministic history order: the root first, then `(created_at, event_id)`.
+///
+/// **Cross-runtime invariant.** Relay arrival order is not history — it is the
+/// order the network happened to hand things over. Rust and the Hermes adapter
+/// must fold in the same order or reconstruct different facts from identical
+/// events. `created_at` alone is not a total order, hence the id tie-break.
+pub(crate) fn history_order_key(root: &str, event_id: &str, created_at: u64) -> (u8, u64, String) {
+    let is_root = if event_id == root { 0 } else { 1 };
+    (is_root, created_at, event_id.to_string())
+}
+
+// ── Mention syntax ────────────────────────────────────────────────────────────
+
+/// Characters that can appear *inside* an identifier token.
+///
+/// Unicode alphanumeric plus `_`. Deliberately not tied to either key alphabet:
+/// a token ends where the lexer says, not where the key's alphabet runs out.
+/// "Is the next character another hex digit" accepted `@<64-hex>garbage`.
+fn is_identifier_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
+}
+
+/// Accepted explicit-mention prefixes. `nostr:` is the NIP-27 form.
+const MENTION_PREFIXES: [&str; 2] = ["nostr:", "@"];
+
+/// Does `content` contain `identity` as a complete explicit mention token?
+///
+/// The whole prefixed candidate must stand alone lexically: a boundary before
+/// the prefix, the exact identity, and a boundary after it. Every occurrence is
+/// scanned, so prose mentioning an identity followed by a genuine mention still
+/// resolves.
+fn explicit_mention_present(content: &str, identity: &str) -> bool {
+    if identity.is_empty() {
+        return false;
+    }
+    let lower = content.to_ascii_lowercase();
+    let ident = identity.to_ascii_lowercase();
+
+    for prefix in MENTION_PREFIXES {
+        let needle = format!("{prefix}{ident}");
+        let mut from = 0usize;
+        while let Some(offset) = lower[from..].find(&needle) {
+            let start = from + offset;
+            let end = start + needle.len();
+            let leading_ok = lower[..start]
+                .chars()
+                .next_back()
+                .is_none_or(|c| !is_identifier_char(c));
+            let trailing_ok = lower[end..]
+                .chars()
+                .next()
+                .is_none_or(|c| !is_identifier_char(c));
+            if leading_ok && trailing_ok {
+                return true;
+            }
+            from = start + 1;
+        }
+    }
+    false
+}
+
+/// This agent's identity, in the forms mention detection needs.
+///
+/// Constructed once from a `PublicKey` so hex and bech32 cannot disagree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AgentIdentity {
+    hex: String,
+    npub: String,
+}
+
+impl AgentIdentity {
+    pub(crate) fn new(pubkey: &nostr::PublicKey) -> Result<Self, nostr::nips::nip19::Error> {
+        use nostr::ToBech32;
+        Ok(Self {
+            hex: pubkey.to_hex(),
+            npub: pubkey.to_bech32()?,
+        })
+    }
+
+    pub(crate) fn hex(&self) -> &str {
+        &self.hex
+    }
+
+    pub(crate) fn npub(&self) -> &str {
+        &self.npub
+    }
+}
+
+// ── Addressing resolution ─────────────────────────────────────────────────────
+
+/// What the event itself says about addressing this agent.
+///
+/// Private fields, derived only from a [`VerifiedProjectEvent`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct AddressingEvidence {
+    p_tag_present: bool,
+    visible_mention: bool,
+}
+
+impl AddressingEvidence {
+    /// Derive addressing evidence from a verified event.
+    ///
+    /// Both identity forms come from the one typed [`AgentIdentity`], so the
+    /// `p` check and mention detection cannot be pointed at different keys.
+    ///
+    /// A visible mention is explicit mention *syntax*, not an identity
+    /// occurrence: substring matching would let an authorised human pasting a
+    /// payload or quoting a log line reactivate a dormant agent.
+    pub(crate) fn resolve(event: &VerifiedProjectEvent, agent: &AgentIdentity) -> Self {
+        let hex = agent.hex().to_ascii_lowercase();
+
+        let p_tag_present = event.tag_vecs().iter().any(|t| {
+            t.first().map(String::as_str) == Some("p")
+                && t.get(1).is_some_and(|v| v.eq_ignore_ascii_case(&hex))
+        });
+
+        let content = &event.event().content;
+        let visible_mention = explicit_mention_present(content, agent.hex())
+            || explicit_mention_present(content, agent.npub());
+
+        Self {
+            p_tag_present,
+            visible_mention,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(p_tag_present: bool, visible_mention: bool) -> Self {
+        Self {
+            p_tag_present,
+            visible_mention,
+        }
+    }
+}
+
+/// Resolve how an event addresses this agent, or refuse it.
+///
+/// `None` means the event must not be processed — not that it defaults to
+/// something harmless. An event on the enrolment subscription **without** a
+/// matching `p` did not match the filter that selected it, so the relay is
+/// broken or lying; treating that as `WatchedRoot` would invent a route.
+///
+/// A bare `p` is weak evidence: Desktop's `p` set unions repository owner, root
+/// author, prior recipients and actual mentions, so "not in the prior set" is
+/// negative evidence about propagation, not proof of intent. It is explicit
+/// only when the snapshot is `Complete`, prior facts exist, the agent was not
+/// already a participant, and the agent is not present merely as repository
+/// owner or root author.
+///
+/// Processing mode is deliberately absent: whether this is replay or live has
+/// no bearing on what the event meant when it was written.
+pub(crate) fn resolve_addressing(
+    source: &ProjectSubscription,
+    evidence: &AddressingEvidence,
+    readiness: &RootHistoryReadiness,
+    facts: Option<&PriorRootFacts>,
+    agent: &AgentIdentity,
+) -> Option<Addressing> {
+    if matches!(source, ProjectSubscription::Discovery) {
+        return None;
+    }
+
+    if !evidence.p_tag_present {
+        if matches!(source, ProjectSubscription::Enrolment) {
+            return None;
+        }
+        return Some(Addressing::WatchedRoot);
+    }
+
+    if evidence.visible_mention {
+        return Some(Addressing::ExplicitMention);
+    }
+
+    if !matches!(readiness, RootHistoryReadiness::Complete) {
+        return Some(Addressing::InheritedParticipant);
+    }
+
+    let Some(facts) = facts else {
+        return Some(Addressing::InheritedParticipant);
+    };
+
+    if facts.agent_was_participant {
+        return Some(Addressing::InheritedParticipant);
+    }
+
+    let hex = agent.hex().to_ascii_lowercase();
+    if facts.root_author.eq_ignore_ascii_case(&hex)
+        || facts.repository_owner.eq_ignore_ascii_case(&hex)
+    {
+        return Some(Addressing::InheritedParticipant);
+    }
+
+    Some(Addressing::ExplicitMention)
+}
+
+/// Constrain an effect by processing mode.
+///
+/// Replay restores state and context but never wakes the model.
+pub(crate) fn apply_processing_mode(effect: ProjectEffect, mode: ProcessingMode) -> ProjectEffect {
+    match mode {
+        ProcessingMode::Live => effect,
+        ProcessingMode::Replay => match effect {
+            ProjectEffect::EnrolAndWake => ProjectEffect::Enrol,
+            ProjectEffect::Wake => ProjectEffect::RefreshContext,
+            // No call can be resumed from history *yet*: Phase 1b has not
+            // frozen the envelope, so there is no durable outstanding-call
+            // state for a replayed result to correlate against.
+            ProjectEffect::ResumeCall => ProjectEffect::Ignore,
+            other => other,
+        },
+    }
+}
+
+/// The call marker for a project event during Phase 1.
+///
+/// Always [`CallMarker::None`]. Normalising a visible `@Agent` into an
+/// invocation here would implement half of Phase 1b through the human
+/// addressing heuristic, in the exact place the reply loop lives.
+pub(crate) fn project_call_marker() -> CallMarker {
+    CallMarker::None
 }
 
 // ── Author gate ───────────────────────────────────────────────────────────────
@@ -833,6 +4724,11 @@ pub(crate) enum ProjectEffect {
     /// Include as clearly-labelled untrusted context. Cannot enrol, wake,
     /// steer, close, reopen, or assign.
     UntrustedContext,
+    /// Ensure the root is in the active set without running a turn.
+    ///
+    /// What [`ProjectEffect::EnrolAndWake`] becomes under replay: the watch is
+    /// restored, the model is not woken.
+    Enrol,
     /// Ensure the root is in the active set — enrolling it, or reactivating a
     /// dormant enrolment — then run a turn.
     ///
@@ -852,6 +4748,130 @@ pub(crate) enum ProjectEffect {
     RefreshContext,
     /// Resume the caller's outstanding call. Never a fresh invocation.
     ResumeCall,
+}
+
+// `SiblingResolver` is consumed by the async authority path in the driver.
+#[allow(unused_imports)]
+pub(crate) use sibling::{SiblingResolver, VerifiedSibling};
+
+/// Sibling attestation, in a private module so the proof cannot be assembled
+/// from strings.
+///
+/// The previous version had a `pub(crate) fn attested(author, owner)` carrying
+/// a doc comment claiming it was "callable only where the lookup actually
+/// happened". That comment was simply false — any caller could pass the current
+/// event's author and the binding's owner and manufacture the result. This
+/// module makes the claim true by construction: the only production route to a
+/// `VerifiedSibling` runs through a [`SiblingResolver`] implementation.
+mod sibling {
+    /// Proof that an authenticated NIP-OA lookup found `author` to be a
+    /// same-owner sibling under `owner`.
+    ///
+    /// Binds both, so a proof is about one pair rather than a general grant.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub(crate) struct VerifiedSibling {
+        author: String,
+        owner: String,
+    }
+
+    impl VerifiedSibling {
+        pub(crate) fn matches(&self, author: &str, owner: &str) -> bool {
+            self.author.eq_ignore_ascii_case(author) && self.owner.eq_ignore_ascii_case(owner)
+        }
+    }
+
+    /// Performs the authenticated NIP-OA sibling lookup.
+    ///
+    /// `attest` is the sole constructor of [`VerifiedSibling`] and is private
+    /// to this module, so an implementation can only mint a proof by returning
+    /// `true` from a lookup it actually performed.
+    pub(crate) trait SiblingResolver {
+        /// Does the authenticated NIP-OA path show `author` and `owner` share
+        /// an owner?
+        fn is_same_owner_sibling(&self, author: &str, owner: &str) -> bool;
+
+        /// Resolve to a proof.
+        ///
+        /// An implementor *can* override this — Rust trait defaults are not
+        /// sealed — but overriding buys nothing: `attest` is private to this
+        /// module, so no implementation outside it can mint a `VerifiedSibling`
+        /// at all. The worst an override achieves is returning `None`, which
+        /// fails closed.
+        fn resolve(&self, author: &str, owner: &str) -> Option<VerifiedSibling> {
+            if !self.is_same_owner_sibling(author, owner) {
+                return None;
+            }
+            attest(author, owner)
+        }
+    }
+
+    fn attest(author: &str, owner: &str) -> Option<VerifiedSibling> {
+        Some(VerifiedSibling {
+            author: super::canonical_root_id(author)?,
+            owner: super::canonical_root_id(owner)?,
+        })
+    }
+}
+
+/// Classify a verified event's author for project purposes.
+///
+/// **Repository ownership is not invocation authority.** These are two
+/// different powers and collapsing them was a privilege escalation: anyone can
+/// sign a `kind:30617` announcement for a repository they invent, so treating
+/// "author is the repository owner" as `AuthorisedHuman` let any relay user
+/// announce a repo, open an issue under it, tag the agent, and thereby enrol
+/// and wake somebody else's agent. Discovery is candidate selection, not
+/// permission.
+///
+/// The split:
+///
+/// - **`agent_owner` / `approved_humans`** — may enrol and wake. This is the
+///   agent owner's decision and nobody else's;
+/// - **repository owner** — may perform *lifecycle* actions on their own root,
+///   via [`lifecycle_actor_allowed`], and anchors the immutable binding. It
+///   does not appear here at all.
+///
+/// Also deliberately ignores channel policy: `RespondTo::Anyone` exists
+/// (`crates/buzz-acp/src/config.rs:99`) and an empty Hermes allow-list means
+/// allow-all. Project routing inherits neither.
+///
+/// The sibling proof binds against `agent_owner`, because a NIP-OA sibling is
+/// an agent sharing *this agent's* owner — not an agent belonging to whoever
+/// happens to own the repository being discussed.
+///
+/// Order matters: self first, so the agent cannot classify itself as an
+/// authorised human; humans before agents, so an owner who also runs agent keys
+/// is treated as the human they are.
+pub(crate) fn classify_project_author(
+    event: &VerifiedProjectEvent,
+    agent: &AgentIdentity,
+    agent_owner: Option<&str>,
+    approved_humans: &BTreeSet<String>,
+    sibling: Option<&VerifiedSibling>,
+    approved_external_agents: &BTreeSet<String>,
+) -> ProjectAuthor {
+    let Some(author) = canonical_root_id(&event.author()) else {
+        return ProjectAuthor::Untrusted;
+    };
+
+    if author.eq_ignore_ascii_case(agent.hex()) {
+        return ProjectAuthor::SelfAuthored;
+    }
+
+    // Invocation authority comes from the agent's owner, never from the
+    // repository's.
+    if agent_owner.is_some_and(|o| o.eq_ignore_ascii_case(&author))
+        || approved_humans.contains(&author)
+    {
+        return ProjectAuthor::AuthorisedHuman;
+    }
+
+    let attested = sibling.is_some_and(|s| agent_owner.is_some_and(|o| s.matches(&author, o)));
+    if attested || approved_external_agents.contains(&author) {
+        return ProjectAuthor::TrustedAgent;
+    }
+
+    ProjectAuthor::Untrusted
 }
 
 /// The project authority gate.
@@ -978,6 +4998,7 @@ fn wake_or_enrol(root_state: RootState, addressing: Addressing) -> ProjectEffect
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nostr::{EventBuilder, JsonUtil, Keys, Kind};
 
     const ROOT: &str = "48be1cc2000000000000000000000000000000000000000000000000000000ab";
     const OTHER_ROOT: &str = "48be1cc2000000000000000000000000000000000000000000000000000000ac";
@@ -1066,12 +5087,27 @@ mod tests {
 
     #[test]
     fn lifecycle_authority_rejects_whitespace_padded_pubkeys() {
-        let coord = format!("30617:{OWNER}:repo");
         assert!(!lifecycle_actor_allowed(
             &format!(" {OWNER}"),
             STRANGER,
-            Some(&coord)
+            OWNER
         ));
+    }
+
+    #[test]
+    fn owner_authority_survives_a_lifecycle_event_with_no_coordinate() {
+        // `GitStatusMeta.repo` is optional, so an owner-signed close that omits
+        // `a` is well-formed. Owner authority comes from the root's immutable
+        // binding, not from whether the event repeated the coordinate — the old
+        // signature derived it from the event and ignored this case.
+        assert!(
+            lifecycle_actor_allowed(OWNER, THIRD_PARTY, OWNER),
+            "repository-owner-signed lifecycle with no event `a` is authorised"
+        );
+        assert!(
+            !lifecycle_actor_allowed(STRANGER, THIRD_PARTY, OWNER),
+            "an unrelated signer with no event `a` is still ignored"
+        );
     }
 
     /// Cross-runtime golden vectors, generated independently with CPython's
@@ -1104,23 +5140,953 @@ mod tests {
 
     // ── Sub ids ──────────────────────────────────────────────────────────────
 
-    #[test]
-    fn project_sub_ids_are_recognised() {
-        assert!(is_project_sub_id(PROJECT_ENROL_SUB_ID));
-        assert!(is_project_sub_id(PROJECT_ROOTS_SUB_ID));
+    fn ident(subscription: ProjectSubscription) -> ProjectRequestIdentity {
+        ProjectRequestIdentity::new(subscription, json!({ "kinds": [30617] }))
+            .expect("a filter naming kinds constrains events")
     }
 
     #[test]
-    fn channel_and_control_sub_ids_are_not_project_sub_ids() {
-        assert!(!is_project_sub_id(
-            "ch-550e8400-e29b-41d4-a716-446655440000"
+    fn an_id_this_agent_never_opened_has_no_class() {
+        // These all used to classify — the parser read the class out of the
+        // relay's own string. Now the question is not "is this id well-formed"
+        // but "did we send this", and none of these was sent. A well-formed id
+        // we never asked for is exactly the case a parser could not tell apart.
+        let requests = ProjectRequests::new();
+        for id in [
+            PROJECT_ENROL_SUB_ID,
+            PROJECT_ROOTS_SUB_ID,
+            "proj-",
+            "proj-unknown",
+            "proj-roots-7",
+            "proj-catchup-garbage",
+            "ch-550e8400-e29b-41d4-a716-446655440000",
+            "membership-notif",
+            "agent-observer-control",
+            "",
+        ] {
+            assert!(requests.match_frame(id).is_none(), "{id}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_frame_is_classified_from_the_record_we_wrote_not_the_id_it_carries() {
+        // The substantive inversion. The id spells a catch-up for ROOT; we
+        // registered it as watched generation 7. What comes back is what we
+        // wrote down, because the relay does not get to name a class into
+        // existence — and neither does an id's spelling.
+        let mut requests = ProjectRequests::new();
+        let misleading = format!("proj-catchup-c-{ROOT}-1");
+        assert_eq!(
+            open_request_on_test_socket(
+                &mut requests,
+                &misleading,
+                ident(ProjectSubscription::Watched { generation: 7 }),
+            )
+            .await,
+            OpenOutcome::Sent
+        );
+
+        assert_eq!(
+            requests.match_frame(&misleading),
+            Some(&ProjectSubscription::Watched { generation: 7 })
+        );
+    }
+
+    #[tokio::test]
+    async fn a_conflicting_open_records_absolutely_nothing() {
+        // The trapdoor this closes: an earlier arrangement admitted intent
+        // first and consulted the live registry second, so a refused identity
+        // was still left sitting in intent — and the next reconnect installed
+        // it. A conflict must leave no residue in *either* map, or the refusal
+        // is only a delay.
+        let mut requests = ProjectRequests::new();
+        let sub_id = discovery_sub_id();
+        let original = ident(ProjectSubscription::Discovery);
+        assert_eq!(
+            open_request_on_test_socket(&mut requests, &sub_id, original.clone()).await,
+            OpenOutcome::Sent
+        );
+
+        let usurper = ident(ProjectSubscription::Watched { generation: 9 });
+        assert_eq!(
+            open_request_on_test_socket(&mut requests, &sub_id, usurper).await,
+            OpenOutcome::Conflict {
+                held: Box::new(original.clone())
+            }
+        );
+
+        assert_eq!(requests.intent(&sub_id), Some(&original));
+        assert_eq!(
+            requests.match_frame(&sub_id),
+            Some(&ProjectSubscription::Discovery)
+        );
+        assert_eq!(
+            requests.replayable(),
+            vec![(sub_id, original)],
+            "and the refused identity is not what a reconnect would re-ask"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_open_differing_only_in_filter_is_a_conflict_not_a_no_op() {
+        // Same class, different question. When the live registry stored only
+        // the class it answered "already live", emitted no REQ, and let the
+        // other filter through as what the next connection would ask for.
+        let mut requests = ProjectRequests::new();
+        let sub_id = discovery_sub_id();
+        let filter_a = ProjectRequestIdentity::new(
+            ProjectSubscription::Discovery,
+            json!({ "kinds": [30617] }),
+        )
+        .expect("bounded");
+        let filter_b = ProjectRequestIdentity::new(
+            ProjectSubscription::Discovery,
+            json!({ "kinds": [30617], "authors": ["deadbeef"] }),
+        )
+        .expect("bounded");
+        assert_eq!(
+            open_request_on_test_socket(&mut requests, &sub_id, filter_a.clone()).await,
+            OpenOutcome::Sent
+        );
+        assert_eq!(
+            open_request_on_test_socket(&mut requests, &sub_id, filter_b).await,
+            OpenOutcome::Conflict {
+                held: Box::new(filter_a.clone())
+            }
+        );
+        assert_eq!(requests.intent(&sub_id), Some(&filter_a));
+    }
+
+    #[tokio::test]
+    async fn an_identical_open_is_already_live_and_emits_no_second_request() {
+        let mut requests = ProjectRequests::new();
+        let sub_id = discovery_sub_id();
+        let identity = ident(ProjectSubscription::Discovery);
+        assert_eq!(
+            open_request_on_test_socket(&mut requests, &sub_id, identity.clone()).await,
+            OpenOutcome::Sent
+        );
+        assert_eq!(
+            open_request_on_test_socket(&mut requests, &sub_id, identity).await,
+            OpenOutcome::AlreadyLive,
+            "this exact request is live; asking again must not re-send"
+        );
+        assert_eq!(requests.live_len(), 1);
+        assert_eq!(requests.intent_len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_failed_send_keeps_the_intent_it_failed_to_send() {
+        // The write failed; the intent did not. Dropping intent here would let
+        // one bad write permanently stop asking.
+        //
+        // There is no `roll_back` to call any more: nothing is registered until
+        // the write returns, so a failure has nothing to undo. The failure has
+        // to come from a real dead socket.
+        let mut requests = ProjectRequests::new();
+        let sub_id = discovery_sub_id();
+        let identity = ident(ProjectSubscription::Discovery);
+        let mut socket = test_socket().await;
+        socket.client.close(None).await.expect("close");
+        assert!(matches!(
+            requests
+                .open_request(&mut socket.client, &sub_id, identity.clone())
+                .await,
+            OpenOutcome::WriteFailed(_)
         ));
-        assert!(!is_project_sub_id("membership-notif"));
-        assert!(!is_project_sub_id("agent-observer-control"));
-        assert!(!is_project_sub_id(""));
+
+        assert!(
+            requests.match_frame(&sub_id).is_none(),
+            "nothing answerable"
+        );
+        assert_eq!(requests.intent(&sub_id), Some(&identity));
+        assert_eq!(requests.replayable().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_suspended_request_is_not_offered_again_until_the_connection_changes() {
+        // A relay refusal is scoped to the connection that issued it. It must
+        // stop a proactive resubscribe on that same connection, and must not
+        // survive it.
+        let mut requests = ProjectRequests::new();
+        let sub_id = discovery_sub_id();
+        let identity = ident(ProjectSubscription::Discovery);
+        open_request_on_test_socket(&mut requests, &sub_id, identity.clone()).await;
+
+        assert!(requests.refuse_live(&sub_id, "restricted: nope").is_some());
+
+        assert_eq!(requests.suspension(&sub_id), Some("restricted: nope"));
+        assert!(
+            requests.replayable().is_empty(),
+            "a proactive resubscribe on this connection must skip it"
+        );
+        assert_eq!(
+            requests.intent(&sub_id),
+            Some(&identity),
+            "but local policy survives the relay's opinion"
+        );
+
+        requests.clear_connection();
+        assert_eq!(requests.suspension(&sub_id), None);
+        assert_eq!(
+            requests.replayable(),
+            vec![(sub_id, identity)],
+            "and a new connection asks once more"
+        );
+    }
+
+    /// A real paired WebSocket.
+    ///
+    /// [`ProjectReqSink`] is sealed and implemented only for the live socket,
+    /// so a test cannot substitute "the write succeeded" at the authority
+    /// boundary. It injects a genuine socket at the transport layer instead —
+    /// which is the point: the previous helper passed
+    /// `|_| async { Ok(()) }` and manufactured send authority with nothing
+    /// listening.
+    struct TestSocket {
+        client: tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+        _server: tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
+    }
+
+    async fn test_socket() -> TestSocket {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test socket");
+        let address = listener.local_addr().expect("read test address");
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            tokio_tungstenite::accept_async(stream)
+                .await
+                .expect("server handshake")
+        });
+        let (client, _) = tokio_tungstenite::connect_async(format!("ws://{address}"))
+            .await
+            .expect("client handshake");
+        TestSocket {
+            client,
+            _server: server.await.expect("join server"),
+        }
+    }
+
+    /// Open a request the only way one can be opened.
+    ///
+    /// Goes through `ProjectRequests::open_request` against a **real paired
+    /// socket**. It is async for the same reason production is: the registry
+    /// performs the write, and there is no synchronous shortcut for a test to
+    /// take because there is none for anyone.
+    ///
+    /// Named for the operation it performs. The previous name, `reserve_sent`,
+    /// described the deleted two-stage reserve-then-promote model — and being
+    /// the helper most tests copy, it was the most likely of all the stale
+    /// names to propagate.
+    async fn open_request_on_test_socket(
+        requests: &mut ProjectRequests,
+        sub_id: &str,
+        identity: ProjectRequestIdentity,
+    ) -> OpenOutcome {
+        let mut socket = test_socket().await;
+        requests
+            .open_request(&mut socket.client, sub_id, identity)
+            .await
+    }
+
+    #[tokio::test]
+    async fn an_eose_witness_requires_a_live_request() {
+        // EOSE is the boundary any completion claim would rest on, so it is
+        // authenticated exactly as `CLOSED` and `EVENT` are: by an exact live
+        // registration, never by the id's spelling. An EOSE for a request we
+        // never sent is the relay's word, not evidence about our backlog.
+        let mut requests = ProjectRequests::new();
+        let sub_id = discovery_sub_id();
+
+        assert_eq!(
+            requests.witness_end_of_stored_events(&sub_id),
+            None,
+            "an id that was never opened yields no witness"
+        );
+
+        open_request_on_test_socket(
+            &mut requests,
+            &sub_id,
+            ident(ProjectSubscription::Discovery),
+        )
+        .await;
+        let witness = requests
+            .witness_end_of_stored_events(&sub_id)
+            .expect("a live request yields one");
+        assert_eq!(witness.sub_id(), sub_id);
+        assert_eq!(witness.subscription(), &ProjectSubscription::Discovery);
+
+        // Intent alone is not evidence that we asked on this connection.
+        requests.clear_connection();
+        assert!(requests.intent(&sub_id).is_some(), "policy survives");
+        assert_eq!(
+            requests.witness_end_of_stored_events(&sub_id),
+            None,
+            "but a dead connection's request cannot witness anything"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_witness_from_a_replaced_request_is_not_the_current_one() {
+        // The seam hermes-gateway found: id, class and filter are all reused on
+        // reconnect, so a witness described only by those is interchangeable
+        // with its predecessor's. The predecessor's boundary proves nothing
+        // about the gap the replacement had to recover.
+        let mut requests = ProjectRequests::new();
+        let sub_id = discovery_sub_id();
+        let identity = ident(ProjectSubscription::Discovery);
+
+        open_request_on_test_socket(&mut requests, &sub_id, identity.clone()).await;
+        let before = requests
+            .witness_end_of_stored_events(&sub_id)
+            .expect("live");
+        assert!(requests.is_live_boundary(&before));
+
+        // Connection dies; the identical request is re-sent on the next one.
+        requests.clear_connection();
+        open_request_on_test_socket(&mut requests, &sub_id, identity).await;
+        let after = requests
+            .witness_end_of_stored_events(&sub_id)
+            .expect("live again");
+
+        assert_ne!(
+            before, after,
+            "identical description, different instance — they must differ"
+        );
+        assert_ne!(before.incarnation(), after.incarnation());
+        assert_eq!(
+            before.sub_id(),
+            after.sub_id(),
+            "and the thing that differs is not the id"
+        );
+        assert_eq!(before.subscription(), after.subscription());
+
+        assert!(
+            !requests.is_live_boundary(&before),
+            "a queued predecessor witness cannot complete the replacement"
+        );
+        assert!(
+            requests.is_live_boundary(&after),
+            "the replacement's own boundary can"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_exhausted_incarnation_space_refuses_rather_than_wrapping() {
+        // `+= 1` on a u64 panics in debug and wraps in release. Wrapping is the
+        // dangerous half: incarnation 0 would come round again and authenticate
+        // a boundary minted an eternity earlier — the exact substitution this
+        // type exists to prevent — and it would happen only in the build where
+        // no panic could warn anyone.
+        let mut requests = ProjectRequests::new();
+        let sub_id = discovery_sub_id();
+        let identity = ident(ProjectSubscription::Discovery);
+
+        // Wind to the last usable value.
+        requests.force_next_incarnation(u64::MAX);
+        assert!(matches!(
+            open_request_on_test_socket(&mut requests, &sub_id, identity.clone()).await,
+            OpenOutcome::Sent
+        ));
+        let last = requests.live_incarnation(&sub_id).expect("live");
+        let final_witness = requests
+            .witness_end_of_stored_events(&sub_id)
+            .expect("live");
+
+        // The space is now spent. The next registration must refuse.
+        requests.clear_connection();
+        assert_eq!(
+            open_request_on_test_socket(&mut requests, &sub_id, identity.clone()).await,
+            OpenOutcome::Exhausted,
+            "no wrap, no reuse — a refusal"
+        );
+        assert!(
+            requests.match_frame(&sub_id).is_none(),
+            "and nothing became live"
+        );
+
+        // The old witness cannot be revived by a later registration, because
+        // there is no later registration.
+        assert!(!requests.is_live_boundary(&final_witness));
+
+        // A reconnect must not restore spent authority.
+        requests.clear_connection();
+        assert_eq!(
+            open_request_on_test_socket(&mut requests, &sub_id, identity).await,
+            OpenOutcome::Exhausted,
+            "exhaustion survives reconnect"
+        );
+        assert_eq!(
+            requests.live_incarnation(&sub_id),
+            None,
+            "and no incarnation is handed out at all"
+        );
+        let _ = last;
+    }
+
+    #[tokio::test]
+    async fn exhaustion_does_not_disturb_requests_already_live() {
+        // Refusing new registrations must not retroactively invalidate one that
+        // was legitimately opened before the space ran out.
+        let mut requests = ProjectRequests::new();
+        let discovery = discovery_sub_id();
+        let watched = watched_sub_id(0);
+
+        requests.force_next_incarnation(u64::MAX);
+        open_request_on_test_socket(
+            &mut requests,
+            &discovery,
+            ident(ProjectSubscription::Discovery),
+        )
+        .await;
+        let witness = requests
+            .witness_end_of_stored_events(&discovery)
+            .expect("live");
+
+        assert_eq!(
+            open_request_on_test_socket(
+                &mut requests,
+                &watched,
+                ident(ProjectSubscription::Watched { generation: 0 })
+            )
+            .await,
+            OpenOutcome::Exhausted
+        );
+
+        assert!(
+            requests.is_live_boundary(&witness),
+            "the request opened before exhaustion is untouched"
+        );
+        assert!(requests.match_frame(&discovery).is_some());
+        assert!(requests.match_frame(&watched).is_none());
+    }
+
+    #[tokio::test]
+    async fn an_incarnation_is_never_reused() {
+        // Monotonic, not merely different from its immediate predecessor. A
+        // counter that recycled values would let an old witness match a much
+        // later request.
+        let mut requests = ProjectRequests::new();
+        let sub_id = discovery_sub_id();
+        let identity = ident(ProjectSubscription::Discovery);
+        let mut seen = Vec::new();
+
+        for _ in 0..8 {
+            assert_eq!(
+                open_request_on_test_socket(&mut requests, &sub_id, identity.clone()).await,
+                OpenOutcome::Sent
+            );
+            seen.push(requests.live_incarnation(&sub_id).expect("live"));
+            requests.clear_connection();
+        }
+
+        let mut sorted = seen.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(sorted.len(), seen.len(), "every instance is distinct");
+        assert_eq!(sorted, seen, "and they only ever increase");
+    }
+
+    #[tokio::test]
+    async fn distinct_requests_get_distinct_incarnations() {
+        let mut requests = ProjectRequests::new();
+        let discovery = discovery_sub_id();
+        let watched = watched_sub_id(0);
+        open_request_on_test_socket(
+            &mut requests,
+            &discovery,
+            ident(ProjectSubscription::Discovery),
+        )
+        .await;
+        open_request_on_test_socket(
+            &mut requests,
+            &watched,
+            ident(ProjectSubscription::Watched { generation: 0 }),
+        )
+        .await;
+
+        assert_ne!(
+            requests.live_incarnation(&discovery),
+            requests.live_incarnation(&watched)
+        );
+
+        // And a witness from one is not current for the other.
+        let w = requests
+            .witness_end_of_stored_events(&discovery)
+            .expect("live");
+        assert!(requests.is_live_boundary(&w));
+        assert_eq!(w.sub_id(), discovery);
+    }
+
+    #[tokio::test]
+    async fn a_witness_is_not_current_once_its_request_is_refused() {
+        let mut requests = ProjectRequests::new();
+        let sub_id = discovery_sub_id();
+        open_request_on_test_socket(
+            &mut requests,
+            &sub_id,
+            ident(ProjectSubscription::Discovery),
+        )
+        .await;
+        let witness = requests
+            .witness_end_of_stored_events(&sub_id)
+            .expect("live");
+
+        requests.refuse_live(&sub_id, "restricted: nope");
+        assert!(!requests.is_live_boundary(&witness));
+    }
+
+    #[tokio::test]
+    async fn witnessing_an_eose_does_not_retire_the_request() {
+        // EOSE means end of *stored* events. Discovery, enrolment and watched
+        // subscriptions keep delivering live traffic afterwards, so closing on
+        // EOSE would silently stop routing the moment a backlog drained. Only
+        // a one-shot catch-up retires here, and the class is read from what
+        // this agent recorded when it sent the REQ.
+        let mut requests = ProjectRequests::new();
+        let sub_id = discovery_sub_id();
+        open_request_on_test_socket(
+            &mut requests,
+            &sub_id,
+            ident(ProjectSubscription::Discovery),
+        )
+        .await;
+
+        for _ in 0..3 {
+            assert!(requests.witness_end_of_stored_events(&sub_id).is_some());
+        }
+        assert!(
+            requests.match_frame(&sub_id).is_some(),
+            "still answerable after its backlog drained"
+        );
+        assert_eq!(requests.live_len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_refused_request_can_no_longer_witness_an_eose() {
+        // A relay that refuses a request and then announces its backlog is
+        // complete must not be believed about the request it just declined.
+        let mut requests = ProjectRequests::new();
+        let sub_id = discovery_sub_id();
+        open_request_on_test_socket(
+            &mut requests,
+            &sub_id,
+            ident(ProjectSubscription::Discovery),
+        )
+        .await;
+        requests.refuse_live(&sub_id, "restricted: nope");
+
+        assert_eq!(requests.witness_end_of_stored_events(&sub_id), None);
+    }
+
+    #[test]
+    fn refusing_an_id_that_is_not_live_changes_nothing() {
+        // The invariant made structural. `refuse_live` is the only way to
+        // record a suspension, and it requires an exact live registration
+        // first — so an unsolicited `CLOSED` for an id we merely *intend*
+        // cannot suspend anything, regardless of what the caller does.
+        let mut requests = ProjectRequests::new();
+        let sub_id = discovery_sub_id();
+        let identity = ident(ProjectSubscription::Discovery);
+        assert_eq!(
+            requests.record_intent(&sub_id, identity.clone()),
+            IntentAdmission::Recorded
+        );
+
+        assert_eq!(
+            requests.refuse_live(&sub_id, "restricted: nope"),
+            None,
+            "intent is not evidence that we asked on this connection"
+        );
+        assert_eq!(requests.suspension(&sub_id), None);
+        assert_eq!(requests.intent(&sub_id), Some(&identity));
+        assert_eq!(
+            requests.replayable(),
+            vec![(sub_id, identity)],
+            "and the next connection still asks"
+        );
+    }
+
+    #[tokio::test]
+    async fn clearing_a_connection_keeps_policy_and_drops_everything_answerable() {
+        let mut requests = ProjectRequests::new();
+        let sub_id = watched_sub_id(0);
+        let identity = ident(ProjectSubscription::Watched { generation: 0 });
+        open_request_on_test_socket(&mut requests, &sub_id, identity.clone()).await;
+
+        requests.clear_connection();
+
+        assert!(requests.match_frame(&sub_id).is_none());
+        assert_eq!(requests.intent(&sub_id), Some(&identity));
+    }
+
+    #[tokio::test]
+    async fn overlapping_watched_generations_are_both_live_until_the_old_one_closes() {
+        // A watched REQ replacement runs alongside its predecessor on purpose,
+        // so both ids must answer during the hand-off — and the older one must
+        // stop the moment it is closed, not before.
+        let mut requests = ProjectRequests::new();
+        let old = watched_sub_id(1);
+        let new = watched_sub_id(2);
+        open_request_on_test_socket(
+            &mut requests,
+            &old,
+            ident(ProjectSubscription::Watched { generation: 1 }),
+        )
+        .await;
+        open_request_on_test_socket(
+            &mut requests,
+            &new,
+            ident(ProjectSubscription::Watched { generation: 2 }),
+        )
+        .await;
+        assert_eq!(requests.live_len(), 2);
+
+        assert!(requests.match_frame(&old).is_some());
+        assert!(requests.match_frame(&new).is_some());
+
+        requests.close_active(&old);
+        assert!(requests.match_frame(&old).is_none());
+        assert!(requests.match_frame(&new).is_some());
+    }
+
+    #[test]
+    fn recording_intent_while_disconnected_is_fail_closed_too() {
+        // Intent recorded while disconnected is replayed verbatim by the next
+        // connection, so admitting a conflict here admits it everywhere.
+        let mut requests = ProjectRequests::new();
+        let sub_id = discovery_sub_id();
+        let original = ident(ProjectSubscription::Discovery);
+        assert_eq!(
+            requests.record_intent(&sub_id, original.clone()),
+            IntentAdmission::Recorded
+        );
+        assert_eq!(
+            requests.record_intent(&sub_id, original.clone()),
+            IntentAdmission::AlreadyIntended
+        );
+        assert_eq!(
+            requests.record_intent(
+                &sub_id,
+                ident(ProjectSubscription::Watched { generation: 4 })
+            ),
+            IntentAdmission::Conflict {
+                held: Box::new(original.clone())
+            }
+        );
+        assert_eq!(requests.intent(&sub_id), Some(&original));
+        assert_eq!(requests.live_len(), 0, "recording intent registers nothing");
+    }
+
+    #[tokio::test]
+    async fn every_subscription_class_survives_a_round_trip_through_the_owner() {
+        // Positive control: the gate is not achieved by refusing everything.
+        let mut requests = ProjectRequests::new();
+        for (sub_id, class) in [
+            (discovery_sub_id(), ProjectSubscription::Discovery),
+            (
+                PROJECT_ENROL_SUB_ID.to_string(),
+                ProjectSubscription::Enrolment,
+            ),
+            (
+                watched_sub_id(7),
+                ProjectSubscription::Watched { generation: 7 },
+            ),
+        ] {
+            assert_eq!(
+                open_request_on_test_socket(&mut requests, &sub_id, ident(class.clone())).await,
+                OpenOutcome::Sent,
+                "{sub_id}"
+            );
+            assert_eq!(requests.match_frame(&sub_id), Some(&class), "{sub_id}");
+        }
+        assert_eq!(requests.live_len(), 3);
+
+        // The fourth class is absent on purpose: a catch-up cannot be opened
+        // through this path at all, because its wire id has to name one
+        // transport attempt and only `open_history_page` mints those.
+        let mut socket = test_socket().await;
+        assert_eq!(
+            requests
+                .open_request(
+                    &mut socket.client,
+                    "proj-catchup-c-anything",
+                    ident(ProjectSubscription::RootCatchUp {
+                        root: ROOT.to_string(),
+                        stream: HistoryStream::Comments,
+                    })
+                )
+                .await,
+            OpenOutcome::NotOpenableHere
+        );
+        assert_eq!(requests.live_len(), 3, "and it recorded nothing");
     }
 
     // ── Root extraction ──────────────────────────────────────────────────────
+
+    /// Build a candidate the only way production can: through the validator.
+    ///
+    /// Deliberately not a struct literal. `mod tests` is a child module and
+    /// *could* reach the private fields, but then the tests would exercise a
+    /// construction path no caller has.
+    /// Sign an event of `kind` carrying `tags`, and verify it.
+    ///
+    /// Validation tests go through a real witness now that the validator reads
+    /// kind, id and tags from one event rather than accepting them separately.
+    async fn verified_with(kind: u32, tags: &[Vec<String>]) -> VerifiedProjectEvent {
+        let keys = Keys::generate();
+        let event = signed(&keys, kind, tags.to_vec());
+        VerifiedProjectEvent::verify(event).await.expect("valid")
+    }
+
+    /// Enrolment-set fixtures need specific root ids, which a real signed event
+    /// cannot be made to have. These tests exercise `ProjectEnrolments`, not
+    /// validation; validation has its own witness-driven tests below.
+    fn candidate_at(root: &str, coordinate: &str, pr: bool) -> EnrolmentCandidate {
+        let owner = repo_owner_from_coordinate(coordinate).expect("well-formed coordinate");
+        EnrolmentCandidate::for_test(root, coordinate, &owner, pr)
+    }
+
+    fn candidate(root: &str, pr: bool) -> EnrolmentCandidate {
+        candidate_at(root, &coord(), pr)
+    }
+
+    /// A kind-`1` comment, which is the surface that can wake a turn.
+    fn comment(
+        author: ProjectAuthor,
+        call: CallMarker,
+        state: RootState,
+        addressing: Addressing,
+    ) -> ProjectEffect {
+        classify_project_event(
+            classify_kind(KIND_TEXT_NOTE),
+            author,
+            call,
+            state,
+            addressing,
+            false,
+        )
+    }
+
+    const ALL_ADDRESSING: [Addressing; 3] = [
+        Addressing::ExplicitMention,
+        Addressing::InheritedParticipant,
+        Addressing::WatchedRoot,
+    ];
+
+    /// A filter key this code does not understand admits nothing.
+    ///
+    /// The direction matters. A matcher that skipped what it could not check
+    /// would keep passing while a request grew a constraint it silently stopped
+    /// enforcing — the failure would be invisible precisely because the filter
+    /// looked more specific than the check. Refusing instead turns that into a
+    /// visible outage rather than a silent widening.
+    #[test]
+    fn a_filter_constraint_this_code_cannot_check_admits_nothing() {
+        let keys = Keys::generate();
+        let event = signed(&keys, KIND_TEXT_NOTE, vec![tag(&["e", ROOT, "", "root"])]);
+
+        let understood = ProjectRequestIdentity::new(
+            ProjectSubscription::Watched { generation: 0 },
+            json!({ "kinds": [KIND_TEXT_NOTE], "#e": [ROOT] }),
+        )
+        .expect("the positive control is a bounded filter");
+        assert!(understood.admits(&event), "the positive control");
+
+        // All still constructible: each names at least one selective
+        // constraint, so it is a *narrow* request this code cannot evaluate —
+        // not an unbounded one. The distinction matters, and the two failures
+        // are opposite: an unreadable filter admits nothing, an unbounded one
+        // admits everything. Only the second is refused at construction, and
+        // `a_request_that_constrains_nothing_cannot_be_built` is where that is
+        // asserted.
+        for unreadable in [
+            json!({ "kinds": [KIND_TEXT_NOTE], "#e": [ROOT], "search": "anything" }),
+            json!({ "kinds": [KIND_TEXT_NOTE], "#e": [ROOT], "unknown": 1 }),
+            // Shapes this crate never writes: a tag list holding non-strings,
+            // a `since` that is not a number.
+            json!({ "#e": [7] }),
+            json!({ "since": "soon" }),
+        ] {
+            let identity = ProjectRequestIdentity::new(
+                ProjectSubscription::Watched { generation: 0 },
+                unreadable.clone(),
+            )
+            .expect("unreadable is not the same as unbounded");
+            assert!(
+                !identity.admits(&event),
+                "must refuse rather than skip: {unreadable}"
+            );
+        }
+    }
+
+    /// OR across a REQ's filters, AND within each one.
+    ///
+    /// NIP-01's rule, and therefore the relay's: an event the relay was entitled
+    /// to send under this id satisfies *some one* filter completely. The
+    /// dangerous looseness is the one in between — matching the kinds of one
+    /// branch and the tags of another describes a request nobody sent, and a
+    /// matcher that merged the branches into one constraint set would admit it.
+    #[test]
+    fn a_request_admits_an_event_matching_any_one_of_its_filters_entirely() {
+        const OTHER: &str = "48be1cc2000000000000000000000000000000000000000000000000000000ac";
+        let keys = Keys::generate();
+
+        let identity = ProjectRequestIdentity::from_filters(
+            ProjectSubscription::Watched { generation: 0 },
+            vec![
+                json!({ "kinds": [KIND_TEXT_NOTE], "#e": [ROOT] }),
+                json!({ "kinds": [KIND_GIT_PULL_REQUEST], "#E": [OTHER] }),
+            ],
+        )
+        .expect("two filters is not empty");
+
+        // Either branch, satisfied whole.
+        assert!(identity.admits(&signed(
+            &keys,
+            KIND_TEXT_NOTE,
+            vec![tag(&["e", ROOT, "", "root"])]
+        )));
+        assert!(identity.admits(&signed(
+            &keys,
+            KIND_GIT_PULL_REQUEST,
+            vec![tag(&["E", OTHER])]
+        )));
+
+        // Half of each. Neither filter is satisfied, so neither admits.
+        for crossed in [
+            signed(&keys, KIND_TEXT_NOTE, vec![tag(&["E", OTHER])]),
+            signed(
+                &keys,
+                KIND_GIT_PULL_REQUEST,
+                vec![tag(&["e", ROOT, "", "root"])],
+            ),
+        ] {
+            assert!(
+                !identity.admits(&crossed),
+                "a filter is satisfied whole or not at all"
+            );
+        }
+
+        // And one unreadable branch does not become a licence for the other:
+        // an event matching only the branch this code cannot check is refused.
+        let with_unreadable = ProjectRequestIdentity::from_filters(
+            ProjectSubscription::Watched { generation: 0 },
+            vec![
+                json!({ "kinds": [KIND_TEXT_NOTE], "#e": [ROOT] }),
+                json!({ "kinds": [KIND_GIT_PULL_REQUEST], "unknown": 1 }),
+            ],
+        )
+        .expect("two filters");
+        assert!(!with_unreadable.admits(&signed(&keys, KIND_GIT_PULL_REQUEST, Vec::new())));
+    }
+
+    /// A request that constrains nothing cannot be built — by any route.
+    ///
+    /// Every shape here asks the relay for its whole store, and each is a
+    /// different way of arriving there. The empty *vector* was refused before;
+    /// the rest were not, and "the collection is non-empty" was being called a
+    /// structural invariant while `["REQ", id, {}]` sat one `json!` away.
+    ///
+    /// `limit` is in the list because it is the same failure wearing a key: a
+    /// limit says how many rows the relay may return, not which events qualify,
+    /// so `{"limit": 500}` is a request for the five hundred most recent events
+    /// on the relay. `constraint_admits` already accepts it without looking at
+    /// the event, which is precisely why it cannot be the only thing in a
+    /// filter.
+    ///
+    /// The mixed case is the one that would have survived a per-filter check
+    /// applied lazily: one unbounded branch among narrow ones admits everything
+    /// through the OR, so the *whole list* has to be refused, not just that
+    /// branch.
+    #[test]
+    fn a_request_that_constrains_nothing_cannot_be_built() {
+        let narrow = json!({ "kinds": [KIND_TEXT_NOTE], "#e": [ROOT] });
+        for unbounded in [
+            Vec::new(),
+            vec![json!({})],
+            vec![json!({ "limit": 500 })],
+            // Not an object at all — including the two-filters-in-one-element
+            // mistake, which is now refused rather than merely unmatchable.
+            vec![json!([{ "kinds": [KIND_TEXT_NOTE] }])],
+            vec![json!("everything")],
+            vec![Value::Null],
+            // Narrow branch, unbounded branch. The OR makes it unbounded.
+            vec![narrow.clone(), json!({})],
+            vec![json!({}), narrow.clone()],
+        ] {
+            assert!(
+                ProjectRequestIdentity::from_filters(
+                    ProjectSubscription::Watched { generation: 0 },
+                    unbounded.clone(),
+                )
+                .is_none(),
+                "must refuse: {unbounded:?}"
+            );
+        }
+
+        // A limit is fine *alongside* something selective — which is what every
+        // catch-up page carries.
+        assert!(ProjectRequestIdentity::new(
+            ProjectSubscription::Watched { generation: 0 },
+            json!({ "kinds": [KIND_TEXT_NOTE], "#e": [ROOT], "limit": 500 }),
+        )
+        .is_some());
+
+        let single = ProjectRequestIdentity::new(
+            ProjectSubscription::Discovery,
+            json!({ "kinds": [30617] }),
+        )
+        .expect("a filter naming kinds constrains events");
+        assert_eq!(single.filters().count(), 1);
+        assert_eq!(
+            single.req_frame("proj-discovery"),
+            json!(["REQ", "proj-discovery", { "kinds": [30617] }]),
+            "one filter rides as the third REQ element, not as an array"
+        );
+    }
+
+    fn tag(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(|p| p.to_string()).collect()
+    }
+
+    fn signed(keys: &Keys, kind: u32, tags: Vec<Vec<String>>) -> nostr::Event {
+        let tags: Vec<nostr::Tag> = tags
+            .into_iter()
+            .map(|t| nostr::Tag::parse(t).expect("tag"))
+            .collect();
+        EventBuilder::new(Kind::Custom(kind as u16), "")
+            .tags(tags)
+            .sign_with_keys(keys)
+            .expect("sign")
+    }
+
+    /// Re-serialise a signed event with mutated tags: id and signature no
+    /// longer match the contents. What a malicious relay would send.
+    fn tampered(event: &nostr::Event, tags: serde_json::Value) -> nostr::Event {
+        let mut json: serde_json::Value = serde_json::from_str(&event.as_json()).expect("parse");
+        json["tags"] = tags;
+        nostr::Event::from_json(json.to_string()).expect("parse")
+    }
+
+    /// Swap the author pubkey while keeping the original signature — the
+    /// forged-identity attack the witness exists to stop.
+    fn forged_author(event: &nostr::Event, pubkey_hex: &str) -> nostr::Event {
+        let mut json: serde_json::Value = serde_json::from_str(&event.as_json()).expect("parse");
+        json["pubkey"] = serde_json::Value::String(pubkey_hex.to_string());
+        nostr::Event::from_json(json.to_string()).expect("parse")
+    }
+
+    fn known(coords: &[&str]) -> DiscoveredRepositories {
+        DiscoveredRepositories::for_test(coords.iter().map(|c| c.to_string()))
+    }
+
+    fn coord() -> String {
+        format!("30617:{OWNER}:repo")
+    }
 
     fn tags(raw: &[&[&str]]) -> Vec<Vec<String>> {
         raw.iter()
@@ -1249,12 +6215,35 @@ mod tests {
     }
 
     #[test]
-    fn lifecycle_authority_ignores_a_wrong_kind_coordinate() {
-        // Fail closed: an unparseable coordinate yields no owner, so authority
-        // falls back to the root author alone.
-        let bogus = format!("30618:{OWNER}:repo");
-        assert!(!lifecycle_actor_allowed(OWNER, STRANGER, Some(&bogus)));
-        assert!(lifecycle_actor_allowed(STRANGER, STRANGER, Some(&bogus)));
+    fn owner_authority_comes_from_the_binding_not_the_events_coordinate() {
+        // Replaces `lifecycle_authority_ignores_a_wrong_kind_coordinate`, whose
+        // premise disappeared when the coordinate left this signature. The two
+        // questions are now separate: whether the event's own `a` is acceptable
+        // is `follow_up_coordinate_allowed`'s job; this asks only who signed.
+        //
+        // `GitStatusMeta.repo` is optional, so an owner-signed close carrying no
+        // `a` at all is well-formed — and the old coordinate-derived version
+        // rejected exactly that.
+        assert!(
+            lifecycle_actor_allowed(OWNER, THIRD_PARTY, OWNER),
+            "repository-owner-signed lifecycle with no event `a` is authorised"
+        );
+        assert!(
+            !lifecycle_actor_allowed(STRANGER, THIRD_PARTY, OWNER),
+            "an unrelated signer with no event `a` is still ignored"
+        );
+        // And the coordinate question, asked separately, still admits absence
+        // for lifecycle and refuses it for comments.
+        assert!(follow_up_coordinate_allowed(
+            KIND_GIT_STATUS_CLOSED,
+            &CoordinateClaim::Absent,
+            &coord()
+        ));
+        assert!(!follow_up_coordinate_allowed(
+            KIND_TEXT_NOTE,
+            &CoordinateClaim::Absent,
+            &coord()
+        ));
     }
 
     // ── Kind classification ──────────────────────────────────────────────────
@@ -1307,971 +6296,2891 @@ mod tests {
 
     #[test]
     fn root_author_and_repo_owner_may_change_lifecycle() {
-        let coord = format!("30617:{OWNER}:repo");
-        assert!(lifecycle_actor_allowed(STRANGER, STRANGER, Some(&coord)));
-        assert!(lifecycle_actor_allowed(OWNER, STRANGER, Some(&coord)));
+        assert!(lifecycle_actor_allowed(STRANGER, STRANGER, OWNER));
+        assert!(lifecycle_actor_allowed(OWNER, STRANGER, OWNER));
     }
 
     #[test]
     fn a_third_party_may_not_change_lifecycle() {
-        let coord = format!("30617:{OWNER}:repo");
-        let third = "1111111111111111111111111111111111111111111111111111111111111111";
-        assert!(!lifecycle_actor_allowed(third, STRANGER, Some(&coord)));
-        // No coordinate to resolve an owner from ⇒ root author only.
-        assert!(!lifecycle_actor_allowed(OWNER, STRANGER, None));
+        assert!(!lifecycle_actor_allowed(THIRD_PARTY, STRANGER, OWNER));
+        // Neither root author nor repository owner.
+        assert!(!lifecycle_actor_allowed(OWNER, STRANGER, THIRD_PARTY));
     }
 
     #[test]
     fn lifecycle_authority_is_case_insensitive() {
-        let coord = format!("30617:{}:repo", OWNER.to_ascii_uppercase());
-        assert!(lifecycle_actor_allowed(OWNER, STRANGER, Some(&coord)));
+        // The adapted version briefly compared OWNER against OWNER, which is
+        // not a case difference and asserted nothing its name claims.
+        let shouty = OWNER.to_ascii_uppercase();
+        assert_ne!(shouty, OWNER, "the fixture must actually differ in case");
+        assert!(lifecycle_actor_allowed(&shouty, STRANGER, OWNER));
+        assert!(lifecycle_actor_allowed(OWNER, &shouty, THIRD_PARTY));
     }
 
-    // ── Author gate: comments ────────────────────────────────────────────────
+    // ── History pagination ───────────────────────────────────────────────────
 
-    /// A kind-`1` comment, which is the surface that can wake a turn.
-    fn comment(
-        author: ProjectAuthor,
-        call: CallMarker,
-        state: RootState,
-        addressing: Addressing,
-    ) -> ProjectEffect {
-        classify_project_event(
-            classify_kind(KIND_TEXT_NOTE),
-            author,
-            call,
-            state,
-            addressing,
-            false,
-        )
+    fn cursor(cutoff: u64, limit: usize, relay_max: usize) -> HistoryCursor {
+        HistoryCursor::new(ROOT, HistoryStream::Comments, cutoff, limit, relay_max)
     }
 
-    const ALL_ADDRESSING: [Addressing; 3] = [
-        Addressing::ExplicitMention,
-        Addressing::InheritedParticipant,
-        Addressing::WatchedRoot,
-    ];
+    fn comment_on(root: &str, ts: u64, marker: &str) -> nostr::Event {
+        let keys = Keys::generate();
+        EventBuilder::new(Kind::Custom(KIND_TEXT_NOTE as u16), marker)
+            .custom_created_at(nostr::Timestamp::from(ts))
+            .tags([nostr::Tag::parse(tag(&["e", root, "", "root"])).unwrap()])
+            .sign_with_keys(&keys)
+            .expect("sign")
+    }
 
-    #[test]
-    fn authorised_human_enrols_on_an_explicit_mention() {
-        assert_eq!(
-            comment(
-                ProjectAuthor::AuthorisedHuman,
-                CallMarker::None,
-                RootState::Unknown,
-                Addressing::ExplicitMention,
-            ),
-            ProjectEffect::EnrolAndWake
+    fn pr_update_on(root: &str, ts: u64, marker: &str) -> nostr::Event {
+        let keys = Keys::generate();
+        EventBuilder::new(Kind::Custom(KIND_GIT_PR_UPDATE as u16), marker)
+            .custom_created_at(nostr::Timestamp::from(ts))
+            .tags([nostr::Tag::parse(tag(&["E", root])).unwrap()])
+            .sign_with_keys(&keys)
+            .expect("sign")
+    }
+
+    fn comment_at(ts: u64, marker: &str) -> nostr::Event {
+        comment_on(ROOT, ts, marker)
+    }
+
+    // ---- Piece 1 falsifiers: the witness-authorised page contract ----------
+    //
+    // Each one names the thing that must NOT be possible. They are grouped so a
+    // later reader can tell at a glance which property a failure has broken.
+
+    /// 1. A predecessor's boundary cannot complete the replacement's page.
+    #[tokio::test]
+    async fn predecessor_witness_cannot_complete_replacement() {
+        let mut h = PageHarness::new();
+        let mut c = cursor(1_000, 4, 1_000);
+
+        let first = h.open(&mut c).await;
+        let stale_witness = h.witness(first.sub_id());
+        drop(first); // connection dies; the boundary is still in flight
+
+        let replacement = h.open(&mut c).await;
+        assert_ne!(
+            stale_witness.incarnation(),
+            replacement.incarnation(),
+            "reopening must mint a new incarnation, or nothing below is testable"
         );
-    }
 
-    #[test]
-    fn an_unknown_root_without_an_explicit_mention_does_not_enrol() {
-        // The enrolment REQ matches on `#p`, and Desktop copies every prior
-        // participant forward — so reaching us is not the same as being asked.
-        for addressing in [Addressing::InheritedParticipant, Addressing::WatchedRoot] {
-            assert_eq!(
-                comment(
-                    ProjectAuthor::AuthorisedHuman,
-                    CallMarker::None,
-                    RootState::Unknown,
-                    addressing,
-                ),
-                ProjectEffect::Ignore,
-                "{addressing:?}"
-            );
+        match c.complete(&stale_witness, replacement) {
+            PageOutcome::Stale { .. } => {}
+            other => panic!("predecessor boundary must not complete: {other:?}"),
         }
     }
 
-    #[test]
-    fn an_active_root_continues_without_re_tagging() {
-        // The regression test for the original Phase 1 gap: a follow-up comment
-        // does not tag the agent again, and must still reach the session.
-        for addressing in ALL_ADDRESSING {
-            assert_eq!(
-                comment(
-                    ProjectAuthor::AuthorisedHuman,
-                    CallMarker::None,
-                    RootState::Active,
-                    addressing,
-                ),
-                ProjectEffect::Wake,
-                "{addressing:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn an_explicit_re_tag_reactivates_a_dormant_root() {
-        assert_eq!(
-            comment(
-                ProjectAuthor::AuthorisedHuman,
-                CallMarker::None,
-                RootState::Dormant,
-                Addressing::ExplicitMention,
-            ),
-            ProjectEffect::EnrolAndWake
-        );
-    }
-
-    #[test]
-    fn an_inherited_p_tag_leaves_a_dormant_root_dormant() {
-        // The defect this classifier exists to contain: if any `p` on a closed
-        // root counted as a re-tag, every issue the agent ever touched would
-        // reanimate the moment someone commented on it.
-        for addressing in [Addressing::InheritedParticipant, Addressing::WatchedRoot] {
-            assert_eq!(
-                comment(
-                    ProjectAuthor::AuthorisedHuman,
-                    CallMarker::None,
-                    RootState::Dormant,
-                    addressing,
-                ),
-                ProjectEffect::Ignore,
-                "{addressing:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn trusted_agent_bare_p_tag_is_never_an_invocation() {
-        // Two agents watching one root must not wake each other with ordinary
-        // participant-`p`-tagged replies — not even an explicitly addressed one.
-        for state in [RootState::Active, RootState::Unknown, RootState::Dormant] {
-            for addressing in ALL_ADDRESSING {
-                assert_eq!(
-                    comment(
-                        ProjectAuthor::TrustedAgent,
-                        CallMarker::None,
-                        state,
-                        addressing,
-                    ),
-                    ProjectEffect::Ignore,
-                    "{state:?} / {addressing:?}"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn trusted_agent_with_a_call_envelope_invokes() {
-        // The envelope names its callee, so it is explicit addressing by
-        // construction — an invocation does not additionally need a fresh `p`.
-        for addressing in ALL_ADDRESSING {
-            assert_eq!(
-                comment(
-                    ProjectAuthor::TrustedAgent,
-                    CallMarker::Invocation,
-                    RootState::Unknown,
-                    addressing,
-                ),
-                ProjectEffect::EnrolAndWake,
-                "{addressing:?}"
-            );
-            assert_eq!(
-                comment(
-                    ProjectAuthor::TrustedAgent,
-                    CallMarker::Invocation,
-                    RootState::Active,
-                    addressing,
-                ),
-                ProjectEffect::Wake,
-                "{addressing:?}"
-            );
-            assert_eq!(
-                comment(
-                    ProjectAuthor::TrustedAgent,
-                    CallMarker::Invocation,
-                    RootState::Dormant,
-                    addressing,
-                ),
-                ProjectEffect::EnrolAndWake,
-                "{addressing:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn call_result_resumes_and_never_invokes() {
-        for state in [RootState::Active, RootState::Unknown, RootState::Dormant] {
-            assert_eq!(
-                comment(
-                    ProjectAuthor::TrustedAgent,
-                    CallMarker::Result,
-                    state,
-                    Addressing::WatchedRoot,
-                ),
-                ProjectEffect::ResumeCall,
-                "{state:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn a_result_from_a_non_agent_author_is_a_forged_correlation() {
-        assert_eq!(
-            comment(
-                ProjectAuthor::Untrusted,
-                CallMarker::Result,
-                RootState::Active,
-                Addressing::ExplicitMention,
-            ),
-            ProjectEffect::UntrustedContext
-        );
-        assert_eq!(
-            comment(
-                ProjectAuthor::AuthorisedHuman,
-                CallMarker::Result,
-                RootState::Active,
-                Addressing::ExplicitMention,
-            ),
-            ProjectEffect::Ignore
-        );
-    }
-
-    #[test]
-    fn the_agents_own_reply_neither_enrols_nor_wakes() {
-        for call in [CallMarker::None, CallMarker::Invocation, CallMarker::Result] {
-            for state in [RootState::Active, RootState::Unknown, RootState::Dormant] {
-                for addressing in ALL_ADDRESSING {
-                    assert_eq!(
-                        comment(ProjectAuthor::SelfAuthored, call, state, addressing),
-                        ProjectEffect::Ignore,
-                        "{call:?} / {state:?} / {addressing:?}"
-                    );
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn untrusted_identity_is_context_and_cannot_invoke() {
-        for call in [CallMarker::None, CallMarker::Invocation, CallMarker::Result] {
-            for state in [RootState::Active, RootState::Unknown, RootState::Dormant] {
-                assert_eq!(
-                    comment(
-                        ProjectAuthor::Untrusted,
-                        call,
-                        state,
-                        Addressing::ExplicitMention,
-                    ),
-                    ProjectEffect::UntrustedContext,
-                    "{call:?} / {state:?}"
-                );
-            }
-        }
-    }
-
-    // ── Author gate: a result marker must not override event class ───────────
-
-    /// A `CallMarker::Result` is only meaningful on the surface-native result
-    /// kind — currently a trusted-agent kind-`1` comment. On any other class it
-    /// must not promote the event into a call resumption, because that would
-    /// route around the locked rules that `1630`-`1633` are lifecycle-only and
-    /// `1619` is context-only.
-    #[test]
-    fn a_result_marker_never_resumes_a_lifecycle_event() {
-        for authorised in [true, false] {
-            let out = classify_project_event(
-                KindEffect::Lifecycle,
-                ProjectAuthor::TrustedAgent,
-                CallMarker::Result,
-                RootState::Active,
-                Addressing::ExplicitMention,
-                authorised,
-            );
-            assert_ne!(out, ProjectEffect::ResumeCall);
-            assert_eq!(
-                out,
-                if authorised {
-                    ProjectEffect::ApplyLifecycle
-                } else {
-                    ProjectEffect::Ignore
-                }
-            );
-        }
-    }
-
-    #[test]
-    fn a_result_marker_never_resumes_a_pr_update() {
-        let out = classify_project_event(
-            KindEffect::ContextRefresh,
-            ProjectAuthor::TrustedAgent,
-            CallMarker::Result,
-            RootState::Active,
-            Addressing::ExplicitMention,
-            false,
-        );
-        assert_ne!(out, ProjectEffect::ResumeCall);
-        assert_eq!(out, ProjectEffect::RefreshContext);
-    }
-
-    #[test]
-    fn a_result_marker_never_resumes_a_root() {
-        // A `1621`/`1618` root is never a call result; the marker is malformed.
-        let out = classify_project_event(
-            KindEffect::Root,
-            ProjectAuthor::TrustedAgent,
-            CallMarker::Result,
-            RootState::Unknown,
-            Addressing::ExplicitMention,
-            false,
-        );
-        assert_ne!(out, ProjectEffect::ResumeCall);
-        assert_eq!(out, ProjectEffect::Ignore);
-    }
-
-    #[test]
-    fn a_result_marker_never_resumes_an_ignored_kind() {
-        let out = classify_project_event(
-            KindEffect::Ignore,
-            ProjectAuthor::TrustedAgent,
-            CallMarker::Result,
-            RootState::Active,
-            Addressing::ExplicitMention,
-            true,
-        );
-        assert_ne!(out, ProjectEffect::ResumeCall);
-        assert_eq!(out, ProjectEffect::Ignore);
-    }
-
-    // ── Author gate: roots and lifecycle ─────────────────────────────────────
-
-    #[test]
-    fn a_root_enrols_only_on_an_explicit_mention() {
-        assert_eq!(
-            classify_project_event(
-                KindEffect::Root,
-                ProjectAuthor::AuthorisedHuman,
-                CallMarker::None,
-                RootState::Unknown,
-                Addressing::ExplicitMention,
-                false,
-            ),
-            ProjectEffect::EnrolAndWake
-        );
-        // Real case `48be1cc2…`: an issue with no `p` at all mentions nobody, so
-        // it enrols nobody and wakes nobody — and does not error.
-        assert_eq!(
-            classify_project_event(
-                KindEffect::Root,
-                ProjectAuthor::AuthorisedHuman,
-                CallMarker::None,
-                RootState::Unknown,
-                Addressing::WatchedRoot,
-                false,
-            ),
-            ProjectEffect::Ignore
-        );
-    }
-
-    // ── Author gate: self-authorship stops turns, not state ──────────────────
-
-    /// Self-suppression lives in the root/comment arms, not at the top of the
-    /// classifier. Suppressing self-authorship before the event class was read
-    /// also threw away the agent's own authorised state events, so an agent
-    /// that opened an issue and later closed it ignored its own `1632` and left
-    /// the watch active forever.
-    #[test]
-    fn authorised_self_authored_lifecycle_updates_state() {
-        assert_eq!(
-            classify_project_event(
-                KindEffect::Lifecycle,
-                ProjectAuthor::SelfAuthored,
-                CallMarker::None,
-                RootState::Active,
-                Addressing::WatchedRoot,
-                true,
-            ),
-            ProjectEffect::ApplyLifecycle
-        );
-    }
-
-    #[test]
-    fn unauthorised_self_authored_lifecycle_is_ignored() {
-        // Self-authorship is not its own authority: the signer check still runs.
-        assert_eq!(
-            classify_project_event(
-                KindEffect::Lifecycle,
-                ProjectAuthor::SelfAuthored,
-                CallMarker::None,
-                RootState::Active,
-                Addressing::WatchedRoot,
-                false,
-            ),
-            ProjectEffect::Ignore
-        );
-    }
-
-    #[test]
-    fn self_authored_pr_update_refreshes_context() {
-        assert_eq!(
-            classify_project_event(
-                KindEffect::ContextRefresh,
-                ProjectAuthor::SelfAuthored,
-                CallMarker::None,
-                RootState::Active,
-                Addressing::WatchedRoot,
-                false,
-            ),
-            ProjectEffect::RefreshContext
-        );
-    }
-
-    #[test]
-    fn self_authored_state_events_never_create_a_turn() {
-        // The other half of the rule: state updates are permitted, turns are
-        // not. Nothing self-authored may reach a waking effect.
-        for kind_effect in [
-            KindEffect::Lifecycle,
-            KindEffect::ContextRefresh,
-            KindEffect::Root,
-            KindEffect::Comment,
-            KindEffect::Ignore,
-        ] {
-            for call in [CallMarker::None, CallMarker::Invocation, CallMarker::Result] {
-                for addressing in ALL_ADDRESSING {
-                    let out = classify_project_event(
-                        kind_effect,
-                        ProjectAuthor::SelfAuthored,
-                        call,
-                        RootState::Active,
-                        addressing,
-                        true,
-                    );
-                    assert!(
-                        !matches!(
-                            out,
-                            ProjectEffect::EnrolAndWake
-                                | ProjectEffect::Wake
-                                | ProjectEffect::ResumeCall
-                        ),
-                        "{kind_effect:?} / {call:?} / {addressing:?} produced {out:?}"
-                    );
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn self_authored_roots_and_comments_remain_suppressed() {
-        // Regression guard for the arms the early return used to cover.
-        for state in [RootState::Active, RootState::Unknown, RootState::Dormant] {
-            for addressing in ALL_ADDRESSING {
-                assert_eq!(
-                    classify_project_event(
-                        KindEffect::Root,
-                        ProjectAuthor::SelfAuthored,
-                        CallMarker::None,
-                        state,
-                        addressing,
-                        true,
-                    ),
-                    ProjectEffect::Ignore,
-                    "root: {state:?} / {addressing:?}"
-                );
-                assert_eq!(
-                    comment(
-                        ProjectAuthor::SelfAuthored,
-                        CallMarker::None,
-                        state,
-                        addressing
-                    ),
-                    ProjectEffect::Ignore,
-                    "comment: {state:?} / {addressing:?}"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn unauthorised_status_event_does_not_close_the_watch() {
-        assert_eq!(
-            classify_project_event(
-                KindEffect::Lifecycle,
-                ProjectAuthor::AuthorisedHuman,
-                CallMarker::None,
-                RootState::Active,
-                Addressing::ExplicitMention,
-                false,
-            ),
-            ProjectEffect::Ignore
-        );
-        assert_eq!(
-            classify_project_event(
-                KindEffect::Lifecycle,
-                ProjectAuthor::AuthorisedHuman,
-                CallMarker::None,
-                RootState::Active,
-                Addressing::ExplicitMention,
-                true,
-            ),
-            ProjectEffect::ApplyLifecycle
-        );
-    }
-
-    #[test]
-    fn lifecycle_is_never_a_model_turn() {
-        for author in [
-            ProjectAuthor::AuthorisedHuman,
-            ProjectAuthor::TrustedAgent,
-            ProjectAuthor::Untrusted,
-        ] {
-            for call in [CallMarker::None, CallMarker::Invocation, CallMarker::Result] {
-                let out = classify_project_event(
-                    KindEffect::Lifecycle,
-                    author,
-                    call,
-                    RootState::Active,
-                    Addressing::ExplicitMention,
-                    true,
-                );
-                assert!(
-                    matches!(out, ProjectEffect::ApplyLifecycle | ProjectEffect::Ignore),
-                    "{author:?} / {call:?} produced {out:?}"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn pr_update_alone_never_creates_a_turn() {
-        assert_eq!(
-            classify_project_event(
-                KindEffect::ContextRefresh,
-                ProjectAuthor::AuthorisedHuman,
-                CallMarker::None,
-                RootState::Active,
-                Addressing::ExplicitMention,
-                false,
-            ),
-            ProjectEffect::RefreshContext
-        );
-        assert_eq!(
-            classify_project_event(
-                KindEffect::ContextRefresh,
-                ProjectAuthor::Untrusted,
-                CallMarker::None,
-                RootState::Active,
-                Addressing::ExplicitMention,
-                false,
-            ),
-            ProjectEffect::UntrustedContext
-        );
-    }
-    // ── Coordinate normalisation ─────────────────────────────────────────────
-
-    #[test]
-    fn coordinate_normalises_and_lowercases_owner() {
-        assert_eq!(
-            normalise_coordinate(&format!("30617:{}:my-repo", OWNER.to_ascii_uppercase())),
-            Some(format!("30617:{OWNER}:my-repo"))
-        );
-    }
-
-    #[test]
-    fn coordinate_allows_colons_in_the_identifier() {
-        assert_eq!(
-            normalise_coordinate(&format!("30617:{OWNER}:a:b")),
-            Some(format!("30617:{OWNER}:a:b"))
-        );
-    }
-
-    #[test]
-    fn coordinate_fails_closed() {
-        // Wrong kind, bad owner, missing or empty identifier, padding.
-        assert_eq!(normalise_coordinate(&format!("30618:{OWNER}:r")), None);
-        assert_eq!(normalise_coordinate("30617:short:r"), None);
-        assert_eq!(normalise_coordinate(&format!("30617:{OWNER}")), None);
-        assert_eq!(normalise_coordinate(&format!("30617:{OWNER}:")), None);
-        assert_eq!(normalise_coordinate(&format!("30617: {OWNER}:r")), None);
-        assert_eq!(normalise_coordinate(""), None);
-    }
-
-    // ── Enrolment candidate validation ───────────────────────────────────────
-
-    fn known(coords: &[&str]) -> DiscoveredRepositories {
-        DiscoveredRepositories::for_test(coords.iter().map(|c| c.to_string()))
-    }
-
-    fn coord() -> String {
-        format!("30617:{OWNER}:repo")
-    }
-
-    #[test]
-    fn a_discovered_issue_root_is_a_valid_candidate() {
-        let c = validate_enrolment_candidate(
-            KIND_GIT_ISSUE,
-            ROOT,
-            &tags(&[&["a", &coord()], &["p", STRANGER]]),
-            &known(&[&coord()]),
-        )
-        .expect("should validate");
-        assert_eq!(c.root, ROOT);
-        assert_eq!(c.coordinate, coord());
-        assert!(!c.is_pull_request);
-    }
-
-    #[test]
-    fn a_pull_request_root_is_marked_as_one() {
-        let c = validate_enrolment_candidate(
-            KIND_GIT_PULL_REQUEST,
-            ROOT,
-            &tags(&[&["a", &coord()]]),
-            &known(&[&coord()]),
-        )
-        .expect("should validate");
-        assert!(c.is_pull_request);
-    }
-
-    #[test]
-    fn candidate_validation_fails_closed() {
-        let k = known(&[&coord()]);
-        // Not a root kind.
-        assert!(
-            validate_enrolment_candidate(KIND_TEXT_NOTE, ROOT, &tags(&[&["a", &coord()]]), &k)
-                .is_none()
-        );
-        // No `a` tag at all — the real `48be1cc2…` shape. Enrols nobody, no error.
-        assert!(validate_enrolment_candidate(
-            KIND_GIT_ISSUE,
-            ROOT,
-            &tags(&[&["subject", "hi"]]),
-            &k
-        )
-        .is_none());
-        // Malformed coordinate.
-        assert!(validate_enrolment_candidate(
-            KIND_GIT_ISSUE,
-            ROOT,
-            &tags(&[&["a", "nonsense"]]),
-            &k
-        )
-        .is_none());
-        // Well-formed but never announced: an `a` tag is an unauthenticated claim.
-        let other = format!("30617:{STRANGER}:elsewhere");
-        assert!(
-            validate_enrolment_candidate(KIND_GIT_ISSUE, ROOT, &tags(&[&["a", &other]]), &k)
-                .is_none()
-        );
-        // Nothing discovered yet ⇒ nothing enrollable.
-        assert!(validate_enrolment_candidate(
-            KIND_GIT_ISSUE,
-            ROOT,
-            &tags(&[&["a", &coord()]]),
-            &DiscoveredRepositories::new()
-        )
-        .is_none());
-        // Malformed root id.
-        assert!(validate_enrolment_candidate(
-            KIND_GIT_ISSUE,
-            "nope",
-            &tags(&[&["a", &coord()]]),
-            &k
-        )
-        .is_none());
-    }
-
-    #[test]
-    fn a_root_with_two_a_tags_is_ambiguous_not_first_wins() {
-        // A forged root could otherwise smuggle a known coordinate past the
-        // gate while a second tag says something else entirely.
-        let k = known(&[&coord()]);
-        let other = format!("30617:{STRANGER}:elsewhere");
-        assert!(validate_enrolment_candidate(
-            KIND_GIT_ISSUE,
-            ROOT,
-            &tags(&[&["a", &coord()], &["a", &other]]),
-            &k
-        )
-        .is_none());
-        // Even two identical tags: ambiguity is about shape, not values.
-        assert!(validate_enrolment_candidate(
-            KIND_GIT_ISSUE,
-            ROOT,
-            &tags(&[&["a", &coord()], &["a", &coord()]]),
-            &k
-        )
-        .is_none());
-    }
-
-    #[test]
-    fn enrolment_matches_the_discovered_coordinate_byte_for_byte() {
-        // Parsing must not widen acceptance: an uppercase-owner coordinate is
-        // not silently equivalent to the canonical discovered string.
-        let k = known(&[&coord()]);
-        let shouty = format!("30617:{}:repo", OWNER.to_ascii_uppercase());
-        assert_eq!(
-            normalise_coordinate(&shouty).as_deref(),
-            Some(coord().as_str())
-        );
-        assert!(
-            validate_enrolment_candidate(KIND_GIT_ISSUE, ROOT, &tags(&[&["a", &shouty]]), &k)
-                .is_none(),
-            "a non-canonical coordinate must not match the discovered set through the parser"
-        );
-    }
-
-    #[test]
-    fn a_caller_cannot_hand_the_validator_a_fabricated_repository_set() {
-        // Private candidate fields close struct-literal forgery; this closes
-        // validator-assisted forgery. With no production insertion method, a
-        // freshly built `DiscoveredRepositories` admits nothing.
-        let fabricated = format!("30617:{STRANGER}:looks-plausible");
-        assert!(validate_enrolment_candidate(
-            KIND_GIT_ISSUE,
-            ROOT,
-            &tags(&[&["a", &fabricated]]),
-            &DiscoveredRepositories::new(),
-        )
-        .is_none());
-    }
-
-    #[test]
-    fn discovered_repositories_starts_empty_in_production() {
-        let d = DiscoveredRepositories::new();
-        assert!(d.is_empty());
-        assert_eq!(d.len(), 0);
-        assert!(!d.contains(&coord()));
-        assert_eq!(d.iter().count(), 0);
-    }
-
-    // ── Malformed and empty tag values ───────────────────────────────────────
-
-    #[test]
-    fn a_value_less_or_empty_coordinate_is_rejected() {
-        let k = known(&[&coord()]);
-        // `["a"]` — the tag exists but carries no value at all.
-        assert!(validate_enrolment_candidate(KIND_GIT_ISSUE, ROOT, &tags(&[&["a"]]), &k).is_none());
-        // `["a", ""]` — present but empty. Rejected here rather than left to a
-        // membership check that only fails by luck.
-        assert!(
-            validate_enrolment_candidate(KIND_GIT_ISSUE, ROOT, &tags(&[&["a", ""]]), &k).is_none()
-        );
-    }
-
-    #[test]
-    fn a_malformed_coordinate_poisons_a_later_valid_one() {
-        // Two `a` tags is ambiguous regardless, but the malformed-first
-        // ordering is the one where a sloppy scan would skip and accept.
-        let k = known(&[&coord()]);
-        assert!(validate_enrolment_candidate(
-            KIND_GIT_ISSUE,
-            ROOT,
-            &tags(&[&["a"], &["a", &coord()]]),
-            &k
-        )
-        .is_none());
-        assert!(validate_enrolment_candidate(
-            KIND_GIT_ISSUE,
-            ROOT,
-            &tags(&[&["a", ""], &["a", &coord()]]),
-            &k
-        )
-        .is_none());
-    }
-
-    #[test]
-    fn follow_up_rejects_value_less_and_empty_coordinates() {
-        for kind in [KIND_TEXT_NOTE, KIND_GIT_PR_UPDATE, KIND_GIT_STATUS_CLOSED] {
-            assert!(!follow_up_coordinate_allowed(
-                kind,
-                &tags(&[&["a"]]),
-                &coord()
-            ));
-            assert!(!follow_up_coordinate_allowed(
-                kind,
-                &tags(&[&["a", ""]]),
-                &coord()
-            ));
-            assert!(!follow_up_coordinate_allowed(
-                kind,
-                &tags(&[&["a", ""], &["a", &coord()]]),
-                &coord()
-            ));
-        }
-    }
-
-    // ── Follow-up coordinate rules, per event class ──────────────────────────
-
-    #[test]
-    fn comments_and_pr_updates_require_a_matching_coordinate() {
-        for kind in [KIND_TEXT_NOTE, KIND_GIT_PR_UPDATE] {
-            assert!(
-                follow_up_coordinate_allowed(kind, &tags(&[&["a", &coord()]]), &coord()),
-                "kind {kind} with the right coordinate"
-            );
-            // Both builders always emit `a`, so absence is malformed here.
-            assert!(
-                !follow_up_coordinate_allowed(kind, &tags(&[&["e", ROOT]]), &coord()),
-                "kind {kind} must not be admitted on an `#e` match alone"
-            );
-            let other = format!("30617:{STRANGER}:elsewhere");
-            assert!(
-                !follow_up_coordinate_allowed(kind, &tags(&[&["a", &other]]), &coord()),
-                "kind {kind} may not move its root to another project"
-            );
-        }
-    }
-
-    #[test]
-    fn lifecycle_may_omit_the_coordinate_but_not_contradict_it() {
-        for kind in [
-            KIND_GIT_STATUS_OPEN,
-            KIND_GIT_STATUS_MERGED,
-            KIND_GIT_STATUS_CLOSED,
-            KIND_GIT_STATUS_DRAFT,
-        ] {
-            // `GitStatusMeta.repo` is optional, so absence is legitimate — the
-            // event is already root-bound by `e`.
-            assert!(follow_up_coordinate_allowed(
-                kind,
-                &tags(&[&["e", ROOT]]),
-                &coord()
-            ));
-            assert!(follow_up_coordinate_allowed(
-                kind,
-                &tags(&[&["a", &coord()]]),
-                &coord()
-            ));
-            let other = format!("30617:{STRANGER}:elsewhere");
-            assert!(!follow_up_coordinate_allowed(
-                kind,
-                &tags(&[&["a", &other]]),
-                &coord()
-            ));
-        }
-    }
-
-    #[test]
-    fn duplicate_coordinates_are_rejected_for_every_event_class() {
-        for kind in [
-            KIND_TEXT_NOTE,
-            KIND_GIT_PR_UPDATE,
-            KIND_GIT_STATUS_OPEN,
-            KIND_GIT_STATUS_CLOSED,
-        ] {
-            assert!(
-                !follow_up_coordinate_allowed(
-                    kind,
-                    &tags(&[&["a", &coord()], &["a", &coord()]]),
-                    &coord()
-                ),
-                "kind {kind}: two coordinates is ambiguity, not redundancy"
-            );
-        }
-    }
-
-    // ── Enrolment sets ───────────────────────────────────────────────────────
-
-    /// Build a candidate the only way production can: through the validator.
+    /// 2. …and it must not poison the replacement either.
     ///
-    /// The helpers deliberately do not use a struct literal. `mod tests` is a
-    /// child module and *could* reach the private fields, but then the tests
-    /// would be exercising a construction path no caller has.
-    fn candidate_at(root: &str, coordinate: &str, pr: bool) -> EnrolmentCandidate {
-        let kind = if pr {
-            KIND_GIT_PULL_REQUEST
-        } else {
-            KIND_GIT_ISSUE
+    /// The reconnect sequence in the adversary model is *ordinary*, so
+    /// degrading here would turn every reconnect into a permanently broken
+    /// reconstruction — strictness that is really a self-inflicted outage.
+    #[tokio::test]
+    async fn predecessor_witness_does_not_degrade_replacement() {
+        let mut h = PageHarness::new();
+        let mut c = cursor(1_000, 4, 1_000);
+
+        let first = h.open(&mut c).await;
+        let stale_witness = h.witness(first.sub_id());
+        drop(first);
+
+        let replacement = h.open(&mut c).await;
+        let returned = match c.complete(&stale_witness, replacement) {
+            PageOutcome::Stale { page } => page,
+            other => panic!("expected Stale, got {other:?}"),
         };
-        validate_enrolment_candidate(
-            kind,
-            root,
-            &tags(&[&["a", coordinate]]),
-            &known(&[coordinate]),
-        )
-        .expect("test candidate must pass real validation")
-    }
 
-    fn candidate(root: &str, pr: bool) -> EnrolmentCandidate {
-        candidate_at(root, &coord(), pr)
-    }
-
-    #[test]
-    fn enrol_moves_an_unknown_root_to_active() {
-        let mut e = ProjectEnrolments::new();
-        assert_eq!(e.enrol(&candidate(ROOT, false)), Ok(EnrolOutcome::Enrolled));
-        assert_eq!(e.state_of(ROOT), RootState::Active);
-        assert_eq!(e.active_count(), 1);
-        assert_eq!(e.dormant_count(), 0);
-    }
-
-    #[test]
-    fn re_enrolling_an_active_root_does_not_churn_the_subscription() {
-        let mut e = ProjectEnrolments::new();
-        e.enrol(&candidate(ROOT, false)).unwrap();
-        assert_eq!(
-            e.enrol(&candidate(ROOT, false)),
-            Ok(EnrolOutcome::Unchanged),
-            "an ordinary re-mention must not force a REQ replacement"
-        );
-        assert!(!EnrolOutcome::Unchanged.changes_subscription());
-    }
-
-    #[test]
-    fn close_then_reopen_round_trips_and_stays_subscribed() {
-        let mut e = ProjectEnrolments::new();
-        e.enrol(&candidate(ROOT, false)).unwrap();
-
-        assert!(e.close(ROOT));
-        assert_eq!(e.state_of(ROOT), RootState::Dormant);
-        // The whole point of the dormant set: still in the `#e` filter, so the
-        // reopen that revives the watch is actually observable.
         assert!(
-            e.all_roots().contains(&ROOT.to_string()),
-            "a dormant root must remain subscribed or reopen can never arrive"
+            c.degraded_reason().is_none(),
+            "a late predecessor is expected traffic, not corruption"
         );
-
-        assert!(e.reopen(ROOT));
-        assert_eq!(e.state_of(ROOT), RootState::Active);
-    }
-
-    #[test]
-    fn close_and_reopen_are_no_ops_in_the_wrong_state() {
-        let mut e = ProjectEnrolments::new();
-        assert!(!e.close(ROOT), "closing an unknown root changes nothing");
-        assert!(!e.reopen(ROOT), "reopening an unknown root changes nothing");
-        e.enrol(&candidate(ROOT, false)).unwrap();
-        assert!(!e.reopen(ROOT), "reopening an active root changes nothing");
-        e.close(ROOT);
-        assert!(!e.close(ROOT), "closing a dormant root changes nothing");
-    }
-
-    #[test]
-    fn an_explicit_re_tag_reactivates_through_enrol() {
-        let mut e = ProjectEnrolments::new();
-        e.enrol(&candidate(ROOT, false)).unwrap();
-        e.close(ROOT);
         assert_eq!(
-            e.enrol(&candidate(ROOT, false)),
-            Ok(EnrolOutcome::Reactivated)
+            returned.incarnation(),
+            h.requests
+                .live_incarnation(returned.sub_id())
+                .expect("replacement still live"),
+            "the page must come back intact and still be the live one"
         );
-        assert_eq!(e.state_of(ROOT), RootState::Active);
-        assert_eq!(e.dormant_count(), 0, "the root must leave the dormant set");
     }
 
+    /// 3. The replacement's own boundary still completes it afterwards.
+    ///
+    /// This is the half that makes falsifier 2 meaningful: "not degraded" is
+    /// worthless if the page can no longer be finished.
+    #[tokio::test]
+    async fn replacement_witness_completes_after_stale_attempt() {
+        let mut h = PageHarness::new();
+        let mut c = cursor(1_000, 4, 1_000);
+
+        let first = h.open(&mut c).await;
+        let stale_witness = h.witness(first.sub_id());
+        drop(first);
+
+        let mut replacement = h.open(&mut c).await;
+        replacement.observe(row(comment_at(900, "a")).await);
+
+        let returned = match c.complete(&stale_witness, replacement) {
+            PageOutcome::Stale { page } => page,
+            other => panic!("expected Stale, got {other:?}"),
+        };
+
+        let good_witness = h.witness(returned.sub_id());
+        match c.complete(&good_witness, returned) {
+            PageOutcome::Complete(stream) => {
+                assert_eq!(stream.len(), 1, "the page's row must survive");
+            }
+            other => panic!("replacement's own boundary must complete: {other:?}"),
+        }
+    }
+
+    /// 3b. A *successor* boundary offered to an older page is a contradiction,
+    ///     not an ordinary late predecessor.
+    ///
+    /// The rule is "an earlier instance is stale", and the comparison that
+    /// implements it is `other.incarnation < self.incarnation`. A `!=` there
+    /// would read the same in the reconnect direction and swallow this one: a
+    /// page would be quietly left in flight by a boundary that cannot exist,
+    /// instead of the reconstruction being abandoned. Both directions are tested
+    /// because only one of them is the ordinary case, and the ordinary case is
+    /// the one that keeps passing.
+    #[tokio::test]
+    async fn a_successor_witness_is_not_treated_as_stale() {
+        let mut h = PageHarness::new();
+        let mut c = cursor(1_000, 4, 1_000);
+
+        let older = h.open(&mut c).await;
+        let newer = h.open(&mut c).await;
+        assert!(
+            newer.incarnation() > older.incarnation(),
+            "the second attempt must be a later instance, or nothing below is \
+             testable"
+        );
+        assert_ne!(
+            older.sub_id(),
+            newer.sub_id(),
+            "and they are two attempts, so they do not share a name"
+        );
+
+        let successor_witness = h.witness(newer.sub_id());
+        match c.complete(&successor_witness, older) {
+            PageOutcome::Degraded { .. } => {}
+            other => panic!("a later instance offered to an older page must degrade: {other:?}"),
+        }
+        assert!(c.degraded_reason().is_some());
+    }
+
+    /// 3c. Another registry's boundary cannot complete this page — even when
+    ///     every number in it says predecessor.
+    ///
+    /// Every `ProjectRequests` starts counting incarnations at zero, so
+    /// `(sub_id, incarnation)` — two public-looking numbers — collided across
+    /// independently constructed registries. Identity is the *allocation*, and
+    /// `registry` is the half of it that this test isolates: the foreign
+    /// boundary is deliberately given a lower incarnation than the page and the
+    /// same root and stream, so every comparison except the epoch says "ordinary
+    /// late predecessor". Without the epoch check this returns `Stale` and the
+    /// page stays quietly in flight.
+    #[tokio::test]
+    async fn a_foreign_registrys_witness_cannot_complete_this_page() {
+        let mut mine = PageHarness::new();
+        let mut theirs = PageHarness::new();
+        let mut c = cursor(1_000, 4, 1_000);
+        let mut same_question = cursor(1_000, 4, 1_000);
+
+        // Theirs is opened first and only once, so it holds incarnation 0.
+        let foreign = theirs.open(&mut same_question).await;
+        // Mine burns one and keeps the second, so its incarnation is strictly
+        // greater — by number alone, the foreign boundary is an earlier
+        // instance of the very same request.
+        drop(mine.open(&mut c).await);
+        let page = mine.open(&mut c).await;
+        assert!(
+            foreign.incarnation() < page.incarnation(),
+            "the numbers must say predecessor, or the epoch is not what refuses it"
+        );
+
+        let foreign_witness = theirs.witness(foreign.sub_id());
+        match c.complete(&foreign_witness, page) {
+            PageOutcome::Degraded { .. } => {}
+            other => panic!("a foreign registry's boundary must not complete: {other:?}"),
+        }
+        assert!(c.degraded_reason().is_some());
+    }
+
+    /// 4. A boundary belonging to another request cannot complete this page.
+    ///
+    /// Unlike a stale predecessor this is an internal contradiction — the owner
+    /// has crossed two pages over — so it degrades permanently.
+    #[tokio::test]
+    async fn witness_for_another_request_degrades() {
+        let mut h = PageHarness::new();
+        let mut c = cursor(1_000, 4, 1_000);
+        let mut other = HistoryCursor::new(OTHER_ROOT, HistoryStream::Comments, 1_000, 4, 1_000);
+
+        let other_page = h.open(&mut other).await;
+        let other_witness = h.witness(other_page.sub_id());
+
+        let mine = h.open(&mut c).await;
+        assert_ne!(other_witness.sub_id(), mine.sub_id());
+
+        match c.complete(&other_witness, mine) {
+            PageOutcome::Degraded { .. } => {}
+            other => panic!("a boundary for another request must degrade: {other:?}"),
+        }
+        assert!(c.degraded_reason().is_some());
+    }
+
+    /// 4b. A cross-request boundary cannot resurrect a cursor that already
+    ///     finished.
+    ///
+    /// Found reviewing my own tranche: the contradiction check originally ran
+    /// *above* the closed-cursor check, so a straggler could flip a `Finished`
+    /// cursor — one whose rows the merge may already hold — to `Degraded`. A
+    /// completed stream must not be retroactively marked failed by a later
+    /// arrival.
+    #[tokio::test]
+    async fn cross_request_witness_cannot_unfinish_a_cursor() {
+        let mut h = PageHarness::new();
+        let mut c = cursor(1_000, 4, 1_000);
+        let mut other = HistoryCursor::new(OTHER_ROOT, HistoryStream::Comments, 1_000, 4, 1_000);
+
+        // Short page -> the cursor finishes.
+        expect_complete(run_page(&mut c, &[(900, "a")]).await);
+        assert!(c.degraded_reason().is_none());
+
+        let other_page = h.open(&mut other).await;
+        let other_witness = h.witness(other_page.sub_id());
+        let mine = h.open(&mut c).await;
+
+        let (reason, rows) = expect_degraded(c.complete(&other_witness, mine));
+        assert!(
+            reason.contains("already yielded"),
+            "a finished cursor reports why it is closed, not the straggler: {reason}"
+        );
+        assert!(rows.is_empty());
+        assert!(
+            c.degraded_reason().is_none(),
+            "a finished cursor must stay finished"
+        );
+    }
+
+    /// 4c. …nor overwrite an existing degradation's cause.
+    ///
+    /// The first recorded cause is the true one; a later contradiction is a
+    /// symptom of it. Reporting the symptom instead loses the diagnosis.
+    #[tokio::test]
+    async fn cross_request_witness_does_not_overwrite_degradation_cause() {
+        let mut h = PageHarness::new();
+        let mut c = cursor(1_000, 4, 1_000);
+        let mut other = HistoryCursor::new(OTHER_ROOT, HistoryStream::Comments, 1_000, 4, 1_000);
+
+        let mut poisoned = h.open(&mut c).await;
+        poisoned.observe_unusable("frame was not parseable as an event");
+        let (first, _) = expect_degraded(complete_opened(&mut c, &mut h, poisoned));
+        assert!(first.contains("parseable"), "{first}");
+
+        let other_page = h.open(&mut other).await;
+        let other_witness = h.witness(other_page.sub_id());
+        let mine = h.open(&mut c).await;
+        let (reason, _) = expect_degraded(c.complete(&other_witness, mine));
+
+        assert!(
+            reason.contains("parseable"),
+            "the original cause must survive, got: {reason}"
+        );
+        assert!(
+            c.degraded_reason().is_some_and(|r| r.contains("parseable")),
+            "recorded cause must still be the first one"
+        );
+    }
+
+    /// A catch-up filter must name its kinds, or the relay refuses it outright.
+    ///
+    /// A REQ with no `kinds` reads as a wildcard that could match p-gated
+    /// kinds, so the relay demands `#p` = self and otherwise answers
+    /// `CLOSED restricted: p-gated events require #p matching your pubkey`
+    /// (`handlers/req.rs:181`). Not an HTTP 403 — that is the HTTP surface's
+    /// framing, and an earlier version of this comment said so wrongly. The
+    /// refusal is explicit and carries a reason, so it is diagnosable; what it
+    /// is not is a subscription that ever opens.
     #[test]
-    fn pull_request_roots_are_tracked_separately_from_all_roots() {
-        let mut e = ProjectEnrolments::new();
-        e.enrol(&candidate(ROOT, false)).unwrap();
-        e.enrol(&candidate(OTHER_ROOT, true)).unwrap();
+    fn catch_up_filter_names_its_kinds_and_root_tag() {
+        for (stream, tag) in [
+            (HistoryStream::Comments, "#e"),
+            (HistoryStream::PullRequestUpdates, "#E"),
+        ] {
+            let filter = catch_up_filter(ROOT, stream, 1_000, 25);
+            let kinds = filter["kinds"]
+                .as_array()
+                .unwrap_or_else(|| panic!("{stream:?} filter must carry kinds"));
+            assert!(!kinds.is_empty(), "{stream:?} kinds must not be empty");
+            assert_eq!(filter[tag], json!([ROOT]), "{stream:?} root tag");
+            assert_eq!(filter["until"], json!(1_000));
+            assert_eq!(filter["limit"], json!(25));
+        }
+    }
+
+    /// Every catch-up filter a page can build is a bounded request.
+    ///
+    /// This is what makes `PageOpen::UnboundedFilter` unreachable rather than
+    /// merely unreached. `open_history_page` builds its identity through the
+    /// same fallible constructor as everything else — there is no
+    /// "we wrote this filter ourselves" door — so the arm has to exist; what
+    /// this pins is the reason it never fires. Bounds and limits are varied
+    /// because they are the parts that move as a reconstruction paginates, and
+    /// a limit alone is exactly the shape that constrains nothing.
+    #[test]
+    fn every_catch_up_filter_a_page_can_build_constrains_events() {
+        for stream in [HistoryStream::Comments, HistoryStream::PullRequestUpdates] {
+            for until in [0, 1, u64::MAX] {
+                for limit in [0, 1, 4, usize::MAX] {
+                    let filter = catch_up_filter(ROOT, stream, until, limit);
+                    assert!(
+                        ProjectRequestIdentity::new(
+                            ProjectSubscription::RootCatchUp {
+                                root: ROOT.to_string(),
+                                stream,
+                            },
+                            filter.clone(),
+                        )
+                        .is_some(),
+                        "{stream:?} until={until} limit={limit}: {filter}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The catch-up filter satisfies this relay's REQ gate *predicates*.
+    ///
+    /// Distinct from the shape assertion above, which passes for *any*
+    /// non-empty kind list — including one made entirely of gated kinds that
+    /// would be refused on sight. This checks the three conditions
+    /// `handlers/req.rs` applies to a global REQ (one with no `#h`), reading
+    /// the same constants the relay reads:
+    ///
+    /// - `p_gated_filters_authorized` (req.rs:1051) — a missing or p-gated
+    ///   kind list demands `#p` = self, which catch-up does not carry;
+    /// - `engram_filters_authorized` (req.rs:1108) — likewise for engrams;
+    /// - `author_only_filters_authorized` (req.rs:1264) — a list consisting
+    ///   *only* of author-only kinds demands `authors` = self.
+    ///
+    /// Note all three use `is_none_or`: an absent `kinds` is a wildcard that
+    /// trips the first two. That is why "non-empty" is load-bearing rather
+    /// than tidiness.
+    ///
+    /// **What this does not do:** it re-states the relay's conditions here
+    /// rather than calling `p_gated_filters_authorized` and friends, which are
+    /// `pub(crate)` to `buzz-relay`. So it catches a bad *kind list* but would
+    /// not notice the relay changing its rules. A shared predicate or a
+    /// relay-side integration test would be strictly stronger; this is the
+    /// version available without widening another crate's API, and the name
+    /// says "predicates" rather than "the relay accepts it" for that reason.
+    #[test]
+    fn catch_up_filter_satisfies_the_req_gate_predicates() {
+        use buzz_core::kind::{AUTHOR_ONLY_KINDS, KIND_AGENT_ENGRAM, P_GATED_KINDS};
+
+        for stream in [HistoryStream::Comments, HistoryStream::PullRequestUpdates] {
+            let kinds = stream.kinds();
+            assert!(
+                !kinds.is_empty(),
+                "{stream:?}: an absent or empty kind list reads as a wildcard and is refused"
+            );
+            for kind in kinds {
+                assert!(
+                    !P_GATED_KINDS.contains(kind),
+                    "{stream:?}: kind {kind} is p-gated and would demand #p=self"
+                );
+                assert_ne!(
+                    *kind, KIND_AGENT_ENGRAM,
+                    "{stream:?}: engram reads demand authors=[self] or #p=[self]"
+                );
+            }
+            assert!(
+                !kinds.iter().all(|k| AUTHOR_ONLY_KINDS.contains(k)),
+                "{stream:?}: an all-author-only list would demand authors=self"
+            );
+        }
+    }
+
+    /// Catch-up and the live watched REQ must ask the same question.
+    ///
+    /// Different time ranges, identical event classes. If these drift, a
+    /// reconstruction silently omits a class the live subscription keeps
+    /// delivering — the root reads as healthy while missing history that
+    /// nothing in the system can point at.
+    #[test]
+    fn catch_up_kinds_match_the_watched_subscription() {
+        let mut enrolments = ProjectEnrolments::new();
+        enrolments.enrol(&candidate(ROOT, true)).unwrap();
+        let watched = watched_roots_filters(&enrolments, 0);
+
+        for (stream, tag) in [
+            (HistoryStream::Comments, "#e"),
+            (HistoryStream::PullRequestUpdates, "#E"),
+        ] {
+            let live = watched
+                .iter()
+                .find(|f| f.get(tag).is_some())
+                .unwrap_or_else(|| panic!("watched REQ must have a {tag} filter"));
+            let catch_up = catch_up_filter(ROOT, stream, 1_000, 25);
+            assert_eq!(
+                catch_up["kinds"], live["kinds"],
+                "{stream:?}: catch-up and watched kinds have drifted"
+            );
+        }
+    }
+
+    // ---- Reviewer counterexamples (hermes-gateway, 2026-08-01) -------------
+    //
+    // Four probes that passed against the previous design. Each names a way the
+    // authority claim was convention rather than structure.
+
+    /// R1. A cancelled open strands nothing.
+    ///
+    /// Replaces "a reserved-but-unsent request cannot bind or witness". That
+    /// state is no longer constructible: `open_request` registers nothing until
+    /// its write has already returned, so there is no pending entry for a
+    /// dropped future to leave behind and no `reserve` to manufacture one with.
+    ///
+    /// An async operation has three exits — `Ok`, `Err`, and *dropped while
+    /// suspended*. The previous shape handled two of them and left the third
+    /// holding the subscription id hostage forever.
+    #[tokio::test]
+    async fn a_cancelled_open_strands_nothing() {
+        let mut requests = ProjectRequests::new();
+        let mut socket = test_socket().await;
+        let sub_id = discovery_sub_id();
+
+        // Build the operation and drop it without driving it to completion.
+        drop(requests.open_request(
+            &mut socket.client,
+            &sub_id,
+            ident(ProjectSubscription::Discovery),
+        ));
+
+        assert!(
+            requests.match_frame(&sub_id).is_none(),
+            "a cancelled open registers nothing answerable"
+        );
+        assert!(
+            requests.witness_end_of_stored_events(&sub_id).is_none(),
+            "and nothing that could mint a boundary"
+        );
+    }
+
+    /// Reconnect restarts the interrupted page at the *same* immutable cutoff,
+    /// under a new registration and a new name.
+    ///
+    /// Three facts that have to hold together, which is why they are one test:
+    /// the cutoff must not move (a page reopened against a later snapshot would
+    /// leave a hole between the two), the reopened page must not inherit the
+    /// dead connection's identity, and it must still be able to complete. A
+    /// reconnect is the ordinary case, so a rule that merely refuses everything
+    /// after one would pass the first two and break the third.
+    #[tokio::test]
+    async fn a_reconnect_restarts_the_page_at_the_same_cutoff() {
+        let mut h = PageHarness::new();
+        let mut c = cursor(1_000, 4, 1_000);
+
+        let interrupted = h.open(&mut c).await;
+        let dead_incarnation = interrupted.incarnation();
+        let dead_sub_id = interrupted.sub_id().to_string();
+        drop(interrupted);
+        h.requests.clear_connection();
+
+        let mut reopened = h.open(&mut c).await;
         assert_eq!(
-            e.all_roots(),
-            vec![ROOT.to_string(), OTHER_ROOT.to_string()]
+            reopened.until(),
+            1_000,
+            "the cutoff is immutable across the reconnect"
         );
-        assert_eq!(e.pull_request_roots(), vec![OTHER_ROOT.to_string()]);
-        // Dormant PRs still need `#E`, or a revision on a closed PR is invisible.
-        e.close(OTHER_ROOT);
-        assert_eq!(e.pull_request_roots(), vec![OTHER_ROOT.to_string()]);
+        assert_ne!(
+            reopened.incarnation(),
+            dead_incarnation,
+            "a reopened page must not inherit the dead connection's identity"
+        );
+        assert_ne!(
+            reopened.sub_id(),
+            dead_sub_id,
+            "nor its name — a frame still in flight for the dead page must not \
+             find this one"
+        );
+
+        reopened.observe(row(comment_at(900, "a")).await);
+        let witness = h.witness(reopened.sub_id());
+        match c.complete(&witness, reopened) {
+            PageOutcome::Complete(stream) => assert_eq!(stream.len(), 1),
+            other => panic!("the reopened page must still complete: {other:?}"),
+        }
+    }
+
+    /// Rows cannot predate the registration they are attributed to.
+    ///
+    /// Observation belongs to the opened page, so the old order — fill a
+    /// collector, then register and bind it — is no longer expressible. What
+    /// remains reachable is handing the open a collector that has already seen
+    /// something, and that is refused before anything is written or burned: a
+    /// prepopulated collector laundered into a fresh registration would file
+    /// rows that arrived before the request existed into the history that
+    /// request claims to have proven.
+    #[tokio::test]
+    async fn a_prepopulated_collector_cannot_be_laundered_into_a_registration() {
+        let mut h = PageHarness::new();
+        let mut c = cursor(1_000, 4, 1_000);
+
+        let mut collector = c.begin_request();
+        collector.observe(row(comment_at(900, "arrived before any request")).await);
+
+        assert!(
+            matches!(h.try_open_with(collector).await, PageOpen::NotPristine),
+            "a collector that has already observed cannot open a page"
+        );
+        assert_eq!(
+            h.requests.live_len(),
+            0,
+            "and the refusal registers nothing"
+        );
+
+        // The refusal is upstream of the token, so it costs the next attempt
+        // nothing — a check that silently burned an incarnation would be a way
+        // to exhaust the space by replaying one bad open. Compared against a
+        // registry that never saw the bad open, because a `RequestIncarnation`
+        // a test can spell is a `RequestIncarnation` anything can spell.
+        let page = h.open(&mut c).await;
+        let mut fresh = PageHarness::new();
+        let mut fresh_cursor = cursor(1_000, 4, 1_000);
+        let untouched = fresh.open(&mut fresh_cursor).await;
+        assert_eq!(
+            page.incarnation(),
+            untouched.incarnation(),
+            "the rejected attempt burned no token"
+        );
+    }
+
+    /// A page open that never lands leaves nothing behind, and never lends its
+    /// name to the next attempt.
+    ///
+    /// A page cannot take its incarnation after the write the way
+    /// `open_request` does — the wire id has to carry it — so the token is
+    /// burned first. That is only safe if a burned token confers nothing and is
+    /// never handed out again. Both halves are here: a future dropped before it
+    /// is ever polled does nothing at all, and a write that genuinely fails
+    /// leaves no registration while consuming the token it had already spent on
+    /// the id it wrote.
+    #[tokio::test]
+    async fn a_page_open_that_never_lands_leaves_nothing_behind() {
+        let mut h = PageHarness::new();
+        let mut c = cursor(1_000, 4, 1_000);
+
+        // Dropped before its first poll: nothing ran, so nothing was taken.
+        let mut socket = test_socket().await;
+        drop(
+            h.requests
+                .open_history_page(&mut socket.client, c.begin_request()),
+        );
+        assert_eq!(
+            h.requests.live_len(),
+            0,
+            "a cancelled page open registers nothing"
+        );
+
+        let first = h.open(&mut c).await;
+
+        // A write that genuinely fails: still nothing registered, and the token
+        // it burned is gone for good.
+        let mut dead = test_socket().await;
+        dead.client.close(None).await.expect("close");
+        assert!(matches!(
+            h.requests
+                .open_history_page(&mut dead.client, c.begin_request())
+                .await,
+            PageOpen::WriteFailed(_)
+        ));
+        assert_eq!(
+            h.requests.live_len(),
+            1,
+            "a failed write installs nothing of its own"
+        );
+
+        let second = h.open(&mut c).await;
+        assert_ne!(first.sub_id(), second.sub_id());
+        assert!(
+            second.incarnation() > first.incarnation(),
+            "and the failed attempt's token was not handed out again"
+        );
+    }
+
+    /// R1d. A failed write leaves nothing that could later be promoted.
+    ///
+    /// The replacement for "receipt A cannot confirm reservation B": there are
+    /// no receipts, so the question becomes whether a failed open can leave a
+    /// registration behind for a second attempt to inherit. It cannot — the
+    /// rollback is inside the same operation as the write.
+    #[tokio::test]
+    async fn a_failed_write_leaves_no_registration_to_inherit() {
+        let mut requests = ProjectRequests::new();
+        let sub_id = discovery_sub_id();
+
+        // A genuinely dead socket, not a closure that returns `Err`. The
+        // failure has to come from the transport for the same reason success
+        // does.
+        let mut socket = test_socket().await;
+        socket.client.close(None).await.expect("close the socket");
+
+        let outcome = requests
+            .open_request(
+                &mut socket.client,
+                &sub_id,
+                ident(ProjectSubscription::Discovery),
+            )
+            .await;
+        assert!(
+            matches!(outcome, OpenOutcome::WriteFailed(_)),
+            "a closed socket must fail the write, got {outcome:?}"
+        );
+
+        assert!(requests.match_frame(&sub_id).is_none());
+        assert!(requests.witness_end_of_stored_events(&sub_id).is_none());
+        assert!(
+            requests.intent(&sub_id).is_some(),
+            "durable intent outlives a failed write — the intent is still what \
+             we want; the write is what failed"
+        );
+
+        // A later successful open is a *new* registration, not a resurrection.
+        assert_eq!(
+            open_request_on_test_socket(
+                &mut requests,
+                &sub_id,
+                ident(ProjectSubscription::Discovery)
+            )
+            .await,
+            OpenOutcome::Sent
+        );
+        assert!(requests.match_frame(&sub_id).is_some());
+    }
+
+    fn identity_for_binding() -> ProjectRequestIdentity {
+        ProjectRequestIdentity::new(
+            ProjectSubscription::RootCatchUp {
+                root: ROOT.to_string(),
+                stream: HistoryStream::Comments,
+            },
+            catch_up_filter(ROOT, HistoryStream::Comments, 1_000, 4),
+        )
+        .expect("a catch-up filter names kinds and a root tag")
+    }
+
+    /// A registry that opens pages the way the driver will have to.
+    ///
+    /// Deliberately *not* a `bind(sub_id, incarnation)` helper, and not one
+    /// that names a subscription id either. A test helper taking the authority
+    /// fields would rebuild the exact forgery route this piece removes, behind
+    /// a friendlier name; one choosing the id would rebuild the reused-name
+    /// defect the same way. Everything here goes through
+    /// `ProjectRequests::open_history_page`, against a real socket.
+    struct PageHarness {
+        requests: ProjectRequests,
+    }
+
+    impl PageHarness {
+        fn new() -> Self {
+            Self {
+                requests: ProjectRequests::new(),
+            }
+        }
+
+        /// Open the catch-up REQ this collector's parameters imply.
+        ///
+        /// One operation now: the registry mints the wire id, writes, installs
+        /// and binds. There is no shortcut available to it — the sink is
+        /// sealed, so a harness cannot substitute a writer — and no id for a
+        /// caller to choose, which is what stops two successive pages sharing
+        /// one name.
+        async fn open_with(&mut self, collector: HistoryPageCollector) -> OpenedHistoryPage {
+            match self.try_open_with(collector).await {
+                PageOpen::Opened(page) => page,
+                other => panic!("a freshly written REQ must open its page: {other:?}"),
+            }
+        }
+
+        async fn try_open_with(&mut self, collector: HistoryPageCollector) -> PageOpen {
+            let mut socket = test_socket().await;
+            self.requests
+                .open_history_page(&mut socket.client, collector)
+                .await
+        }
+
+        async fn open(&mut self, c: &mut HistoryCursor) -> OpenedHistoryPage {
+            let collector = c.begin_request();
+            self.open_with(collector).await
+        }
+
+        /// Mint the boundary for a live registration.
+        ///
+        /// `&mut` because minting one is not a read: a catch-up registration is
+        /// retired by its own boundary, in production and here. A second call
+        /// for the same id therefore panics, which is the point — there is only
+        /// ever one end of one request's stored events.
+        fn witness(&mut self, sub_id: &str) -> EndOfStoredEvents {
+            self.requests
+                .witness_end_of_stored_events(sub_id)
+                .expect("registration must be live to mint a boundary")
+        }
+    }
+
+    /// Run one page through a fresh registration.
+    ///
+    /// The harness is per-page here because these callers test pagination,
+    /// retention and merging — not request identity. They still mint authority
+    /// through the real path; what they do not exercise is incarnation
+    /// continuity across pages, which the falsifiers below do explicitly.
+    async fn run_page(c: &mut HistoryCursor, entries: &[(u64, &str)]) -> PageOutcome {
+        let mut h = PageHarness::new();
+        let mut page = h.open(c).await;
+        for (ts, marker) in entries {
+            page.observe(row(comment_at(*ts, marker)).await);
+        }
+        let witness = h.witness(page.sub_id());
+        c.complete(&witness, page)
+    }
+
+    /// Complete a page whose rows arrived through the page itself.
+    ///
+    /// There is deliberately no helper that takes a pre-filled collector any
+    /// more. Rows can only enter via [`OpenedHistoryPage::observe`], and no
+    /// page exists until the REQ has been written and its registration
+    /// installed — so the test helpers can no longer express the order that let
+    /// rows predate their registration.
+    fn complete_opened(
+        c: &mut HistoryCursor,
+        h: &mut PageHarness,
+        page: OpenedHistoryPage,
+    ) -> PageOutcome {
+        let witness = h.witness(page.sub_id());
+        c.complete(&witness, page)
+    }
+
+    /// Feed already-built events, so a page can re-deliver the *same* event a
+    /// second time. `run_page` mints a fresh key per row and cannot.
+    async fn run_page_with(c: &mut HistoryCursor, events: &[nostr::Event]) -> PageOutcome {
+        let mut h = PageHarness::new();
+        let mut page = h.open(c).await;
+        for event in events {
+            page.observe(row(event.clone()).await);
+        }
+        complete_opened(c, &mut h, page)
+    }
+
+    // `PageOutcome` is no longer `PartialEq` — two of its variants carry event
+    // collections now. These destructure instead, which also keeps each
+    // assertion pointed at the one field it means to check.
+    fn expect_continue(outcome: PageOutcome) -> (u64, usize) {
+        match outcome {
+            PageOutcome::Continue { until, limit } => (until, limit),
+            other => panic!("expected Continue, got {other:?}"),
+        }
+    }
+
+    fn expect_complete(outcome: PageOutcome) -> RetainedStream {
+        match outcome {
+            PageOutcome::Complete(retained) => retained,
+            other => panic!("expected Complete, got {other:?}"),
+        }
+    }
+
+    fn expect_degraded(outcome: PageOutcome) -> (String, DiagnosticRows) {
+        match outcome {
+            PageOutcome::Degraded { reason, rows } => (reason, rows),
+            other => panic!("expected Degraded, got {other:?}"),
+        }
+    }
+
+    fn stamps_of(events: &[VerifiedProjectEvent]) -> Vec<u64> {
+        events
+            .iter()
+            .map(|e| e.event().created_at.as_secs())
+            .collect()
+    }
+
+    fn ids_of(events: &[VerifiedProjectEvent]) -> Vec<String> {
+        events.iter().map(VerifiedProjectEvent::id).collect()
+    }
+
+    #[tokio::test]
+    async fn a_short_page_means_this_stream_is_complete() {
+        let mut c = cursor(1_000, 4, 1_000);
+        let retained = expect_complete(run_page(&mut c, &[(900, "a"), (890, "b")]).await);
+        assert_eq!(retained.len(), 2);
+        assert_eq!(retained.stream(), HistoryStream::Comments);
+        assert_eq!(retained.root(), ROOT);
+        // Handed over, not copied.
+        assert_eq!(c.retained_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn completion_is_judged_against_the_relay_applied_limit() {
+        // The concrete false-complete: ask for 2,000, the relay clamps to
+        // 1,000 (`buzz-db/src/event.rs:25`) and returns exactly that with EOSE.
+        // Comparing against what we *asked* for would report Complete while a
+        // page may remain.
+        let mut c = cursor(1_000, 2_000, 1_000);
+        assert_eq!(
+            c.limit(),
+            1_000,
+            "the request is clamped to the relay ceiling"
+        );
+
+        let entries: Vec<(u64, String)> = (0..1_000)
+            .map(|i| (900 - (i % 7) as u64, format!("e{i}")))
+            .collect();
+        let borrowed: Vec<(u64, &str)> = entries.iter().map(|(t, m)| (*t, m.as_str())).collect();
+
+        assert!(
+            !matches!(run_page(&mut c, &borrowed).await, PageOutcome::Complete(_)),
+            "a page saturating the effective limit is not proof of exhaustion"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_page_witness_cannot_be_built_without_a_cursor_request() {
+        // Structural, not documentary: `HistoryPageCollector` has no public
+        // constructor, and `EoseHistoryPage` has no constructor at all outside
+        // the private module. `begin_request` is the only route in, so an empty
+        // collector cannot be conjured and asked for a `Complete`.
+        let mut c = cursor(1_000, 4, 1_000);
+        let mut h = PageHarness::new();
+        let page = h.open(&mut c).await;
+        // An empty page from a *real* request is still legitimate: zero rows
+        // under the limit genuinely means exhausted. It yields an empty
+        // collection rather than nothing at all.
+        let retained = expect_complete(complete_opened(&mut c, &mut h, page));
+        assert!(retained.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_superseded_request_cannot_be_absorbed() {
+        // Generation binding: a page answering an earlier request must not be
+        // applied to the cursor's current one.
+        let mut c = cursor(1_000, 4, 1_000);
+        let mut h = PageHarness::new();
+        let stale = h.open(&mut c).await;
+        let _current = c.begin_request();
+        let (reason, _rows) = expect_degraded(complete_opened(&mut c, &mut h, stale));
+        assert!(reason.contains("outstanding request"), "{reason}");
+        // And permanently. `abandon` is the route for a request the driver
+        // superseded, so a page reaching absorption is either a driver defect or
+        // something the cursor never asked for; neither is recoverable by
+        // asking again.
+        assert!(c.degraded_reason().is_some());
+    }
+
+    #[tokio::test]
+    async fn the_collector_poisons_a_page_containing_a_foreign_root() {
+        // Integrity is the collector's job, not the caller's. A row for another
+        // root occupied a slot under the relay limit, so the short page can no
+        // longer distinguish exhaustion from displacement.
+        let mut c = cursor(1_000, 4, 1_000);
+        let mut h = PageHarness::new();
+        let mut page = h.open(&mut c).await;
+        page.observe(row(comment_at(900, "mine")).await);
+
+        let keys = Keys::generate();
+        let foreign = EventBuilder::new(Kind::Custom(KIND_TEXT_NOTE as u16), "elsewhere")
+            .custom_created_at(nostr::Timestamp::from(890))
+            .tags([nostr::Tag::parse(tag(&["e", OTHER_ROOT, "", "root"])).unwrap()])
+            .sign_with_keys(&keys)
+            .expect("sign");
+        page.observe(row(foreign).await);
+
+        let (reason, rows) = expect_degraded(complete_opened(&mut c, &mut h, page));
+        assert!(reason.contains("root"), "{reason}");
+        // The row that passed its own checks is diagnosable. It is not history:
+        // it arrives as `DiagnosticRows`, which has no route to a
+        // `RetainedStream`.
+        assert_eq!(rows.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn the_collector_poisons_a_page_containing_a_wrong_kind() {
+        let mut c = HistoryCursor::new(ROOT, HistoryStream::PullRequestUpdates, 1_000, 4, 1_000);
+        let mut h = PageHarness::new();
+        let mut page = h.open(&mut c).await;
+        // A comment on a PR-update stream: wrong filter class.
+        page.observe(row(comment_at(900, "a")).await);
+        let (reason, _rows) = expect_degraded(complete_opened(&mut c, &mut h, page));
+        assert!(reason.contains("does not belong"), "{reason}");
+    }
+
+    #[tokio::test]
+    async fn the_collector_poisons_a_page_containing_a_too_new_event() {
+        let mut c = cursor(1_000, 4, 1_000);
+        let mut h = PageHarness::new();
+        let mut page = h.open(&mut c).await;
+        page.observe(row(comment_at(2_000, "future")).await);
+        let (reason, _rows) = expect_degraded(complete_opened(&mut c, &mut h, page));
+        assert!(reason.contains("newer than"), "{reason}");
+    }
+
+    #[tokio::test]
+    async fn a_malformed_frame_poisons_the_page_rather_than_vanishing() {
+        let mut c = cursor(1_000, 4, 1_000);
+        let mut h = PageHarness::new();
+        let mut page = h.open(&mut c).await;
+        page.observe_unusable("frame was not parseable as an event");
+        let (reason, _rows) = expect_degraded(complete_opened(&mut c, &mut h, page));
+        assert!(reason.contains("parseable"), "{reason}");
+    }
+
+    #[tokio::test]
+    async fn the_cursor_moves_inclusively_not_one_second_earlier() {
+        let mut c = cursor(1_000, 3, 1_000);
+        assert_eq!(
+            expect_continue(run_page(&mut c, &[(900, "a"), (880, "b"), (870, "c")]).await),
+            (870, 3)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_saturated_single_timestamp_page_grows_rather_than_skipping() {
+        let mut c = cursor(1_000, 2, 1_000);
+        assert_eq!(
+            expect_continue(run_page(&mut c, &[(900, "a"), (900, "b")]).await),
+            (1_000, 8),
+            "same `until`, larger page"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unprovable_cohort_degrades_and_reports_only_what_is_known() {
+        let mut c = cursor(1_000, 4, 4);
+        let (reason, rows) = expect_degraded(
+            run_page(&mut c, &[(900, "a"), (900, "b"), (900, "c"), (900, "d")]).await,
+        );
+        assert!(reason.contains("900"), "names the timestamp: {reason}");
+        assert!(
+            reason.contains('4'),
+            "names the effective ceiling: {reason}"
+        );
+        assert!(
+            !reason.contains("has at least"),
+            "diagnostic must not overstate its evidence: {reason}"
+        );
+        assert_eq!(rows.len(), 4, "the cohort is diagnosable, not replayable");
+    }
+
+    // ── Pagination retains what it accepts ───────────────────────────────────
+
+    #[tokio::test]
+    async fn a_completed_stream_yields_the_rows_it_retained_not_a_count() {
+        // The defect this closes: pagination proved progress and produced no
+        // history. The cursor recorded ids in a `seen` set purely to detect
+        // repeats and dropped every event, so a caller that paginated a root to
+        // exhaustion finished holding nothing to replay.
+        let mut c = cursor(1_000, 2, 1_000);
+        assert_eq!(
+            expect_continue(run_page(&mut c, &[(900, "a"), (880, "b")]).await),
+            (880, 2)
+        );
+        let retained = expect_complete(run_page(&mut c, &[(870, "c")]).await);
+
+        assert_eq!(retained.len(), 3, "rows from both pages, not just the last");
+        assert_eq!(
+            stamps_of(retained.events()),
+            vec![870, 880, 900],
+            "`(created_at, event_id)` order"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_inclusive_boundary_duplicate_folds_exactly_once() {
+        // `until` moves to the oldest timestamp inclusively, so the boundary row
+        // is delivered a second time by design. It must be retained once.
+        let mut c = cursor(1_000, 2, 1_000);
+        let newer = comment_at(900, "newer");
+        let boundary = comment_at(880, "boundary");
+        let older = comment_at(870, "older");
+
+        assert_eq!(
+            expect_continue(run_page_with(&mut c, &[newer, boundary.clone()]).await),
+            (880, 2)
+        );
+        assert_eq!(c.retained_count(), 2);
+
+        assert_eq!(
+            expect_continue(run_page_with(&mut c, &[boundary, older]).await),
+            (870, 2)
+        );
+        assert_eq!(c.retained_count(), 3, "the repeat added nothing");
+
+        let retained = expect_complete(run_page_with(&mut c, &[]).await);
+        assert_eq!(retained.len(), 3);
+        let mut unique = ids_of(retained.events());
+        unique.sort();
+        unique.dedup();
+        assert_eq!(unique.len(), 3, "no id appears twice in the retained rows");
+    }
+
+    #[tokio::test]
+    async fn duplicate_rows_still_count_towards_the_relay_page_limit() {
+        // A page the relay filled with rows already held is still a *full* page:
+        // it stopped at its limit, so older events may remain behind it.
+        // Judging saturation on fresh rows rather than raw rows would read a
+        // page of repeats as the end of history.
+        let mut c = cursor(1_000, 2, 1_000);
+        let newer = comment_at(900, "newer");
+        let boundary = comment_at(880, "boundary");
+        assert_eq!(
+            expect_continue(run_page_with(&mut c, &[newer, boundary.clone()]).await),
+            (880, 2)
+        );
+
+        // Both slots filled by the boundary row already retained.
+        assert_eq!(
+            expect_continue(run_page_with(&mut c, &[boundary.clone(), boundary]).await),
+            (880, 8),
+            "saturated, so the cursor grows its page rather than declaring exhaustion"
+        );
+        assert_eq!(
+            c.retained_count(),
+            2,
+            "and both repeats folded into nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_degraded_cursor_surrenders_its_rows_as_diagnostics_only() {
+        let mut c = cursor(1_000, 2, 1_000);
+        assert_eq!(
+            expect_continue(run_page(&mut c, &[(900, "a"), (880, "b")]).await),
+            (880, 2)
+        );
+        assert_eq!(c.retained_count(), 2);
+
+        let mut h = PageHarness::new();
+        let mut page = h.open(&mut c).await;
+        page.observe_unusable("frame was not parseable as an event");
+        let (reason, rows) = expect_degraded(complete_opened(&mut c, &mut h, page));
+        assert!(reason.contains("parseable"), "{reason}");
+        assert_eq!(rows.len(), 2, "what was held is diagnosable");
+        assert_eq!(c.retained_count(), 0, "and is gone from the cursor");
+
+        // No later short page rehabilitates it. A short page after integrity was
+        // lost looks exactly like exhaustion, which is precisely why it must not
+        // be allowed to mean it.
+        let (reason, rows) = expect_degraded(run_page(&mut c, &[(870, "c")]).await);
+        assert!(reason.contains("permanently degraded"), "{reason}");
+        assert!(
+            reason.contains("parseable"),
+            "the original reason is kept, not replaced: {reason}"
+        );
+        assert!(
+            rows.is_empty(),
+            "a dead cursor gains nothing from a new page"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_finished_stream_cannot_yield_its_history_twice() {
+        let mut c = cursor(1_000, 4, 1_000);
+        assert_eq!(
+            expect_complete(run_page(&mut c, &[(900, "a")]).await).len(),
+            1
+        );
+        let (reason, rows) = expect_degraded(run_page(&mut c, &[(890, "b")]).await);
+        assert!(reason.contains("already yielded"), "{reason}");
+        assert!(rows.is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_abandoned_request_leaves_the_cursor_open() {
+        // The superseded-page rule is permanent, so `abandon` has to be a real
+        // escape: a request dropped on CLOSED, timeout or reconnect must not
+        // degrade a cursor that never absorbed anything.
+        let mut c = cursor(1_000, 4, 1_000);
+        c.begin_request().abandon();
+        assert!(c.degraded_reason().is_none());
+        assert_eq!(
+            expect_complete(run_page(&mut c, &[(900, "a")]).await).len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn comments_and_pull_request_updates_retain_independently() {
+        // One cursor per exact filter means one accumulator per exact filter.
+        // Sharing them would let a complete Comments stream carry rows the PR
+        // stream never proved exhausted, and vice versa.
+        let mut comments = HistoryCursor::new(ROOT, HistoryStream::Comments, 1_000, 4, 1_000);
+        let mut updates =
+            HistoryCursor::new(ROOT, HistoryStream::PullRequestUpdates, 1_000, 4, 1_000);
+
+        let comment_rows =
+            expect_complete(run_page(&mut comments, &[(900, "c1"), (890, "c2")]).await);
+
+        let mut h = PageHarness::new();
+        let mut page = h.open(&mut updates).await;
+        page.observe(row(pr_update_on(ROOT, 895, "r1")).await);
+        let update_rows = expect_complete(complete_opened(&mut updates, &mut h, page));
+
+        assert_eq!(comment_rows.stream(), HistoryStream::Comments);
+        assert_eq!(update_rows.stream(), HistoryStream::PullRequestUpdates);
+        assert_eq!(comment_rows.len(), 2);
+        assert_eq!(update_rows.len(), 1);
+        for id in ids_of(update_rows.events()) {
+            assert!(!ids_of(comment_rows.events()).contains(&id));
+        }
+    }
+
+    // ── Merging completed streams ────────────────────────────────────────────
+
+    /// A proven root plus its id, for the merge tests.
+    async fn bound_root(kind: u32) -> (VerifiedBoundRoot, String) {
+        let keys = Keys::generate();
+        let event = signed(&keys, kind, vec![tag(&["a", &coord()])]);
+        let event = VerifiedProjectEvent::verify(event).await.expect("valid");
+        let id = event.id();
+        let bound = VerifiedBoundRoot::prove(std::slice::from_ref(&event), &known(&[&coord()]))
+            .expect("proves");
+        (bound, id)
+    }
+
+    /// A verified row, produced the way the relay dispatch produces one.
+    ///
+    /// A page takes a [`VerifiedProjectEvent`] rather than verifying for itself,
+    /// so a test that feeds a page has to mint the same proof the dispatch
+    /// mints. That is the point of the signature change: one verifier, not a
+    /// second one inside the page that has to keep agreeing with the first.
+    async fn row(event: nostr::Event) -> VerifiedProjectEvent {
+        VerifiedProjectEvent::verify(event)
+            .await
+            .expect("test rows are signed")
+    }
+
+    /// Admit a row the way the relay dispatch admits one: from the live
+    /// registration under `sub_id`.
+    ///
+    /// Panics when nothing is live there, because that is not a weaker version
+    /// of the same test — a frame on an id this agent has not asked about never
+    /// reaches a reconstruction at all, and a helper that quietly produced one
+    /// anyway would be manufacturing the admission this piece is about.
+    async fn admitted(h: &PageHarness, sub_id: &str, event: nostr::Event) -> CatchUpFrame {
+        h.requests
+            .admit_frame(sub_id)
+            .expect("nothing is live under that id, so no frame could be admitted")
+            .catch_up(CatchUpOutcome::Row(Box::new(row(event).await)))
+    }
+
+    // ---- Piece 2: the RootReconstruction owner -----------------------------
+
+    /// Open a page **through the reconstruction's own cursor**.
+    ///
+    /// The collector comes from `begin_page`, and the registry does the rest in
+    /// one operation — mint the id, write, install, bind. Nothing here names a
+    /// subscription id: there is no id until the registry has minted one.
+    async fn open_for(
+        h: &mut PageHarness,
+        recon: &mut RootReconstruction,
+        stream: HistoryStream,
+    ) -> OpenedHistoryPage {
+        let collector = recon
+            .begin_page(stream)
+            .unwrap_or_else(|| panic!("the owner must want a page for {stream:?}"));
+        h.open_with(collector).await
+    }
+
+    /// A page for a root/stream this reconstruction would never issue.
+    ///
+    /// **Only valid for rejection tests.** Its collector comes from a
+    /// standalone cursor, so its generation matches no owner's — which is fine
+    /// precisely because `attach` must refuse it before generation could
+    /// matter. Anything testing a *successful* path must use [`open_for`].
+    async fn unissuable_page(
+        h: &mut PageHarness,
+        root: &str,
+        stream: HistoryStream,
+    ) -> OpenedHistoryPage {
+        let mut cursor = HistoryCursor::new(root, stream, 1_000, 4, 1_000);
+        h.open_with(cursor.begin_request()).await
+    }
+
+    /// The composed lifecycle: issue → open → attach → genuine EOSE → finished.
+    ///
+    /// The falsifier the first eight were missing. Each of those checked one
+    /// edge of the owner in isolation; none crossed the boundary between the
+    /// owner and the Piece 1 registry, so a reconstruction that could never
+    /// complete a page passed all eight.
+    #[tokio::test]
+    async fn an_advertised_page_completes_under_its_own_boundary() {
+        let (issue, _) = bound_root(KIND_GIT_ISSUE).await;
+        let mut recon = RootReconstruction::begin(&issue, 1_000, 4, 1_000);
+        let mut h = PageHarness::new();
+
+        let page = open_for(&mut h, &mut recon, HistoryStream::Comments).await;
+        let sub_id = page.sub_id().to_string();
+        recon.attach(page).map_err(|r| r.error).expect("attaches");
+
+        let witness = h.witness(&sub_id);
+        match recon.complete(&witness) {
+            Some(StreamAdvance::Finished { stream }) => {
+                assert_eq!(stream, HistoryStream::Comments);
+            }
+            other => panic!("an empty page under the limit is exhausted: {other:?}"),
+        }
+        assert_eq!(recon.finished_streams().len(), 1);
+    }
+
+    /// A saturated page yields `Continue`, and the next page opens from the
+    /// **advanced** position.
+    ///
+    /// The pagination loop end to end. Nothing previously called `complete()`
+    /// at all, so `Continue` — the outcome every page but the last produces —
+    /// had never once been reached through the owner.
+    #[tokio::test]
+    async fn a_saturated_page_continues_from_the_advanced_position() {
+        let (issue, _) = bound_root(KIND_GIT_ISSUE).await;
+        let mut recon = RootReconstruction::begin(&issue, 1_000, 2, 1_000);
+        let mut h = PageHarness::new();
+        let root = recon.root().to_string();
+
+        let mut page = open_for(&mut h, &mut recon, HistoryStream::Comments).await;
+        let sub_id = page.sub_id().to_string();
+        page.observe(row(comment_on(&root, 900, "a")).await);
+        page.observe(row(comment_on(&root, 880, "b")).await);
+        recon.attach(page).map_err(|r| r.error).expect("attaches");
+
+        let witness = h.witness(&sub_id);
+        let (until, limit) = match recon.complete(&witness) {
+            Some(StreamAdvance::Continue { until, limit, .. }) => (until, limit),
+            other => panic!("a page filling the limit continues: {other:?}"),
+        };
+        assert_eq!(until, 880, "the next page starts at the oldest row seen");
+
+        assert_eq!(
+            recon.pages_wanted(),
+            vec![(HistoryStream::Comments, until, limit)],
+            "the owner advertises the advanced position, not the cutoff"
+        );
+
+        // And the next page really opens there.
+        let next = open_for(&mut h, &mut recon, HistoryStream::Comments).await;
+        assert_eq!(next.until(), until);
+        recon.attach(next).map_err(|r| r.error).expect("attaches");
+    }
+
+    /// A disconnect after a `Continue` keeps the advanced cursor, not the
+    /// original cutoff.
+    #[tokio::test]
+    async fn a_disconnect_after_continue_keeps_the_advanced_position() {
+        let (issue, _) = bound_root(KIND_GIT_ISSUE).await;
+        let mut recon = RootReconstruction::begin(&issue, 1_000, 2, 1_000);
+        let mut h = PageHarness::new();
+        let root = recon.root().to_string();
+
+        let mut page = open_for(&mut h, &mut recon, HistoryStream::Comments).await;
+        let sub_id = page.sub_id().to_string();
+        page.observe(row(comment_on(&root, 900, "a")).await);
+        page.observe(row(comment_on(&root, 880, "b")).await);
+        recon.attach(page).map_err(|r| r.error).expect("attaches");
+        let witness = h.witness(&sub_id);
+        assert!(matches!(
+            recon.complete(&witness),
+            Some(StreamAdvance::Continue { .. })
+        ));
+
+        recon.disconnected();
+
+        assert_eq!(
+            recon.pages_wanted(),
+            vec![(HistoryStream::Comments, 880, 2)],
+            "a reconnect resumes where pagination got to — resuming at the \
+             cutoff would re-walk history already retained"
+        );
+        assert_eq!(recon.cutoff(), 1_000, "and the cutoff is still the cutoff");
+    }
+
+    /// A stale boundary refuses, then the page's own boundary completes it.
+    ///
+    /// The half that makes "does not degrade" worth anything: a page left in
+    /// flight is only useful if it can still be finished.
+    #[tokio::test]
+    async fn after_a_stale_boundary_the_pages_own_boundary_still_completes() {
+        let (issue, _) = bound_root(KIND_GIT_ISSUE).await;
+        let mut recon = RootReconstruction::begin(&issue, 1_000, 4, 1_000);
+        let mut h = PageHarness::new();
+
+        // A first page, and its boundary, held back while the page itself is
+        // dropped — the predecessor whose EOSE arrives late.
+        let first = open_for(&mut h, &mut recon, HistoryStream::Comments).await;
+        let stale = h.witness(first.sub_id());
+        drop(first);
+
+        let page = open_for(&mut h, &mut recon, HistoryStream::Comments).await;
+        let sub_id = page.sub_id().to_string();
+        recon.attach(page).map_err(|r| r.error).expect("attaches");
+
+        assert!(
+            recon.complete(&stale).is_none(),
+            "a predecessor's boundary names a registration that holds no page"
+        );
+        assert!(recon.in_flight(HistoryStream::Comments));
+
+        let current = h.witness(&sub_id);
+        match recon.complete(&current) {
+            Some(StreamAdvance::Finished { .. }) => {}
+            other => panic!("the replacement's own boundary must finish it: {other:?}"),
+        }
+    }
+
+    /// A page opened with the wrong limit is refused at attachment, and comes
+    /// back.
+    #[tokio::test]
+    async fn a_wrong_limit_page_is_refused_and_returned() {
+        let (issue, _) = bound_root(KIND_GIT_ISSUE).await;
+        let mut recon = RootReconstruction::begin(&issue, 1_000, 4, 1_000);
+        let mut h = PageHarness::new();
+
+        // Genuine root, stream and `until`; a different page limit.
+        let mut odd = HistoryCursor::new(recon.root(), HistoryStream::Comments, 1_000, 9, 1_000);
+        let page = h.open_with(odd.begin_request()).await;
+
+        let rejected = recon.attach(page).unwrap_err();
+        assert_eq!(
+            rejected.error,
+            AttachError::WrongLimit {
+                expected: 4,
+                found: 9
+            },
+            "the cursor compares the limit exactly, so attachment must too — \
+             otherwise the page is held to EOSE and degrades the whole root"
+        );
+        assert_eq!(rejected.page.effective_limit(), 9, "and it comes back");
+    }
+
+    /// A boundary cannot be delivered to a stream it does not belong to.
+    #[tokio::test]
+    async fn a_boundary_reaches_only_the_page_opened_under_its_own_id() {
+        let (pr, _) = bound_root(KIND_GIT_PULL_REQUEST).await;
+        let mut recon = RootReconstruction::begin(&pr, 1_000, 4, 1_000);
+        let mut h = PageHarness::new();
+
+        let comments = open_for(&mut h, &mut recon, HistoryStream::Comments).await;
+        let comments_sub = comments.sub_id().to_string();
+        let updates = open_for(&mut h, &mut recon, HistoryStream::PullRequestUpdates).await;
+        let updates_sub = updates.sub_id().to_string();
+        recon
+            .attach(comments)
+            .map_err(|r| r.error)
+            .expect("comments attach");
+        recon
+            .attach(updates)
+            .map_err(|r| r.error)
+            .expect("updates attach");
+
+        // Admitted while the registration is still live, so the frame below is
+        // a genuine one whose page has since gone — not an unadmissible frame
+        // failing for a different reason.
+        let late = admitted(&h, &comments_sub, comment_at(900, "late")).await;
+
+        // The comments boundary finishes the comments page, and cannot be
+        // aimed anywhere else: there is no stream argument to aim it with.
+        let witness = h.witness(&comments_sub);
+        match recon.complete(&witness) {
+            Some(StreamAdvance::Finished { stream }) => {
+                assert_eq!(stream, HistoryStream::Comments);
+            }
+            other => panic!("expected the comments stream to finish: {other:?}"),
+        }
+        assert!(
+            recon.in_flight(HistoryStream::PullRequestUpdates),
+            "the sibling page is untouched"
+        );
+        assert!(
+            h.requests.match_frame(&updates_sub).is_some(),
+            "and so is the registration that opened it — a boundary retires the \
+             request it answers, not every catch-up in the registry"
+        );
+
+        // The boundary retired the comments registration along with the page it
+        // completed, so nothing can even be admitted under that id any more —
+        // which is the stronger half of "reaches nothing".
+        assert!(
+            h.requests.admit_frame(&comments_sub).is_none(),
+            "a completed catch-up stops being answerable"
+        );
+
+        // And a frame admitted while it *was* live still reaches nothing, since
+        // the reconstruction no longer holds a page under it.
+        assert_eq!(recon.observe(late), FrameRouting::NotOurs);
+    }
+
+    /// Both required PR streams open under one registry.
+    ///
+    /// They are different questions, so they need different subscription ids
+    /// and different classes. When the id was root-only they collided and the
+    /// second stream could not be opened at all — the owner could enumerate two
+    /// and the registry could serve one.
+    #[tokio::test]
+    async fn both_required_pr_streams_open_under_one_registry() {
+        let (pr, _) = bound_root(KIND_GIT_PULL_REQUEST).await;
+        let mut recon = RootReconstruction::begin(&pr, 1_000, 4, 1_000);
+        let mut h = PageHarness::new();
+
+        let comments = open_for(&mut h, &mut recon, HistoryStream::Comments).await;
+        let updates = open_for(&mut h, &mut recon, HistoryStream::PullRequestUpdates).await;
+        assert_ne!(
+            comments.sub_id(),
+            updates.sub_id(),
+            "two questions cannot share one subscription id"
+        );
+
+        recon
+            .attach(comments)
+            .map_err(|r| r.error)
+            .expect("comments attach");
+        recon
+            .attach(updates)
+            .map_err(|r| r.error)
+            .expect("updates attach");
+        assert!(recon.in_flight(HistoryStream::Comments));
+        assert!(recon.in_flight(HistoryStream::PullRequestUpdates));
+    }
+
+    /// One stream degrading terminalises the whole reconstruction.
+    #[tokio::test]
+    async fn a_degrading_stream_drops_every_other_page() {
+        let (pr, _) = bound_root(KIND_GIT_PULL_REQUEST).await;
+        let mut recon = RootReconstruction::begin(&pr, 1_000, 4, 1_000);
+        let mut h = PageHarness::new();
+
+        let comments = open_for(&mut h, &mut recon, HistoryStream::Comments).await;
+        let comments_sub = comments.sub_id().to_string();
+        let mut updates = open_for(&mut h, &mut recon, HistoryStream::PullRequestUpdates).await;
+        let updates_sub = updates.sub_id().to_string();
+        updates.observe_unusable("frame was not parseable as an event");
+
+        recon
+            .attach(comments)
+            .map_err(|r| r.error)
+            .expect("comments attach");
+        recon
+            .attach(updates)
+            .map_err(|r| r.error)
+            .expect("updates attach");
+
+        let witness = h.witness(&updates_sub);
+        match recon.complete(&witness) {
+            Some(StreamAdvance::Degraded { .. }) => {}
+            other => panic!("a poisoned page degrades: {other:?}"),
+        }
+
+        assert!(recon.abandoned_reason().is_some());
+        assert!(
+            !recon.in_flight(HistoryStream::Comments),
+            "terminal degradation must drop every other connection-owned page"
+        );
+        let late = admitted(&h, &comments_sub, comment_at(900, "late")).await;
+        assert_eq!(
+            recon.observe(late),
+            FrameRouting::NotOurs,
+            "and must accept nothing further"
+        );
+        assert!(recon.begin_page(HistoryStream::Comments).is_none());
+    }
+
+    /// Open a successor registration for the same root and stream.
+    ///
+    /// What a paginating driver does between pages, and what a retry does after
+    /// a page is abandoned. The successor's collector comes from a standalone
+    /// cursor because the owner is deliberately *not* told: the point is that
+    /// the registry has moved on while the reconstruction may not have.
+    async fn reopen(
+        h: &mut PageHarness,
+        recon: &RootReconstruction,
+        stream: HistoryStream,
+    ) -> OpenedHistoryPage {
+        let mut successor = HistoryCursor::new(recon.root(), stream, 1_000, 4, 1_000);
+        h.open_with(successor.begin_request()).await
+    }
+
+    /// A frame admitted by a *different* registration cannot enter this page.
+    ///
+    /// Two layers now say no, and the outer one is new. A successor
+    /// registration has an id of its own, so a frame admitted by it is not even
+    /// looked up against the page in flight — `NotOurs`, not absorbed. Under
+    /// the old deterministic id the two shared a name, the lookup succeeded,
+    /// and only the authority comparison stood between a successor's rows and a
+    /// page opened against a different `until` bound.
+    ///
+    /// This is the *dropped* direction, which is the safe one: nothing enters
+    /// the page and nothing is damaged. The frames that must reach a page —
+    /// the ones its own registration admitted — are covered by
+    /// `a_page_fills_from_the_wire_and_completes_at_its_own_boundary`.
+    #[tokio::test]
+    async fn a_frame_from_another_registration_cannot_enter_this_page() {
+        let (issue, _) = bound_root(KIND_GIT_ISSUE).await;
+        let mut recon = RootReconstruction::begin(&issue, 1_000, 4, 1_000);
+        let mut h = PageHarness::new();
+
+        let page = open_for(&mut h, &mut recon, HistoryStream::Comments).await;
+        let sub_id = page.sub_id().to_string();
+        recon.attach(page).map_err(|r| r.error).expect("attaches");
+
+        // The registry moves on; the reconstruction still holds the old page.
+        let successor = reopen(&mut h, &recon, HistoryStream::Comments).await;
+        assert_ne!(
+            successor.sub_id(),
+            sub_id,
+            "a successor must not be able to wear its predecessor's name"
+        );
+
+        let frame = admitted(
+            &h,
+            successor.sub_id(),
+            comment_at(900, "from the successor"),
+        )
+        .await;
+        assert_eq!(
+            recon.observe(frame),
+            FrameRouting::NotOurs,
+            "the page in flight was opened by a different registration"
+        );
+        assert!(
+            recon.abandoned_reason().is_none(),
+            "and nothing about that is a contradiction — it is simply not ours"
+        );
+
+        // The page is untouched and still completes on its own boundary, with
+        // none of the successor's rows in it.
+        let witness = h.witness(&sub_id);
+        match recon.complete(&witness) {
+            Some(StreamAdvance::Finished { .. }) => {}
+            other => panic!("the page must still complete: {other:?}"),
+        }
+        assert_eq!(recon.finished_streams()[0].len(), 0);
+    }
+
+    /// A predecessor's row is refused, and the page it was offered to is
+    /// untouched.
+    ///
+    /// The same shape as above from the other side: the frame belongs to a
+    /// registration that has *been* replaced rather than one that replaced it.
+    /// Also `NotOurs` — a retired registration's id names no page in flight.
+    #[tokio::test]
+    async fn a_predecessors_row_is_refused_without_touching_the_page() {
+        let (issue, _) = bound_root(KIND_GIT_ISSUE).await;
+        let mut recon = RootReconstruction::begin(&issue, 1_000, 4, 1_000);
+        let mut h = PageHarness::new();
+
+        // A first registration and a frame admitted by it. The page it opened
+        // is dropped without ever being attached.
+        let first = open_for(&mut h, &mut recon, HistoryStream::Comments).await;
+        let stale = admitted(
+            &h,
+            first.sub_id(),
+            comment_at(900, "late from the predecessor"),
+        )
+        .await;
+        drop(first);
+
+        // The successor's page is the one in flight.
+        let page = open_for(&mut h, &mut recon, HistoryStream::Comments).await;
+        let sub_id = page.sub_id().to_string();
+        assert_ne!(stale.sub_id(), sub_id, "two attempts, two names");
+        recon.attach(page).map_err(|r| r.error).expect("attaches");
+
+        assert_eq!(recon.observe(stale), FrameRouting::NotOurs);
+        assert!(recon.abandoned_reason().is_none(), "and nothing is damaged");
+
+        // The current page still completes under its own boundary, with none of
+        // the predecessor's rows in it.
+        let witness = h.witness(&sub_id);
+        match recon.complete(&witness) {
+            Some(StreamAdvance::Finished { .. }) => {}
+            other => panic!("the current page is unharmed and completes: {other:?}"),
+        }
+        assert_eq!(
+            recon.finished_streams()[0].len(),
+            0,
+            "the refused row is not in the retained history"
+        );
+    }
+
+    /// The router hands each root only the frames its own requests admitted.
+    #[tokio::test]
+    async fn the_router_gives_each_root_only_its_own_frames() {
+        let (one, _) = bound_root(KIND_GIT_ISSUE).await;
+        let (two, _) = bound_root(KIND_GIT_ISSUE).await;
+        let mut h = PageHarness::new();
+        let mut first = RootReconstruction::begin(&one, 1_000, 4, 1_000);
+        let mut second = RootReconstruction::begin(&two, 1_000, 4, 1_000);
+        let first_id = first.root().to_string();
+        let second_id = second.root().to_string();
+        assert_ne!(first_id, second_id, "two distinct roots");
+
+        let first_sub = {
+            let page = open_for(&mut h, &mut first, HistoryStream::Comments).await;
+            let sub_id = page.sub_id().to_string();
+            first.attach(page).map_err(|r| r.error).expect("attaches");
+            sub_id
+        };
+        let second_sub = {
+            let page = open_for(&mut h, &mut second, HistoryStream::Comments).await;
+            let sub_id = page.sub_id().to_string();
+            second.attach(page).map_err(|r| r.error).expect("attaches");
+            sub_id
+        };
+
+        let mut router = ProjectReconstructions::new();
+        assert!(router.insert(first));
+        assert!(router.insert(second));
+
+        // Deliberately the **second** root's request, and the second inserted.
+        // Sending the first root's traffic would pass under a router that
+        // ignored the root entirely and always took the reconstruction it
+        // happened to hold first — which is how the first version of this test
+        // survived exactly that mutant.
+        let second_root = second_id.clone();
+        let frame = admitted(
+            &h,
+            &second_sub,
+            comment_on(&second_root, 900, "for the second"),
+        )
+        .await;
+        assert_eq!(
+            router.observe(frame),
+            FrameRouting::Absorbed {
+                stream: HistoryStream::Comments
+            }
+        );
+
+        // Each page completes on its own boundary, and the row is in exactly
+        // one of them.
+        for (sub_id, root, expected) in [(&second_sub, &second_root, 1), (&first_sub, &first_id, 0)]
+        {
+            let witness = h.witness(sub_id);
+            match router.complete(&witness) {
+                Some(StreamAdvance::Finished { .. }) => {}
+                other => panic!("{root} completes on its own boundary: {other:?}"),
+            }
+            assert_eq!(
+                router.get(root).expect("still tracked").finished_streams()[0].len(),
+                expected,
+                "wrong number of rows retained for {root}"
+            );
+        }
+    }
+
+    /// A second reconstruction of one root is refused.
+    #[tokio::test]
+    async fn one_root_gets_one_reconstruction() {
+        let (issue, _) = bound_root(KIND_GIT_ISSUE).await;
+        let mut router = ProjectReconstructions::new();
+        assert!(router.insert(RootReconstruction::begin(&issue, 1_000, 4, 1_000)));
+        assert!(
+            !router.insert(RootReconstruction::begin(&issue, 1_000, 4, 1_000)),
+            "two owners for one root would both be offered every frame, and \
+             which one absorbed it would depend on insertion order"
+        );
+    }
+
+    /// A stale boundary at the owner level leaves the page in flight.
+    #[tokio::test]
+    async fn a_stale_boundary_leaves_the_owners_page_in_flight() {
+        let (issue, _) = bound_root(KIND_GIT_ISSUE).await;
+        let mut recon = RootReconstruction::begin(&issue, 1_000, 4, 1_000);
+        let mut h = PageHarness::new();
+
+        // A first page and its boundary, the page dropped without ever being
+        // attached — the predecessor whose EOSE arrives late.
+        let first = open_for(&mut h, &mut recon, HistoryStream::Comments).await;
+        let stale = h.witness(first.sub_id());
+        drop(first);
+
+        // The replacement is a strictly later instance, under a name of its
+        // own — so the stale boundary does not even reach it.
+        let page = open_for(&mut h, &mut recon, HistoryStream::Comments).await;
+        assert_ne!(page.incarnation(), stale.incarnation());
+        assert_ne!(page.sub_id(), stale.sub_id());
+        recon.attach(page).map_err(|r| r.error).expect("attaches");
+
+        match recon.complete(&stale) {
+            None => {}
+            other => panic!("a predecessor boundary reaches no page, got {other:?}"),
+        }
+        assert!(
+            recon.in_flight(HistoryStream::Comments),
+            "the page stays in flight — only its own boundary may finish it"
+        );
+        assert!(recon.abandoned_reason().is_none());
+    }
+
+    /// An issue requires one stream; a pull request requires two.
+    #[tokio::test]
+    async fn required_streams_come_from_the_proven_root_class() {
+        let (issue, _) = bound_root(KIND_GIT_ISSUE).await;
+        let (pr, _) = bound_root(KIND_GIT_PULL_REQUEST).await;
+
+        let issue_recon = RootReconstruction::begin(&issue, 1_000, 4, 1_000);
+        let pr_recon = RootReconstruction::begin(&pr, 1_000, 4, 1_000);
+
+        assert!(!issue_recon.is_pull_request());
+        assert_eq!(issue_recon.pages_wanted().len(), 1);
+        assert!(pr_recon.is_pull_request());
+        assert_eq!(pr_recon.pages_wanted().len(), 2);
+    }
+
+    /// One cutoff, taken once, with no method that moves it.
+    #[tokio::test]
+    async fn the_cutoff_is_shared_by_every_stream_and_never_moves() {
+        let (pr, _) = bound_root(KIND_GIT_PULL_REQUEST).await;
+        let recon = RootReconstruction::begin(&pr, 1_000, 4, 1_000);
+
+        assert_eq!(recon.cutoff(), 1_000);
+        for (_, until, _) in recon.pages_wanted() {
+            assert_eq!(
+                until, 1_000,
+                "every stream starts at the one cutoff, or the merge compares \
+                 histories ending at different moments"
+            );
+        }
+
+        let source = include_str!("project.rs");
+        assert!(
+            !source.contains(concat!("fn set_", "cutoff")),
+            "nothing may move the cutoff after construction"
+        );
+    }
+
+    /// A page is routed by what it says it collects for, not by a caller
+    /// argument.
+    #[tokio::test]
+    async fn a_page_is_attached_by_its_own_stream_not_a_caller_claim() {
+        let (pr, _) = bound_root(KIND_GIT_PULL_REQUEST).await;
+        let mut recon = RootReconstruction::begin(&pr, 1_000, 4, 1_000);
+        let mut h = PageHarness::new();
+
+        let page = open_for(&mut h, &mut recon, HistoryStream::PullRequestUpdates).await;
+        assert_eq!(page.stream(), HistoryStream::PullRequestUpdates);
+        recon.attach(page).expect("attaches to its own stream");
+
+        assert!(recon.in_flight(HistoryStream::PullRequestUpdates));
+        assert!(!recon.in_flight(HistoryStream::Comments));
+
+        // `attach` takes no stream argument at all — the signature cannot
+        // express the wrong claim.
+        let source = include_str!("project.rs");
+        assert!(
+            !source.contains(concat!("fn attach(&mut self, stream", ":")),
+            "attach must not accept a caller-supplied stream"
+        );
+    }
+
+    /// One page in flight per stream.
+    #[tokio::test]
+    async fn a_stream_holds_at_most_one_page_in_flight() {
+        let (issue, _) = bound_root(KIND_GIT_ISSUE).await;
+        let mut recon = RootReconstruction::begin(&issue, 1_000, 4, 1_000);
+        let mut h = PageHarness::new();
+
+        // Two collectors issued before either is attached, then bound in turn.
+        let a = recon.begin_page(HistoryStream::Comments).expect("first");
+        let b = recon.begin_page(HistoryStream::Comments).expect("second");
+        assert_eq!(
+            a.generation(),
+            b.generation(),
+            "issuing is a proposal, not an advance — a second issue must not \
+             invalidate a first that is still on its way to the socket"
+        );
+        let first = h.open_with(a).await;
+        let second = h.open_with(b).await;
+        recon
+            .attach(first)
+            .map_err(|r| r.error)
+            .expect("first attaches");
+
+        let rejected = recon.attach(second).unwrap_err();
+        assert_eq!(
+            rejected.error,
+            AttachError::AlreadyInFlight,
+            "two boundaries on one stream could not be ordered by its cursor"
+        );
+        assert_eq!(
+            rejected.page.stream(),
+            HistoryStream::Comments,
+            "and the page comes back, so its registration is still reachable"
+        );
+
+        // Completion of the survivor is asserted separately, in
+        // `a_second_issue_cannot_poison_the_first_genuine_page`: binding twice
+        // under one subscription id necessarily retires the first
+        // registration, so this test cannot also witness the first page.
+    }
+
+    /// Merely *issuing* a second collector must not poison the first.
+    ///
+    /// The exact counterexample this piece failed. `begin_page` used to call
+    /// `begin_request`, advancing the owned cursor on every call, so a second
+    /// issue superseded a first page that was already on its way to the socket
+    /// — and the first page's own genuine boundary then degraded the whole
+    /// reconstruction.
+    ///
+    /// The previous version of the in-flight test built exactly this state and
+    /// asserted only that the *loser* was rejected. It passed while leaving the
+    /// reconstruction holding a page its own cursor had superseded.
+    #[tokio::test]
+    async fn a_second_issue_cannot_poison_the_first_genuine_page() {
+        let (issue, _) = bound_root(KIND_GIT_ISSUE).await;
+        let mut recon = RootReconstruction::begin(&issue, 1_000, 4, 1_000);
+        let mut h = PageHarness::new();
+
+        let first = recon.begin_page(HistoryStream::Comments).expect("first");
+        let second = recon.begin_page(HistoryStream::Comments).expect("second");
+        assert_eq!(
+            first.generation(),
+            second.generation(),
+            "issuing proposes; it does not advance"
+        );
+        drop(second);
+
+        let page = h.open_with(first).await;
+        let sub_id = page.sub_id().to_string();
+        recon.attach(page).map_err(|r| r.error).expect("attaches");
+
+        let witness = h.witness(&sub_id);
+        match recon.complete(&witness) {
+            Some(StreamAdvance::Finished { .. }) => {}
+            other => panic!("the first genuine page must survive a second issue: {other:?}"),
+        }
+        assert!(recon.abandoned_reason().is_none());
+    }
+
+    /// A collector from an unrelated cursor cannot commit the owner's.
+    ///
+    /// The reviewer's counterexample. An outsider cursor with identical root,
+    /// stream, cutoff, bound and limit stamps the *same* generation, so the
+    /// number authenticates nothing on its own — the descriptive-value identity
+    /// corrected in Piece 1, recurring one layer down.
+    #[tokio::test]
+    async fn an_unproposed_collector_cannot_commit_the_owners_cursor() {
+        let (issue, _) = bound_root(KIND_GIT_ISSUE).await;
+        let mut recon = RootReconstruction::begin(&issue, 1_000, 4, 1_000);
+        let mut h = PageHarness::new();
+
+        // Never call `recon.begin_page()`.
+        let mut outsider =
+            HistoryCursor::new(recon.root(), HistoryStream::Comments, 1_000, 4, 1_000);
+        let collector = outsider.begin_request();
+        assert_eq!(
+            collector.generation(),
+            1,
+            "the outsider stamps the same number the owner would"
+        );
+
+        let page = h.open_with(collector).await;
+        let rejected = recon.attach(page).unwrap_err();
+        assert_eq!(
+            rejected.error,
+            AttachError::Superseded,
+            "an unproposed collector must not advance the owner's cursor"
+        );
+
+        // The owner is undamaged: its own page still completes.
+        let mine = open_for(&mut h, &mut recon, HistoryStream::Comments).await;
+        let sub_id = mine.sub_id().to_string();
+        recon.attach(mine).map_err(|r| r.error).expect("attaches");
+        let witness = h.witness(&sub_id);
+        assert!(matches!(
+            recon.complete(&witness),
+            Some(StreamAdvance::Finished { .. })
+        ));
+    }
+
+    /// Generation exhaustion fails closed and terminalises.
+    ///
+    /// Unchecked `+ 1` panicked in debug and wrapped to zero in release — the
+    /// same counter divergence already refused for registration incarnations.
+    /// A wrapped generation lets a superseded page match a later request, which
+    /// is the one thing the generation exists to prevent.
+    #[tokio::test]
+    async fn exhausted_page_generations_terminalise_rather_than_wrap() {
+        let (issue, _) = bound_root(KIND_GIT_ISSUE).await;
+        let mut recon = RootReconstruction::begin(&issue, 1_000, 4, 1_000);
+        recon.force_stream_generation(HistoryStream::Comments, u64::MAX);
+
+        assert!(
+            recon.begin_page(HistoryStream::Comments).is_none(),
+            "no collector may be issued once the space is spent"
+        );
+        assert!(
+            recon
+                .abandoned_reason()
+                .is_some_and(|r| r.contains("exhausted")),
+            "and the reconstruction terminalises rather than spinning"
+        );
+        assert!(
+            recon.pages_wanted().is_empty(),
+            "an exhausted stream must stop being advertised"
+        );
+    }
+
+    /// A cursor at the ceiling proposes nothing, rather than wrapping to zero.
+    #[test]
+    fn a_cursor_at_the_generation_ceiling_proposes_nothing() {
+        let mut c = cursor(1_000, 4, 1_000);
+        c.force_generation(u64::MAX);
+        assert!(c.propose_request().is_none());
+    }
+
+    /// A failed transport leaves the stream able to retry.
+    ///
+    /// The other half of the proposal contract: issuing without advancing must
+    /// not strand a stream when the write never lands. Nothing is outstanding
+    /// to clear, because nothing moved.
+    #[tokio::test]
+    async fn a_failed_open_leaves_the_stream_retryable() {
+        let (issue, _) = bound_root(KIND_GIT_ISSUE).await;
+        let mut recon = RootReconstruction::begin(&issue, 1_000, 4, 1_000);
+        let mut h = PageHarness::new();
+
+        let doomed = recon.begin_page(HistoryStream::Comments).expect("issued");
+        let mut dead = test_socket().await;
+        dead.client.close(None).await.expect("close");
+        assert!(matches!(
+            h.requests.open_history_page(&mut dead.client, doomed).await,
+            PageOpen::WriteFailed(_)
+        ));
+
+        // The stream is still asking, at the same bound, and a fresh attempt
+        // completes.
+        assert_eq!(
+            recon.pages_wanted(),
+            vec![(HistoryStream::Comments, 1_000, 4)]
+        );
+        let page = open_for(&mut h, &mut recon, HistoryStream::Comments).await;
+        let good_sub = page.sub_id().to_string();
+        recon.attach(page).map_err(|r| r.error).expect("attaches");
+        let witness = h.witness(&good_sub);
+        assert!(matches!(
+            recon.complete(&witness),
+            Some(StreamAdvance::Finished { .. })
+        ));
+    }
+
+    /// A page for another root, or a stream this class does not require, is
+    /// refused.
+    #[tokio::test]
+    async fn a_foreign_page_is_refused() {
+        let (issue, _) = bound_root(KIND_GIT_ISSUE).await;
+        let (other, _) = bound_root(KIND_GIT_ISSUE).await;
+        let mut recon = RootReconstruction::begin(&issue, 1_000, 4, 1_000);
+        let mut other_recon = RootReconstruction::begin(&other, 1_000, 4, 1_000);
+        let mut h = PageHarness::new();
+
+        let foreign = open_for(&mut h, &mut other_recon, HistoryStream::Comments).await;
+        assert_eq!(
+            recon.attach(foreign).unwrap_err().error,
+            AttachError::WrongRoot
+        );
+
+        // An issue does not require PR updates. Built on *this* root, so the
+        // root check passes and the stream check is what refuses it — the
+        // earlier version of this test used a different root and was really
+        // asserting `WrongRoot` twice.
+        let updates =
+            unissuable_page(&mut h, recon.root(), HistoryStream::PullRequestUpdates).await;
+        assert_eq!(
+            recon.attach(updates).unwrap_err().error,
+            AttachError::StreamNotRequired
+        );
+
+        other_recon.disconnected();
+    }
+
+    /// A disconnect drops pages but keeps the cutoff and the cursors.
+    #[tokio::test]
+    async fn a_disconnect_drops_pages_and_keeps_position() {
+        let (issue, _) = bound_root(KIND_GIT_ISSUE).await;
+        let mut recon = RootReconstruction::begin(&issue, 1_000, 4, 1_000);
+        let mut h = PageHarness::new();
+
+        let page = open_for(&mut h, &mut recon, HistoryStream::Comments).await;
+        recon.attach(page).map_err(|r| r.error).expect("attaches");
+        assert!(recon.in_flight(HistoryStream::Comments));
+
+        recon.disconnected();
+
+        assert!(
+            !recon.in_flight(HistoryStream::Comments),
+            "pages belonged to the connection that died"
+        );
+        assert_eq!(recon.cutoff(), 1_000, "the cutoff survives the reconnect");
+        assert_eq!(
+            recon.pages_wanted(),
+            vec![(HistoryStream::Comments, 1_000, 4)],
+            "and the stream asks again from where it was"
+        );
+    }
+
+    /// Abandonment is terminal: no further page may attach.
+    #[tokio::test]
+    async fn an_abandoned_reconstruction_accepts_nothing_further() {
+        let (issue, _) = bound_root(KIND_GIT_ISSUE).await;
+        let mut recon = RootReconstruction::begin(&issue, 1_000, 4, 1_000);
+        let mut h = PageHarness::new();
+        let page = open_for(&mut h, &mut recon, HistoryStream::Comments).await;
+
+        recon.abandon("relay refused the catch-up");
+
+        assert_eq!(recon.abandoned_reason(), Some("relay refused the catch-up"));
+        assert!(recon.pages_wanted().is_empty());
+        assert_eq!(recon.attach(page).unwrap_err().error, AttachError::Closed);
+    }
+
+    /// No accessible registry API can manufacture send authority.
+    ///
+    /// Structural, and checked as source text because the claim is about the
+    /// *absence* of a method. An earlier revision had `confirm_sent(&str)` — a
+    /// bare lever any crate caller could pull — and a test that called it proved
+    /// only that the boolean worked, not that a socket existed.
+    ///
+    /// Every needle is assembled with `concat!` so this test's own source does
+    /// not contain the pattern it forbids. That is not fastidiousness: the first
+    /// version of a test in this file failed against itself, and a source-reading
+    /// test that matches its own text is a test that can only ever report on
+    /// itself.
+    #[test]
+    fn no_api_can_manufacture_send_authority() {
+        let source = include_str!("project.rs");
+
+        assert!(
+            !source.contains(concat!("fn confirm", "_sent")),
+            "a bare mark-as-sent method is a lever; the write must own the transition"
+        );
+
+        // The write must not be a caller-supplied callback. A generic
+        // `FnOnce(..) -> Result<(), E>` lets `|_| async { Ok(()) }` manufacture
+        // send authority with no socket, which is `confirm_sent` in disguise.
+        assert!(
+            !source.contains(concat!("write", ": F,")),
+            "the openers must not take a caller-supplied writer"
+        );
+        assert!(
+            !source.contains(concat!(
+                "Fut: std::future::Future<Output",
+                " = Result<(), E>>"
+            )),
+            "no generic success-returning callback may produce send authority"
+        );
+
+        // The sink must actually be sealed. Counting implementations does not
+        // establish this — an unsealed trait with one impl today is an open door
+        // tomorrow — and an earlier version of this test asserted only the count,
+        // so unsealing the trait passed it.
+        assert!(
+            source.contains(concat!("trait ProjectReqSink: ", "sealed::Sealed")),
+            "ProjectReqSink must be sealed by a private supertrait"
+        );
+
+        // Exactly one implementation of the sealed sink, and it is for the live
+        // socket. A second impl anywhere in the crate would reopen the hole.
+        assert_eq!(
+            source.matches(concat!("\nimpl ProjectReq", "Sink")).count(),
+            1,
+            "ProjectReqSink must have exactly one implementation"
+        );
+        assert_eq!(
+            source.matches(concat!("\nimpl sealed::", "Sealed")).count(),
+            1,
+            "the private supertrait must have exactly one implementation"
+        );
+
+        // Anchored to the struct-field form: the bare needle `sent: bool` is a
+        // substring of `p_tag_present: bool` elsewhere in this file, so it failed
+        // for a reason that had nothing to do with send authority.
+        assert!(
+            !source.contains(concat!("\n        sent", ": bool,")),
+            "no pending/sent flag may exist; installation happens post-write"
+        );
+    }
+
+    /// No registration is installed before its write returns — at either opener.
+    ///
+    /// The structural half of cancellation-safety, and the load-bearing half: a
+    /// real socket write completes on its first poll, so a *mid-write* cancel
+    /// cannot be forced deterministically from a test, and sealing the sink
+    /// (correctly) removed the ability to inject a writer that pends. That
+    /// trade-off is why this is asserted against the source rather than observed
+    /// at runtime.
+    ///
+    /// There are two openers now — one for pages, one for everything else — and
+    /// the earlier version of this test asserted a single installation site. That
+    /// assertion had to be updated rather than deleted: a count of one was never
+    /// the property, it was the shape the property happened to have while there
+    /// was one opener. What is pinned is that installation sites and awaited
+    /// writes strictly alternate, so each install follows a write that returned
+    /// and none can drift above the one before it.
+    #[test]
+    fn no_registration_is_installed_before_its_write_returns() {
+        let source = include_str!("project.rs");
+
+        let installs: Vec<usize> = source
+            .match_indices(concat!("self.live.", "insert("))
+            .map(|(i, _)| i)
+            .collect();
+        let writes: Vec<usize> = source
+            .match_indices(concat!("write_project_", "req(text).await"))
+            .map(|(i, _)| i)
+            .collect();
+
+        assert_eq!(
+            installs.len(),
+            2,
+            "exactly two places install a live registration: {installs:?}"
+        );
+        assert_eq!(
+            writes.len(),
+            installs.len(),
+            "each installation must have a write of its own: {writes:?}"
+        );
+
+        // write, install, write, install — strictly interleaved. A site that
+        // moved above its write, or a second install sharing one write, breaks
+        // the ordering rather than the count.
+        let mut expected = Vec::new();
+        for (w, i) in writes.iter().zip(&installs) {
+            expected.push(*w);
+            expected.push(*i);
+        }
+        let mut sorted = expected.clone();
+        sorted.sort_unstable();
+        assert_eq!(
+            sorted, expected,
+            "every registration must be installed after the write it belongs to \
+             returns, or a dropped future strands a pending entry nothing can \
+             promote"
+        );
+    }
+
+    /// The page type is constructed in exactly one place.
+    ///
+    /// This is what the deleted binding checks were really protecting: not that
+    /// a caller passed matching halves, but that nothing outside the registry
+    /// can produce an `OpenedHistoryPage` at all. With the open folded into one
+    /// operation there is a single construction site, and it sits after a write
+    /// that returned.
+    #[test]
+    fn the_page_type_is_constructed_in_exactly_one_place() {
+        let source = include_str!("project.rs");
+        // Built with `concat!` so the needle is not itself in the file — the
+        // count would otherwise include this test. Definitions, `impl` blocks
+        // and return types wear the same name, so they are filtered out rather
+        // than counted and explained away: what is left is construction.
+        let needle = concat!("OpenedHistoryPage ", "{");
+        let sites: Vec<&str> = source
+            .lines()
+            .filter(|line| line.contains(needle))
+            .filter(|line| {
+                !line.contains("-> ") && !line.contains("struct ") && !line.contains("impl ")
+            })
+            .collect();
+        assert_eq!(
+            sites.len(),
+            1,
+            "exactly one construction site, inside `open_history_page`: {sites:?}"
+        );
+    }
+
+    /// Piece 2 makes no readiness claim; that is Piece 6.
+    #[test]
+    fn the_owner_claims_nothing_about_completeness() {
+        let source = include_str!("project.rs");
+        for forbidden in [
+            concat!("fn is_", "complete"),
+            concat!("fn is_", "ready"),
+            concat!("fn readiness", "("),
+        ] {
+            assert!(
+                !source.contains(forbidden),
+                "readiness depends on backpressure recovery that does not exist \
+                 yet: {forbidden}"
+            );
+        }
+    }
+
+    /// The cutoff the merge tests' reconstruction selected, unless one says
+    /// otherwise.
+    const SNAPSHOT: u64 = 1_000;
+
+    async fn completed_comments_from(
+        root: &str,
+        cutoff: u64,
+        entries: &[(u64, &str)],
+    ) -> RetainedStream {
+        let mut c = HistoryCursor::new(root, HistoryStream::Comments, cutoff, 100, 1_000);
+        let mut h = PageHarness::new();
+        let mut page = h.open(&mut c).await;
+        for (ts, marker) in entries {
+            page.observe(row(comment_on(root, *ts, marker)).await);
+        }
+        expect_complete(complete_opened(&mut c, &mut h, page))
+    }
+
+    async fn completed_updates_from(
+        root: &str,
+        cutoff: u64,
+        entries: &[(u64, &str)],
+    ) -> RetainedStream {
+        let mut c = HistoryCursor::new(root, HistoryStream::PullRequestUpdates, cutoff, 100, 1_000);
+        let mut h = PageHarness::new();
+        let mut page = h.open(&mut c).await;
+        for (ts, marker) in entries {
+            page.observe(row(pr_update_on(root, *ts, marker)).await);
+        }
+        expect_complete(complete_opened(&mut c, &mut h, page))
+    }
+
+    async fn completed_comments(root: &str, entries: &[(u64, &str)]) -> RetainedStream {
+        completed_comments_from(root, SNAPSHOT, entries).await
+    }
+
+    async fn completed_updates(root: &str, entries: &[(u64, &str)]) -> RetainedStream {
+        completed_updates_from(root, SNAPSHOT, entries).await
+    }
+
+    #[tokio::test]
+    async fn a_merge_puts_the_root_first_then_orders_by_time_and_id() {
+        let (bound, root_id) = bound_root(KIND_GIT_PULL_REQUEST).await;
+        let comments = completed_comments(&root_id, &[(900, "c1"), (880, "c2")]).await;
+        let updates = completed_updates(&root_id, &[(890, "r1")]).await;
+
+        let merged =
+            merge_completed_streams(&bound, SNAPSHOT, vec![comments, updates]).expect("merges");
+
+        assert_eq!(merged.len(), 4);
+        assert_eq!(merged.root(), root_id);
+        assert_eq!(
+            merged.cutoff(),
+            SNAPSHOT,
+            "the output names the snapshot every stream was checked against"
+        );
+        assert_eq!(
+            merged.rows()[0].id(),
+            root_id,
+            "the root leads because it is the root, not because it is oldest"
+        );
+        assert_eq!(stamps_of(&merged.rows()[1..]), vec![880, 890, 900]);
+    }
+
+    #[tokio::test]
+    async fn a_merge_breaks_same_second_ties_on_event_id() {
+        let (bound, root_id) = bound_root(KIND_GIT_ISSUE).await;
+        let comments = completed_comments(&root_id, &[(900, "a"), (900, "b"), (900, "c")]).await;
+
+        let merged = merge_completed_streams(&bound, SNAPSHOT, vec![comments]).expect("merges");
+        let tail = ids_of(&merged.rows()[1..]);
+        let mut sorted = tail.clone();
+        sorted.sort();
+        assert_eq!(tail, sorted, "one order, not whichever was visited first");
+    }
+
+    #[tokio::test]
+    async fn a_merge_refuses_until_every_required_stream_has_completed() {
+        // A `1618` root merged from its comments alone would produce a
+        // well-ordered, entirely plausible history with every revision missing.
+        let (bound, root_id) = bound_root(KIND_GIT_PULL_REQUEST).await;
+        let comments = completed_comments(&root_id, &[(900, "c1")]).await;
+        let err = merge_completed_streams(&bound, SNAPSHOT, vec![comments]).expect_err("refuses");
+        assert!(err.contains("PullRequestUpdates"), "{err}");
+
+        // The same root merges once the second stream has completed too.
+        let comments = completed_comments(&root_id, &[(900, "c1")]).await;
+        let updates = completed_updates(&root_id, &[(890, "r1")]).await;
+        assert_eq!(
+            merge_completed_streams(&bound, SNAPSHOT, vec![comments, updates])
+                .expect("merges")
+                .len(),
+            3
+        );
+    }
+
+    #[tokio::test]
+    async fn a_merge_refuses_a_stream_paginated_for_another_root() {
+        let (bound, root_id) = bound_root(KIND_GIT_ISSUE).await;
+        let foreign = completed_comments(OTHER_ROOT, &[(900, "c1")]).await;
+        let err = merge_completed_streams(&bound, SNAPSHOT, vec![foreign]).expect_err("refuses");
+        assert!(err.contains(OTHER_ROOT), "{err}");
+        assert!(err.contains(&root_id), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_merge_refuses_a_duplicated_stream() {
+        // Two Comments streams would double every comment while satisfying any
+        // "all required streams present" check written as a subset test.
+        let (bound, root_id) = bound_root(KIND_GIT_ISSUE).await;
+        let one = completed_comments(&root_id, &[(900, "c1")]).await;
+        let two = completed_comments(&root_id, &[(900, "c1")]).await;
+        let err = merge_completed_streams(&bound, SNAPSHOT, vec![one, two]).expect_err("refuses");
+        assert!(err.contains("requires exactly"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_merge_cannot_be_handed_a_stream_that_did_not_complete() {
+        // Structural, not documentary: `RetainedStream` has no constructor
+        // outside `mod history`, and the only expression that produces one is
+        // `PageOutcome::Complete`. A degraded or still-paginating cursor
+        // therefore has nothing to pass to `merge_completed_streams`.
+        let (bound, root_id) = bound_root(KIND_GIT_ISSUE).await;
+        let mut c = HistoryCursor::new(&root_id, HistoryStream::Comments, 1_000, 2, 1_000);
+        let mut h = PageHarness::new();
+        let mut page = h.open(&mut c).await;
+        page.observe_unusable("frame was not parseable as an event");
+        let (_reason, rows) = expect_degraded(complete_opened(&mut c, &mut h, page));
+        assert!(rows.is_empty());
+
+        // The only thing that can be merged is a stream that completed.
+        let comments = completed_comments(&root_id, &[(900, "c1")]).await;
+        assert_eq!(
+            merge_completed_streams(&bound, SNAPSHOT, vec![comments])
+                .expect("merges")
+                .len(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn a_merge_refuses_streams_paginated_from_different_cutoffs() {
+        // Both streams completed, both belong to this root, both are of the
+        // required classes — and together they describe two different
+        // snapshots. Everything in 501..=1_000 that was a PR update is absent,
+        // and nothing in the merged result says so. A tidy, deterministic lie.
+        let (bound, root_id) = bound_root(KIND_GIT_PULL_REQUEST).await;
+        let comments = completed_comments_from(&root_id, 1_000, &[(900, "c1")]).await;
+        let updates = completed_updates_from(&root_id, 500, &[(400, "r1")]).await;
+
+        let err =
+            merge_completed_streams(&bound, 1_000, vec![comments, updates]).expect_err("refuses");
+        assert!(err.contains("PullRequestUpdates"), "{err}");
+        assert!(err.contains("500"), "{err}");
+        assert!(err.contains("1000"), "{err}");
+
+        // Paginated from one snapshot, it merges.
+        let comments = completed_comments_from(&root_id, 1_000, &[(900, "c1")]).await;
+        let updates = completed_updates_from(&root_id, 1_000, &[(890, "r1")]).await;
+        assert_eq!(
+            merge_completed_streams(&bound, 1_000, vec![comments, updates])
+                .expect("merges")
+                .cutoff(),
+            1_000
+        );
+    }
+
+    #[tokio::test]
+    async fn a_single_stream_root_still_has_to_match_the_selected_cutoff() {
+        // A one-stream root has nothing to disagree with, so the check has to
+        // be against the reconstruction's own cutoff rather than against a
+        // sibling. Otherwise a driver cannot tell a stream of the snapshot it
+        // chose from a stream of an earlier one it has forgotten about.
+        let (bound, root_id) = bound_root(KIND_GIT_ISSUE).await;
+        let stale = completed_comments_from(&root_id, 500, &[(400, "c1")]).await;
+        let err = merge_completed_streams(&bound, 1_000, vec![stale]).expect_err("refuses");
+        assert!(err.contains("Comments"), "{err}");
+        assert!(err.contains("500"), "{err}");
+
+        let current = completed_comments_from(&root_id, 1_000, &[(900, "c1")]).await;
+        assert_eq!(
+            merge_completed_streams(&bound, 1_000, vec![current])
+                .expect("merges")
+                .cutoff(),
+            1_000
+        );
+    }
+
+    #[tokio::test]
+    async fn a_completed_stream_remembers_the_cutoff_it_was_opened_against() {
+        // `until` moves as pages are consumed; `cutoff` must not, or there is
+        // nothing left for the merge to check by the time a stream completes.
+        let mut c = HistoryCursor::new(ROOT, HistoryStream::Comments, 1_000, 2, 1_000);
+        assert_eq!(c.cutoff(), 1_000);
+        assert_eq!(
+            expect_continue(run_page(&mut c, &[(900, "a"), (880, "b")]).await),
+            (880, 2)
+        );
+        assert_eq!(c.until(), 880, "pagination has moved");
+        assert_eq!(c.cutoff(), 1_000, "the snapshot boundary has not");
+
+        let retained = expect_complete(run_page(&mut c, &[(870, "c")]).await);
+        assert_eq!(retained.cutoff(), 1_000);
+    }
+
+    #[tokio::test]
+    async fn degraded_rows_are_metadata_and_carry_no_replayable_witness() {
+        // The previous version handed out `&[VerifiedProjectEvent]` crate-wide,
+        // and those witnesses clone: a caller could copy them straight into a
+        // fold without ever building a `RetainedStream`. Being unable to reach
+        // the history type only ever closed one route. Now the witnesses are
+        // described and dropped at the boundary, so what survives a failure is
+        // a `DiagnosticRow` — ids, kinds and timestamps — which no authority
+        // function accepts.
+        // A one-row page against a one-row limit is saturated, so the cursor
+        // holds the row rather than completing on it.
+        let mut c = cursor(1_000, 1, 1_000);
+        let held = comment_at(900, "a");
+        assert_eq!(
+            expect_continue(run_page_with(&mut c, std::slice::from_ref(&held)).await),
+            (1_000, 4)
+        );
+
+        let mut h = PageHarness::new();
+        let mut page = h.open(&mut c).await;
+        page.observe_unusable("frame was not parseable as an event");
+        let (_reason, rows) = expect_degraded(complete_opened(&mut c, &mut h, page));
+
+        assert_eq!(
+            rows.rows(),
+            &[DiagnosticRow {
+                id: held.id.to_hex(),
+                kind: KIND_TEXT_NOTE,
+                created_at: 900,
+            }]
+        );
+    }
+
+    // ── One cursor per exact filter ──────────────────────────────────────────
+
+    #[test]
+    fn the_root_is_not_an_exhaustible_stream() {
+        // An exact-id query returning zero rows would satisfy "exhausted"
+        // while proving no root exists — no root author, no binding, no class.
+        // The root is a required object, proven by `VerifiedBoundRoot`.
+        assert_eq!(
+            HistoryStream::required_for(false),
+            &[HistoryStream::Comments]
+        );
+        assert_eq!(
+            HistoryStream::required_for(true),
+            &[HistoryStream::Comments, HistoryStream::PullRequestUpdates]
+        );
     }
 
     #[test]
-    fn candidate_accessors_report_what_validation_established() {
-        let c = candidate_at(ROOT, &coord(), true);
-        assert_eq!(c.root(), ROOT);
-        assert_eq!(c.coordinate(), coord());
-        assert!(c.is_pull_request());
+    fn a_cursor_knows_which_stream_it_proves() {
+        let c = HistoryCursor::new(ROOT, HistoryStream::PullRequestUpdates, 1_000, 10, 1_000);
+        assert_eq!(c.stream(), HistoryStream::PullRequestUpdates);
+    }
+
+    // ── Addressing resolution ────────────────────────────────────────────────
+
+    /// This agent. Distinct from `STRANGER`, which happens to share this value
+    /// elsewhere in the module — a collision that made an earlier version of
+    /// `a_novel_bare_p_on_complete_live_history_is_explicit` fail, because the
+    /// "unrelated root author" *was* the agent and the structural-presence rule
+    /// correctly fired.
+    const AGENT_PK: &str = "222b9658e0e4945cbca51ffa8d364a178a02e349d79847e9282e6ee1306a00ce";
+    /// A third party who is neither the agent, the owner, nor a participant.
+    const THIRD_PARTY: &str = "1111111111111111111111111111111111111111111111111111111111111111";
+
+    fn agent_identity() -> AgentIdentity {
+        AgentIdentity::new(&nostr::PublicKey::parse(AGENT_PK).expect("pubkey")).expect("identity")
+    }
+
+    fn prior(participant: bool, root_author: &str, owner: &str) -> PriorRootFacts {
+        PriorRootFacts::for_test(participant, root_author, owner, RootState::Active)
+    }
+
+    fn watched() -> ProjectSubscription {
+        ProjectSubscription::Watched { generation: 0 }
+    }
+
+    fn addressing(
+        source: &ProjectSubscription,
+        evidence: AddressingEvidence,
+        readiness: &RootHistoryReadiness,
+        facts: Option<&PriorRootFacts>,
+    ) -> Option<Addressing> {
+        resolve_addressing(source, &evidence, readiness, facts, &agent_identity())
+    }
+
+    #[test]
+    fn no_p_tag_on_a_watched_subscription_means_watched_root() {
+        assert_eq!(
+            addressing(
+                &watched(),
+                AddressingEvidence::for_test(false, false),
+                &RootHistoryReadiness::Complete,
+                Some(&prior(false, THIRD_PARTY, OWNER)),
+            ),
+            Some(Addressing::WatchedRoot)
+        );
+    }
+
+    #[test]
+    fn an_enrolment_event_without_a_matching_p_is_refused() {
+        // It was selected by a `#p` filter and does not carry a matching `p`:
+        // the relay is broken or lying. Inventing `WatchedRoot` for it would be
+        // treating a filter as authority.
+        assert_eq!(
+            addressing(
+                &ProjectSubscription::Enrolment,
+                AddressingEvidence::for_test(false, false),
+                &RootHistoryReadiness::Complete,
+                Some(&prior(false, THIRD_PARTY, OWNER)),
+            ),
+            None,
+            "even from an authorised human, this must not enrol or wake"
+        );
+    }
+
+    #[test]
+    fn discovery_never_reaches_addressing() {
+        assert_eq!(
+            addressing(
+                &ProjectSubscription::Discovery,
+                AddressingEvidence::for_test(true, true),
+                &RootHistoryReadiness::Complete,
+                Some(&prior(false, THIRD_PARTY, OWNER)),
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn a_novel_bare_p_on_complete_history_is_explicit() {
+        assert_eq!(
+            addressing(
+                &watched(),
+                AddressingEvidence::for_test(true, false),
+                &RootHistoryReadiness::Complete,
+                Some(&prior(false, THIRD_PARTY, OWNER)),
+            ),
+            Some(Addressing::ExplicitMention)
+        );
+    }
+
+    #[test]
+    fn a_bare_p_is_never_explicit_without_complete_history() {
+        // "Not seen before" is meaningless when we have not finished looking.
+        for readiness in [
+            RootHistoryReadiness::Unknown,
+            RootHistoryReadiness::Reconstructing,
+            RootHistoryReadiness::Degraded("breaker tripped".into()),
+        ] {
+            assert_eq!(
+                addressing(
+                    &watched(),
+                    AddressingEvidence::for_test(true, false),
+                    &readiness,
+                    Some(&prior(false, THIRD_PARTY, OWNER)),
+                ),
+                Some(Addressing::InheritedParticipant),
+                "{readiness:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_already_present_participant_stays_inherited() {
+        assert_eq!(
+            addressing(
+                &watched(),
+                AddressingEvidence::for_test(true, false),
+                &RootHistoryReadiness::Complete,
+                Some(&prior(true, THIRD_PARTY, OWNER)),
+            ),
+            Some(Addressing::InheritedParticipant)
+        );
+    }
+
+    #[test]
+    fn structural_presence_as_owner_or_root_author_is_not_intent() {
+        // Desktop puts both in `p` on every comment, so their appearance says
+        // nothing about whether anyone addressed the agent.
+        assert_eq!(
+            addressing(
+                &watched(),
+                AddressingEvidence::for_test(true, false),
+                &RootHistoryReadiness::Complete,
+                Some(&prior(false, AGENT_PK, OWNER)),
+            ),
+            Some(Addressing::InheritedParticipant),
+            "agent is the root author"
+        );
+        assert_eq!(
+            addressing(
+                &watched(),
+                AddressingEvidence::for_test(true, false),
+                &RootHistoryReadiness::Complete,
+                Some(&prior(false, THIRD_PARTY, AGENT_PK)),
+            ),
+            Some(Addressing::InheritedParticipant),
+            "agent is the repository owner"
+        );
+    }
+
+    #[test]
+    fn a_visible_mention_is_explicit_even_for_an_existing_participant() {
+        assert_eq!(
+            addressing(
+                &watched(),
+                AddressingEvidence::for_test(true, true),
+                &RootHistoryReadiness::Complete,
+                Some(&prior(true, THIRD_PARTY, OWNER)),
+            ),
+            Some(Addressing::ExplicitMention)
+        );
+    }
+
+    #[test]
+    fn visible_text_without_the_matching_p_tag_is_not_addressing() {
+        assert_eq!(
+            addressing(
+                &watched(),
+                AddressingEvidence::for_test(false, true),
+                &RootHistoryReadiness::Complete,
+                Some(&prior(false, THIRD_PARTY, OWNER)),
+            ),
+            Some(Addressing::WatchedRoot)
+        );
+    }
+
+    // ── Mention syntax, with token boundaries ────────────────────────────────
+
+    async fn evidence_for(content: &str) -> AddressingEvidence {
+        let keys = Keys::generate();
+        let event = EventBuilder::new(Kind::Custom(KIND_TEXT_NOTE as u16), content)
+            .tags([nostr::Tag::parse(tag(&["p", AGENT_PK])).unwrap()])
+            .sign_with_keys(&keys)
+            .expect("sign");
+        let verified = VerifiedProjectEvent::verify(event).await.expect("valid");
+        AddressingEvidence::resolve(&verified, &agent_identity())
+    }
+
+    /// This agent's npub. Asserted against the derived form in
+    /// `the_test_npub_matches_the_derived_identity`, so a stale literal cannot
+    /// quietly make every mention test vacuous — the same failure mode as the
+    /// `STRANGER` collision earlier in this module.
+    const AGENT_NPUB: &str = "npub1yg4evk8quj29e099rlag6dj2z79q9c6f67vy06fg9ehwzvr2qr8qw26j58";
+
+    #[test]
+    fn the_test_npub_matches_the_derived_identity() {
+        // Without this, a stale literal would make every npub mention test
+        // silently assert nothing.
+        assert_eq!(agent_identity().npub(), AGENT_NPUB);
+        assert_eq!(agent_identity().hex(), AGENT_PK);
+    }
+
+    #[tokio::test]
+    async fn accepted_mention_forms_are_recognised() {
+        for content in [
+            format!("nostr:{AGENT_NPUB} please look"),
+            format!("@{AGENT_NPUB} please look"),
+            format!("nostr:{AGENT_PK} please look"),
+            format!("@{AGENT_PK} please look"),
+            format!("(see nostr:{AGENT_NPUB})"),
+            format!("ping @{AGENT_PK}."),
+        ] {
+            assert!(
+                evidence_for(&content).await.visible_mention,
+                "should recognise: {content}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn bare_identity_in_prose_or_payload_is_not_a_mention() {
+        // The defect this replaces: an authorised human quoting a key in
+        // diagnostics could reactivate a dormant agent whose inherited `p` was
+        // already present.
+        for content in [
+            format!("the pubkey is {AGENT_PK}"),
+            format!("{{\"pubkey\":\"{AGENT_PK}\"}}"),
+            format!("see {AGENT_NPUB} in the logs"),
+            format!("author={AGENT_PK}"),
+        ] {
+            assert!(
+                !evidence_for(&content).await.visible_mention,
+                "should NOT recognise: {content}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_identity_inside_a_longer_token_is_not_a_mention() {
+        // The defect the previous continuation rule missed: `g` is not a hex
+        // digit, but `@<hex>garbage` is plainly still one token. Termination is
+        // lexical, not alphabet-specific.
+        for content in [
+            format!("@{AGENT_PK}garbage"),
+            format!("nostr:{AGENT_PK}suffix"),
+            format!("@{AGENT_PK}ab"),
+            format!("@{AGENT_NPUB}qqqq"),
+            format!("nostr:{AGENT_NPUB}x7"),
+            format!("@{AGENT_PK}_1"),
+        ] {
+            assert!(
+                !evidence_for(&content).await.visible_mention,
+                "should NOT recognise: {content}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_prefix_inside_a_larger_token_is_not_a_mention() {
+        // The leading boundary. Finding `@` or `nostr:` immediately before the
+        // identity is not enough — the prefix itself must start a token.
+        for content in [
+            format!("prefix@{AGENT_PK}"),
+            format!("xnostr:{AGENT_NPUB}"),
+            format!("email_address@{AGENT_PK}"),
+        ] {
+            assert!(
+                !evidence_for(&content).await.visible_mention,
+                "should NOT recognise: {content}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn punctuation_and_whitespace_terminate_a_mention() {
+        for content in [
+            format!("(@{AGENT_PK})"),
+            format!("see nostr:{AGENT_NPUB}, please"),
+            format!("nostr:{AGENT_NPUB}."),
+            format!("[@{AGENT_PK}]"),
+            format!("nostr:{AGENT_NPUB}"),
+        ] {
+            assert!(
+                evidence_for(&content).await.visible_mention,
+                "should recognise: {content}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_display_name_in_content_is_not_a_visible_mention() {
+        // `content.contains("@Claude")` would let any author invoke any agent
+        // by typing its display name. Display names are neither unique nor
+        // owned.
+        let evidence = evidence_for("hey @Claude look").await;
+        assert!(evidence.p_tag_present);
+        assert!(!evidence.visible_mention);
+    }
+
+    #[tokio::test]
+    async fn a_genuine_mention_after_prose_is_still_found() {
+        // Scanning must not stop at the first non-qualifying occurrence.
+        let content = format!("logs show {AGENT_PK} — anyway, nostr:{AGENT_NPUB} please look");
+        assert!(evidence_for(&content).await.visible_mention);
+    }
+
+    #[tokio::test]
+    async fn a_mention_without_a_matching_p_tag_is_not_addressing() {
+        // Bound together: naming an agent the event did not address is not an
+        // invocation. Resolution happens through `resolve_addressing`.
+        let keys = Keys::generate();
+        let event = EventBuilder::new(
+            Kind::Custom(KIND_TEXT_NOTE as u16),
+            format!("nostr:{AGENT_NPUB} look"),
+        )
+        .tags([nostr::Tag::parse(tag(&["p", THIRD_PARTY])).unwrap()])
+        .sign_with_keys(&keys)
+        .expect("sign");
+        let verified = VerifiedProjectEvent::verify(event).await.expect("valid");
+        let evidence = AddressingEvidence::resolve(&verified, &agent_identity());
+
+        assert!(evidence.visible_mention);
+        assert!(!evidence.p_tag_present);
+        assert_eq!(
+            resolve_addressing(
+                &watched(),
+                &evidence,
+                &RootHistoryReadiness::Complete,
+                Some(&prior(false, THIRD_PARTY, OWNER)),
+                &agent_identity(),
+            ),
+            Some(Addressing::WatchedRoot)
+        );
+    }
+
+    // ── Seeding requires a validated binding ─────────────────────────────────
+
+    #[tokio::test]
+    async fn a_root_cannot_be_bound_to_a_repository_it_does_not_claim() {
+        // The exact former counterexample: repository A is discovered, the
+        // signed root claims repository B. Under the old decomposed signature a
+        // caller could reuse the root's genuine id and kind while supplying
+        // tags naming A. There is now no API path that does that — the
+        // validator and `VerifiedBoundRoot` both read the `a` tag from the same
+        // witness they are validating.
+        let discovered_a = coord();
+        let claimed_b = format!("30617:{THIRD_PARTY}:their-repo");
+
+        let keys = Keys::generate();
+        let root = signed(&keys, KIND_GIT_ISSUE, vec![tag(&["a", &claimed_b])]);
+        let root = VerifiedProjectEvent::verify(root).await.expect("valid");
+
+        let only_a = known(&[&discovered_a]);
+        assert!(
+            validate_enrolment_candidate(&root, &only_a).is_none(),
+            "a root claiming an undiscovered repository does not validate"
+        );
+        assert!(
+            VerifiedBoundRoot::prove(std::slice::from_ref(&root), &only_a).is_none(),
+            "and cannot be bound to the discovered one either"
+        );
+
+        // Discovering B does let it through — the refusal is about the claim
+        // matching the discovered set, not about rejecting everything.
+        let both = known(&[&discovered_a, &claimed_b]);
+        let bound = VerifiedBoundRoot::prove(std::slice::from_ref(&root), &both)
+            .expect("a root claiming a discovered repository binds");
+        assert_eq!(bound.binding().coordinate(), claimed_b);
+        assert_ne!(bound.binding().coordinate(), discovered_a);
+    }
+
+    #[tokio::test]
+    async fn proving_a_root_refuses_a_non_root_kind() {
+        let keys = Keys::generate();
+        let comment = signed(&keys, KIND_TEXT_NOTE, vec![tag(&["a", &coord()])]);
+        let comment = VerifiedProjectEvent::verify(comment).await.expect("valid");
+        assert!(
+            VerifiedBoundRoot::prove(std::slice::from_ref(&comment), &known(&[&coord()])).is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn proving_a_root_refuses_zero_or_conflicting_candidates() {
+        // The false-complete this closes: an empty result satisfying an
+        // exhaustion test while proving nothing exists.
+        let keys = Keys::generate();
+        let root = signed(&keys, KIND_GIT_ISSUE, vec![tag(&["a", &coord()])]);
+        let root = VerifiedProjectEvent::verify(root).await.expect("valid");
+        let d = known(&[&coord()]);
+
+        assert!(VerifiedBoundRoot::prove(&[], &d).is_none(), "zero roots");
+        assert!(
+            VerifiedBoundRoot::prove(&[root.clone(), root.clone()], &d).is_none(),
+            "conflicting rows"
+        );
+        assert!(VerifiedBoundRoot::prove(std::slice::from_ref(&root), &d).is_some());
+    }
+
+    #[tokio::test]
+    async fn seeding_takes_the_owner_from_the_proven_binding() {
+        let keys = Keys::generate();
+        let root = signed(&keys, KIND_GIT_ISSUE, vec![tag(&["a", &coord()])]);
+        let root = VerifiedProjectEvent::verify(root).await.expect("valid");
+        let bound = VerifiedBoundRoot::prove(std::slice::from_ref(&root), &known(&[&coord()]))
+            .expect("proves");
+
+        let facts = PriorRootFacts::seed(&bound);
+        assert_eq!(facts.repository_owner(), OWNER);
+        assert_eq!(facts.root_author(), keys.public_key().to_hex());
+        assert!(!facts.agent_was_participant());
     }
 
     // ── Root to repository binding is immutable ──────────────────────────────
@@ -2457,5 +9366,2115 @@ mod tests {
             100,
         );
         assert!(frames.is_empty());
+    }
+
+    // ── Recovered from 0e5f20ae ──────────────────────────────────────────────
+    //
+    // Restored verbatim from the approved commit rather than rewritten from
+    // memory. Signatures that changed since are adapted below; the assertions
+    // and fixtures are the originals.
+
+    #[tokio::test]
+    async fn a_caller_cannot_hand_the_validator_a_fabricated_repository_set() {
+        // Private candidate fields close struct-literal forgery; this closes
+        // validator-assisted forgery. With no production insertion method, a
+        // freshly built `DiscoveredRepositories` admits nothing.
+        let fabricated = format!("30617:{STRANGER}:looks-plausible");
+        assert!(validate_enrolment_candidate(
+            &verified_with(KIND_GIT_ISSUE, &tags(&[&["a", &fabricated]])).await,
+            &DiscoveredRepositories::new(),
+        )
+        .is_none());
+    }
+
+    #[tokio::test]
+    async fn a_discovered_issue_root_is_a_valid_candidate() {
+        let event =
+            verified_with(KIND_GIT_ISSUE, &tags(&[&["a", &coord()], &["p", STRANGER]])).await;
+        let c = validate_enrolment_candidate(&event, &known(&[&coord()])).expect("should validate");
+        // The root id comes from the event, not from a caller-chosen constant —
+        // that substitution is what the witness-based signature removed.
+        assert_eq!(c.root(), event.id());
+        assert_eq!(c.coordinate(), coord());
+        assert!(!c.is_pull_request());
+    }
+
+    #[tokio::test]
+    async fn a_malformed_coordinate_poisons_a_later_valid_one() {
+        // Two `a` tags is ambiguous regardless, but the malformed-first
+        // ordering is the one where a sloppy scan would skip and accept.
+        let k = known(&[&coord()]);
+        assert!(validate_enrolment_candidate(
+            &verified_with(KIND_GIT_ISSUE, &tags(&[&["a"], &["a", &coord()]])).await,
+            &k,
+        )
+        .is_none());
+        assert!(validate_enrolment_candidate(
+            &verified_with(KIND_GIT_ISSUE, &tags(&[&["a", ""], &["a", &coord()]])).await,
+            &k,
+        )
+        .is_none());
+    }
+
+    #[tokio::test]
+    async fn a_pull_request_root_is_marked_as_one() {
+        let c = validate_enrolment_candidate(
+            &verified_with(KIND_GIT_PULL_REQUEST, &tags(&[&["a", &coord()]])).await,
+            &known(&[&coord()]),
+        )
+        .expect("should validate");
+        assert!(c.is_pull_request);
+    }
+
+    #[test]
+    fn a_result_from_a_non_agent_author_is_a_forged_correlation() {
+        assert_eq!(
+            comment(
+                ProjectAuthor::Untrusted,
+                CallMarker::Result,
+                RootState::Active,
+                Addressing::ExplicitMention,
+            ),
+            ProjectEffect::UntrustedContext
+        );
+        assert_eq!(
+            comment(
+                ProjectAuthor::AuthorisedHuman,
+                CallMarker::Result,
+                RootState::Active,
+                Addressing::ExplicitMention,
+            ),
+            ProjectEffect::Ignore
+        );
+    }
+
+    /// A `CallMarker::Result` is only meaningful on the surface-native result
+    /// kind — currently a trusted-agent kind-`1` comment. On any other class it
+    /// must not promote the event into a call resumption, because that would
+    /// route around the locked rules that `1630`-`1633` are lifecycle-only and
+    /// `1619` is context-only.
+    #[test]
+    fn a_result_marker_never_resumes_a_lifecycle_event() {
+        for authorised in [true, false] {
+            let out = classify_project_event(
+                KindEffect::Lifecycle,
+                ProjectAuthor::TrustedAgent,
+                CallMarker::Result,
+                RootState::Active,
+                Addressing::ExplicitMention,
+                authorised,
+            );
+            assert_ne!(out, ProjectEffect::ResumeCall);
+            assert_eq!(
+                out,
+                if authorised {
+                    ProjectEffect::ApplyLifecycle
+                } else {
+                    ProjectEffect::Ignore
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn a_result_marker_never_resumes_a_pr_update() {
+        let out = classify_project_event(
+            KindEffect::ContextRefresh,
+            ProjectAuthor::TrustedAgent,
+            CallMarker::Result,
+            RootState::Active,
+            Addressing::ExplicitMention,
+            false,
+        );
+        assert_ne!(out, ProjectEffect::ResumeCall);
+        assert_eq!(out, ProjectEffect::RefreshContext);
+    }
+
+    #[test]
+    fn a_result_marker_never_resumes_a_root() {
+        // A `1621`/`1618` root is never a call result; the marker is malformed.
+        let out = classify_project_event(
+            KindEffect::Root,
+            ProjectAuthor::TrustedAgent,
+            CallMarker::Result,
+            RootState::Unknown,
+            Addressing::ExplicitMention,
+            false,
+        );
+        assert_ne!(out, ProjectEffect::ResumeCall);
+        assert_eq!(out, ProjectEffect::Ignore);
+    }
+
+    #[test]
+    fn a_result_marker_never_resumes_an_ignored_kind() {
+        let out = classify_project_event(
+            KindEffect::Ignore,
+            ProjectAuthor::TrustedAgent,
+            CallMarker::Result,
+            RootState::Active,
+            Addressing::ExplicitMention,
+            true,
+        );
+        assert_ne!(out, ProjectEffect::ResumeCall);
+        assert_eq!(out, ProjectEffect::Ignore);
+    }
+
+    #[test]
+    fn a_root_enrols_only_on_an_explicit_mention() {
+        assert_eq!(
+            classify_project_event(
+                KindEffect::Root,
+                ProjectAuthor::AuthorisedHuman,
+                CallMarker::None,
+                RootState::Unknown,
+                Addressing::ExplicitMention,
+                false,
+            ),
+            ProjectEffect::EnrolAndWake
+        );
+        // Real case `48be1cc2…`: an issue with no `p` at all mentions nobody, so
+        // it enrols nobody and wakes nobody — and does not error.
+        assert_eq!(
+            classify_project_event(
+                KindEffect::Root,
+                ProjectAuthor::AuthorisedHuman,
+                CallMarker::None,
+                RootState::Unknown,
+                Addressing::WatchedRoot,
+                false,
+            ),
+            ProjectEffect::Ignore
+        );
+    }
+
+    #[tokio::test]
+    async fn a_root_with_two_a_tags_is_ambiguous_not_first_wins() {
+        // A forged root could otherwise smuggle a known coordinate past the
+        // gate while a second tag says something else entirely.
+        let k = known(&[&coord()]);
+        let other = format!("30617:{STRANGER}:elsewhere");
+        assert!(validate_enrolment_candidate(
+            &verified_with(KIND_GIT_ISSUE, &tags(&[&["a", &coord()], &["a", &other]])).await,
+            &k,
+        )
+        .is_none());
+        // Even two identical tags: ambiguity is about shape, not values.
+        assert!(validate_enrolment_candidate(
+            &verified_with(KIND_GIT_ISSUE, &tags(&[&["a", &coord()], &["a", &coord()]])).await,
+            &k,
+        )
+        .is_none());
+    }
+
+    #[tokio::test]
+    async fn a_value_less_or_empty_coordinate_is_rejected() {
+        let k = known(&[&coord()]);
+        // `["a"]` — the tag exists but carries no value at all.
+        assert!(validate_enrolment_candidate(
+            &verified_with(KIND_GIT_ISSUE, &tags(&[&["a"]])).await,
+            &k
+        )
+        .is_none(),);
+        // `["a", ""]` — present but empty. Rejected here rather than left to a
+        // membership check that only fails by luck.
+        assert!(validate_enrolment_candidate(
+            &verified_with(KIND_GIT_ISSUE, &tags(&[&["a", ""]])).await,
+            &k
+        )
+        .is_none(),);
+    }
+
+    #[test]
+    fn an_active_root_continues_without_re_tagging() {
+        // The regression test for the original Phase 1 gap: a follow-up comment
+        // does not tag the agent again, and must still reach the session.
+        for addressing in ALL_ADDRESSING {
+            assert_eq!(
+                comment(
+                    ProjectAuthor::AuthorisedHuman,
+                    CallMarker::None,
+                    RootState::Active,
+                    addressing,
+                ),
+                ProjectEffect::Wake,
+                "{addressing:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_explicit_re_tag_reactivates_a_dormant_root() {
+        assert_eq!(
+            comment(
+                ProjectAuthor::AuthorisedHuman,
+                CallMarker::None,
+                RootState::Dormant,
+                Addressing::ExplicitMention,
+            ),
+            ProjectEffect::EnrolAndWake
+        );
+    }
+
+    #[test]
+    fn an_explicit_re_tag_reactivates_through_enrol() {
+        let mut e = ProjectEnrolments::new();
+        e.enrol(&candidate(ROOT, false)).unwrap();
+        e.close(ROOT);
+        assert_eq!(
+            e.enrol(&candidate(ROOT, false)),
+            Ok(EnrolOutcome::Reactivated)
+        );
+        assert_eq!(e.state_of(ROOT), RootState::Active);
+        assert_eq!(e.dormant_count(), 0, "the root must leave the dormant set");
+    }
+
+    #[test]
+    fn an_inherited_p_tag_leaves_a_dormant_root_dormant() {
+        // The defect this classifier exists to contain: if any `p` on a closed
+        // root counted as a re-tag, every issue the agent ever touched would
+        // reanimate the moment someone commented on it.
+        for addressing in [Addressing::InheritedParticipant, Addressing::WatchedRoot] {
+            assert_eq!(
+                comment(
+                    ProjectAuthor::AuthorisedHuman,
+                    CallMarker::None,
+                    RootState::Dormant,
+                    addressing,
+                ),
+                ProjectEffect::Ignore,
+                "{addressing:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unknown_root_without_an_explicit_mention_does_not_enrol() {
+        // The enrolment REQ matches on `#p`, and Desktop copies every prior
+        // participant forward — so reaching us is not the same as being asked.
+        for addressing in [Addressing::InheritedParticipant, Addressing::WatchedRoot] {
+            assert_eq!(
+                comment(
+                    ProjectAuthor::AuthorisedHuman,
+                    CallMarker::None,
+                    RootState::Unknown,
+                    addressing,
+                ),
+                ProjectEffect::Ignore,
+                "{addressing:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn authorised_human_enrols_on_an_explicit_mention() {
+        assert_eq!(
+            comment(
+                ProjectAuthor::AuthorisedHuman,
+                CallMarker::None,
+                RootState::Unknown,
+                Addressing::ExplicitMention,
+            ),
+            ProjectEffect::EnrolAndWake
+        );
+    }
+
+    /// Self-suppression lives in the root/comment arms, not at the top of the
+    /// classifier. Suppressing self-authorship before the event class was read
+    /// also threw away the agent's own authorised state events, so an agent
+    /// that opened an issue and later closed it ignored its own `1632` and left
+    /// the watch active forever.
+    #[test]
+    fn authorised_self_authored_lifecycle_updates_state() {
+        assert_eq!(
+            classify_project_event(
+                KindEffect::Lifecycle,
+                ProjectAuthor::SelfAuthored,
+                CallMarker::None,
+                RootState::Active,
+                Addressing::WatchedRoot,
+                true,
+            ),
+            ProjectEffect::ApplyLifecycle
+        );
+    }
+
+    #[test]
+    fn call_result_resumes_and_never_invokes() {
+        for state in [RootState::Active, RootState::Unknown, RootState::Dormant] {
+            assert_eq!(
+                comment(
+                    ProjectAuthor::TrustedAgent,
+                    CallMarker::Result,
+                    state,
+                    Addressing::WatchedRoot,
+                ),
+                ProjectEffect::ResumeCall,
+                "{state:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn candidate_accessors_report_what_validation_established() {
+        let c = candidate_at(ROOT, &coord(), true);
+        assert_eq!(c.root(), ROOT);
+        assert_eq!(c.coordinate(), coord());
+        assert!(c.is_pull_request());
+    }
+
+    #[tokio::test]
+    async fn candidate_validation_fails_closed() {
+        let k = known(&[&coord()]);
+        // Not a root kind.
+        assert!(validate_enrolment_candidate(
+            &verified_with(KIND_TEXT_NOTE, &tags(&[&["a", &coord()]])).await,
+            &k,
+        )
+        .is_none());
+        // No `a` tag at all — the real `48be1cc2…` shape. Enrols nobody, no error.
+        assert!(validate_enrolment_candidate(
+            &verified_with(KIND_GIT_ISSUE, &tags(&[&["subject", "hi"]])).await,
+            &k,
+        )
+        .is_none());
+        // Malformed coordinate.
+        assert!(validate_enrolment_candidate(
+            &verified_with(KIND_GIT_ISSUE, &tags(&[&["a", "nonsense"]])).await,
+            &k,
+        )
+        .is_none());
+        // Well-formed but never announced: an `a` tag is an unauthenticated claim.
+        let other = format!("30617:{STRANGER}:elsewhere");
+        assert!(validate_enrolment_candidate(
+            &verified_with(KIND_GIT_ISSUE, &tags(&[&["a", &other]])).await,
+            &k,
+        )
+        .is_none());
+        // Nothing discovered yet ⇒ nothing enrollable.
+        assert!(validate_enrolment_candidate(
+            &verified_with(KIND_GIT_ISSUE, &tags(&[&["a", &coord()]])).await,
+            &DiscoveredRepositories::new(),
+        )
+        .is_none());
+        // The old "malformed root id" case is deliberately absent: the id now
+        // comes from the verified event, so an ill-formed one is not
+        // representable at this boundary at all. A case that can no longer be
+        // constructed is stronger than one that is rejected — but it must not
+        // be left asserting `is_none()` against a perfectly valid event, which
+        // is how it failed when the signature changed.
+    }
+
+    #[test]
+    fn close_and_reopen_are_no_ops_in_the_wrong_state() {
+        let mut e = ProjectEnrolments::new();
+        assert!(!e.close(ROOT), "closing an unknown root changes nothing");
+        assert!(!e.reopen(ROOT), "reopening an unknown root changes nothing");
+        e.enrol(&candidate(ROOT, false)).unwrap();
+        assert!(!e.reopen(ROOT), "reopening an active root changes nothing");
+        e.close(ROOT);
+        assert!(!e.close(ROOT), "closing a dormant root changes nothing");
+    }
+
+    #[test]
+    fn close_then_reopen_round_trips_and_stays_subscribed() {
+        let mut e = ProjectEnrolments::new();
+        e.enrol(&candidate(ROOT, false)).unwrap();
+
+        assert!(e.close(ROOT));
+        assert_eq!(e.state_of(ROOT), RootState::Dormant);
+        // The whole point of the dormant set: still in the `#e` filter, so the
+        // reopen that revives the watch is actually observable.
+        assert!(
+            e.all_roots().contains(&ROOT.to_string()),
+            "a dormant root must remain subscribed or reopen can never arrive"
+        );
+
+        assert!(e.reopen(ROOT));
+        assert_eq!(e.state_of(ROOT), RootState::Active);
+    }
+
+    #[test]
+    fn comments_and_pr_updates_require_a_matching_coordinate() {
+        for kind in [KIND_TEXT_NOTE, KIND_GIT_PR_UPDATE] {
+            assert!(
+                follow_up_coordinate_allowed(
+                    kind,
+                    &coordinate_claim(&tags(&[&["a", &coord()]])),
+                    &coord()
+                ),
+                "kind {kind} with the right coordinate"
+            );
+            // Both builders always emit `a`, so absence is malformed here.
+            assert!(
+                !follow_up_coordinate_allowed(
+                    kind,
+                    &coordinate_claim(&tags(&[&["e", ROOT]])),
+                    &coord()
+                ),
+                "kind {kind} must not be admitted on an `#e` match alone"
+            );
+            let other = format!("30617:{STRANGER}:elsewhere");
+            assert!(
+                !follow_up_coordinate_allowed(
+                    kind,
+                    &coordinate_claim(&tags(&[&["a", &other]])),
+                    &coord()
+                ),
+                "kind {kind} may not move its root to another project"
+            );
+        }
+    }
+
+    #[test]
+    fn coordinate_allows_colons_in_the_identifier() {
+        assert_eq!(
+            normalise_coordinate(&format!("30617:{OWNER}:a:b")),
+            Some(format!("30617:{OWNER}:a:b"))
+        );
+    }
+
+    #[test]
+    fn coordinate_fails_closed() {
+        // Wrong kind, bad owner, missing or empty identifier, padding.
+        assert_eq!(normalise_coordinate(&format!("30618:{OWNER}:r")), None);
+        assert_eq!(normalise_coordinate("30617:short:r"), None);
+        assert_eq!(normalise_coordinate(&format!("30617:{OWNER}")), None);
+        assert_eq!(normalise_coordinate(&format!("30617:{OWNER}:")), None);
+        assert_eq!(normalise_coordinate(&format!("30617: {OWNER}:r")), None);
+        assert_eq!(normalise_coordinate(""), None);
+    }
+
+    #[test]
+    fn coordinate_normalises_and_lowercases_owner() {
+        assert_eq!(
+            normalise_coordinate(&format!("30617:{}:my-repo", OWNER.to_ascii_uppercase())),
+            Some(format!("30617:{OWNER}:my-repo"))
+        );
+    }
+
+    #[test]
+    fn discovered_repositories_starts_empty_in_production() {
+        let d = DiscoveredRepositories::new();
+        assert!(d.is_empty());
+        assert_eq!(d.len(), 0);
+        assert!(!d.contains(&coord()));
+        assert_eq!(d.iter().count(), 0);
+    }
+
+    #[test]
+    fn duplicate_coordinates_are_rejected_for_every_event_class() {
+        for kind in [
+            KIND_TEXT_NOTE,
+            KIND_GIT_PR_UPDATE,
+            KIND_GIT_STATUS_OPEN,
+            KIND_GIT_STATUS_CLOSED,
+        ] {
+            assert!(
+                !follow_up_coordinate_allowed(
+                    kind,
+                    &coordinate_claim(&tags(&[&["a", &coord()], &["a", &coord()]])),
+                    &coord()
+                ),
+                "kind {kind}: two coordinates is ambiguity, not redundancy"
+            );
+        }
+    }
+
+    #[test]
+    fn enrol_moves_an_unknown_root_to_active() {
+        let mut e = ProjectEnrolments::new();
+        assert_eq!(e.enrol(&candidate(ROOT, false)), Ok(EnrolOutcome::Enrolled));
+        assert_eq!(e.state_of(ROOT), RootState::Active);
+        assert_eq!(e.active_count(), 1);
+        assert_eq!(e.dormant_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn enrolment_matches_the_discovered_coordinate_byte_for_byte() {
+        // Parsing must not widen acceptance: an uppercase-owner coordinate is
+        // not silently equivalent to the canonical discovered string.
+        let k = known(&[&coord()]);
+        let shouty = format!("30617:{}:repo", OWNER.to_ascii_uppercase());
+        assert_eq!(
+            normalise_coordinate(&shouty).as_deref(),
+            Some(coord().as_str())
+        );
+        assert!(
+            validate_enrolment_candidate(
+                &verified_with(KIND_GIT_ISSUE, &tags(&[&["a", &shouty]])).await,
+                &k,
+            )
+            .is_none(),
+            "a non-canonical coordinate must not match the discovered set through the parser"
+        );
+    }
+
+    #[test]
+    fn follow_up_rejects_value_less_and_empty_coordinates() {
+        for kind in [KIND_TEXT_NOTE, KIND_GIT_PR_UPDATE, KIND_GIT_STATUS_CLOSED] {
+            assert!(!follow_up_coordinate_allowed(
+                kind,
+                &coordinate_claim(&tags(&[&["a"]])),
+                &coord()
+            ));
+            assert!(!follow_up_coordinate_allowed(
+                kind,
+                &coordinate_claim(&tags(&[&["a", ""]])),
+                &coord()
+            ));
+            assert!(!follow_up_coordinate_allowed(
+                kind,
+                &coordinate_claim(&tags(&[&["a", ""], &["a", &coord()]])),
+                &coord()
+            ));
+        }
+    }
+
+    #[test]
+    fn lifecycle_is_never_a_model_turn() {
+        for author in [
+            ProjectAuthor::AuthorisedHuman,
+            ProjectAuthor::TrustedAgent,
+            ProjectAuthor::Untrusted,
+        ] {
+            for call in [CallMarker::None, CallMarker::Invocation, CallMarker::Result] {
+                let out = classify_project_event(
+                    KindEffect::Lifecycle,
+                    author,
+                    call,
+                    RootState::Active,
+                    Addressing::ExplicitMention,
+                    true,
+                );
+                assert!(
+                    matches!(out, ProjectEffect::ApplyLifecycle | ProjectEffect::Ignore),
+                    "{author:?} / {call:?} produced {out:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn lifecycle_may_omit_the_coordinate_but_not_contradict_it() {
+        for kind in [
+            KIND_GIT_STATUS_OPEN,
+            KIND_GIT_STATUS_MERGED,
+            KIND_GIT_STATUS_CLOSED,
+            KIND_GIT_STATUS_DRAFT,
+        ] {
+            // `GitStatusMeta.repo` is optional, so absence is legitimate — the
+            // event is already root-bound by `e`.
+            assert!(follow_up_coordinate_allowed(
+                kind,
+                &coordinate_claim(&tags(&[&["e", ROOT]])),
+                &coord()
+            ));
+            assert!(follow_up_coordinate_allowed(
+                kind,
+                &coordinate_claim(&tags(&[&["a", &coord()]])),
+                &coord()
+            ));
+            let other = format!("30617:{STRANGER}:elsewhere");
+            assert!(!follow_up_coordinate_allowed(
+                kind,
+                &coordinate_claim(&tags(&[&["a", &other]])),
+                &coord()
+            ));
+        }
+    }
+
+    #[test]
+    fn pr_update_alone_never_creates_a_turn() {
+        assert_eq!(
+            classify_project_event(
+                KindEffect::ContextRefresh,
+                ProjectAuthor::AuthorisedHuman,
+                CallMarker::None,
+                RootState::Active,
+                Addressing::ExplicitMention,
+                false,
+            ),
+            ProjectEffect::RefreshContext
+        );
+        assert_eq!(
+            classify_project_event(
+                KindEffect::ContextRefresh,
+                ProjectAuthor::Untrusted,
+                CallMarker::None,
+                RootState::Active,
+                Addressing::ExplicitMention,
+                false,
+            ),
+            ProjectEffect::UntrustedContext
+        );
+    }
+
+    #[test]
+    fn pull_request_roots_are_tracked_separately_from_all_roots() {
+        let mut e = ProjectEnrolments::new();
+        e.enrol(&candidate(ROOT, false)).unwrap();
+        e.enrol(&candidate(OTHER_ROOT, true)).unwrap();
+        assert_eq!(
+            e.all_roots(),
+            vec![ROOT.to_string(), OTHER_ROOT.to_string()]
+        );
+        assert_eq!(e.pull_request_roots(), vec![OTHER_ROOT.to_string()]);
+        // Dormant PRs still need `#E`, or a revision on a closed PR is invisible.
+        e.close(OTHER_ROOT);
+        assert_eq!(e.pull_request_roots(), vec![OTHER_ROOT.to_string()]);
+    }
+
+    #[test]
+    fn re_enrolling_an_active_root_does_not_churn_the_subscription() {
+        let mut e = ProjectEnrolments::new();
+        e.enrol(&candidate(ROOT, false)).unwrap();
+        assert_eq!(
+            e.enrol(&candidate(ROOT, false)),
+            Ok(EnrolOutcome::Unchanged),
+            "an ordinary re-mention must not force a REQ replacement"
+        );
+        assert!(!EnrolOutcome::Unchanged.changes_subscription());
+    }
+
+    #[test]
+    fn self_authored_pr_update_refreshes_context() {
+        assert_eq!(
+            classify_project_event(
+                KindEffect::ContextRefresh,
+                ProjectAuthor::SelfAuthored,
+                CallMarker::None,
+                RootState::Active,
+                Addressing::WatchedRoot,
+                false,
+            ),
+            ProjectEffect::RefreshContext
+        );
+    }
+
+    #[test]
+    fn self_authored_roots_and_comments_remain_suppressed() {
+        // Regression guard for the arms the early return used to cover.
+        for state in [RootState::Active, RootState::Unknown, RootState::Dormant] {
+            for addressing in ALL_ADDRESSING {
+                assert_eq!(
+                    classify_project_event(
+                        KindEffect::Root,
+                        ProjectAuthor::SelfAuthored,
+                        CallMarker::None,
+                        state,
+                        addressing,
+                        true,
+                    ),
+                    ProjectEffect::Ignore,
+                    "root: {state:?} / {addressing:?}"
+                );
+                assert_eq!(
+                    comment(
+                        ProjectAuthor::SelfAuthored,
+                        CallMarker::None,
+                        state,
+                        addressing
+                    ),
+                    ProjectEffect::Ignore,
+                    "comment: {state:?} / {addressing:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn self_authored_state_events_never_create_a_turn() {
+        // The other half of the rule: state updates are permitted, turns are
+        // not. Nothing self-authored may reach a waking effect.
+        for kind_effect in [
+            KindEffect::Lifecycle,
+            KindEffect::ContextRefresh,
+            KindEffect::Root,
+            KindEffect::Comment,
+            KindEffect::Ignore,
+        ] {
+            for call in [CallMarker::None, CallMarker::Invocation, CallMarker::Result] {
+                for addressing in ALL_ADDRESSING {
+                    let out = classify_project_event(
+                        kind_effect,
+                        ProjectAuthor::SelfAuthored,
+                        call,
+                        RootState::Active,
+                        addressing,
+                        true,
+                    );
+                    assert!(
+                        !matches!(
+                            out,
+                            ProjectEffect::EnrolAndWake
+                                | ProjectEffect::Wake
+                                | ProjectEffect::ResumeCall
+                        ),
+                        "{kind_effect:?} / {call:?} / {addressing:?} produced {out:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_agents_own_reply_neither_enrols_nor_wakes() {
+        for call in [CallMarker::None, CallMarker::Invocation, CallMarker::Result] {
+            for state in [RootState::Active, RootState::Unknown, RootState::Dormant] {
+                for addressing in ALL_ADDRESSING {
+                    assert_eq!(
+                        comment(ProjectAuthor::SelfAuthored, call, state, addressing),
+                        ProjectEffect::Ignore,
+                        "{call:?} / {state:?} / {addressing:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn trusted_agent_bare_p_tag_is_never_an_invocation() {
+        // Two agents watching one root must not wake each other with ordinary
+        // participant-`p`-tagged replies — not even an explicitly addressed one.
+        for state in [RootState::Active, RootState::Unknown, RootState::Dormant] {
+            for addressing in ALL_ADDRESSING {
+                assert_eq!(
+                    comment(
+                        ProjectAuthor::TrustedAgent,
+                        CallMarker::None,
+                        state,
+                        addressing,
+                    ),
+                    ProjectEffect::Ignore,
+                    "{state:?} / {addressing:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn trusted_agent_with_a_call_envelope_invokes() {
+        // The envelope names its callee, so it is explicit addressing by
+        // construction — an invocation does not additionally need a fresh `p`.
+        for addressing in ALL_ADDRESSING {
+            assert_eq!(
+                comment(
+                    ProjectAuthor::TrustedAgent,
+                    CallMarker::Invocation,
+                    RootState::Unknown,
+                    addressing,
+                ),
+                ProjectEffect::EnrolAndWake,
+                "{addressing:?}"
+            );
+            assert_eq!(
+                comment(
+                    ProjectAuthor::TrustedAgent,
+                    CallMarker::Invocation,
+                    RootState::Active,
+                    addressing,
+                ),
+                ProjectEffect::Wake,
+                "{addressing:?}"
+            );
+            assert_eq!(
+                comment(
+                    ProjectAuthor::TrustedAgent,
+                    CallMarker::Invocation,
+                    RootState::Dormant,
+                    addressing,
+                ),
+                ProjectEffect::EnrolAndWake,
+                "{addressing:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn unauthorised_self_authored_lifecycle_is_ignored() {
+        // Self-authorship is not its own authority: the signer check still runs.
+        assert_eq!(
+            classify_project_event(
+                KindEffect::Lifecycle,
+                ProjectAuthor::SelfAuthored,
+                CallMarker::None,
+                RootState::Active,
+                Addressing::WatchedRoot,
+                false,
+            ),
+            ProjectEffect::Ignore
+        );
+    }
+
+    #[test]
+    fn unauthorised_status_event_does_not_close_the_watch() {
+        assert_eq!(
+            classify_project_event(
+                KindEffect::Lifecycle,
+                ProjectAuthor::AuthorisedHuman,
+                CallMarker::None,
+                RootState::Active,
+                Addressing::ExplicitMention,
+                false,
+            ),
+            ProjectEffect::Ignore
+        );
+        assert_eq!(
+            classify_project_event(
+                KindEffect::Lifecycle,
+                ProjectAuthor::AuthorisedHuman,
+                CallMarker::None,
+                RootState::Active,
+                Addressing::ExplicitMention,
+                true,
+            ),
+            ProjectEffect::ApplyLifecycle
+        );
+    }
+
+    #[test]
+    fn untrusted_identity_is_context_and_cannot_invoke() {
+        for call in [CallMarker::None, CallMarker::Invocation, CallMarker::Result] {
+            for state in [RootState::Active, RootState::Unknown, RootState::Dormant] {
+                assert_eq!(
+                    comment(
+                        ProjectAuthor::Untrusted,
+                        call,
+                        state,
+                        Addressing::ExplicitMention,
+                    ),
+                    ProjectEffect::UntrustedContext,
+                    "{call:?} / {state:?}"
+                );
+            }
+        }
+    }
+
+    // ── Reconstructed WIP: authenticated discovery ───────────────────────────
+    //
+    // Rebuilt from notes rather than recovered from Git. Each keeps the
+    // falsifier that makes it meaningful — a forged event must *parse* before
+    // verification rejects it, or the test passes for the wrong reason.
+
+    #[tokio::test]
+    async fn ingest_derives_the_coordinate_from_the_signer_not_the_announcement() {
+        let keys = Keys::generate();
+        let signer = keys.public_key().to_hex();
+        // A genuine announcement that also claims someone else's coordinate.
+        // A valid signature proves who wrote the event, not that its contents
+        // are honest — so `a` must not be read.
+        let forged = format!("30617:{THIRD_PARTY}:not-mine");
+        let event = signed(
+            &keys,
+            KIND_GIT_REPO_ANNOUNCEMENT,
+            vec![tag(&["d", "my-repo"]), tag(&["a", &forged])],
+        );
+
+        let proven =
+            VerifiedAnnouncement::prove(VerifiedProjectEvent::verify(event).await.expect("valid"))
+                .expect("well-formed despite the forged `a`");
+        let mut d = DiscoveredRepositories::new();
+        let added = d.ingest(&proven);
+
+        assert_eq!(added, Discovered::Added(format!("30617:{signer}:my-repo")));
+        let added = format!("30617:{signer}:my-repo");
+        assert!(d.contains(&added));
+        assert!(
+            !d.contains(&forged),
+            "the announcement's own `a` claim must never enter the set"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_tampered_announcement_cannot_be_verified_or_ingested() {
+        let keys = Keys::generate();
+        let event = signed(&keys, KIND_GIT_REPO_ANNOUNCEMENT, vec![tag(&["d", "mine"])]);
+        let rewritten = tampered(&event, serde_json::json!([["d", "someone-elses-repo"]]));
+
+        // Falsifier: the tampered event must still parse, or this proves only
+        // that `from_json` is strict.
+        assert_eq!(
+            rewritten.tags.len(),
+            1,
+            "the tampered event parsed, so verification is what rejects it"
+        );
+        assert!(VerifiedProjectEvent::verify(rewritten).await.is_err());
+
+        // And with no witness it cannot reach ingestion at all.
+        let d = DiscoveredRepositories::new();
+        assert!(d.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_forged_author_cannot_be_verified() {
+        // The attack that matters most: project authority reads `event.pubkey`
+        // for owner, root author, authorised human and sibling checks.
+        let keys = Keys::generate();
+        let event = signed(&keys, KIND_TEXT_NOTE, vec![tag(&["e", ROOT, "", "root"])]);
+        let impersonated = forged_author(&event, OWNER);
+
+        // Falsifier: without this the test would pass if `from_json` rejected
+        // the event, proving nothing about the witness.
+        assert_eq!(
+            impersonated.pubkey.to_hex(),
+            OWNER,
+            "the forgery is in place"
+        );
+        assert!(
+            VerifiedProjectEvent::verify(impersonated).await.is_err(),
+            "a forged author must not survive verification"
+        );
+    }
+
+    #[tokio::test]
+    async fn forged_lifecycle_and_comment_events_never_yield_a_witness() {
+        // Each would otherwise pass the authority gate: an owner close, a
+        // root-author reopen, an authorised human's comment, a PR update.
+        let keys = Keys::generate();
+        for kind in [
+            KIND_GIT_STATUS_CLOSED,
+            KIND_GIT_STATUS_OPEN,
+            KIND_TEXT_NOTE,
+            KIND_GIT_PR_UPDATE,
+        ] {
+            let genuine = signed(&keys, kind, vec![tag(&["e", ROOT, "", "root"])]);
+
+            let impersonated = forged_author(&genuine, OWNER);
+            assert_eq!(
+                impersonated.pubkey.to_hex(),
+                OWNER,
+                "kind {kind}: forgery parsed"
+            );
+            assert!(
+                VerifiedProjectEvent::verify(impersonated).await.is_err(),
+                "kind {kind}: forged owner must not verify"
+            );
+
+            let rewritten = tampered(&genuine, serde_json::json!([["e", OTHER_ROOT, "", "root"]]));
+            assert_eq!(rewritten.tags.len(), 1, "kind {kind}: retarget parsed");
+            assert!(
+                VerifiedProjectEvent::verify(rewritten).await.is_err(),
+                "kind {kind}: retargeted root must not verify"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_verified_event_exposes_the_fields_authority_depends_on() {
+        let keys = Keys::generate();
+        let event = signed(&keys, KIND_TEXT_NOTE, vec![tag(&["e", ROOT, "", "root"])]);
+        let id = event.id.to_hex();
+        let verified = VerifiedProjectEvent::verify(event).await.expect("valid");
+
+        assert_eq!(verified.author(), keys.public_key().to_hex());
+        assert_eq!(verified.kind(), KIND_TEXT_NOTE);
+        assert_eq!(verified.id(), id);
+        assert_eq!(
+            root_event_id(verified.kind(), &verified.id(), &verified.tag_vecs()),
+            Some(ROOT.to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn proving_an_announcement_rejects_wrong_kind_and_ambiguous_identifiers() {
+        // These refusals moved up to the proof boundary. `ingest` can no longer
+        // reject anything, because nothing rejectable can reach it.
+        let keys = Keys::generate();
+
+        // Right shape, wrong kind.
+        let note = signed(&keys, KIND_TEXT_NOTE, vec![tag(&["d", "repo"])]);
+        assert!(
+            VerifiedAnnouncement::prove(VerifiedProjectEvent::verify(note).await.unwrap())
+                .is_none()
+        );
+
+        for (label, tags) in [
+            ("no `d`", vec![tag(&["a", "30617:x:y"])]),
+            ("empty `d`", vec![tag(&["d", ""])]),
+            (
+                "conflicting `d`",
+                vec![tag(&["d", "one"]), tag(&["d", "two"])],
+            ),
+            // Two tags that agree is still two tags. "They happen to match"
+            // and "there is one" are different claims, and only the second is
+            // unambiguous — a rule that reads the first would be picking a
+            // winner by tag order.
+            (
+                "duplicate equal `d`",
+                vec![tag(&["d", "same"]), tag(&["d", "same"])],
+            ),
+        ] {
+            let event = signed(&keys, KIND_GIT_REPO_ANNOUNCEMENT, tags);
+            assert!(
+                VerifiedAnnouncement::prove(VerifiedProjectEvent::verify(event).await.unwrap())
+                    .is_none(),
+                "{label} must not prove an announcement"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_proven_announcement_carries_the_coordinate_it_established() {
+        // The coordinate is computed once, at the proof boundary. Nothing
+        // downstream parses `d` a second time and risks a different answer.
+        let keys = Keys::generate();
+        let signer = keys.public_key().to_hex();
+        let event = signed(
+            &keys,
+            KIND_GIT_REPO_ANNOUNCEMENT,
+            vec![tag(&["d", "my-repo"])],
+        );
+        let proven =
+            VerifiedAnnouncement::prove(VerifiedProjectEvent::verify(event).await.unwrap())
+                .expect("well-formed");
+
+        assert_eq!(proven.coordinate(), format!("30617:{signer}:my-repo"));
+        assert_eq!(proven.event().author(), signer);
+
+        let mut d = DiscoveredRepositories::new();
+        assert_eq!(
+            d.ingest(&proven),
+            Discovered::Added(proven.coordinate().to_string())
+        );
+        assert!(d.contains(proven.coordinate()));
+    }
+
+    #[tokio::test]
+    async fn an_ingested_coordinate_is_what_enrolment_will_accept() {
+        // The two ends must agree byte-for-byte or discovery is decorative.
+        let keys = Keys::generate();
+        let event = signed(
+            &keys,
+            KIND_GIT_REPO_ANNOUNCEMENT,
+            vec![tag(&["d", "my-repo"])],
+        );
+        let proven =
+            VerifiedAnnouncement::prove(VerifiedProjectEvent::verify(event).await.expect("valid"))
+                .expect("well-formed");
+        let mut d = DiscoveredRepositories::new();
+        let Discovered::Added(coordinate) = d.ingest(&proven) else {
+            panic!("a fresh announcement is added");
+        };
+
+        let candidate = validate_enrolment_candidate(
+            &verified_with(KIND_GIT_ISSUE, &tags(&[&["a", &coordinate]])).await,
+            &d,
+        )
+        .expect("an issue on a discovered repo enrols");
+        assert_eq!(candidate.coordinate(), coordinate);
+    }
+
+    #[tokio::test]
+    async fn the_discovery_ceiling_refuses_rather_than_evicts() {
+        // The set is fed by a global `kinds: [30617]` REQ, so anyone can grow
+        // it. Bounding it by eviction would have traded a memory bound for
+        // silent authority-state amnesia: a repository would disappear while
+        // the set still looked complete, and an enrolment that used to be valid
+        // would stop being so with nothing saying why.
+        let keys = Keys::generate();
+        let mut d = DiscoveredRepositories::for_test(
+            (0..DISCOVERY_CEILING).map(|i| format!("30617:{}:repo-{i}", "a".repeat(64))),
+        );
+        assert_eq!(d.len(), DISCOVERY_CEILING);
+        assert!(
+            !d.has_overflowed(),
+            "a full set is not yet an overflowed one"
+        );
+
+        let event = signed(
+            &keys,
+            KIND_GIT_REPO_ANNOUNCEMENT,
+            vec![tag(&["d", "one-too-many"])],
+        );
+        let proven =
+            VerifiedAnnouncement::prove(VerifiedProjectEvent::verify(event).await.expect("valid"))
+                .expect("well-formed");
+
+        assert_eq!(
+            d.ingest(&proven),
+            Discovered::Refused {
+                because: RefusedBecause::Cardinality,
+                degradation: Degradation::BecameDegraded,
+            }
+        );
+        assert_eq!(d.len(), DISCOVERY_CEILING, "nothing was evicted");
+        assert!(!d.contains(proven.coordinate()));
+        assert!(
+            d.has_overflowed(),
+            "and the incompleteness is visible rather than silent"
+        );
+        assert_eq!(d.refused_count(), 1);
+    }
+
+    /// An announcement whose `d` makes the coordinate exactly `bytes` long.
+    async fn announcement_of_coordinate_bytes(keys: &Keys, bytes: usize) -> VerifiedAnnouncement {
+        // `30617:` + 64 hex + `:` = 71 bytes of fixed structure.
+        let identifier = "x".repeat(bytes - 71);
+        let event = signed(
+            keys,
+            KIND_GIT_REPO_ANNOUNCEMENT,
+            vec![tag(&["d", &identifier])],
+        );
+        let proven =
+            VerifiedAnnouncement::prove(VerifiedProjectEvent::verify(event).await.expect("valid"))
+                .expect("well-formed");
+        assert_eq!(
+            proven.coordinate().len(),
+            bytes,
+            "fixture builds the size it claims"
+        );
+        proven
+    }
+
+    #[tokio::test]
+    async fn an_oversized_coordinate_is_refused_even_by_an_empty_set() {
+        // Cardinality does not bound bytes. One announcement with a large
+        // enough `d` is a large allocation regardless of how few there are, and
+        // the relay in this repository accepts 512 KiB frames by default.
+        let keys = Keys::generate();
+        let mut d = DiscoveredRepositories::new();
+        let huge = announcement_of_coordinate_bytes(&keys, DISCOVERY_COORDINATE_BYTES + 1).await;
+
+        assert_eq!(
+            d.ingest(&huge),
+            Discovered::Refused {
+                because: RefusedBecause::CoordinateTooLarge,
+                degradation: Degradation::BecameDegraded,
+            }
+        );
+        assert!(d.is_empty());
+        assert_eq!(d.retained_bytes(), 0, "a refused coordinate is not charged");
+        assert!(d.has_overflowed());
+
+        // And the boundary is inclusive on the accepting side.
+        let mut d = DiscoveredRepositories::new();
+        let exact = announcement_of_coordinate_bytes(&keys, DISCOVERY_COORDINATE_BYTES).await;
+        assert!(matches!(d.ingest(&exact), Discovered::Added(_)));
+        assert_eq!(d.retained_bytes(), DISCOVERY_COORDINATE_BYTES);
+        assert!(!d.has_overflowed());
+    }
+
+    #[tokio::test]
+    async fn the_byte_ceiling_can_trip_before_the_count_ceiling() {
+        // The case the count ceiling alone misses: far fewer than
+        // DISCOVERY_CEILING coordinates, each individually acceptable, adding
+        // up to more memory than the agent will hold.
+        let keys = Keys::generate();
+        let filler: Vec<String> = (0..DISCOVERY_RETAINED_BYTES / DISCOVERY_COORDINATE_BYTES)
+            // 71 bytes of fixed structure + 441 = exactly
+            // DISCOVERY_COORDINATE_BYTES per coordinate.
+            .map(|i| format!("30617:{}:{i:0>441}", "a".repeat(64)))
+            .collect();
+        let mut d = DiscoveredRepositories::for_test(filler);
+
+        assert!(
+            d.len() < DISCOVERY_CEILING,
+            "the count ceiling is nowhere near: {} of {DISCOVERY_CEILING}",
+            d.len()
+        );
+        assert_eq!(d.retained_bytes(), DISCOVERY_RETAINED_BYTES);
+
+        let one_more = announcement_of_coordinate_bytes(&keys, 100).await;
+        assert_eq!(
+            d.ingest(&one_more),
+            Discovered::Refused {
+                because: RefusedBecause::RetainedBytes,
+                degradation: Degradation::BecameDegraded,
+            }
+        );
+        assert_eq!(
+            d.retained_bytes(),
+            DISCOVERY_RETAINED_BYTES,
+            "nothing was charged and nothing was evicted"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_duplicate_announcement_is_charged_no_bytes() {
+        // Duplicates arrive constantly on a live REQ. Charging them would walk
+        // the byte total to the ceiling on no new information at all.
+        let keys = Keys::generate();
+        let mut d = DiscoveredRepositories::new();
+        let proven = announcement_of_coordinate_bytes(&keys, 200).await;
+
+        assert!(matches!(d.ingest(&proven), Discovered::Added(_)));
+        let after_first = d.retained_bytes();
+        assert_eq!(after_first, 200);
+
+        for _ in 0..50 {
+            assert!(matches!(d.ingest(&proven), Discovered::AlreadyKnown(_)));
+        }
+        assert_eq!(d.retained_bytes(), after_first);
+        assert_eq!(d.len(), 1);
+        assert!(!d.has_overflowed());
+    }
+
+    #[tokio::test]
+    async fn degradation_is_reported_once_and_counted_thereafter() {
+        // The log-amplifier fix, at the type. Every refusal after the first is
+        // `AlreadyDegraded`, so a caller has something bounded to say — and the
+        // outcome carries no coordinate, so there is nothing attacker-chosen to
+        // print even by accident.
+        let keys = Keys::generate();
+        let mut d = DiscoveredRepositories::new();
+
+        let first = announcement_of_coordinate_bytes(&keys, DISCOVERY_COORDINATE_BYTES + 1).await;
+        assert!(matches!(
+            d.ingest(&first),
+            Discovered::Refused {
+                degradation: Degradation::BecameDegraded,
+                ..
+            }
+        ));
+
+        for i in 0..5 {
+            let next =
+                announcement_of_coordinate_bytes(&keys, DISCOVERY_COORDINATE_BYTES + 2 + i).await;
+            assert!(
+                matches!(
+                    d.ingest(&next),
+                    Discovered::Refused {
+                        degradation: Degradation::AlreadyDegraded,
+                        ..
+                    }
+                ),
+                "only the transition is newsworthy"
+            );
+        }
+        assert_eq!(d.refused_count(), 6);
+        assert!(d.has_overflowed());
+    }
+
+    #[tokio::test]
+    async fn a_full_set_still_accepts_a_repeat_of_something_it_already_holds() {
+        // The ceiling bounds *growth*. Refusing a coordinate already in the set
+        // would report a spurious overflow on ordinary duplicate traffic, and
+        // the relay's live REQ delivers duplicates routinely.
+        let keys = Keys::generate();
+        let event = signed(
+            &keys,
+            KIND_GIT_REPO_ANNOUNCEMENT,
+            vec![tag(&["d", "already-here"])],
+        );
+        let proven =
+            VerifiedAnnouncement::prove(VerifiedProjectEvent::verify(event).await.expect("valid"))
+                .expect("well-formed");
+
+        let mut filler: Vec<String> = (0..DISCOVERY_CEILING - 1)
+            .map(|i| format!("30617:{}:repo-{i}", "a".repeat(64)))
+            .collect();
+        filler.push(proven.coordinate().to_string());
+        let mut d = DiscoveredRepositories::for_test(filler);
+        assert_eq!(d.len(), DISCOVERY_CEILING);
+
+        assert_eq!(
+            d.ingest(&proven),
+            Discovered::AlreadyKnown(proven.coordinate().to_string())
+        );
+        assert!(!d.has_overflowed(), "a duplicate is not an overflow");
+    }
+
+    #[tokio::test]
+    async fn discovery_incompleteness_is_permanent_once_the_ceiling_has_refused() {
+        // There is no way back: the refused announcements are gone and the set
+        // cannot learn what it missed. Anything that later wants to claim a
+        // complete enrolment filter has to consult `has_overflowed`.
+        let keys = Keys::generate();
+
+        // One coordinate the set already holds, so the duplicate below takes
+        // the `AlreadyKnown` path. My first version re-ingested the *refused*
+        // coordinate — which is never in the set, so it simply re-entered the
+        // overflow branch, and the test passed even when the flag was cleared
+        // on every duplicate.
+        let held = signed(&keys, KIND_GIT_REPO_ANNOUNCEMENT, vec![tag(&["d", "held"])]);
+        let held =
+            VerifiedAnnouncement::prove(VerifiedProjectEvent::verify(held).await.expect("valid"))
+                .expect("well-formed");
+
+        let mut filler: Vec<String> = (0..DISCOVERY_CEILING - 1)
+            .map(|i| format!("30617:{}:repo-{i}", "a".repeat(64)))
+            .collect();
+        filler.push(held.coordinate().to_string());
+        let mut d = DiscoveredRepositories::for_test(filler);
+
+        let refused = signed(&keys, KIND_GIT_REPO_ANNOUNCEMENT, vec![tag(&["d", "lost"])]);
+        let refused = VerifiedAnnouncement::prove(
+            VerifiedProjectEvent::verify(refused).await.expect("valid"),
+        )
+        .expect("well-formed");
+        assert!(matches!(d.ingest(&refused), Discovered::Refused { .. }));
+        assert!(d.has_overflowed());
+
+        // An ordinary duplicate of something the set does hold — the common
+        // case on a live REQ — must not launder it back to complete.
+        assert!(matches!(d.ingest(&held), Discovered::AlreadyKnown(_)));
+        assert!(d.has_overflowed(), "incompleteness does not heal");
+    }
+
+    #[tokio::test]
+    async fn ingest_is_idempotent() {
+        let keys = Keys::generate();
+        let event = signed(
+            &keys,
+            KIND_GIT_REPO_ANNOUNCEMENT,
+            vec![tag(&["d", "my-repo"])],
+        );
+        let mut d = DiscoveredRepositories::new();
+        let prove = |e: nostr::Event| async move {
+            VerifiedAnnouncement::prove(VerifiedProjectEvent::verify(e).await.unwrap())
+                .expect("well-formed")
+        };
+        let first = d.ingest(&prove(event.clone()).await);
+        let second = d.ingest(&prove(event).await);
+        assert!(matches!(first, Discovered::Added(_)));
+        assert!(matches!(second, Discovered::AlreadyKnown(_)));
+        assert_eq!(d.len(), 1);
+    }
+
+    // ── Reconstructed WIP: replay, folding, ancestry, routes ─────────────────
+
+    #[test]
+    fn replay_recovers_a_historical_bare_p_enrolment_without_a_turn() {
+        // The defect this replaces: suppressing replayed bare `p` as inherited
+        // meant a root enrolled by an authorised human's structural `p` was
+        // silently forgotten across a restart.
+        let effect = classify_project_event(
+            classify_kind(KIND_TEXT_NOTE),
+            ProjectAuthor::AuthorisedHuman,
+            project_call_marker(),
+            RootState::Unknown,
+            Addressing::ExplicitMention,
+            false,
+        );
+        // Two separate assertions, per the falsifier: state is restored, and
+        // no turn is produced.
+        assert_eq!(effect, ProjectEffect::EnrolAndWake, "meaning is unchanged");
+        assert_eq!(
+            apply_processing_mode(effect, ProcessingMode::Replay),
+            ProjectEffect::Enrol,
+            "the watch is restored"
+        );
+        assert_ne!(
+            apply_processing_mode(effect, ProcessingMode::Replay),
+            ProjectEffect::EnrolAndWake,
+            "and the model is not woken"
+        );
+        assert_eq!(
+            apply_processing_mode(effect, ProcessingMode::Live),
+            ProjectEffect::EnrolAndWake
+        );
+    }
+
+    #[test]
+    fn replay_never_produces_a_waking_effect() {
+        for effect in [
+            ProjectEffect::EnrolAndWake,
+            ProjectEffect::Wake,
+            ProjectEffect::ResumeCall,
+            ProjectEffect::ApplyLifecycle,
+            ProjectEffect::RefreshContext,
+            ProjectEffect::UntrustedContext,
+            ProjectEffect::Enrol,
+            ProjectEffect::Ignore,
+        ] {
+            let replayed = apply_processing_mode(effect, ProcessingMode::Replay);
+            assert!(
+                !matches!(
+                    replayed,
+                    ProjectEffect::EnrolAndWake | ProjectEffect::Wake | ProjectEffect::ResumeCall
+                ),
+                "{effect:?} replayed to {replayed:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_later_inherited_p_does_not_re_enrol() {
+        let effect = classify_project_event(
+            classify_kind(KIND_TEXT_NOTE),
+            ProjectAuthor::AuthorisedHuman,
+            project_call_marker(),
+            RootState::Active,
+            Addressing::InheritedParticipant,
+            false,
+        );
+        assert_eq!(effect, ProjectEffect::Wake, "an active root continues");
+        assert_ne!(effect, ProjectEffect::EnrolAndWake, "it does not re-enrol");
+        assert_eq!(
+            apply_processing_mode(effect, ProcessingMode::Replay),
+            ProjectEffect::RefreshContext
+        );
+    }
+
+    #[tokio::test]
+    async fn prior_facts_are_folded_after_evaluation_not_before() {
+        // Sequential proof, not final state: incorporating an event's own `p`
+        // before evaluating it would make the first genuine mention see itself
+        // and classify as inherited.
+        let keys = Keys::generate();
+        let root = signed(&keys, KIND_GIT_ISSUE, vec![tag(&["a", &coord()])]);
+        let root = VerifiedProjectEvent::verify(root).await.expect("valid");
+        let bound = VerifiedBoundRoot::prove(std::slice::from_ref(&root), &known(&[&coord()]))
+            .expect("proves");
+        let mut facts = PriorRootFacts::seed(&bound);
+
+        let mention = signed(&keys, KIND_TEXT_NOTE, vec![tag(&["p", AGENT_PK])]);
+        let mention = VerifiedProjectEvent::verify(mention).await.expect("valid");
+        let evidence = AddressingEvidence::resolve(&mention, &agent_identity());
+
+        assert!(
+            !facts.agent_was_participant(),
+            "state before the first mention"
+        );
+        assert_eq!(
+            resolve_addressing(
+                &watched(),
+                &evidence,
+                &RootHistoryReadiness::Complete,
+                Some(&facts),
+                &agent_identity(),
+            ),
+            Some(Addressing::ExplicitMention),
+            "the first mention must not see itself"
+        );
+
+        facts.observe(&mention, &agent_identity());
+        assert!(facts.agent_was_participant(), "only now is it folded in");
+
+        let later = signed(&keys, KIND_TEXT_NOTE, vec![tag(&["p", AGENT_PK])]);
+        let later = VerifiedProjectEvent::verify(later).await.expect("valid");
+        let later_evidence = AddressingEvidence::resolve(&later, &agent_identity());
+        assert_eq!(
+            resolve_addressing(
+                &watched(),
+                &later_evidence,
+                &RootHistoryReadiness::Complete,
+                Some(&facts),
+                &agent_identity(),
+            ),
+            Some(Addressing::InheritedParticipant),
+            "the next bare `p` is propagation"
+        );
+    }
+
+    #[tokio::test]
+    async fn observe_records_the_agent_only_from_verified_p_tags() {
+        let keys = Keys::generate();
+        let root = signed(&keys, KIND_GIT_ISSUE, vec![tag(&["a", &coord()])]);
+        let root = VerifiedProjectEvent::verify(root).await.expect("valid");
+        let bound = VerifiedBoundRoot::prove(std::slice::from_ref(&root), &known(&[&coord()]))
+            .expect("proves");
+        let mut facts = PriorRootFacts::seed(&bound);
+
+        assert!(!facts.agent_was_participant());
+        assert_eq!(facts.root_author(), keys.public_key().to_hex());
+        assert_eq!(facts.repository_owner(), OWNER);
+
+        let unrelated = signed(&keys, KIND_TEXT_NOTE, vec![tag(&["p", THIRD_PARTY])]);
+        let unrelated = VerifiedProjectEvent::verify(unrelated)
+            .await
+            .expect("valid");
+        facts.observe(&unrelated, &agent_identity());
+        assert!(!facts.agent_was_participant());
+
+        // The unverified negative: a raw event tagging the agent cannot be
+        // observed at all, because `observe` takes only a witness. Its forged
+        // form does not survive verification, so it never reaches the fold.
+        let tagging = signed(&keys, KIND_TEXT_NOTE, vec![tag(&["p", AGENT_PK])]);
+        let forged = forged_author(&tagging, OWNER);
+        assert_eq!(forged.pubkey.to_hex(), OWNER, "the forgery parsed");
+        assert!(
+            VerifiedProjectEvent::verify(forged).await.is_err(),
+            "an unverifiable event yields no witness, so it cannot be folded"
+        );
+        assert!(!facts.agent_was_participant());
+
+        let tagging = VerifiedProjectEvent::verify(tagging).await.expect("valid");
+        facts.observe(&tagging, &agent_identity());
+        assert!(facts.agent_was_participant());
+    }
+
+    #[test]
+    fn history_orders_the_root_first_then_time_then_id() {
+        // Relay arrival order is not history. Both runtimes must fold the same
+        // events in the same order or reconstruct different facts from them.
+        let root_key = history_order_key(ROOT, ROOT, 500);
+        let later = history_order_key(ROOT, OTHER_ROOT, 100);
+        assert!(root_key < later, "the root sorts first despite being newer");
+
+        let a = history_order_key(ROOT, "aa".repeat(32).as_str(), 100);
+        let b = history_order_key(ROOT, "bb".repeat(32).as_str(), 100);
+        assert!(a < b, "equal timestamps tie-break on event id");
+
+        let early = history_order_key(ROOT, "ff".repeat(32).as_str(), 100);
+        let late = history_order_key(ROOT, "aa".repeat(32).as_str(), 200);
+        assert!(early < late, "time dominates the id tie-break");
+    }
+
+    // ── Reconstructed WIP: strict ancestry ───────────────────────────────────
+
+    #[test]
+    fn conflicting_root_markers_are_refused_not_ordered() {
+        // The defect once `ProjectRoute` made this the session key: an author
+        // could otherwise pick their conversation by tag order.
+        assert_eq!(
+            root_event_id(
+                KIND_TEXT_NOTE,
+                THIRD_PARTY,
+                &tags(&[&["e", ROOT, "", "root"], &["e", OTHER_ROOT, "", "root"]])
+            ),
+            None
+        );
+        // Reversed order must also be refused, not resolved differently.
+        assert_eq!(
+            root_event_id(
+                KIND_TEXT_NOTE,
+                THIRD_PARTY,
+                &tags(&[&["e", OTHER_ROOT, "", "root"], &["e", ROOT, "", "root"]])
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn a_malformed_marked_root_is_not_rescued_by_a_valid_fallback() {
+        // "My root is <garbage>" is malformed, not legacy.
+        assert_eq!(
+            root_event_id(
+                KIND_TEXT_NOTE,
+                THIRD_PARTY,
+                &tags(&[&["e", "garbage", "", "root"], &["e", ROOT]])
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn multiple_unmarked_candidates_are_refused() {
+        assert_eq!(
+            root_event_id(
+                KIND_TEXT_NOTE,
+                THIRD_PARTY,
+                &tags(&[&["e", ROOT], &["e", OTHER_ROOT]])
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn a_root_marker_plus_a_reply_reference_resolves_to_the_root() {
+        // The legitimate status-event shape: root plus accepted revision.
+        // Order-independence is the property that was missing.
+        assert_eq!(
+            root_event_id(
+                KIND_GIT_STATUS_CLOSED,
+                THIRD_PARTY,
+                &tags(&[&["e", ROOT, "", "root"], &["e", OTHER_ROOT, "", "reply"]])
+            ),
+            Some(ROOT.to_string())
+        );
+        assert_eq!(
+            root_event_id(
+                KIND_GIT_STATUS_CLOSED,
+                THIRD_PARTY,
+                &tags(&[&["e", OTHER_ROOT, "", "reply"], &["e", ROOT, "", "root"]])
+            ),
+            Some(ROOT.to_string())
+        );
+    }
+
+    #[test]
+    fn a_lone_reply_reference_with_no_root_marker_is_refused() {
+        // Nothing here says which event is the root.
+        assert_eq!(
+            root_event_id(
+                KIND_TEXT_NOTE,
+                THIRD_PARTY,
+                &tags(&[&["e", ROOT, "", "reply"]])
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn a_single_unmarked_reference_is_still_accepted() {
+        assert_eq!(
+            root_event_id(KIND_GIT_STATUS_OPEN, THIRD_PARTY, &tags(&[&["e", ROOT]])),
+            Some(ROOT.to_string())
+        );
+    }
+
+    #[test]
+    fn pr_updates_need_exactly_one_uppercase_e() {
+        assert_eq!(
+            root_event_id(KIND_GIT_PR_UPDATE, THIRD_PARTY, &tags(&[&["E", ROOT]])),
+            Some(ROOT.to_string())
+        );
+        assert_eq!(
+            root_event_id(
+                KIND_GIT_PR_UPDATE,
+                THIRD_PARTY,
+                &tags(&[&["E", ROOT], &["E", OTHER_ROOT]])
+            ),
+            None
+        );
+        // Lowercase does not stand in for uppercase.
+        assert_eq!(
+            root_event_id(KIND_GIT_PR_UPDATE, THIRD_PARTY, &tags(&[&["e", ROOT]])),
+            None
+        );
+    }
+
+    #[test]
+    fn coordinate_claims_distinguish_absent_from_incoherent() {
+        // The distinction the old `Option<String>` destroyed.
+        assert_eq!(
+            coordinate_claim(&tags(&[&["e", ROOT]])),
+            CoordinateClaim::Absent
+        );
+        assert_eq!(
+            coordinate_claim(&tags(&[&["a", &coord()]])),
+            CoordinateClaim::Unique(coord())
+        );
+        assert_eq!(coordinate_claim(&tags(&[&["a"]])), CoordinateClaim::Invalid);
+        assert_eq!(
+            coordinate_claim(&tags(&[&["a", ""]])),
+            CoordinateClaim::Invalid
+        );
+        assert_eq!(
+            coordinate_claim(&tags(&[&["a", &coord()], &["a", &coord()]])),
+            CoordinateClaim::Invalid
+        );
+    }
+
+    // ── Reconstructed WIP: routes and subscription classification ────────────
+
+    #[test]
+    fn an_announcement_has_no_root_route() {
+        assert_eq!(
+            root_event_id(
+                KIND_GIT_REPO_ANNOUNCEMENT,
+                ROOT,
+                &tags(&[&["d", "my-repo"]])
+            ),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn a_verified_announcement_derives_no_project_route() {
+        // Why `Discovery` is its own variant: derivation correctly finds
+        // nothing, so a `Routed`-only design would drop every announcement
+        // through a path that looks like it handled it.
+        let keys = Keys::generate();
+        let event = signed(
+            &keys,
+            KIND_GIT_REPO_ANNOUNCEMENT,
+            vec![tag(&["d", "my-repo"])],
+        );
+        let verified = VerifiedProjectEvent::verify(event).await.expect("valid");
+        assert!(ProjectRoute::derive(&verified).is_none());
+    }
+
+    #[tokio::test]
+    async fn a_routed_event_derives_its_root_and_claim() {
+        let keys = Keys::generate();
+        let event = signed(
+            &keys,
+            KIND_TEXT_NOTE,
+            vec![tag(&["e", ROOT, "", "root"]), tag(&["a", &coord()])],
+        );
+        let verified = VerifiedProjectEvent::verify(event).await.expect("valid");
+        let route = ProjectRoute::derive(&verified).expect("routes");
+
+        assert_eq!(route.root(), ROOT);
+        assert_eq!(route.key(), project_route_key(ROOT).unwrap());
+        assert_eq!(route.coordinate_claim(), &CoordinateClaim::Unique(coord()));
+    }
+
+    #[tokio::test]
+    async fn a_catch_up_route_can_be_bound_to_its_expected_root() {
+        // Relay filters are candidate selection, not authority: a catch-up
+        // subscription answering with a different root must be detectable.
+        let keys = Keys::generate();
+        let event = signed(
+            &keys,
+            KIND_TEXT_NOTE,
+            vec![tag(&["e", OTHER_ROOT, "", "root"])],
+        );
+        let verified = VerifiedProjectEvent::verify(event).await.expect("valid");
+        let route = ProjectRoute::derive(&verified).expect("routes");
+
+        let mut h = PageHarness::new();
+        let mut c = HistoryCursor::new(ROOT, HistoryStream::Comments, 1_000, 4, 1_000);
+        let page = h.open_with(c.begin_request()).await;
+        let Some(ProjectSubscription::RootCatchUp { root: expected, .. }) =
+            h.requests.match_frame(page.sub_id())
+        else {
+            panic!("the request we registered should match");
+        };
+        assert_ne!(
+            route.root(),
+            expected,
+            "the mismatch the dispatch branch refuses"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_catch_up_subscription_id_fits_this_relay() {
+        // `proj-catchup-` + a one-character stream marker + `-` + the
+        // 64-character root + `-` + the attempt's incarnation.
+        // `buzz-relay/src/protocol.rs:9` advertises 256, so this is accepted
+        // here; NIP-01's conventional cap is 64, which the root alone already
+        // exceeded before this piece.
+        //
+        // The stream marker is what stops a pull request's two required
+        // streams colliding on one id — they are different questions and the
+        // registry must be able to hold both. The incarnation is what stops two
+        // *attempts* colliding, which is the same argument one level down.
+        let mut h = PageHarness::new();
+        let mut comments_cursor =
+            HistoryCursor::new(ROOT, HistoryStream::Comments, 1_000, 4, 1_000);
+        let mut updates_cursor =
+            HistoryCursor::new(ROOT, HistoryStream::PullRequestUpdates, 1_000, 4, 1_000);
+        let comments = h.open_with(comments_cursor.begin_request()).await;
+        let updates = h.open_with(updates_cursor.begin_request()).await;
+
+        assert!(
+            comments.sub_id().len() <= 256,
+            "{} is longer than this relay accepts",
+            comments.sub_id().len()
+        );
+        assert!(
+            comments.sub_id().contains(ROOT),
+            "the root is named exactly"
+        );
+        assert_ne!(
+            comments.sub_id(),
+            updates.sub_id(),
+            "one id per stream, not per root"
+        );
+    }
+
+    // ── Project-specific author classification ───────────────────────────────
+    //
+    // Rebuilt after discovering they were lost in the damage and missed by my
+    // own recovery check: I verified against test names I could recall having
+    // published, which is not an inventory.
+
+    fn no_one() -> BTreeSet<String> {
+        BTreeSet::new()
+    }
+
+    fn set_of(keys: &[&str]) -> BTreeSet<String> {
+        keys.iter().map(|k| k.to_string()).collect()
+    }
+
+    async fn some_event() -> (VerifiedProjectEvent, String) {
+        let keys = Keys::generate();
+        let event = signed(&keys, KIND_TEXT_NOTE, vec![tag(&["e", ROOT, "", "root"])]);
+        let author = keys.public_key().to_hex();
+        (
+            VerifiedProjectEvent::verify(event).await.expect("valid"),
+            author,
+        )
+    }
+
+    struct StubResolver {
+        siblings: Vec<(String, String)>,
+    }
+
+    impl SiblingResolver for StubResolver {
+        fn is_same_owner_sibling(&self, author: &str, owner: &str) -> bool {
+            self.siblings.iter().any(|(a, o)| a == author && o == owner)
+        }
+    }
+
+    #[tokio::test]
+    async fn self_is_classified_before_anything_else() {
+        let secret = "0000000000000000000000000000000000000000000000000000000000000001";
+        let keys = Keys::parse(secret).expect("keys");
+        let event = signed(&keys, KIND_TEXT_NOTE, vec![tag(&["e", ROOT, "", "root"])]);
+        let event = VerifiedProjectEvent::verify(event).await.expect("valid");
+        let identity = AgentIdentity::new(&keys.public_key()).expect("identity");
+        let author = event.author();
+
+        assert_eq!(
+            classify_project_author(
+                &event,
+                &identity,
+                Some(&author),
+                &set_of(&[&author]),
+                None,
+                &set_of(&[&author]),
+            ),
+            ProjectAuthor::SelfAuthored,
+            "the agent cannot become an authorised human by owning things"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_agent_owner_and_approved_humans_are_authorised() {
+        let (event, author) = some_event().await;
+        assert_eq!(
+            classify_project_author(
+                &event,
+                &agent_identity(),
+                Some(&author),
+                &no_one(),
+                None,
+                &no_one()
+            ),
+            ProjectAuthor::AuthorisedHuman,
+            "the agent owner"
+        );
+        assert_eq!(
+            classify_project_author(
+                &event,
+                &agent_identity(),
+                Some(OWNER),
+                &set_of(&[&author]),
+                None,
+                &no_one()
+            ),
+            ProjectAuthor::AuthorisedHuman,
+            "an explicitly approved human"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_attested_sibling_binds_to_the_agent_owner() {
+        // A NIP-OA sibling shares *this agent's* owner, not the owner of
+        // whichever repository is being discussed.
+        let (event, author) = some_event().await;
+        let resolver = StubResolver {
+            siblings: vec![(author.clone(), OWNER.to_string())],
+        };
+        let proof = resolver.resolve(&author, OWNER).expect("proof");
+
+        assert_eq!(
+            classify_project_author(
+                &event,
+                &agent_identity(),
+                Some(OWNER),
+                &no_one(),
+                Some(&proof),
+                &no_one()
+            ),
+            ProjectAuthor::TrustedAgent
+        );
+        assert_eq!(
+            classify_project_author(
+                &event,
+                &agent_identity(),
+                Some(THIRD_PARTY),
+                &no_one(),
+                Some(&proof),
+                &no_one()
+            ),
+            ProjectAuthor::Untrusted,
+            "a proof against a different owner does not transfer"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_sibling_proof_for_someone_else_grants_nothing() {
+        let (event, _) = some_event().await;
+        let resolver = StubResolver {
+            siblings: vec![(THIRD_PARTY.to_string(), OWNER.to_string())],
+        };
+        let wrong_author = resolver.resolve(THIRD_PARTY, OWNER).expect("proof");
+        assert_eq!(
+            classify_project_author(
+                &event,
+                &agent_identity(),
+                Some(OWNER),
+                &no_one(),
+                Some(&wrong_author),
+                &no_one()
+            ),
+            ProjectAuthor::Untrusted
+        );
+    }
+
+    #[tokio::test]
+    async fn an_owner_approved_external_agent_is_trusted_without_a_sibling_proof() {
+        let (event, author) = some_event().await;
+        assert_eq!(
+            classify_project_author(
+                &event,
+                &agent_identity(),
+                Some(OWNER),
+                &no_one(),
+                None,
+                &set_of(&[&author])
+            ),
+            ProjectAuthor::TrustedAgent
+        );
+    }
+
+    #[tokio::test]
+    async fn an_empty_approval_set_means_nobody_not_everybody() {
+        // The Hermes allow-list convention that empty means allow-all must not
+        // leak in, and `RespondTo::Anyone` is not consulted at all.
+        let (event, _) = some_event().await;
+        assert_eq!(
+            classify_project_author(&event, &agent_identity(), None, &no_one(), None, &no_one()),
+            ProjectAuthor::Untrusted
+        );
+    }
+
+    #[test]
+    fn a_sibling_proof_exists_only_where_the_lookup_succeeded() {
+        let resolver = StubResolver {
+            siblings: vec![(THIRD_PARTY.to_string(), OWNER.to_string())],
+        };
+        assert!(resolver.resolve(THIRD_PARTY, OWNER).is_some());
+        assert!(resolver.resolve(THIRD_PARTY, AGENT_PK).is_none());
+        assert!(resolver.resolve(OWNER, OWNER).is_none());
+    }
+
+    #[tokio::test]
+    async fn an_untrusted_author_cannot_enrol_or_wake() {
+        // Deliberately *not* "cannot produce any effect": it produces
+        // `UntrustedContext`, which is an effect and remains an open blocker.
+        // Attacker-controlled prose reaching a model prompt is steering
+        // whatever the variant is called. The stronger name becomes available
+        // once untrusted content is excluded from model context entirely.
+        for addressing in ALL_ADDRESSING {
+            for state in [RootState::Active, RootState::Unknown, RootState::Dormant] {
+                let effect = classify_project_event(
+                    classify_kind(KIND_TEXT_NOTE),
+                    ProjectAuthor::Untrusted,
+                    project_call_marker(),
+                    state,
+                    addressing,
+                    false,
+                );
+                assert_eq!(effect, ProjectEffect::UntrustedContext);
+                assert!(!matches!(
+                    apply_processing_mode(effect, ProcessingMode::Live),
+                    ProjectEffect::EnrolAndWake | ProjectEffect::Wake | ProjectEffect::Enrol
+                ));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn announcing_a_repository_does_not_authorise_invoking_the_agent() {
+        // The privilege escalation the agent-owner/repository-owner split
+        // closes. Anyone can sign a valid kind-30617 for a repository they
+        // invent, so if repository ownership implied invocation authority, any
+        // relay user could announce a repo, open an issue under it, tag the
+        // agent, and operate somebody else's agent.
+        let intruder = Keys::generate();
+        let intruder_hex = intruder.public_key().to_hex();
+
+        let announcement = signed(
+            &intruder,
+            KIND_GIT_REPO_ANNOUNCEMENT,
+            vec![tag(&["d", "my-very-own-repo"])],
+        );
+        let announcement = VerifiedAnnouncement::prove(
+            VerifiedProjectEvent::verify(announcement)
+                .await
+                .expect("valid"),
+        )
+        .expect("a genuine announcement");
+        let mut discovered = DiscoveredRepositories::new();
+        let Discovered::Added(coordinate) = discovered.ingest(&announcement) else {
+            panic!("a fresh announcement is added");
+        };
+        assert!(
+            coordinate.contains(&intruder_hex),
+            "they really do own this repository"
+        );
+
+        let root = EventBuilder::new(
+            Kind::Custom(KIND_GIT_ISSUE as u16),
+            format!("please look, nostr:{AGENT_NPUB}"),
+        )
+        .tags([
+            nostr::Tag::parse(tag(&["a", &coordinate])).unwrap(),
+            nostr::Tag::parse(tag(&["p", AGENT_PK])).unwrap(),
+        ])
+        .sign_with_keys(&intruder)
+        .expect("sign");
+        let root = VerifiedProjectEvent::verify(root).await.expect("valid");
+
+        // It verifies, routes, and is fully addressed — transport and discovery
+        // are candidate selection, and all of that is expected to succeed.
+        let candidate = validate_enrolment_candidate(&root, &discovered)
+            .expect("a discovered coordinate does route");
+        assert_eq!(candidate.owner(), intruder_hex);
+
+        let evidence = AddressingEvidence::resolve(&root, &agent_identity());
+        assert!(
+            evidence.p_tag_present && evidence.visible_mention,
+            "fully addressed, structurally and visibly"
+        );
+
+        // And the author is still untrusted, because the agent's owner never
+        // approved them.
+        let author = classify_project_author(
+            &root,
+            &agent_identity(),
+            Some(OWNER),
+            &no_one(),
+            None,
+            &no_one(),
+        );
+        assert_eq!(
+            author,
+            ProjectAuthor::Untrusted,
+            "repository ownership is not invocation authority"
+        );
+
+        for addressing in ALL_ADDRESSING {
+            let effect = classify_project_event(
+                classify_kind(KIND_GIT_ISSUE),
+                author,
+                project_call_marker(),
+                RootState::Unknown,
+                addressing,
+                false,
+            );
+            assert_eq!(effect, ProjectEffect::UntrustedContext, "{addressing:?}");
+            assert!(!matches!(
+                apply_processing_mode(effect, ProcessingMode::Live),
+                ProjectEffect::EnrolAndWake | ProjectEffect::Wake | ProjectEffect::Enrol
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_repository_owner_still_holds_lifecycle_authority() {
+        // The power that legitimately follows from repository ownership, kept
+        // separate from invocation.
+        let owner = Keys::generate();
+        let owner_hex = owner.public_key().to_hex();
+        assert!(
+            lifecycle_actor_allowed(&owner_hex, THIRD_PARTY, &owner_hex),
+            "the repository owner may close their own root"
+        );
+
+        let event = signed(
+            &owner,
+            KIND_GIT_STATUS_CLOSED,
+            vec![tag(&["e", ROOT, "", "root"])],
+        );
+        let event = VerifiedProjectEvent::verify(event).await.expect("valid");
+        assert_eq!(
+            classify_project_author(
+                &event,
+                &agent_identity(),
+                Some(OWNER),
+                &no_one(),
+                None,
+                &no_one()
+            ),
+            ProjectAuthor::Untrusted,
+            "…while still not being able to invoke the agent"
+        );
     }
 }
