@@ -7911,9 +7911,13 @@ mod tests {
             ),
         ];
 
+        // (event id, whether it reached dispatch rather than being refused at
+        // admission)
+        let mut refused_ids: Vec<(String, bool)> = Vec::new();
         for (why, event) in cases {
             deliver_frame(&mut state, &enrol_id, &event, &tx).await;
             let delivered = drain(&mut rx);
+            let reached_dispatch = !delivered.is_empty();
             // Some refusals happen at admission and never reach dispatch at
             // all; those that do must refuse there. Either way the queue is
             // the thing that must stay empty.
@@ -7932,7 +7936,55 @@ mod tests {
                 enrolments.all_roots().is_empty(),
                 "{why}: a refusal enrolled a root"
             );
+            refused_ids.push((event.id.to_hex(), reached_dispatch));
         }
+
+        // **Where a refused event's dedup slot ends up, measured rather than
+        // assumed.**
+        //
+        // Refusals happen at two different depths and the dedup consequence
+        // differs, which is worth stating exactly because "a refusal consumes
+        // no dedup slot" is true of only one of them:
+        //
+        // - refused at *admission* (the relay could not verify, route or bind
+        //   it) — `project_seen_ids` was never reached, so no slot is spent;
+        // - refused at *dispatch* (admitted and delivered, then declined by the
+        //   authority gate) — the slot was taken on delivery, because dedup is
+        //   about not delivering the same bytes twice and is decided before
+        //   permission is.
+        //
+        // Neither leaks authority. The second means the identical event id
+        // cannot be re-delivered, which is correct: it is the same event.
+        for (id, reached_dispatch) in &refused_ids {
+            assert_eq!(
+                state.project_seen_ids.contains(id),
+                *reached_dispatch,
+                "a refused event's dedup slot must be spent exactly when it was \
+                 delivered — never merely because it was refused"
+            );
+        }
+
+        // What must still hold: a different, legitimate event arriving
+        // afterwards on the same registration is unaffected.
+        let legitimate = root_named(&owner, &owner_coord, &agent_hex);
+        deliver_frame(&mut state, &enrol_id, &legitimate, &tx).await;
+        let mut queued = false;
+        for ev in drain(&mut rx) {
+            if let BuzzEvent::Project(p) = ev {
+                if let crate::ProjectDispatched::Queued { queued: q, .. } = dispatch!(&p) {
+                    queued = q;
+                }
+            }
+        }
+        assert!(
+            queued,
+            "three refusals left the path unable to admit a legitimate mention"
+        );
+        assert_eq!(
+            enrolments.all_roots().len(),
+            1,
+            "exactly the legitimate root is watched"
+        );
     }
 
     /// The flag-off control: no project REQ bytes at all.
