@@ -1822,9 +1822,23 @@ pub async fn run_prompt_task(
     } else if let Some(ref b) = batch {
         // Build prompt from batch with context enrichment.
         // Try startup cache first; lazy-fetch via REST for dynamic channels.
-        let channel_info = ctx.channel_info.resolve(b.channel_id).await;
+        // A project batch is keyed by a UUIDv5 of a root, which names no
+        // channel. Resolving it would query the relay for a channel that does
+        // not exist and then fall back to a default that describes the turn as
+        // something it is not — including the DM policy the project gate has
+        // already declined to apply. The batch says which it is; nothing here
+        // has to guess.
+        let project_origin = b.project_origin();
+        let channel_info = if project_origin.is_some() {
+            None
+        } else {
+            ctx.channel_info.resolve(b.channel_id).await
+        };
 
-        let conversation_context = if ctx.context_message_limit > 0 {
+        // Conversation context is fetched by channel id for the same reason it
+        // cannot be fetched here: there is no channel to fetch it from. Project
+        // history belongs to the durability phase.
+        let conversation_context = if ctx.context_message_limit > 0 && project_origin.is_none() {
             fetch_conversation_context(b, &channel_info, &ctx).await
         } else {
             None
@@ -1856,6 +1870,7 @@ pub async fn run_prompt_task(
                 channel_info: channel_info.as_ref(),
                 conversation_context: conversation_context.as_ref(),
                 profile_lookup: profile_lookup.as_ref(),
+                project: project_origin,
                 has_system_prompt_support: agent.has_system_prompt_support(),
                 base_prompt: ctx.base_prompt,
                 system_prompt: ctx.system_prompt.as_deref(),

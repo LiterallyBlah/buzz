@@ -59,6 +59,25 @@ pub struct QueuedEvent {
     pub project: Option<crate::project::ProjectOrigin>,
 }
 
+impl FlushBatch {
+    /// The project binding this batch belongs to, if any.
+    ///
+    /// Read from the batch's own events rather than by resolving
+    /// `channel_id`: the key is a UUIDv5 of a root and names no channel, so
+    /// every channel-shaped lookup against it answers from a default. A batch
+    /// is project-origin when its events say so and not otherwise.
+    ///
+    /// Takes the first origin present. Events under one route key derive it
+    /// from the same immutable enrolment binding, so a later event cannot
+    /// legitimately disagree with an earlier one.
+    pub fn project_origin(&self) -> Option<&crate::project::ProjectOrigin> {
+        self.events
+            .iter()
+            .chain(self.cancelled_events.iter())
+            .find_map(|e| e.project.as_ref())
+    }
+}
+
 /// A single event inside a [`FlushBatch`].
 #[derive(Debug, Clone)]
 pub struct BatchEvent {
@@ -1111,14 +1130,20 @@ pub(crate) fn format_event_block(
     let kind = be.event.kind.as_u16() as u32;
     let event_id = be.event.id.to_hex();
 
-    let channel_display = match channel_info {
-        Some(ci) => format!("{} (#{channel_id})", ci.name),
-        None => channel_id.to_string(),
+    // A project event's route key is a UUIDv5 of a root. Printing it after
+    // "Channel:" was the last place the key still claimed to be one — the
+    // `[Project]` section can say otherwise all it likes while every event
+    // block underneath contradicts it. The origin travels on the event, so the
+    // block reports the root it actually belongs to.
+    let locus = match (be.project.as_ref(), channel_info) {
+        (Some(project), _) => format!("Project: {} root {}", project.coordinate(), project.root()),
+        (None, Some(ci)) => format!("Channel: {} (#{channel_id})", ci.name),
+        (None, None) => format!("Channel: {channel_id}"),
     };
 
     let mut block = format!(
         "Event ID: {event_id}\n\
-         Channel: {channel_display}\n\
+         {locus}\n\
          Kind: {kind}\n\
          From: {}\n\
          Time: {time}\n\
@@ -1242,6 +1267,56 @@ fn resolve_reply_anchor(
             .root_event_id
             .clone()
             .unwrap_or_else(|| triggering_event_id.to_string()),
+    )
+}
+
+/// Format the `[Project]` context section for a project-routed turn.
+///
+/// Replaces the channel hints entirely. It names what the agent is actually
+/// looking at — repository coordinate, root, and whether it is an issue or a
+/// pull request — and gives the exact command that answers on that root.
+///
+/// **The reply command is spelled out rather than described.** An agent that
+/// knows it is on an issue but has to guess the command reaches for
+/// `buzz messages send --channel <uuid>`, which is the one thing that cannot
+/// work: the UUID names no channel and the reply would go nowhere the issue
+/// can see.
+///
+/// `triggering` is the event id of the last event in the batch — the one being
+/// answered — so a reply can be threaded under it rather than only at the root.
+fn format_project_context(project: &crate::project::ProjectOrigin, triggering: &str) -> String {
+    let coordinate = project.coordinate();
+    let root = project.root();
+    let class = project.class_noun();
+    // `30617:<owner>:<identifier>` — split for the command's own flags. The
+    // coordinate is validated before it can reach a `ProjectOrigin`, so the
+    // parts are present; the fallbacks keep a malformed one from panicking a
+    // prompt.
+    let mut parts = coordinate.splitn(3, ':');
+    let _kind = parts.next();
+    let repo_owner = parts.next().unwrap_or_default();
+    let repo_id = parts.next().unwrap_or_default();
+
+    format!(
+        "[Project]\n\
+         You are working on a git {class}, not a channel. This conversation \
+         belongs to a repository root, and replies must be attached to that \
+         root — there is no channel to post in.\n\n\
+         Repository: {coordinate}\n\
+         Root event: {root}\n\
+         Triggering event: {triggering}\n\n\
+         To reply on this {class}:\n\n\
+         ```bash\n\
+         buzz issues comment \\\n  \
+           --repo-owner {repo_owner} \\\n  \
+           --repo-id {repo_id} \\\n  \
+           --root {root} \\\n  \
+           --content -\n\
+         ```\n\n\
+         Pass the body on stdin. Add `--to <pubkey>` to notify a participant, \
+         and `--reply-to <event-id>` to answer a specific comment rather than \
+         the root. The ordinary channel-message command cannot be used here — \
+         it requires a channel id, and this conversation has none."
     )
 }
 
@@ -1387,6 +1462,13 @@ pub struct FormatPromptArgs<'a> {
     pub system_prompt: Option<&'a str>,
     /// Team instructions for legacy agents, rendered after `[System]`.
     pub team_instructions: Option<&'a str>,
+    /// The project root this batch belongs to, when it is not a channel.
+    ///
+    /// Present exactly when [`FlushBatch::project_origin`] is `Some`. Drives
+    /// the `[Project]` section, which names the repository and root and gives
+    /// the agent the reply command — without it the agent has a conversation
+    /// and no way to answer on the thing it is about.
+    pub project: Option<&'a crate::project::ProjectOrigin>,
     /// Rendered `[Channel Canvas]` metadata section for legacy agents.
     ///
     /// For modern agents (protocol_version >= 2) the section is delivered via
@@ -1500,14 +1582,27 @@ pub fn format_prompt(batch: &FlushBatch, args: &FormatPromptArgs<'_>) -> Vec<Str
             args.profile_lookup,
         )
     };
-    sections.push(format_context_hints(
-        batch.channel_id,
-        args.channel_info,
-        &thread_tags,
-        is_dm,
-        args.conversation_context.is_some(),
-        reply_anchor.as_deref(),
-    ));
+    // A project batch replaces the channel context hints rather than adding to
+    // them. The hints name a channel, quote its id and describe replying with
+    // `buzz messages send --channel` — every line of which is false here. The
+    // route key is a UUIDv5 of a root and names no channel, so emitting both
+    // would hand the agent a correct instruction and an incorrect one and let
+    // it choose.
+    if let Some(project) = args.project {
+        sections.push(format_project_context(
+            project,
+            &last_event.event.id.to_hex(),
+        ));
+    } else {
+        sections.push(format_context_hints(
+            batch.channel_id,
+            args.channel_info,
+            &thread_tags,
+            is_dm,
+            args.conversation_context.is_some(),
+            reply_anchor.as_deref(),
+        ));
+    }
 
     // 3. Conversation context (thread or DM).
     if let Some(ctx) = args.conversation_context {
@@ -1711,6 +1806,136 @@ mod tests {
 
     fn any_in_flight(q: &EventQueue) -> bool {
         !q.in_flight_channels.is_empty()
+    }
+
+    /// A project turn must be told what it is looking at and how to answer.
+    ///
+    /// Asserts the content of the prompt, not that a function was called: the
+    /// agent only ever sees this string.
+    #[test]
+    fn a_project_batch_is_framed_as_a_root_with_a_working_reply_command() {
+        let owner = "a".repeat(64);
+        let root = "b".repeat(64);
+        let origin = crate::project::ProjectOrigin::for_test(
+            &format!("30617:{owner}:my-repo"),
+            &root,
+            false,
+        );
+        let event = make_event("please look at this");
+        let batch = FlushBatch {
+            channel_id: Uuid::new_v4(),
+            events: vec![BatchEvent {
+                event,
+                prompt_tag: "@mention".into(),
+                received_at: Instant::now(),
+                project: Some(origin.clone()),
+            }],
+            cancelled_events: vec![],
+            cancel_reason: None,
+        };
+
+        let prompt = format_prompt(
+            &batch,
+            &FormatPromptArgs {
+                project: batch.project_origin(),
+                ..Default::default()
+            },
+        )
+        .join("\n\n");
+
+        assert!(prompt.contains("[Project]"), "no project section");
+        assert!(
+            prompt.contains(&format!("30617:{owner}:my-repo")),
+            "prompt does not name the repository"
+        );
+        assert!(prompt.contains(&root), "prompt does not name the root");
+        assert!(prompt.contains("issue"), "prompt does not name the class");
+        // The command has to be usable as written, not merely mentioned.
+        assert!(prompt.contains("buzz issues comment"), "no reply command");
+        assert!(
+            prompt.contains(&format!("--repo-owner {owner}")),
+            "reply command lacks the repo owner"
+        );
+        assert!(
+            prompt.contains("--repo-id my-repo"),
+            "reply command lacks the repo id"
+        );
+        assert!(
+            prompt.contains(&format!("--root {root}")),
+            "reply command lacks the root"
+        );
+    }
+
+    /// The channel hints and the project section are alternatives, not
+    /// additions. Emitting both would give the agent a working instruction and
+    /// a broken one and let it pick.
+    #[test]
+    fn a_project_batch_is_never_described_as_a_channel() {
+        let origin = crate::project::ProjectOrigin::for_test(
+            &format!("30617:{}:r", "a".repeat(64)),
+            &"b".repeat(64),
+            true,
+        );
+        let batch = FlushBatch {
+            channel_id: Uuid::new_v4(),
+            events: vec![BatchEvent {
+                event: make_event("hi"),
+                prompt_tag: "@mention".into(),
+                received_at: Instant::now(),
+                project: Some(origin),
+            }],
+            cancelled_events: vec![],
+            cancel_reason: None,
+        };
+
+        let prompt = format_prompt(
+            &batch,
+            &FormatPromptArgs {
+                project: batch.project_origin(),
+                ..Default::default()
+            },
+        )
+        .join("\n\n");
+
+        assert!(
+            !prompt.contains("[Context]"),
+            "project turn still carries channel context hints"
+        );
+        assert!(
+            !prompt.contains("buzz messages send"),
+            "project turn offers the channel reply command, which cannot work here"
+        );
+        assert!(
+            !prompt.contains(&batch.channel_id.to_string()),
+            "project turn quotes its route key as if it were a channel"
+        );
+        assert!(
+            prompt.contains("pull request"),
+            "a PR root should be named as one"
+        );
+    }
+
+    /// The channel path is untouched: no project section, hints intact.
+    #[test]
+    fn a_channel_batch_is_unchanged_by_project_framing() {
+        let ch = Uuid::new_v4();
+        let batch = FlushBatch {
+            channel_id: ch,
+            events: vec![BatchEvent {
+                event: make_event("ordinary channel message"),
+                prompt_tag: "@mention".into(),
+                received_at: Instant::now(),
+                project: None,
+            }],
+            cancelled_events: vec![],
+            cancel_reason: None,
+        };
+
+        let prompt = format_prompt(&batch, &FormatPromptArgs::default()).join("\n\n");
+
+        assert!(batch.project_origin().is_none());
+        assert!(!prompt.contains("[Project]"));
+        assert!(prompt.contains("[Context]"));
     }
 
     #[test]

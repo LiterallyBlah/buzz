@@ -2245,6 +2245,18 @@ impl ProjectOrigin {
         self.is_pull_request
     }
 
+    /// Test-only construction. Production has exactly two routes, both from an
+    /// already-validated source; this exists so prompt-rendering tests need not
+    /// stand up a whole enrolment to check a string.
+    #[cfg(test)]
+    pub(crate) fn for_test(coordinate: &str, root: &str, is_pull_request: bool) -> Self {
+        Self {
+            coordinate: coordinate.to_string(),
+            root: root.to_string(),
+            is_pull_request,
+        }
+    }
+
     /// How the class reads in a prompt.
     pub(crate) fn class_noun(&self) -> &'static str {
         if self.is_pull_request {
