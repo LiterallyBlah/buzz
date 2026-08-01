@@ -1720,6 +1720,35 @@ async fn tokio_main() -> Result<()> {
     // subscribes to discovery, so nothing ingests.
     let mut discovered_repositories = project::DiscoveredRepositories::new();
 
+    // Which roots this process is watching, and whether each is active or
+    // dormant. In-process only: Phase A makes no restart-history claim, so a
+    // restart legitimately begins with an empty set and re-enrols on the next
+    // authorised mention. Restoring this from the relay is the durability
+    // phase's job and is deliberately absent here rather than half-present.
+    let mut project_enrolments = project::ProjectEnrolments::new();
+
+    // The agent's own identity, in both spellings, from one source — so the
+    // `p`-tag check and visible-mention detection cannot end up pointed at
+    // different keys.
+    let project_agent_identity = project::AgentIdentity::new(&config.keys.public_key())
+        .map_err(|e| anyhow::anyhow!("agent identity: {e}"))?;
+
+    // Project invocation authority is **not** inherited from channel config.
+    // `RespondTo::Anyone` and an empty allow-list both mean "permissive" for
+    // channels; neither may grant a stranger the right to wake this agent on a
+    // repository issue. Only the explicitly listed pubkeys count here, and the
+    // owner is added separately by `classify_project_author`.
+    let project_approved_humans: std::collections::BTreeSet<String> = config
+        .respond_to_allowlist
+        .iter()
+        .filter_map(|p| project::canonical_root_id(p))
+        .collect();
+
+    // Empty in this phase: peer-agent calls are Phase C, and an external agent
+    // in this set could not wake anything anyway while `CallMarker` is `None`.
+    let project_approved_external_agents: std::collections::BTreeSet<String> =
+        std::collections::BTreeSet::new();
+
     let mut crash_history: Vec<SlotCircuit> = (0..config.agents as usize)
         .map(|_| SlotCircuit {
             crash_times: Vec::new(),
@@ -1948,7 +1977,27 @@ async fn tokio_main() -> Result<()> {
                             // no channel, so that lookup would fail and its
                             // fail-closed default would silently reinterpret
                             // every project event as DM policy.
-                            handle_project_event(&mut discovered_repositories, &project_event);
+                            // The dispatch context is built here, per event,
+                            // from live state. It holds no channel resolver, so
+                            // the channel lookup described above is not merely
+                            // avoided by this arm — it is unreachable from the
+                            // function this arm calls.
+                            let dispatched = handle_project_event(
+                                &mut ProjectDispatch {
+                                    identity: project::ProjectIdentity {
+                                        agent: &project_agent_identity,
+                                        agent_owner: owner_cache.get(),
+                                        approved_humans: &project_approved_humans,
+                                        approved_external_agents:
+                                            &project_approved_external_agents,
+                                    },
+                                    discovered: &mut discovered_repositories,
+                                    enrolments: &mut project_enrolments,
+                                    queue: &mut queue,
+                                },
+                                &project_event,
+                            );
+                            tracing::debug!(?dispatched, "project dispatch");
                         }
                         Some(BuzzEvent::Channel { channel_id, event }) => {
                             let buzz_event = ChannelEvent { channel_id, event };
@@ -2830,10 +2879,46 @@ fn should_report_refusal(degradation: project::Degradation, refused_total: u64) 
 /// is not built. Dropping is the only correct behaviour in the interim.
 ///
 /// Still a work-in-progress state that must not be committed.
+/// Everything the project branch is permitted to touch.
+///
+/// **What it does not carry is the point.** There is no
+/// [`pool::ChannelInfoResolver`] here and no route to one, so a channel-info
+/// or DM-policy lookup from the project path is a compile error rather than a
+/// runtime lookup that fails closed. The project route key is a UUIDv5 of a
+/// root; it names no channel, and every channel-shaped question asked of it
+/// would answer from a default rather than from fact.
+///
+/// Asserting "the project path performs no channel lookup" in a test would
+/// only describe today's code. Not holding the resolver is a property the next
+/// edit inherits.
+struct ProjectDispatch<'a> {
+    identity: project::ProjectIdentity<'a>,
+    discovered: &'a mut project::DiscoveredRepositories,
+    enrolments: &'a mut project::ProjectEnrolments,
+    queue: &'a mut queue::EventQueue,
+}
+
+/// What dispatch did, for the caller to act on and for tests to observe.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ProjectDispatched {
+    /// Nothing happened. Refusals land here, and they spend nothing.
+    Ignored,
+    /// Discovery state changed; the enrolment filter may now be wider.
+    DiscoveryChanged,
+    /// Discovery was seen and changed nothing.
+    DiscoveryUnchanged,
+    /// The root is now watched. No turn was run.
+    Enrolled,
+    /// Queued under the root's route key. `queued` is false when the queue's
+    /// own dedup refused it, which is not a refusal by this gate.
+    Queued { key: uuid::Uuid, queued: bool },
+}
+
 fn handle_project_event(
-    discovered: &mut project::DiscoveredRepositories,
+    dispatch: &mut ProjectDispatch<'_>,
     project_event: &project::ProjectEvent,
-) {
+) -> ProjectDispatched {
+    let discovered = &mut *dispatch.discovered;
     match project_event {
         project::ProjectEvent::Discovery { announcement } => {
             match discovered.ingest(announcement) {
@@ -2843,9 +2928,11 @@ fn handle_project_event(
                         known = discovered.len(),
                         "discovered repository"
                     );
+                    ProjectDispatched::DiscoveryChanged
                 }
                 project::Discovered::AlreadyKnown(coordinate) => {
                     tracing::debug!(coordinate, "repository already discovered");
+                    ProjectDispatched::DiscoveryUnchanged
                 }
                 project::Discovered::Refused {
                     because,
@@ -2863,7 +2950,7 @@ fn handle_project_event(
                     // is the reason, the ceilings, and a running count.
                     let refused_total = discovered.refused_count();
                     if !should_report_refusal(degradation, refused_total) {
-                        return;
+                        return ProjectDispatched::DiscoveryUnchanged;
                     }
                     match degradation {
                         project::Degradation::BecameDegraded => tracing::warn!(
@@ -2882,6 +2969,7 @@ fn handle_project_event(
                             "repository discovery is still refusing announcements"
                         ),
                     }
+                    ProjectDispatched::DiscoveryUnchanged
                 }
             }
         }
@@ -2890,13 +2978,100 @@ fn handle_project_event(
             route,
             event,
         } => {
-            tracing::debug!(
-                ?source,
-                route = %route.key(),
-                root = %route.root(),
-                kind = event.kind(),
-                "project event received before the authority gate is wired — dropping"
+            // Phase A holds no reconstructed history, so readiness is `Unknown`
+            // and stays honest about it. `resolve_addressing` reads that
+            // conservatively, which is the intended direction to be wrong in.
+            //
+            // Sibling attestation is `None`: the NIP-OA lookup is async and
+            // Phase A admits no trusted-agent wake, so a resolver here would
+            // buy an authority this phase refuses to grant anyway.
+            let decision = project::decide_project_event(
+                source,
+                route,
+                event,
+                dispatch.identity,
+                project::ProjectState {
+                    discovered: dispatch.discovered,
+                    enrolments: dispatch.enrolments,
+                    readiness: &project::RootHistoryReadiness::Unknown,
+                    sibling: None,
+                },
             );
+
+            let Some(origin) = decision.origin.clone() else {
+                tracing::debug!(
+                    ?source,
+                    root = %route.root(),
+                    kind = event.kind(),
+                    effect = ?decision.effect,
+                    "project event refused — nothing enrolled, queued or spent"
+                );
+                return ProjectDispatched::Ignored;
+            };
+
+            // Enrolment happens before any queue insertion. A wake whose
+            // enrolment was refused must not be queued: the binding refusal is
+            // the whole authority for watching this root, and queueing anyway
+            // would run a turn on a root we declined to watch.
+            if matches!(
+                decision.effect,
+                project::ProjectEffect::Enrol | project::ProjectEffect::EnrolAndWake
+            ) {
+                let candidate = project::validate_enrolment_candidate(event, dispatch.discovered);
+                let Some(candidate) = candidate else {
+                    return ProjectDispatched::Ignored;
+                };
+                if let Err(mismatch) = dispatch.enrolments.enrol(&candidate) {
+                    tracing::warn!(
+                        root = %route.root(),
+                        ?mismatch,
+                        "refusing to move an enrolled root to a different binding"
+                    );
+                    return ProjectDispatched::Ignored;
+                }
+            }
+
+            match decision.effect {
+                project::ProjectEffect::Enrol => {
+                    tracing::info!(
+                        root = %route.root(),
+                        coordinate = origin.coordinate(),
+                        "project root enrolled without a turn"
+                    );
+                    ProjectDispatched::Enrolled
+                }
+                project::ProjectEffect::EnrolAndWake | project::ProjectEffect::Wake => {
+                    let key = route.key();
+                    let queued = dispatch.queue.push(queue::QueuedEvent {
+                        channel_id: key,
+                        event: event.event().clone(),
+                        received_at: std::time::Instant::now(),
+                        prompt_tag: "@mention".into(),
+                        project: Some(origin.clone()),
+                    });
+                    tracing::info!(
+                        root = %route.root(),
+                        coordinate = origin.coordinate(),
+                        class = origin.class_noun(),
+                        key = %key,
+                        queued,
+                        "project event queued for a turn"
+                    );
+                    ProjectDispatched::Queued { key, queued }
+                }
+                // Everything else is state or context, not a turn. Phase A
+                // implements neither lifecycle application nor stored context,
+                // so these are recorded and dropped rather than silently
+                // treated as a wake.
+                other => {
+                    tracing::debug!(
+                        root = %route.root(),
+                        effect = ?other,
+                        "project effect not implemented in this phase — no turn"
+                    );
+                    ProjectDispatched::Ignored
+                }
+            }
         }
     }
 }
@@ -3820,6 +3995,136 @@ mod project_discovery_ingestion_tests {
         .expect("well-formed")
     }
 
+    /// Build a dispatch context over the given state, the way the run loop
+    /// does. Test-local so every test names the same production entry point;
+    /// nothing here classifies or decides.
+    fn dispatch_over<'a>(
+        agent: &'a project::AgentIdentity,
+        owner: Option<&'a str>,
+        humans: &'a std::collections::BTreeSet<String>,
+        externals: &'a std::collections::BTreeSet<String>,
+        discovered: &'a mut project::DiscoveredRepositories,
+        enrolments: &'a mut project::ProjectEnrolments,
+        queue: &'a mut EventQueue,
+    ) -> ProjectDispatch<'a> {
+        ProjectDispatch {
+            identity: project::ProjectIdentity {
+                agent,
+                agent_owner: owner,
+                approved_humans: humans,
+                approved_external_agents: externals,
+            },
+            discovered,
+            enrolments,
+            queue,
+        }
+    }
+
+    /// Dispatch a discovery announcement into `discovered` alone — the shape
+    /// every pre-existing discovery test used before dispatch grew a context.
+    fn dispatch_discovery(
+        discovered: &mut project::DiscoveredRepositories,
+        event: &project::ProjectEvent,
+    ) -> ProjectDispatched {
+        let agent = project::AgentIdentity::new(&Keys::generate().public_key()).unwrap();
+        let humans = std::collections::BTreeSet::new();
+        let externals = std::collections::BTreeSet::new();
+        let mut enrolments = project::ProjectEnrolments::new();
+        let mut queue = EventQueue::new(config::DedupMode::Queue);
+        handle_project_event(
+            &mut dispatch_over(
+                &agent,
+                None,
+                &humans,
+                &externals,
+                discovered,
+                &mut enrolments,
+                &mut queue,
+            ),
+            event,
+        )
+    }
+
+    /// An authorised owner mention with a `p` tag and no visible `@` — the
+    /// plan's own definition of done. Records what the accepted primitives
+    /// actually do with it today rather than what we intend them to do.
+    ///
+    /// Phase A holds no reconstructed history, so `resolve_addressing` sees
+    /// `RootHistoryReadiness::Unknown` and cannot tell a fresh `p` from one
+    /// copied forward. It answers `InheritedParticipant`, which the decision
+    /// table maps to `Ignore`. This test pins that so the behaviour cannot
+    /// change silently while the question is open.
+    #[tokio::test]
+    async fn a_p_tag_only_owner_mention_does_not_wake_without_history() {
+        let owner = Keys::generate();
+        let agent = Keys::generate();
+        let agent_identity = project::AgentIdentity::new(&agent.public_key()).unwrap();
+        let owner_hex = owner.public_key().to_hex();
+
+        let mut discovered = project::DiscoveredRepositories::new();
+        let mut enrolments = project::ProjectEnrolments::new();
+        let mut queue = EventQueue::new(config::DedupMode::Queue);
+        let humans = std::collections::BTreeSet::new();
+        let externals = std::collections::BTreeSet::new();
+
+        // The owner announces a repository, so the coordinate is discovered.
+        handle_project_event(
+            &mut dispatch_over(
+                &agent_identity,
+                Some(&owner_hex),
+                &humans,
+                &externals,
+                &mut discovered,
+                &mut enrolments,
+                &mut queue,
+            ),
+            &project::ProjectEvent::Discovery {
+                announcement: proven_announcement(&owner, "proj").await,
+            },
+        );
+
+        // The owner opens an issue on it and `p`-tags the agent, with no
+        // visible mention syntax in the body.
+        let issue = EventBuilder::new(
+            nostr::Kind::Custom(buzz_core::kind::KIND_GIT_ISSUE as u16),
+            "please take a look",
+        )
+        .tags([
+            nostr::Tag::parse(["a", &format!("30617:{owner_hex}:proj")]).unwrap(),
+            nostr::Tag::parse(["p", &agent.public_key().to_hex()]).unwrap(),
+        ])
+        .sign_with_keys(&owner)
+        .expect("sign");
+        let verified = project::VerifiedProjectEvent::verify(issue)
+            .await
+            .expect("valid");
+        let route = project::ProjectRoute::derive(&verified).expect("routes");
+
+        let dispatched = handle_project_event(
+            &mut dispatch_over(
+                &agent_identity,
+                Some(&owner_hex),
+                &humans,
+                &externals,
+                &mut discovered,
+                &mut enrolments,
+                &mut queue,
+            ),
+            &project::ProjectEvent::Routed {
+                source: project::ProjectSubscription::Enrolment,
+                route,
+                event: verified,
+            },
+        );
+
+        assert_eq!(
+            dispatched,
+            ProjectDispatched::Ignored,
+            "documented gap: without complete history a bare `p` reads as \
+             inherited, so the owner's own explicit mention does not wake"
+        );
+    }
+
     #[tokio::test]
     async fn a_discovered_announcement_enters_the_run_loops_repository_set() {
         // Previously this arm logged and dropped, so the discovery REQ was
@@ -3830,7 +4135,7 @@ mod project_discovery_ingestion_tests {
         let mut discovered = project::DiscoveredRepositories::new();
         assert!(discovered.is_empty());
 
-        handle_project_event(
+        dispatch_discovery(
             &mut discovered,
             &project::ProjectEvent::Discovery {
                 announcement: proven_announcement(&keys, "my-repo").await,
@@ -3846,7 +4151,7 @@ mod project_discovery_ingestion_tests {
         let keys = Keys::generate();
         let mut discovered = project::DiscoveredRepositories::new();
         for _ in 0..2 {
-            handle_project_event(
+            dispatch_discovery(
                 &mut discovered,
                 &project::ProjectEvent::Discovery {
                     announcement: proven_announcement(&keys, "my-repo").await,
@@ -3865,7 +4170,7 @@ mod project_discovery_ingestion_tests {
         // unrelated root does not become enrollable.
         let stranger = Keys::generate();
         let mut discovered = project::DiscoveredRepositories::new();
-        handle_project_event(
+        dispatch_discovery(
             &mut discovered,
             &project::ProjectEvent::Discovery {
                 announcement: proven_announcement(&stranger, "theirs").await,
@@ -3966,7 +4271,7 @@ mod project_discovery_ingestion_tests {
             .expect("valid");
         let route = project::ProjectRoute::derive(&verified).expect("routes");
 
-        handle_project_event(
+        dispatch_discovery(
             &mut discovered,
             &project::ProjectEvent::Routed {
                 source: project::ProjectSubscription::Watched { generation: 0 },

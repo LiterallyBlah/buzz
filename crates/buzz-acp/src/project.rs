@@ -1411,7 +1411,7 @@ pub(crate) fn watched_sub_id(generation: u64) -> String {
     format!("{PROJECT_SUB_ID_PREFIX}roots-{generation}")
 }
 
-fn canonical_root_id(raw: &str) -> Option<String> {
+pub(crate) fn canonical_root_id(raw: &str) -> Option<String> {
     if raw.len() != 64 || !raw.bytes().all(|b| b.is_ascii_hexdigit()) {
         return None;
     }
@@ -2043,6 +2043,146 @@ impl EnrolmentCandidate {
             is_pull_request,
         }
     }
+}
+
+/// The runtime identity and configuration the authority gate is evaluated
+/// against.
+///
+/// Grouped into one borrow so a caller cannot supply the agent's own key from
+/// one place and its owner from another, which is how a self-authored event
+/// would end up compared against somebody else's identity. Every field is read
+/// from live configuration; none of them is a decision.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ProjectIdentity<'a> {
+    pub agent: &'a AgentIdentity,
+    pub agent_owner: Option<&'a str>,
+    pub approved_humans: &'a BTreeSet<String>,
+    pub approved_external_agents: &'a BTreeSet<String>,
+}
+
+/// What the process currently knows, as distinct from who it is.
+///
+/// Grouped because these are the inputs that change as the process runs, and
+/// because a decision derived from one event's discovery set and another's
+/// enrolment set would be incoherent. Read-only: deciding never mutates state.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ProjectState<'a> {
+    pub discovered: &'a DiscoveredRepositories,
+    pub enrolments: &'a ProjectEnrolments,
+    /// How complete this process's history for the root is. Supplied by the
+    /// caller because it is a property of what the process holds, not of the
+    /// event. A caller with no reconstruction reports
+    /// [`RootHistoryReadiness::Unknown`].
+    pub readiness: &'a RootHistoryReadiness,
+    /// A completed NIP-OA sibling attestation, when one was performed.
+    pub sibling: Option<&'a VerifiedSibling>,
+}
+
+/// What the gate decided, and the binding that survives with it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ProjectDecision {
+    pub effect: ProjectEffect,
+    /// Present only when the effect is one that queues or enrols. An effect
+    /// that never reaches the queue carries no origin, so a caller cannot
+    /// queue a refused event by reading a binding off the decision anyway.
+    pub origin: Option<ProjectOrigin>,
+}
+
+/// Compose the accepted primitives against live runtime state.
+///
+/// This is the whole authority path in one place, deliberately: the inputs to
+/// [`classify_project_event`] are each derived by exactly one accepted
+/// primitive, and gathering them here is what stops a caller assembling them
+/// from convenient booleans. Nothing in this function decides anything itself —
+/// it derives, then delegates.
+///
+/// `readiness` is supplied by the caller because it is a property of the
+/// history the process actually holds, not of this event. A caller with no
+/// reconstruction reports [`RootHistoryReadiness::Unknown`], which
+/// [`resolve_addressing`] treats conservatively.
+pub(crate) fn decide_project_event(
+    source: &ProjectSubscription,
+    route: &ProjectRoute,
+    event: &VerifiedProjectEvent,
+    identity: ProjectIdentity<'_>,
+    state: ProjectState<'_>,
+) -> ProjectDecision {
+    let ignored = ProjectDecision {
+        effect: ProjectEffect::Ignore,
+        origin: None,
+    };
+
+    // Addressing first, because a discovery-sourced event has no addressing at
+    // all and must not be pushed further — `resolve_addressing` returns `None`
+    // for it rather than guessing.
+    let evidence = AddressingEvidence::resolve(event, identity.agent);
+    let Some(addressing) =
+        resolve_addressing(source, &evidence, state.readiness, None, identity.agent)
+    else {
+        return ignored;
+    };
+
+    let kind_effect = classify_kind(event.kind());
+    let author = classify_project_author(
+        event,
+        identity.agent,
+        identity.agent_owner,
+        identity.approved_humans,
+        state.sibling,
+        identity.approved_external_agents,
+    );
+    let root_state = state.enrolments.state_of(route.root());
+
+    // A root event carries its own candidate; a continuation reads the binding
+    // already stored. Both are validated sources — neither is assembled here.
+    let candidate = validate_enrolment_candidate(event, state.discovered);
+    let stored = state.enrolments.get(route.root());
+
+    // Lifecycle authority needs the root's author and the repository owner,
+    // which only a validated candidate establishes. Without one there is
+    // nothing to authorise against, so it stays false — a lifecycle event on an
+    // unbound root is refused rather than assumed.
+    let lifecycle_authorised = candidate
+        .as_ref()
+        .is_some_and(|c| lifecycle_actor_allowed(&event.author(), &event.author(), c.owner()));
+
+    let effect = classify_project_event(
+        kind_effect,
+        author,
+        // Phase A does not implement peer calls, so no event can present as an
+        // invocation or a result. This is a phase boundary, not a default.
+        CallMarker::None,
+        root_state,
+        addressing,
+        lifecycle_authorised,
+    );
+
+    let origin = match effect {
+        ProjectEffect::Enrol | ProjectEffect::EnrolAndWake => {
+            candidate.as_ref().map(ProjectOrigin::from_candidate)
+        }
+        ProjectEffect::Wake | ProjectEffect::RefreshContext => stored
+            .map(|enrolment| ProjectOrigin::from_enrolment(route.root(), enrolment))
+            .or_else(|| candidate.as_ref().map(ProjectOrigin::from_candidate)),
+        ProjectEffect::Ignore
+        | ProjectEffect::UntrustedContext
+        | ProjectEffect::ApplyLifecycle
+        | ProjectEffect::ResumeCall => None,
+    };
+
+    // An effect that needs a binding and has none cannot proceed. This is the
+    // mismatched-`a` refusal: the event named a repository that no discovered
+    // announcement authorises, so there is no validated coordinate to enrol
+    // under and nothing downstream may be spent on it.
+    if matches!(
+        effect,
+        ProjectEffect::Enrol | ProjectEffect::EnrolAndWake | ProjectEffect::Wake
+    ) && origin.is_none()
+    {
+        return ignored;
+    }
+
+    ProjectDecision { effect, origin }
 }
 
 /// Where a queued project event came from, carried beside the UUIDv5 queue key.
