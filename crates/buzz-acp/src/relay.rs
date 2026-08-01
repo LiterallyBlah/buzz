@@ -8173,10 +8173,20 @@ for line in sys.stdin:
                 "the turn is attributed to the root's UUIDv5"
             );
             pool.return_agent(result.agent);
-            assert!(
-                pool.try_claim(None).is_some(),
-                "the agent slot is returned cleanly and claimable again"
-            );
+            let mut reclaimed = pool
+                .try_claim(None)
+                .expect("the agent slot is returned cleanly and claimable again");
+
+            // Guaranteed reaping. `Drop` only best-efforts a SIGKILL and a
+            // non-blocking `try_wait` (`acp.rs:2168`); `shutdown` kills the
+            // process group and waits, which is what the API documents as the
+            // path a caller "SHOULD" take. Leaving the child to `Drop` would
+            // leave the test's own cleanup weaker than production's.
+            //
+            // The enclosing 60s timeout is what makes this an assertion: a
+            // child that never exits wedges here and fails the scenario rather
+            // than leaking quietly past a green result.
+            reclaimed.acp.shutdown().await;
 
             // ── what the child was actually told ─────────────────────────────
             let captured = std::fs::read_to_string(&capture).expect("the stub captured a prompt");
