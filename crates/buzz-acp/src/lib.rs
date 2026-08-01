@@ -1727,6 +1727,11 @@ async fn tokio_main() -> Result<()> {
     // phase's job and is deliberately absent here rather than half-present.
     let mut project_enrolments = project::ProjectEnrolments::new();
 
+    // Bumped every time the watched-root REQ is replaced. The relay keeps
+    // answering the previous request until it processes the replacement, so the
+    // generation is what tells one incarnation's frames from the next.
+    let mut project_watch_generation: u64 = 0;
+
     // The agent's own identity, in both spellings, from one source — so the
     // `p`-tag check and visible-mention detection cannot end up pointed at
     // different keys.
@@ -1998,6 +2003,73 @@ async fn tokio_main() -> Result<()> {
                                 &project_event,
                             );
                             tracing::debug!(?dispatched, "project dispatch");
+
+                            // Subscription upkeep is the loop's job, not the
+                            // gate's: dispatch decides, the loop performs I/O.
+                            // That is why `ProjectDispatch` holds no relay
+                            // handle — a gate that could open subscriptions
+                            // could also open one for an event it just refused.
+                            match dispatched {
+                                // A newly discovered coordinate widens the
+                                // enrolment filter, and the filter is derived
+                                // from the discovered set, so the REQ has to be
+                                // replaced for the new project to be visible at
+                                // all. Nothing arrives for an undiscovered
+                                // repository, which is why discovery precedes
+                                // enrolment rather than running beside it.
+                                ProjectDispatched::DiscoveryChanged => {
+                                    if let Some(filter) = project::enrolment_filter(
+                                        &discovered_repositories,
+                                        &pubkey_hex,
+                                        startup_watermark,
+                                    ) {
+                                        if let Err(e) = relay
+                                            .subscribe_project(
+                                                project::PROJECT_ENROL_SUB_ID,
+                                                project::ProjectSubscription::Enrolment,
+                                                vec![filter],
+                                            )
+                                            .await
+                                        {
+                                            tracing::warn!("enrolment subscribe error: {e}");
+                                        }
+                                    }
+                                }
+                                // A root joined or rejoined the watched set.
+                                // The watched REQ names every root explicitly,
+                                // so it is replaced under a fresh generation —
+                                // the generation is what lets the relay's old
+                                // request and its replacement be told apart
+                                // while both are briefly answerable.
+                                ProjectDispatched::Enrolled
+                                | ProjectDispatched::Queued {
+                                    watch_changed: true,
+                                    ..
+                                } => {
+                                    let filters = project::watched_roots_filters(
+                                        &project_enrolments,
+                                        startup_watermark,
+                                    );
+                                    if !filters.is_empty() {
+                                        project_watch_generation += 1;
+                                        let sub_id =
+                                            project::watched_sub_id(project_watch_generation);
+                                        if let Err(e) = relay
+                                            .subscribe_project(
+                                                &sub_id,
+                                                project::ProjectSubscription::Watched {
+                                                    generation: project_watch_generation,
+                                                },
+                                                filters,
+                                            )
+                                            .await
+                                        {
+                                            tracing::warn!("watched-roots subscribe error: {e}");
+                                        }
+                                    }
+                                }
+                                _ => {}
+                            }
                         }
                         Some(BuzzEvent::Channel { channel_id, event }) => {
                             let buzz_event = ChannelEvent { channel_id, event };
@@ -2911,7 +2983,16 @@ enum ProjectDispatched {
     Enrolled,
     /// Queued under the root's route key. `queued` is false when the queue's
     /// own dedup refused it, which is not a refusal by this gate.
-    Queued { key: uuid::Uuid, queued: bool },
+    ///
+    /// `watch_changed` says whether the watched-root set actually gained or
+    /// reactivated a root, which is the only thing that warrants replacing the
+    /// watched-root REQ. A re-mention of a root already active reports
+    /// `EnrolOutcome::Unchanged` and must not churn the subscription.
+    Queued {
+        key: uuid::Uuid,
+        queued: bool,
+        watch_changed: bool,
+    },
 }
 
 fn handle_project_event(
@@ -3009,6 +3090,8 @@ fn handle_project_event(
                 return ProjectDispatched::Ignored;
             };
 
+            let mut watch_changed = false;
+
             // Enrolment happens before any queue insertion. A wake whose
             // enrolment was refused must not be queued: the binding refusal is
             // the whole authority for watching this root, and queueing anyway
@@ -3021,13 +3104,22 @@ fn handle_project_event(
                 let Some(candidate) = candidate else {
                     return ProjectDispatched::Ignored;
                 };
-                if let Err(mismatch) = dispatch.enrolments.enrol(&candidate) {
-                    tracing::warn!(
-                        root = %route.root(),
-                        ?mismatch,
-                        "refusing to move an enrolled root to a different binding"
-                    );
-                    return ProjectDispatched::Ignored;
+                match dispatch.enrolments.enrol(&candidate) {
+                    // Only a genuine join or rejoin warrants replacing the
+                    // watched-root REQ. A re-mention of an already-active root
+                    // reports `Unchanged`, and churning the subscription for it
+                    // would replace a live request with an identical one.
+                    Ok(outcome) => {
+                        watch_changed = !matches!(outcome, project::EnrolOutcome::Unchanged);
+                    }
+                    Err(mismatch) => {
+                        tracing::warn!(
+                            root = %route.root(),
+                            ?mismatch,
+                            "refusing to move an enrolled root to a different binding"
+                        );
+                        return ProjectDispatched::Ignored;
+                    }
                 }
             }
 
@@ -3057,7 +3149,11 @@ fn handle_project_event(
                         queued,
                         "project event queued for a turn"
                     );
-                    ProjectDispatched::Queued { key, queued }
+                    ProjectDispatched::Queued {
+                        key,
+                        queued,
+                        watch_changed,
+                    }
                 }
                 // Everything else is state or context, not a turn. Phase A
                 // implements neither lifecycle application nor stored context,
@@ -4146,6 +4242,109 @@ mod project_discovery_ingestion_tests {
             ])
             .sign_with_keys(owner)
             .expect("sign")
+    }
+
+    /// The watched-root REQ is replaced only when the watched set actually
+    /// changed. Without this, a `watch_changed` that never became true would
+    /// leave the subscription unissued and nothing would fail — and a
+    /// `watch_changed` always true would replace a live request with an
+    /// identical one on every re-mention.
+    #[tokio::test]
+    async fn only_a_genuine_join_marks_the_watched_set_changed() {
+        let owner = Keys::generate();
+        let agent = Keys::generate();
+        let agent_identity = project::AgentIdentity::new(&agent.public_key()).unwrap();
+        let owner_hex = owner.public_key().to_hex();
+        let humans = std::collections::BTreeSet::new();
+        let externals = std::collections::BTreeSet::new();
+        let mut discovered = project::DiscoveredRepositories::new();
+        let mut enrolments = project::ProjectEnrolments::new();
+        let mut queue = EventQueue::new(config::DedupMode::Queue);
+
+        handle_project_event(
+            &mut dispatch_over(
+                &agent_identity,
+                Some(&owner_hex),
+                &humans,
+                &externals,
+                &mut discovered,
+                &mut enrolments,
+                &mut queue,
+            ),
+            &project::ProjectEvent::Discovery {
+                announcement: proven_announcement(&owner, "proj").await,
+            },
+        );
+
+        let root = root_event(
+            &owner,
+            &agent,
+            "proj",
+            buzz_core::kind::KIND_GIT_ISSUE,
+            "first",
+        );
+
+        let verified = project::VerifiedProjectEvent::verify(root.clone())
+            .await
+            .expect("valid");
+        let route = project::ProjectRoute::derive(&verified).expect("routes");
+        let first = handle_project_event(
+            &mut dispatch_over(
+                &agent_identity,
+                Some(&owner_hex),
+                &humans,
+                &externals,
+                &mut discovered,
+                &mut enrolments,
+                &mut queue,
+            ),
+            &project::ProjectEvent::Routed {
+                source: project::ProjectSubscription::Enrolment,
+                route,
+                event: verified,
+            },
+        );
+        assert!(
+            matches!(
+                first,
+                ProjectDispatched::Queued {
+                    watch_changed: true,
+                    ..
+                }
+            ),
+            "a root joining the watched set must replace the watched REQ, got {first:?}"
+        );
+
+        let verified = project::VerifiedProjectEvent::verify(root)
+            .await
+            .expect("valid");
+        let route = project::ProjectRoute::derive(&verified).expect("routes");
+        let again = handle_project_event(
+            &mut dispatch_over(
+                &agent_identity,
+                Some(&owner_hex),
+                &humans,
+                &externals,
+                &mut discovered,
+                &mut enrolments,
+                &mut queue,
+            ),
+            &project::ProjectEvent::Routed {
+                source: project::ProjectSubscription::Enrolment,
+                route,
+                event: verified,
+            },
+        );
+        assert!(
+            matches!(
+                again,
+                ProjectDispatched::Queued {
+                    watch_changed: false,
+                    ..
+                }
+            ),
+            "the same root re-mentioned must not churn the subscription, got {again:?}"
+        );
     }
 
     /// A root has no predecessor, so its `p` cannot have been copied forward.
