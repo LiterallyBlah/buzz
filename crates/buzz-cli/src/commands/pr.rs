@@ -280,6 +280,28 @@ pub async fn dispatch(cmd: crate::PrCmd, client: &BuzzClient) -> Result<(), CliE
             )
             .await
         }
+        // Delegates to the issues command: one builder, one event shape. A
+        // second implementation here would be a second spelling of the same
+        // event, free to drift.
+        PrCmd::Comment {
+            repo_owner,
+            repo_id,
+            root,
+            reply_to,
+            content,
+            to,
+        } => {
+            crate::commands::issues::cmd_comment_issue(
+                client,
+                &repo_owner,
+                &repo_id,
+                &root,
+                reply_to.as_deref(),
+                &content,
+                &to,
+            )
+            .await
+        }
         PrCmd::Get { event } => cmd_get_pr(client, &event).await,
         PrCmd::List {
             repo_owner,

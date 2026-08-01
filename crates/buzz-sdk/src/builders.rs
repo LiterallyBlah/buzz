@@ -3128,6 +3128,55 @@ mod tests {
         assert!(has_tag(&ev, "p", &agent));
     }
 
+    /// One event shape serves both root kinds.
+    ///
+    /// The builder never sees the root's kind — a root is an event id, and the
+    /// client reads issue and PR comments with the same `#a` filter and the
+    /// same `e`-value matcher. This pins that, so a future "PR comments are
+    /// different" change has to break a test rather than quietly add a second
+    /// spelling of one event.
+    #[test]
+    fn one_comment_shape_serves_issue_and_pull_request_roots() {
+        let repo = GitRepoCoord {
+            owner: "a".repeat(64),
+            id: "repo".to_string(),
+        };
+        let issue_root = event_id().to_hex();
+        let pr_root = "d".repeat(64);
+
+        let for_issue = sign(
+            build_git_comment(
+                &repo,
+                "same",
+                &GitCommentMeta {
+                    root_event: issue_root.clone(),
+                    ..Default::default()
+                },
+            )
+            .unwrap(),
+        );
+        let for_pr = sign(
+            build_git_comment(
+                &repo,
+                "same",
+                &GitCommentMeta {
+                    root_event: pr_root.clone(),
+                    ..Default::default()
+                },
+            )
+            .unwrap(),
+        );
+
+        assert_eq!(for_issue.kind, for_pr.kind);
+        assert_eq!(
+            tag_values(&for_issue, "a"),
+            tag_values(&for_pr, "a"),
+            "both carry the same repository coordinate"
+        );
+        assert!(tag_values(&for_issue, "e").contains(&issue_root));
+        assert!(tag_values(&for_pr, "e").contains(&pr_root));
+    }
+
     #[test]
     fn git_comment_reply_still_names_the_root() {
         let repo = GitRepoCoord {

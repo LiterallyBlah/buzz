@@ -1335,6 +1335,32 @@ pub enum PatchesCmd {
 
 #[derive(Subcommand)]
 pub enum PrCmd {
+    /// Comment on a pull request (kind:1)
+    ///
+    /// The same event shape as `buzz issues comment` — a project comment is a
+    /// kind:1 carrying the repository `a` tag and the root `e` tag, and the
+    /// client reads issue and PR comments with one filter and one matcher.
+    /// This is an alias for discoverability, not a second format.
+    Comment {
+        /// Repo owner pubkey (64-char hex)
+        #[arg(long)]
+        repo_owner: String,
+        /// Repo identifier (d-tag)
+        #[arg(long)]
+        repo_id: String,
+        /// Pull request root event id (64-char hex)
+        #[arg(long)]
+        root: String,
+        /// Comment being replied to (64-char hex). Omit to comment on the root.
+        #[arg(long)]
+        reply_to: Option<String>,
+        /// Comment body, markdown. Use '-' to read from stdin.
+        #[arg(long)]
+        content: String,
+        /// Pubkey(s) to notify. Can be specified multiple times.
+        #[arg(long = "to")]
+        to: Vec<String>,
+    },
     /// Open a git pull request (NIP-34 kind:1618)
     #[command(
         after_help = "Examples:\n  buzz pr open --repo-owner <hex> --repo-id myrepo --subject 'Fix bug' --body-file - --commit $(git rev-parse HEAD) --clone https://relay/git/owner/myrepo --branch-name fix-bug\n  buzz pr update --repo-owner <hex> --repo-id myrepo --pr <event> --pr-author <hex> --commit $(git rev-parse HEAD) --clone https://relay/git/owner/myrepo"
@@ -2054,7 +2080,7 @@ mod tests {
         assert_eq!(protect_names, vec!["list", "remove", "set"]);
         assert_eq!(
             names(&cmd, "pr"),
-            vec!["get", "list", "open", "status", "update"]
+            vec!["comment", "get", "list", "open", "status", "update"]
         );
         assert_eq!(
             names(&cmd, "patches"),
@@ -2096,7 +2122,7 @@ mod tests {
             ("messages", 8),
             ("pack", 2),
             ("patches", 4),
-            ("pr", 5),
+            ("pr", 6),
             ("reactions", 3),
             ("repos", 5),
             ("social", 7),
