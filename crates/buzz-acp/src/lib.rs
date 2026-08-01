@@ -4045,29 +4045,28 @@ mod project_discovery_ingestion_tests {
         )
     }
 
-    /// An authorised owner mention with a `p` tag and no visible `@` — the
-    /// plan's own definition of done. Records what the accepted primitives
-    /// actually do with it today rather than what we intend them to do.
+    /// Dispatch one already-signed event through the production entry with a
+    /// discovered repository in place. Returns what dispatch decided.
     ///
-    /// Phase A holds no reconstructed history, so `resolve_addressing` sees
-    /// `RootHistoryReadiness::Unknown` and cannot tell a fresh `p` from one
-    /// copied forward. It answers `InheritedParticipant`, which the decision
-    /// table maps to `Ignore`. This test pins that so the behaviour cannot
-    /// change silently while the question is open.
-    #[tokio::test]
-    async fn a_p_tag_only_owner_mention_does_not_wake_without_history() {
-        let owner = Keys::generate();
-        let agent = Keys::generate();
+    /// Builds nothing the gate consumes: the caller supplies a real signed
+    /// event, and verification, route derivation and every classification
+    /// happen inside `handle_project_event`.
+    async fn dispatch_routed(
+        owner: &Keys,
+        agent: &Keys,
+        repo_id: &str,
+        source: project::ProjectSubscription,
+        preceding: Option<nostr::Event>,
+        event: nostr::Event,
+    ) -> ProjectDispatched {
         let agent_identity = project::AgentIdentity::new(&agent.public_key()).unwrap();
         let owner_hex = owner.public_key().to_hex();
-
+        let humans = std::collections::BTreeSet::new();
+        let externals = std::collections::BTreeSet::new();
         let mut discovered = project::DiscoveredRepositories::new();
         let mut enrolments = project::ProjectEnrolments::new();
         let mut queue = EventQueue::new(config::DedupMode::Queue);
-        let humans = std::collections::BTreeSet::new();
-        let externals = std::collections::BTreeSet::new();
 
-        // The owner announces a repository, so the coordinate is discovered.
         handle_project_event(
             &mut dispatch_over(
                 &agent_identity,
@@ -4079,28 +4078,42 @@ mod project_discovery_ingestion_tests {
                 &mut queue,
             ),
             &project::ProjectEvent::Discovery {
-                announcement: proven_announcement(&owner, "proj").await,
+                announcement: proven_announcement(owner, repo_id).await,
             },
         );
 
-        // The owner opens an issue on it and `p`-tags the agent, with no
-        // visible mention syntax in the body.
-        let issue = EventBuilder::new(
-            nostr::Kind::Custom(buzz_core::kind::KIND_GIT_ISSUE as u16),
-            "please take a look",
-        )
-        .tags([
-            nostr::Tag::parse(["a", &format!("30617:{owner_hex}:proj")]).unwrap(),
-            nostr::Tag::parse(["p", &agent.public_key().to_hex()]).unwrap(),
-        ])
-        .sign_with_keys(&owner)
-        .expect("sign");
-        let verified = project::VerifiedProjectEvent::verify(issue)
+        // A comment carries no enrolment candidate of its own — only a root
+        // does — so a comment can only wake a root the process already bound.
+        // Dispatching the root first is what production does; without it the
+        // gate has no validated coordinate and fails closed.
+        if let Some(first) = preceding {
+            let verified = project::VerifiedProjectEvent::verify(first)
+                .await
+                .expect("valid");
+            let route = project::ProjectRoute::derive(&verified).expect("routes");
+            handle_project_event(
+                &mut dispatch_over(
+                    &agent_identity,
+                    Some(&owner_hex),
+                    &humans,
+                    &externals,
+                    &mut discovered,
+                    &mut enrolments,
+                    &mut queue,
+                ),
+                &project::ProjectEvent::Routed {
+                    source: project::ProjectSubscription::Enrolment,
+                    route,
+                    event: verified,
+                },
+            );
+        }
+
+        let verified = project::VerifiedProjectEvent::verify(event)
             .await
             .expect("valid");
         let route = project::ProjectRoute::derive(&verified).expect("routes");
-
-        let dispatched = handle_project_event(
+        handle_project_event(
             &mut dispatch_over(
                 &agent_identity,
                 Some(&owner_hex),
@@ -4111,17 +4124,217 @@ mod project_discovery_ingestion_tests {
                 &mut queue,
             ),
             &project::ProjectEvent::Routed {
-                source: project::ProjectSubscription::Enrolment,
+                source,
                 route,
                 event: verified,
             },
+        )
+    }
+
+    fn root_event(
+        owner: &Keys,
+        agent: &Keys,
+        repo_id: &str,
+        kind: u32,
+        body: &str,
+    ) -> nostr::Event {
+        let coord = format!("30617:{}:{repo_id}", owner.public_key().to_hex());
+        EventBuilder::new(nostr::Kind::Custom(kind as u16), body)
+            .tags([
+                nostr::Tag::parse(["a", &coord]).unwrap(),
+                nostr::Tag::parse(["p", &agent.public_key().to_hex()]).unwrap(),
+            ])
+            .sign_with_keys(owner)
+            .expect("sign")
+    }
+
+    /// A root has no predecessor, so its `p` cannot have been copied forward.
+    /// This is the plan's definition of done: a person opens an issue, names an
+    /// agent, the agent wakes — with no reconstructed history anywhere.
+    #[tokio::test]
+    async fn an_issue_root_p_tag_wakes_without_any_history() {
+        let owner = Keys::generate();
+        let agent = Keys::generate();
+        let event = root_event(
+            &owner,
+            &agent,
+            "proj",
+            buzz_core::kind::KIND_GIT_ISSUE,
+            "please take a look",
         );
+
+        let dispatched = dispatch_routed(
+            &owner,
+            &agent,
+            "proj",
+            project::ProjectSubscription::Enrolment,
+            None,
+            event,
+        )
+        .await;
+
+        assert!(
+            matches!(dispatched, ProjectDispatched::Queued { queued: true, .. }),
+            "an issue root naming the agent must queue exactly one turn, got {dispatched:?}"
+        );
+    }
+
+    /// Same rule, other root kind. A pull request root is equally first on its
+    /// own root, so the exception must not be spelled for issues alone.
+    #[tokio::test]
+    async fn a_pull_request_root_p_tag_wakes_without_any_history() {
+        let owner = Keys::generate();
+        let agent = Keys::generate();
+        let event = root_event(
+            &owner,
+            &agent,
+            "proj",
+            buzz_core::kind::KIND_GIT_PULL_REQUEST,
+            "review this please",
+        );
+
+        let dispatched = dispatch_routed(
+            &owner,
+            &agent,
+            "proj",
+            project::ProjectSubscription::Enrolment,
+            None,
+            event,
+        )
+        .await;
+
+        assert!(
+            matches!(dispatched, ProjectDispatched::Queued { queued: true, .. }),
+            "a PR root naming the agent must queue exactly one turn, got {dispatched:?}"
+        );
+    }
+
+    /// The protection the root exception must not weaken.
+    ///
+    /// A comment *can* carry a `p` copied from an earlier participant list, and
+    /// without complete history nothing can tell the difference — so it cannot
+    /// bring an unwatched root into the active set. Note the scope: an
+    /// already-active root continues on any comment by design
+    /// (`wake_or_enrol`, `RootState::Active => Wake`), because that is the
+    /// follow-up the enrolment `#p` REQ alone could never deliver. What is
+    /// guarded here is *enrolment*, not delivery.
+    #[tokio::test]
+    async fn a_comment_p_tag_cannot_enrol_an_unwatched_root() {
+        let owner = Keys::generate();
+        let agent = Keys::generate();
+        let root = root_event(
+            &owner,
+            &agent,
+            "proj",
+            buzz_core::kind::KIND_GIT_ISSUE,
+            "root",
+        );
+        let coord = format!("30617:{}:proj", owner.public_key().to_hex());
+        let comment = EventBuilder::new(
+            nostr::Kind::Custom(buzz_core::kind::KIND_TEXT_NOTE as u16),
+            "no visible mention here",
+        )
+        .tags([
+            nostr::Tag::parse(["a", &coord]).unwrap(),
+            nostr::Tag::parse(["e", &root.id.to_hex(), "", "root"]).unwrap(),
+            nostr::Tag::parse(["p", &agent.public_key().to_hex()]).unwrap(),
+        ])
+        .sign_with_keys(&owner)
+        .expect("sign");
+
+        let dispatched = dispatch_routed(
+            &owner,
+            &agent,
+            "proj",
+            project::ProjectSubscription::Enrolment,
+            None,
+            comment,
+        )
+        .await;
 
         assert_eq!(
             dispatched,
             ProjectDispatched::Ignored,
-            "documented gap: without complete history a bare `p` reads as \
-             inherited, so the owner's own explicit mention does not wake"
+            "a bare `p` on a comment is indistinguishable from propagation \
+             without history, so it must not enrol an unwatched root"
+        );
+    }
+
+    /// Visible mention syntax is evidence the primitive trusts without history,
+    /// and the root exception must not have displaced it for comments.
+    #[tokio::test]
+    async fn a_comment_with_a_visible_mention_still_wakes() {
+        let owner = Keys::generate();
+        let agent = Keys::generate();
+        let agent_npub = {
+            use nostr::ToBech32;
+            agent.public_key().to_bech32().unwrap()
+        };
+        let root = root_event(
+            &owner,
+            &agent,
+            "proj",
+            buzz_core::kind::KIND_GIT_ISSUE,
+            "root",
+        );
+        let coord = format!("30617:{}:proj", owner.public_key().to_hex());
+        let comment = EventBuilder::new(
+            nostr::Kind::Custom(buzz_core::kind::KIND_TEXT_NOTE as u16),
+            format!("nostr:{agent_npub} could you look at this"),
+        )
+        .tags([
+            nostr::Tag::parse(["a", &coord]).unwrap(),
+            nostr::Tag::parse(["e", &root.id.to_hex(), "", "root"]).unwrap(),
+            nostr::Tag::parse(["p", &agent.public_key().to_hex()]).unwrap(),
+        ])
+        .sign_with_keys(&owner)
+        .expect("sign");
+
+        let dispatched = dispatch_routed(
+            &owner,
+            &agent,
+            "proj",
+            project::ProjectSubscription::Enrolment,
+            Some(root),
+            comment,
+        )
+        .await;
+
+        assert!(
+            matches!(dispatched, ProjectDispatched::Queued { .. }),
+            "visible mention syntax still wakes a comment, got {dispatched:?}"
+        );
+    }
+
+    /// The root exception is about *addressing*. Author classification is a
+    /// separate gate and still suppresses the agent's own root, which is what
+    /// stops an agent that opens an issue from waking itself.
+    #[tokio::test]
+    async fn a_self_authored_root_still_does_not_wake() {
+        let agent = Keys::generate();
+        // The agent announces the repository and opens the issue itself.
+        let event = root_event(
+            &agent,
+            &agent,
+            "proj",
+            buzz_core::kind::KIND_GIT_ISSUE,
+            "filing this myself",
+        );
+
+        let dispatched = dispatch_routed(
+            &agent,
+            &agent,
+            "proj",
+            project::ProjectSubscription::Enrolment,
+            None,
+            event,
+        )
+        .await;
+
+        assert_eq!(
+            dispatched,
+            ProjectDispatched::Ignored,
+            "self-authorship is suppressed by the author gate regardless of addressing"
         );
     }
 
@@ -4250,7 +4463,7 @@ mod project_discovery_ingestion_tests {
     }
 
     #[tokio::test]
-    async fn a_routed_project_event_is_still_dropped() {
+    async fn a_routed_project_event_does_not_mutate_discovery_state() {
         // The asymmetry is deliberate: delivering a routed event means deciding
         // who may invoke this agent, and that gate does not exist yet.
         let keys = Keys::generate();

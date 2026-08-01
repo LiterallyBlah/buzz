@@ -2115,14 +2115,18 @@ pub(crate) fn decide_project_event(
     // Addressing first, because a discovery-sourced event has no addressing at
     // all and must not be pushed further — `resolve_addressing` returns `None`
     // for it rather than guessing.
+    let kind_effect = classify_kind(event.kind());
     let evidence = AddressingEvidence::resolve(event, identity.agent);
-    let Some(addressing) =
-        resolve_addressing(source, &evidence, state.readiness, None, identity.agent)
-    else {
+    let Some(addressing) = resolve_addressing(
+        source,
+        kind_effect,
+        &evidence,
+        state.readiness,
+        None,
+        identity.agent,
+    ) else {
         return ignored;
     };
-
-    let kind_effect = classify_kind(event.kind());
     let author = classify_project_author(
         event,
         identity.agent,
@@ -4788,6 +4792,7 @@ impl AddressingEvidence {
 /// no bearing on what the event meant when it was written.
 pub(crate) fn resolve_addressing(
     source: &ProjectSubscription,
+    kind: KindEffect,
     evidence: &AddressingEvidence,
     readiness: &RootHistoryReadiness,
     facts: Option<&PriorRootFacts>,
@@ -4805,6 +4810,30 @@ pub(crate) fn resolve_addressing(
     }
 
     if evidence.visible_mention {
+        return Some(Addressing::ExplicitMention);
+    }
+
+    // **A root has no predecessor, so its `p` cannot have been inherited.**
+    //
+    // `InheritedParticipant` means "this key is here only because an earlier
+    // participant list was copied forward". A `1621`/`1618` root event *is* the
+    // first event on its root — there is no earlier list to copy from, so the
+    // reading is not merely unlikely, it is unavailable. Requiring complete
+    // history before honouring it made the ordinary path — a person opens an
+    // issue and names an agent — unreachable without reconstruction that
+    // proves nothing, because there is no history preceding a root to
+    // reconstruct.
+    //
+    // Keyed on `KindEffect`, which the caller derived from the event's own kind
+    // via `classify_kind`, rather than on a boolean a caller could assert. An
+    // unsupported or malformed kind never classifies as `Root` and so gains
+    // nothing here, and everything upstream — signature verification, route
+    // derivation, source admission — has already happened.
+    //
+    // Comments are deliberately untouched: a copied-forward `p` on a comment is
+    // exactly the risk this guard exists for, and it still requires complete
+    // history or visible mention syntax.
+    if matches!(kind, KindEffect::Root) {
         return Some(Addressing::ExplicitMention);
     }
 
@@ -9008,7 +9037,16 @@ mod tests {
         readiness: &RootHistoryReadiness,
         facts: Option<&PriorRootFacts>,
     ) -> Option<Addressing> {
-        resolve_addressing(source, &evidence, readiness, facts, &agent_identity())
+        // Existing addressing tests are about the comment path; `Comment` keeps
+        // their meaning unchanged now that roots take an earlier exit.
+        resolve_addressing(
+            source,
+            KindEffect::Comment,
+            &evidence,
+            readiness,
+            facts,
+            &agent_identity(),
+        )
     }
 
     #[test]
@@ -9303,6 +9341,7 @@ mod tests {
         assert_eq!(
             resolve_addressing(
                 &watched(),
+                KindEffect::Comment,
                 &evidence,
                 &RootHistoryReadiness::Complete,
                 Some(&prior(false, THIRD_PARTY, OWNER)),
@@ -11035,6 +11074,7 @@ mod tests {
         assert_eq!(
             resolve_addressing(
                 &watched(),
+                KindEffect::Comment,
                 &evidence,
                 &RootHistoryReadiness::Complete,
                 Some(&facts),
@@ -11053,6 +11093,7 @@ mod tests {
         assert_eq!(
             resolve_addressing(
                 &watched(),
+                KindEffect::Comment,
                 &later_evidence,
                 &RootHistoryReadiness::Complete,
                 Some(&facts),
