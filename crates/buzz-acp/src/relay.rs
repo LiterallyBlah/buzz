@@ -7605,6 +7605,225 @@ mod tests {
         ));
     }
 
+    /// **The connected inbound slice, entered as relay bytes.**
+    ///
+    /// Nothing here constructs a `ProjectEvent`, a `ProjectEffect`, an author
+    /// classification or a queue insertion. The test writes REQs through
+    /// `send_project_subscribe` against a real socket, reads the bytes the
+    /// relay actually received, feeds EVENT frames back on the exact ids those
+    /// REQs registered, and lets `handle_ws_message` and `handle_project_event`
+    /// do the rest. What it inspects is the resulting queue.
+    ///
+    /// The `watch_changed` near-miss is why this observes wire bytes rather
+    /// than trusting what dispatch reports: a guard that never fired would have
+    /// left every state assertion passing.
+    #[tokio::test]
+    async fn relay_bytes_from_an_authorised_root_mention_queue_exactly_one_project_turn() {
+        let owner = nostr::Keys::generate();
+        let agent = nostr::Keys::generate();
+        let owner_hex = owner.public_key().to_hex();
+        let agent_hex = agent.public_key().to_hex();
+        let agent_identity =
+            crate::project::AgentIdentity::new(&agent.public_key()).expect("identity");
+
+        let mut state = BgState::new();
+        let (tx, mut rx) = mpsc::channel(16);
+
+        let mut discovered = crate::project::DiscoveredRepositories::new();
+        let mut enrolments = crate::project::ProjectEnrolments::new();
+        let mut queue = crate::queue::EventQueue::new(crate::config::DedupMode::Queue);
+        let humans = std::collections::BTreeSet::new();
+        let externals = std::collections::BTreeSet::new();
+
+        macro_rules! dispatch {
+            ($ev:expr) => {{
+                let mut d = crate::ProjectDispatch {
+                    identity: crate::project::ProjectIdentity {
+                        agent: &agent_identity,
+                        agent_owner: Some(&owner_hex),
+                        approved_humans: &humans,
+                        approved_external_agents: &externals,
+                    },
+                    discovered: &mut discovered,
+                    enrolments: &mut enrolments,
+                    queue: &mut queue,
+                };
+                crate::handle_project_event(&mut d, $ev)
+            }};
+        }
+
+        // ── 1. Discovery REQ, written the way production writes it ──────────
+        let (mut ws, mut server) = test_ws_pair().await;
+        let discovery_id = crate::project::discovery_sub_id();
+        assert_eq!(
+            send_project_subscribe(&mut ws, &mut state, &discovery_id, discovery_identity()).await,
+            ProjectSendOutcome::Sent
+        );
+        let frame = next_test_frame(&mut server).await;
+        assert_eq!(frame[0], "REQ", "discovery must open with a REQ");
+        assert_eq!(frame[1], discovery_id, "REQ carries the registered id");
+
+        // ── 2. The announcement arrives on that exact registration ──────────
+        let announcement = EventBuilder::new(
+            nostr::Kind::Custom(buzz_core::kind::KIND_GIT_REPO_ANNOUNCEMENT as u16),
+            "",
+        )
+        .tags([nostr::Tag::parse(["d", "connected-repo"]).expect("d tag")])
+        .sign_with_keys(&owner)
+        .expect("sign announcement");
+        deliver_frame(&mut state, &discovery_id, &announcement, &tx).await;
+
+        let delivered = drain(&mut rx);
+        assert_eq!(delivered.len(), 1, "the announcement was admitted");
+        let outcome = match &delivered[0] {
+            BuzzEvent::Project(ev) => dispatch!(ev),
+            other => panic!("expected a project event, got {other:?}"),
+        };
+        assert_eq!(
+            outcome,
+            crate::ProjectDispatched::DiscoveryChanged,
+            "a new coordinate must widen the enrolment filter"
+        );
+
+        // ── 3. Enrolment REQ, derived from what discovery just admitted ─────
+        let filter = crate::project::enrolment_filter(&discovered, &agent_hex, 0)
+            .expect("a discovered repository yields an enrolment filter");
+        let identity = crate::project::ProjectRequestIdentity::from_filters(
+            crate::project::ProjectSubscription::Enrolment,
+            vec![filter],
+        )
+        .expect("the enrolment filter is bounded");
+        let enrol_id = crate::project::PROJECT_ENROL_SUB_ID.to_string();
+        assert_eq!(
+            send_project_subscribe(&mut ws, &mut state, &enrol_id, identity).await,
+            ProjectSendOutcome::Sent
+        );
+        let frame = next_test_frame(&mut server).await;
+        assert_eq!(frame[0], "REQ");
+        assert_eq!(frame[1], enrol_id);
+        let filter_text = frame[2].to_string();
+        assert!(
+            filter_text.contains(&agent_hex),
+            "the enrolment REQ must be scoped to this agent"
+        );
+
+        // ── 4. The owner opens an issue naming the agent ────────────────────
+        let coordinate = format!("30617:{owner_hex}:connected-repo");
+        let root = EventBuilder::new(
+            nostr::Kind::Custom(buzz_core::kind::KIND_GIT_ISSUE as u16),
+            "please take a look",
+        )
+        .tags([
+            nostr::Tag::parse(["a", &coordinate]).expect("a tag"),
+            nostr::Tag::parse(["p", &agent_hex]).expect("p tag"),
+        ])
+        .sign_with_keys(&owner)
+        .expect("sign root");
+        deliver_frame(&mut state, &enrol_id, &root, &tx).await;
+
+        let delivered = drain(&mut rx);
+        assert_eq!(
+            delivered.len(),
+            1,
+            "the root was admitted on the enrolment id"
+        );
+        let outcome = match &delivered[0] {
+            BuzzEvent::Project(ev) => dispatch!(ev),
+            other => panic!("expected a project event, got {other:?}"),
+        };
+
+        // ── 5. Exactly one queued turn, under the root's UUIDv5 ─────────────
+        let expected_key = {
+            let verified = crate::project::VerifiedProjectEvent::verify(root.clone())
+                .await
+                .expect("the same event the relay admitted");
+            crate::project::ProjectRoute::derive(&verified)
+                .expect("routes")
+                .key()
+        };
+        match outcome {
+            crate::ProjectDispatched::Queued {
+                key,
+                queued,
+                watch_changed,
+            } => {
+                assert!(queued, "the turn must actually enter the queue");
+                assert_eq!(key, expected_key, "queued under the root's UUIDv5");
+                assert!(
+                    watch_changed,
+                    "a newly enrolled root must replace the watched REQ"
+                );
+            }
+            other => panic!("expected a queued turn, got {other:?}"),
+        }
+        assert_eq!(
+            queue.queued_event_count(&expected_key),
+            1,
+            "exactly one turn queued under the root key, not zero and not two"
+        );
+        assert_eq!(
+            queue.pending_channels(),
+            1,
+            "nothing was queued anywhere else"
+        );
+
+        // ── 6. The watched REQ replacement carries the root ─────────────────
+        let watched = crate::project::watched_roots_filters(&enrolments, 0);
+        assert!(
+            !watched.is_empty(),
+            "an enrolled root must produce watched-root filters"
+        );
+        let identity = crate::project::ProjectRequestIdentity::from_filters(
+            crate::project::ProjectSubscription::Watched { generation: 1 },
+            watched,
+        )
+        .expect("watched filters are bounded");
+        let watched_id = crate::project::watched_sub_id(1);
+        assert_eq!(
+            send_project_subscribe(&mut ws, &mut state, &watched_id, identity).await,
+            ProjectSendOutcome::Sent
+        );
+        let frame = next_test_frame(&mut server).await;
+        assert_eq!(
+            frame[1], watched_id,
+            "the replacement uses a fresh generation"
+        );
+        assert!(
+            frame.to_string().contains(&root.id.to_hex()),
+            "the watched REQ must name the root just enrolled"
+        );
+    }
+
+    /// The flag-off control: no project REQ bytes at all.
+    #[test]
+    fn the_flag_off_control_writes_no_project_req_bytes() {
+        let discovered = crate::project::DiscoveredRepositories::for_test(std::iter::once(
+            format!("30617:{}:repo", "a".repeat(64)),
+        ));
+        let mut enrolments = crate::project::ProjectEnrolments::new();
+        enrolments
+            .enrol(&crate::project::EnrolmentCandidate::for_test(
+                &"b".repeat(64),
+                &format!("30617:{}:repo", "a".repeat(64)),
+                &"a".repeat(64),
+                false,
+            ))
+            .expect("enrol");
+
+        // State that would produce every project REQ if the flag were on.
+        let off =
+            crate::project::project_req_frames(false, &discovered, &enrolments, &"c".repeat(64), 0);
+        assert!(off.is_empty(), "flag off must write no project REQ bytes");
+
+        let on =
+            crate::project::project_req_frames(true, &discovered, &enrolments, &"c".repeat(64), 0);
+        assert!(
+            !on.is_empty(),
+            "the same state with the flag on must produce REQs — otherwise the \
+             control proves nothing"
+        );
+    }
+
     #[tokio::test]
     async fn a_catch_up_root_mismatch_does_not_burn_the_correct_rooted_delivery() {
         // The catch-up root check already existed, but it ran *after*
