@@ -1,7 +1,7 @@
 use crate::client::BuzzClient;
 use crate::error::CliError;
 use crate::validate::{read_or_stdin, sdk_err, validate_hex64, validate_repo_id};
-use buzz_sdk::{GitIssueMeta, GitRepoCoord, GitStatusMeta};
+use buzz_sdk::{GitCommentMeta, GitIssueMeta, GitRepoCoord, GitStatusMeta};
 
 pub async fn cmd_create_issue(
     client: &BuzzClient,
@@ -27,6 +27,42 @@ pub async fn cmd_create_issue(
     };
 
     let builder = buzz_sdk::build_git_issue(&repo, subject, &body, &meta).map_err(sdk_err)?;
+    let event = client.sign_event(builder)?;
+    let resp = client.submit_event(event).await?;
+    println!("{resp}");
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn cmd_comment_issue(
+    client: &BuzzClient,
+    repo_owner: &str,
+    repo_id: &str,
+    root: &str,
+    reply_to: Option<&str>,
+    content: &str,
+    to: &[String],
+) -> Result<(), CliError> {
+    validate_hex64(repo_owner)?;
+    validate_repo_id(repo_id)?;
+    validate_hex64(root)?;
+    if let Some(parent) = reply_to {
+        validate_hex64(parent)?;
+    }
+    let body = read_or_stdin(content)?;
+
+    let meta = GitCommentMeta {
+        root_event: root.to_string(),
+        parent_event: reply_to.map(str::to_string),
+        recipients: to.to_vec(),
+    };
+
+    let repo = GitRepoCoord {
+        owner: repo_owner.to_string(),
+        id: repo_id.to_string(),
+    };
+
+    let builder = buzz_sdk::build_git_comment(&repo, &body, &meta).map_err(sdk_err)?;
     let event = client.sign_event(builder)?;
     let resp = client.submit_event(event).await?;
     println!("{resp}");
@@ -155,6 +191,25 @@ pub async fn dispatch(cmd: crate::IssuesCmd, client: &BuzzClient) -> Result<(), 
             label,
             to,
         } => cmd_create_issue(client, &repo_owner, &repo_id, &title, &content, &label, &to).await,
+        IssuesCmd::Comment {
+            repo_owner,
+            repo_id,
+            root,
+            reply_to,
+            content,
+            to,
+        } => {
+            cmd_comment_issue(
+                client,
+                &repo_owner,
+                &repo_id,
+                &root,
+                reply_to.as_deref(),
+                &content,
+                &to,
+            )
+            .await
+        }
         IssuesCmd::Get { event } => cmd_get_issue(client, &event).await,
         IssuesCmd::List {
             repo_owner,

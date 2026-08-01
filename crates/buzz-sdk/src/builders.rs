@@ -11,8 +11,8 @@ use buzz_core::{
         KIND_GIT_STATUS_CLOSED, KIND_GIT_STATUS_DRAFT, KIND_GIT_STATUS_MERGED,
         KIND_GIT_STATUS_OPEN, KIND_IA_ARCHIVE_REQUEST, KIND_IA_UNARCHIVE_REQUEST,
         KIND_MODERATION_BAN, KIND_MODERATION_RESOLVE_REPORT, KIND_MODERATION_TIMEOUT,
-        KIND_MODERATION_UNBAN, KIND_MODERATION_UNTIMEOUT, KIND_PRESENCE_UPDATE, KIND_USER_STATUS,
-        KIND_WORKFLOW_DEF, KIND_WORKFLOW_TRIGGER,
+        KIND_MODERATION_UNBAN, KIND_MODERATION_UNTIMEOUT, KIND_PRESENCE_UPDATE, KIND_TEXT_NOTE,
+        KIND_USER_STATUS, KIND_WORKFLOW_DEF, KIND_WORKFLOW_TRIGGER,
     },
     observer::{
         content_looks_like_nip44, OBSERVER_AGENT_TAG, OBSERVER_FRAME_CONTROL, OBSERVER_FRAME_TAG,
@@ -1108,6 +1108,65 @@ pub fn build_git_issue(
     }
 
     Ok(EventBuilder::new(Kind::Custom(KIND_GIT_ISSUE as u16), content).tags(tags))
+}
+
+/// Addressing for a comment on an issue or pull-request root.
+#[derive(Debug, Clone, Default)]
+pub struct GitCommentMeta {
+    /// The issue/PR root being commented on — required.
+    pub root_event: String,
+    /// The comment being replied to, when this is a reply rather than a
+    /// top-level comment. Omit to attach directly to the root.
+    pub parent_event: Option<String>,
+    /// Pubkeys to `p`-tag. This is what notifies a participant — including
+    /// waking a mentioned agent — so an empty list is a comment nobody is
+    /// told about.
+    pub recipients: Vec<String>,
+}
+
+/// Build a comment on a git issue or pull request (kind:1).
+///
+/// Comments are ordinary text notes rather than a NIP-34 kind of their own, so
+/// what makes one a *project* comment is its addressing:
+///
+/// - the `a` tag carries the repo coordinate, which is how the client
+///   subscribes to a project's comments at all — a comment without it is
+///   invisible no matter how correct its `e` tag is;
+/// - the `e` tag names the root, which is how a comment is attached to one
+///   issue rather than to the repo at large.
+///
+/// Both are therefore required, and neither is inferable from the other.
+pub fn build_git_comment(
+    repo: &GitRepoCoord,
+    content: &str,
+    meta: &GitCommentMeta,
+) -> Result<EventBuilder, SdkError> {
+    check_content(content, 64 * 1024)?;
+    if content.trim().is_empty() {
+        return Err(SdkError::InvalidInput(
+            "comment content must not be empty".into(),
+        ));
+    }
+    let root = check_hex_exact(&meta.root_event, 64, "root_event")?;
+    let a_value = repo.to_a_tag_value()?;
+
+    // Marked `e` tags per NIP-10, matching `build_git_status`. The root marker
+    // stays on the root even when replying to a comment, so a client that
+    // groups by root still sees the reply — reusing `root` for the parent
+    // would silently reparent every threaded comment to itself.
+    let mut tags = vec![tag(&["a", &a_value])?, tag(&["e", &root, "", "root"])?];
+    if let Some(ref parent) = meta.parent_event {
+        let parent = check_hex_exact(parent, 64, "parent_event")?;
+        if parent != root {
+            tags.push(tag(&["e", &parent, "", "reply"])?);
+        }
+    }
+    for recipient in &meta.recipients {
+        let pk = check_pubkey_hex(recipient, "recipient")?;
+        tags.push(tag(&["p", &pk])?);
+    }
+
+    Ok(EventBuilder::new(Kind::Custom(KIND_TEXT_NOTE as u16), content).tags(tags))
 }
 
 /// Status to apply to a patch or issue root (kind:1630/1631/1632/1633, NIP-34).
@@ -3034,6 +3093,113 @@ mod tests {
         assert!(has_tag(&ev, "subject", "Crashes on startup"));
         assert!(has_tag(&ev, "t", "bug"));
         assert!(has_tag(&ev, "t", "p1"));
+    }
+
+    /// The assertions here are Desktop's, not this builder's: `hooks.ts` fetches
+    /// comments as kind:1 filtered by `#a`, and `projectIssues.mjs`
+    /// `commentsForIssue` keeps an event only when some `e`/`E` tag's *value*
+    /// equals the issue id. A comment that fails either is not rendered, so both
+    /// are asserted the way that consumer reads them.
+    #[test]
+    fn git_comment_is_addressed_the_way_the_client_reads_it() {
+        let owner = "a".repeat(64);
+        let repo = GitRepoCoord {
+            owner: owner.clone(),
+            id: "repo".to_string(),
+        };
+        let root = event_id().to_hex();
+        let agent = "b".repeat(64);
+        let meta = GitCommentMeta {
+            root_event: root.clone(),
+            parent_event: None,
+            recipients: vec![agent.clone()],
+        };
+
+        let ev = sign(build_git_comment(&repo, "on it", &meta).unwrap());
+
+        assert_eq!(ev.kind.as_u16(), 1);
+        assert_eq!(ev.content, "on it");
+        // Subscription reach: without this the comment is invisible to the
+        // client regardless of how correct the `e` tag is.
+        assert!(has_tag(&ev, "a", &format!("30617:{owner}:repo")));
+        // Grouping: the client compares tag[1] against the issue id.
+        assert!(tag_values(&ev, "e").contains(&root));
+        // Notification: this is what wakes a mentioned agent.
+        assert!(has_tag(&ev, "p", &agent));
+    }
+
+    #[test]
+    fn git_comment_reply_still_names_the_root() {
+        let repo = GitRepoCoord {
+            owner: "a".repeat(64),
+            id: "repo".to_string(),
+        };
+        let root = event_id().to_hex();
+        let parent = "c".repeat(64);
+        let meta = GitCommentMeta {
+            root_event: root.clone(),
+            parent_event: Some(parent.clone()),
+            recipients: vec![],
+        };
+
+        let ev = sign(build_git_comment(&repo, "replying", &meta).unwrap());
+
+        // Both present: dropping the root would strand the reply outside the
+        // issue it belongs to, since the client groups by root only.
+        let e_values = tag_values(&ev, "e");
+        assert!(e_values.contains(&root), "reply lost its root");
+        assert!(e_values.contains(&parent), "reply lost its parent");
+    }
+
+    #[test]
+    fn git_comment_replying_to_the_root_does_not_tag_it_twice() {
+        let repo = GitRepoCoord {
+            owner: "a".repeat(64),
+            id: "repo".to_string(),
+        };
+        let root = event_id().to_hex();
+        let meta = GitCommentMeta {
+            root_event: root.clone(),
+            parent_event: Some(root.clone()),
+            recipients: vec![],
+        };
+
+        let ev = sign(build_git_comment(&repo, "top level", &meta).unwrap());
+
+        // A caller that passes the root as its own parent means "top level",
+        // not "reply to itself". Two `e` tags with the same id would make the
+        // comment its own parent in any client that reads the reply marker.
+        assert_eq!(
+            tag_values(&ev, "e").iter().filter(|v| **v == root).count(),
+            1
+        );
+    }
+
+    #[test]
+    fn git_comment_rejects_bad_root_and_empty_content() {
+        let repo = GitRepoCoord {
+            owner: "a".repeat(64),
+            id: "repo".to_string(),
+        };
+        let bad_root = GitCommentMeta {
+            root_event: "nothex".to_string(),
+            ..Default::default()
+        };
+        assert!(matches!(
+            build_git_comment(&repo, "body", &bad_root).unwrap_err(),
+            SdkError::InvalidInput(_)
+        ));
+
+        let good_root = GitCommentMeta {
+            root_event: event_id().to_hex(),
+            ..Default::default()
+        };
+        // Whitespace-only, not just empty: a blank comment is a published event
+        // that renders as nothing.
+        assert!(matches!(
+            build_git_comment(&repo, "   \n ", &good_root).unwrap_err(),
+            SdkError::InvalidInput(_)
+        ));
     }
 
     #[test]

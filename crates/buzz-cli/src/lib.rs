@@ -1500,6 +1500,28 @@ pub enum IssuesCmd {
         #[arg(long = "to")]
         to: Vec<String>,
     },
+    /// Comment on an issue or pull request (kind:1)
+    Comment {
+        /// Repo owner pubkey (64-char hex)
+        #[arg(long)]
+        repo_owner: String,
+        /// Repo identifier (d-tag)
+        #[arg(long)]
+        repo_id: String,
+        /// Issue or pull-request root event id (64-char hex)
+        #[arg(long)]
+        root: String,
+        /// Comment being replied to (64-char hex). Omit to comment on the root.
+        #[arg(long)]
+        reply_to: Option<String>,
+        /// Comment body, markdown. Use '-' to read from stdin.
+        #[arg(long)]
+        content: String,
+        /// Pubkey(s) to notify — the issue author, or an agent you want to
+        /// wake. Can be specified multiple times.
+        #[arg(long = "to")]
+        to: Vec<String>,
+    },
     /// Get an issue by event id
     Get {
         /// Issue event id (64-char hex)
@@ -2040,7 +2062,7 @@ mod tests {
         );
         assert_eq!(
             names(&cmd, "issues"),
-            vec!["create", "get", "list", "status"]
+            vec!["comment", "create", "get", "list", "status"]
         );
         assert_eq!(names(&cmd, "media"), vec!["get"]);
         assert_eq!(names(&cmd, "upload"), vec!["file"]);
@@ -2069,7 +2091,7 @@ mod tests {
             ("dms", 4),
             ("emoji", 5),
             ("feed", 1),
-            ("issues", 4),
+            ("issues", 5),
             ("media", 1),
             ("messages", 8),
             ("pack", 2),
