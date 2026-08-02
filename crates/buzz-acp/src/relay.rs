@@ -545,22 +545,34 @@ enum RelayCommand {
     PublishEvent { event: Box<Event> },
     /// Floor `since` for membership notification replay; events before startup are never re-delivered.
     SetStartupWatermark { ts: u64 },
-    /// Open a project REQ under `sub_id`, registering it in lockstep.
+    /// Open the repository-discovery REQ, registering it in lockstep.
     ///
     /// `filters` is the REQ's whole filter list, ORed, in wire order. Empty
-    /// opens nothing — see [`HarnessRelay::subscribe_project`].
-    SubscribeProject {
-        sub_id: String,
-        subscription: crate::project::ProjectSubscription,
-        filters: Vec<Value>,
-    },
+    /// opens nothing — see [`HarnessRelay::submit_project_discovery`].
+    ///
+    /// **Discovery only, and it carries no id and no class.** This was
+    /// `SubscribeProject { sub_id, subscription, filters }`, which let any
+    /// crate caller submit `ProjectSubscription::Watched { generation: 99 }`
+    /// under an id of its choosing. That installed durable watched intent
+    /// outside the semantic replacement owner, so the owner's next replacement
+    /// derived a predecessor that did not account for it and left the
+    /// manufactured generation durable beside the successor — the stale
+    /// predecessor defect, reached through a neighbouring command rather than
+    /// through the run loop.
+    ///
+    /// Removing the generic capability is what closes it. A promise not to
+    /// pass `Watched` would not have: the defect was that the argument existed.
+    /// Discovery is the one project subscription with no prior state to derive
+    /// from and a fixed id, so it is the only one that can be opened rather
+    /// than replaced — and the handler, not the sender, supplies both.
+    SubscribeProjectDiscovery { filters: Vec<Value> },
     /// Replace a live project subscription, transactionally.
     ///
-    /// Distinct from [`RelayCommand::SubscribeProject`] because the registry
-    /// distinguishes them: opening refuses to change the identity held under an
-    /// id, and replacement is the operation permitted to. Folding them into one
-    /// command would put that decision at the call site rather than in the
-    /// registry that owns it.
+    /// Distinct from [`RelayCommand::SubscribeProjectDiscovery`] because the
+    /// registry distinguishes them: opening refuses to change the identity held
+    /// under an id, and replacement is the operation permitted to. Folding them
+    /// into one command would put that decision at the call site rather than in
+    /// the registry that owns it.
     /// **Semantic, not addressed.** The command names the class it wants
     /// replaced and the filters it wants asked. It carries no id, no
     /// generation and no predecessor, because the component that knows what is
@@ -932,12 +944,17 @@ impl HarnessRelay {
             .map_err(|_| RelayError::ConnectionClosed)
     }
 
-    /// Open a project REQ under `sub_id` carrying `filters`, ORed.
+    /// **Submit** the repository-discovery REQ carrying `filters`, ORed.
     ///
-    /// The class recorded here is what every inbound frame on this id will be
-    /// classified as — the id's spelling carries no authority. Registration
-    /// happens in lockstep with the write, so a failed send leaves nothing
-    /// answerable.
+    /// The class every inbound frame on this subscription is classified as is
+    /// stamped by the background task, not named here — the id's spelling
+    /// carries no authority, and neither does the sender's opinion of what it
+    /// is opening. Registration happens in lockstep with the write, so a failed
+    /// send leaves nothing answerable.
+    ///
+    /// This took a `sub_id` and a `ProjectSubscription` until it was found to
+    /// be a second, unowned producer of watched generations; see
+    /// [`RelayCommand::SubscribeProjectDiscovery`] for what that cost.
     ///
     /// A `Vec` because a NIP-01 REQ carries one *or more* filters and this
     /// crate's own watched-root builder returns two — a lowercase `#e` branch
@@ -945,18 +962,9 @@ impl HarnessRelay {
     /// An empty vector opens nothing: `["REQ", id]` is an unbounded request,
     /// not an empty one, so a builder that produced no filters must produce no
     /// REQ.
-    pub async fn subscribe_project(
-        &self,
-        sub_id: &str,
-        subscription: crate::project::ProjectSubscription,
-        filters: Vec<Value>,
-    ) -> Result<(), RelayError> {
+    pub async fn submit_project_discovery(&self, filters: Vec<Value>) -> Result<(), RelayError> {
         self.cmd_tx
-            .send(RelayCommand::SubscribeProject {
-                sub_id: sub_id.to_string(),
-                subscription,
-                filters,
-            })
+            .send(RelayCommand::SubscribeProjectDiscovery { filters })
             .await
             .map_err(|_| RelayError::ConnectionClosed)
     }
@@ -975,7 +983,7 @@ impl HarnessRelay {
     /// name no longer invites one.
     ///
     /// See [`RelayCommand::ReplaceProject`] for why this is not
-    /// [`Self::subscribe_project`] with different arguments.
+    /// [`Self::submit_project_discovery`] with different arguments.
     pub async fn submit_project_replacement(
         &self,
         replacement: crate::project::ProjectReplacement,
@@ -1487,18 +1495,19 @@ fn apply_command_to_state(state: &mut BgState, cmd: RelayCommand) {
             state.active_subscriptions.remove(&channel_id);
             state.clear_channel_state(&channel_id);
         }
-        RelayCommand::SubscribeProject {
-            sub_id,
-            subscription,
-            filters,
-        } => {
+        RelayCommand::SubscribeProjectDiscovery { filters } => {
+            // The id and the class are stamped here, from the one place that
+            // names them. A command that carried them was a command that could
+            // name a watched generation.
+            let sub_id = crate::project::discovery_sub_id();
             // Offline: record the intent only — nothing becomes answerable
             // until a REQ is actually written for it. Fail-closed all the same,
             // because a conflicting command accepted while disconnected would
             // be opened verbatim by the next connection's replay.
-            let Some(identity) =
-                crate::project::ProjectRequestIdentity::from_filters(subscription, filters)
-            else {
+            let Some(identity) = crate::project::ProjectRequestIdentity::from_filters(
+                crate::project::ProjectSubscription::Discovery,
+                filters,
+            ) else {
                 // Recording this as intent would replay a filterless REQ onto
                 // the next connection, which asks the relay for everything.
                 warn!(sub_id, "refusing a project subscription with no filters");
@@ -1534,17 +1543,34 @@ fn apply_command_to_state(state: &mut BgState, cmd: RelayCommand) {
                 }
             };
             match outcome {
-                crate::project::ReplaceOutcome::Refused => {
+                crate::project::ReplaceOutcome::InvalidFilters => {
                     warn!(?replacement, "refusing an unbounded project replacement");
                 }
-                crate::project::ReplaceOutcome::Exhausted => {
+                crate::project::ReplaceOutcome::WatchedGenerationExhausted => {
                     error!(
                         ?replacement,
-                        "project generations exhausted while disconnected — no further \
+                        "watched generations exhausted while disconnected — no further \
                          replacement can be recorded"
                     );
                 }
-                _ => {}
+                crate::project::ReplaceOutcome::RequestIncarnationExhausted => {
+                    error!(
+                        ?replacement,
+                        "request incarnations exhausted while disconnected — no further \
+                         replacement can be recorded"
+                    );
+                }
+                crate::project::ReplaceOutcome::InvariantViolation(violation) => {
+                    error!(
+                        ?replacement,
+                        violation,
+                        "project subscription invariant violated while disconnected — \
+                         no intent recorded"
+                    );
+                }
+                crate::project::ReplaceOutcome::Replaced { .. }
+                | crate::project::ReplaceOutcome::Unchanged
+                | crate::project::ReplaceOutcome::WriteFailed(_) => {}
             }
         }
         RelayCommand::SubscribeMembership => {
@@ -1708,18 +1734,16 @@ async fn execute_connected_command(
             state.clear_channel_state(&channel_id);
             true
         }
-        RelayCommand::SubscribeProject {
-            sub_id,
-            subscription,
-            filters,
-        } => {
+        RelayCommand::SubscribeProjectDiscovery { filters } => {
+            let sub_id = crate::project::discovery_sub_id();
             // Intent and registration are decided together, in one operation
             // that either fully succeeds or records nothing. Admitting intent
             // first and consulting the registry second left a refused identity
             // sitting in intent, and the next reconnect installed it.
-            let Some(identity) =
-                crate::project::ProjectRequestIdentity::from_filters(subscription, filters)
-            else {
+            let Some(identity) = crate::project::ProjectRequestIdentity::from_filters(
+                crate::project::ProjectSubscription::Discovery,
+                filters,
+            ) else {
                 // Nothing written, nothing registered, and the socket is fine —
                 // a filterless REQ asks the relay for everything.
                 warn!(sub_id, "refusing a project subscription with no filters");
@@ -1766,15 +1790,38 @@ async fn execute_connected_command(
                 // Nothing was written and nothing installed, so the predecessor
                 // is still current and a later valid replacement will retire
                 // it. The connection is fine; our own filters were not.
-                crate::project::ReplaceOutcome::Refused => {
+                crate::project::ReplaceOutcome::InvalidFilters => {
                     warn!(?replacement, "refusing an unbounded project replacement");
                     true
                 }
-                crate::project::ReplaceOutcome::Exhausted => {
+                // Named separately from the incarnation ceiling below. One
+                // message covered both, so an operator reading "generations
+                // exhausted" would have gone looking at the wrong counter.
+                crate::project::ReplaceOutcome::WatchedGenerationExhausted => {
                     error!(
                         ?replacement,
-                        "project generations exhausted — no further project subscription \
+                        "watched generations exhausted — no further watched subscription \
+                         can be replaced"
+                    );
+                    true
+                }
+                crate::project::ReplaceOutcome::RequestIncarnationExhausted => {
+                    error!(
+                        ?replacement,
+                        "request incarnations exhausted — no further project subscription \
                          can be opened or replaced"
+                    );
+                    true
+                }
+                // Something installed watched intent outside this owner. The
+                // registry refused to guess which one to retire, so nothing was
+                // written and the connection is unharmed — but the state is not
+                // reachable through any command, so it is a defect rather than
+                // a condition.
+                crate::project::ReplaceOutcome::InvariantViolation(violation) => {
+                    error!(
+                        ?replacement,
+                        violation, "project subscription invariant violated — nothing replaced"
                     );
                     true
                 }
@@ -6629,7 +6676,13 @@ mod tests {
             .await,
             "a successful replacement keeps the connection"
         );
-        assert_eq!(state.project_requests.watched_current(), Some(0));
+        assert_eq!(
+            state
+                .project_requests
+                .current_watched()
+                .expect("exactly one watched intent"),
+            Some(0)
+        );
         let frames = drain_test_frames(&mut server).await;
         assert_eq!(
             req_ids(&frames),
@@ -6652,7 +6705,10 @@ mod tests {
             "a write failure must take the connection down"
         );
         assert_eq!(
-            state.project_requests.watched_current(),
+            state
+                .project_requests
+                .current_watched()
+                .expect("exactly one watched intent"),
             Some(0),
             "a failed attempt must not move the installed predecessor"
         );
@@ -6672,7 +6728,13 @@ mod tests {
 
         // Generation 1 was burned and is gone. The successor is 2, and what it
         // retires is 0 — the generation that was genuinely installed.
-        assert_eq!(state.project_requests.watched_current(), Some(2));
+        assert_eq!(
+            state
+                .project_requests
+                .current_watched()
+                .expect("exactly one watched intent"),
+            Some(2)
+        );
         let frames = drain_test_frames(&mut server2).await;
         assert_eq!(
             req_ids(&frames),
@@ -6722,7 +6784,13 @@ mod tests {
             )
             .await
         );
-        assert_eq!(state.project_requests.watched_current(), Some(0));
+        assert_eq!(
+            state
+                .project_requests
+                .current_watched()
+                .expect("exactly one watched intent"),
+            Some(0)
+        );
         drain_test_frames(&mut server).await;
 
         // `{"limit": ..}` constrains nothing about *which* events are wanted,
@@ -6744,13 +6812,22 @@ mod tests {
             "a refused replacement must write nothing at all: {frames:?}"
         );
         assert_eq!(
-            state.project_requests.watched_current(),
+            state
+                .project_requests
+                .current_watched()
+                .expect("exactly one watched intent"),
             Some(0),
             "a refusal must leave the actual predecessor current"
         );
 
-        // And the next valid replacement retires that predecessor, not the
-        // generation the refusal burned.
+        // And the next valid replacement retires that predecessor — using the
+        // generation the refusal did *not* spend.
+        //
+        // This is where the ordering shows. Validation used to happen after the
+        // burn, so the refusal consumed generation 1 and the successor here
+        // came out as `proj-roots-2`. A number was retired from the wire
+        // identity space by a request that was never going to be written, and
+        // the gap it left was indistinguishable from a failed write's.
         assert!(
             submit_replacement(
                 &mut ws,
@@ -6762,10 +6839,88 @@ mod tests {
         );
         let frames = drain_test_frames(&mut server).await;
         assert_eq!(
+            req_ids(&frames),
+            vec![crate::project::watched_sub_id(1)],
+            "the refusal must have burned no generation, so the successor is 1: {frames:?}"
+        );
+        assert_eq!(
             close_ids(&frames),
             vec![crate::project::watched_sub_id(0)],
             "the valid replacement must retire the real predecessor: {frames:?}"
         );
+        assert_eq!(
+            state
+                .project_requests
+                .current_watched()
+                .expect("exactly one watched intent"),
+            Some(1),
+        );
+    }
+
+    /// **A replacement that changes nothing burns nothing.**
+    ///
+    /// The other half of validate-before-burn. A genuine no-op used to consume
+    /// a generation and write a REQ asking exactly what the relay was already
+    /// answering — churning the relay's admission budget to arrive where it
+    /// already was, and spending a wire identity to do it.
+    ///
+    /// Asserted through the command path, and asserted on the *bytes*: a test
+    /// that only read `current_watched()` would pass against an implementation
+    /// that re-sent the REQ under a fresh id and then reported the same
+    /// generation back.
+    #[tokio::test]
+    async fn an_unchanged_replacement_writes_nothing_and_spends_no_generation() {
+        let (mut ws, mut server) = test_ws_pair().await;
+        let mut state = BgState::new();
+
+        assert!(
+            submit_replacement(
+                &mut ws,
+                &mut state,
+                crate::project::ProjectReplacement::Watched,
+                vec![watched_filter(1)],
+            )
+            .await
+        );
+        assert_eq!(
+            req_ids(&drain_test_frames(&mut server).await),
+            vec![crate::project::watched_sub_id(0)]
+        );
+
+        // The same question, submitted again.
+        assert!(
+            submit_replacement(
+                &mut ws,
+                &mut state,
+                crate::project::ProjectReplacement::Watched,
+                vec![watched_filter(1)],
+            )
+            .await
+        );
+        let frames = drain_test_frames(&mut server).await;
+        assert!(
+            frames.is_empty(),
+            "an unchanged replacement must write no REQ and no CLOSE: {frames:?}"
+        );
+
+        // Now a genuinely different question. It must be generation 1 — if the
+        // no-op had burned one, this would be 2.
+        assert!(
+            submit_replacement(
+                &mut ws,
+                &mut state,
+                crate::project::ProjectReplacement::Watched,
+                vec![watched_filter(2)],
+            )
+            .await
+        );
+        let frames = drain_test_frames(&mut server).await;
+        assert_eq!(
+            req_ids(&frames),
+            vec![crate::project::watched_sub_id(1)],
+            "the no-op must have spent no generation: {frames:?}"
+        );
+        assert_eq!(close_ids(&frames), vec![crate::project::watched_sub_id(0)]);
     }
 
     /// **Spent watched generations fail closed, in both build modes.**
@@ -6793,7 +6948,13 @@ mod tests {
             )
             .await
         );
-        assert_eq!(state.project_requests.watched_current(), Some(u64::MAX));
+        assert_eq!(
+            state
+                .project_requests
+                .current_watched()
+                .expect("exactly one watched intent"),
+            Some(u64::MAX)
+        );
         drain_test_frames(&mut server).await;
 
         // The space is now spent.
@@ -6819,7 +6980,10 @@ mod tests {
             "generation zero was reused: {frames:?}"
         );
         assert_eq!(
-            state.project_requests.watched_current(),
+            state
+                .project_requests
+                .current_watched()
+                .expect("exactly one watched intent"),
             Some(u64::MAX),
             "the predecessor must be retained on refusal"
         );
@@ -6852,7 +7016,13 @@ mod tests {
             )
             .await
         );
-        assert_eq!(state.project_requests.watched_current(), Some(0));
+        assert_eq!(
+            state
+                .project_requests
+                .current_watched()
+                .expect("exactly one watched intent"),
+            Some(0)
+        );
         drain_test_frames(&mut server).await;
 
         // Burn the incarnation space, leaving generations available.
@@ -6891,7 +7061,10 @@ mod tests {
             "a spent incarnation space must write nothing: {frames:?}"
         );
         assert_eq!(
-            state.project_requests.watched_current(),
+            state
+                .project_requests
+                .current_watched()
+                .expect("exactly one watched intent"),
             Some(1),
             "the last genuinely installed generation stays current"
         );
@@ -6901,6 +7074,131 @@ mod tests {
                 .intent(&crate::project::watched_sub_id(1))
                 .is_some(),
             "and its durable intent is preserved"
+        );
+    }
+
+    /// **A watched generation nobody allocated makes the owner refuse, not
+    /// guess.**
+    ///
+    /// The counterexample this closes was reachable in production. The relay
+    /// command surface used to carry `SubscribeProject { sub_id, subscription,
+    /// filters }`, so any crate caller could submit
+    /// `ProjectSubscription::Watched { generation: 99 }` under an id of its
+    /// choosing. That installed durable watched intent outside the semantic
+    /// replacement owner:
+    ///
+    /// ```text
+    /// generic SubscribeProject installs proj-roots-99
+    ///   → the owner's next replacement allocates generation 0
+    ///   → its predecessor resolves to None
+    ///   → proj-roots-99 stays durable beside proj-roots-0
+    /// ```
+    ///
+    /// Two things had to change, and this asserts the second. The command is
+    /// gone, so nothing can produce that state; and the predecessor is now read
+    /// out of durable intent rather than held beside it, so if the state
+    /// occurred anyway the owner cannot fail to see it.
+    ///
+    /// **Why this is not a test that the command was deleted.** Asserting the
+    /// absence of a name is a test that matches itself: it passes forever after
+    /// the capability returns under a different spelling, and it would have
+    /// passed against every version of this file that had the defect, since
+    /// none of them contained the string. What is asserted here is the property
+    /// the deletion was *for* — that a second watched generation cannot be
+    /// silently absorbed — and that property is checked against the state
+    /// itself, however it arrived.
+    ///
+    /// The intruder is installed through a test-only hook because production
+    /// now has no route to it. That is the claim, not a gap in the test.
+    #[tokio::test]
+    async fn a_watched_generation_from_outside_the_owner_fails_the_replacement_closed() {
+        let (mut ws, mut server) = test_ws_pair().await;
+        let mut state = BgState::new();
+
+        // One generation installed the legitimate way.
+        assert!(
+            submit_replacement(
+                &mut ws,
+                &mut state,
+                crate::project::ProjectReplacement::Watched,
+                vec![watched_filter(1)],
+            )
+            .await
+        );
+        assert_eq!(
+            req_ids(&drain_test_frames(&mut server).await),
+            vec![crate::project::watched_sub_id(0)]
+        );
+
+        // And one that no allocator ever handed out.
+        state
+            .project_requests
+            .force_watched_intent(99, watched_filter(9));
+
+        // The owner refuses rather than choosing a predecessor. Choosing would
+        // retire one and leave the other durable beside the successor, which is
+        // the defect arrived at from the other direction.
+        assert!(
+            submit_replacement(
+                &mut ws,
+                &mut state,
+                crate::project::ProjectReplacement::Watched,
+                vec![watched_filter(2)],
+            )
+            .await,
+            "an invariant violation is not a transport failure"
+        );
+        let frames = drain_test_frames(&mut server).await;
+        assert!(
+            frames.is_empty(),
+            "nothing may be written while the predecessor is ambiguous: {frames:?}"
+        );
+
+        // Neither intent was retired, and no successor was installed.
+        for id in [
+            crate::project::watched_sub_id(0),
+            crate::project::watched_sub_id(99),
+        ] {
+            assert!(
+                state.project_requests.intent(&id).is_some(),
+                "{id} must survive a refused replacement"
+            );
+        }
+        assert!(
+            state
+                .project_requests
+                .intent(&crate::project::watched_sub_id(1))
+                .is_none(),
+            "no successor may be installed"
+        );
+
+        let violation = state
+            .project_requests
+            .current_watched()
+            .expect_err("two watched intents must not resolve to a single predecessor");
+        assert!(
+            violation.contains(&crate::project::watched_sub_id(0))
+                && violation.contains(&crate::project::watched_sub_id(99)),
+            "the report must name both intents so the intruder is identifiable: {violation}"
+        );
+
+        // Recovery is possible once the ambiguity is gone: the owner was
+        // blocked by the state, not permanently poisoned by it.
+        state.project_requests.clear_watched_intent(99);
+        assert!(
+            submit_replacement(
+                &mut ws,
+                &mut state,
+                crate::project::ProjectReplacement::Watched,
+                vec![watched_filter(2)],
+            )
+            .await
+        );
+        let frames = drain_test_frames(&mut server).await;
+        assert_eq!(
+            close_ids(&frames),
+            vec![crate::project::watched_sub_id(0)],
+            "and the real predecessor is what gets retired: {frames:?}"
         );
     }
 
@@ -7508,9 +7806,7 @@ mod tests {
                 &mut ws,
                 &mut state,
                 &agent,
-                RelayCommand::SubscribeProject {
-                    sub_id: sub_id.clone(),
-                    subscription: crate::project::ProjectSubscription::Discovery,
+                RelayCommand::SubscribeProjectDiscovery {
                     filters: vec![test_filter()],
                 },
             )
@@ -7604,9 +7900,7 @@ mod tests {
                 &mut ws,
                 &mut state,
                 &agent,
-                RelayCommand::SubscribeProject {
-                    sub_id: sub_id.clone(),
-                    subscription: crate::project::ProjectSubscription::Discovery,
+                RelayCommand::SubscribeProjectDiscovery {
                     filters: vec![test_filter()],
                 },
             )
@@ -7619,9 +7913,7 @@ mod tests {
                 &mut ws,
                 &mut state,
                 &agent,
-                RelayCommand::SubscribeProject {
-                    sub_id: sub_id.clone(),
-                    subscription: crate::project::ProjectSubscription::Watched { generation: 9 },
+                RelayCommand::SubscribeProjectDiscovery {
                     filters: vec![json!({ "kinds": [1] })],
                 },
             )
@@ -7661,17 +7953,19 @@ mod tests {
     /// assertion below covers.
     #[tokio::test]
     async fn a_subscribe_command_that_constrains_nothing_opens_nothing() {
-        let sub_id = crate::project::watched_sub_id(0);
-        let watched = crate::project::ProjectSubscription::Watched { generation: 0 };
+        // Discovery, because that is the only subscription a command can now
+        // open. The refusal being proved is the filter list's, not the class's:
+        // `watched_roots_filters` returning an empty vector is where an
+        // unbounded list comes from in practice, and it reaches the registry
+        // through the same `from_filters` gate this exercises.
+        let sub_id = crate::project::discovery_sub_id();
 
         for filters in [Vec::new(), vec![json!({})], vec![json!({ "limit": 500 })]] {
             // ---- Disconnected: no durable intent, so no later replay. ------
             let mut disconnected = BgState::new();
             apply_command_to_state(
                 &mut disconnected,
-                RelayCommand::SubscribeProject {
-                    sub_id: sub_id.clone(),
-                    subscription: watched.clone(),
+                RelayCommand::SubscribeProjectDiscovery {
                     filters: filters.clone(),
                 },
             );
@@ -7694,9 +7988,7 @@ mod tests {
                     &mut ws,
                     &mut state,
                     &agent,
-                    RelayCommand::SubscribeProject {
-                        sub_id: sub_id.clone(),
-                        subscription: watched.clone(),
+                    RelayCommand::SubscribeProjectDiscovery {
                         filters: filters.clone(),
                     },
                 )
@@ -7736,14 +8028,10 @@ mod tests {
         let mut state = BgState::new();
         let sub_id = crate::project::discovery_sub_id();
         for cmd in [
-            RelayCommand::SubscribeProject {
-                sub_id: sub_id.clone(),
-                subscription: crate::project::ProjectSubscription::Discovery,
+            RelayCommand::SubscribeProjectDiscovery {
                 filters: vec![test_filter()],
             },
-            RelayCommand::SubscribeProject {
-                sub_id: sub_id.clone(),
-                subscription: crate::project::ProjectSubscription::Watched { generation: 4 },
+            RelayCommand::SubscribeProjectDiscovery {
                 filters: vec![json!({ "kinds": [1] })],
             },
         ] {
@@ -9356,10 +9644,8 @@ for line in sys.stdin:
     }
 
     impl crate::ProjectOpener for SocketOpener {
-        async fn subscribe_project(
+        async fn submit_project_discovery(
             &self,
-            sub_id: &str,
-            class: crate::project::ProjectSubscription,
             filters: Vec<serde_json::Value>,
         ) -> Result<(), RelayError> {
             let mut guard = self.inner.lock().await;
@@ -9368,11 +9654,7 @@ for line in sys.stdin:
                 ws,
                 state,
                 &"0".repeat(64),
-                RelayCommand::SubscribeProject {
-                    sub_id: sub_id.to_string(),
-                    subscription: class,
-                    filters,
-                },
+                RelayCommand::SubscribeProjectDiscovery { filters },
             )
             .await;
             Ok(())
@@ -9387,7 +9669,7 @@ for line in sys.stdin:
     /// config.project_routing_enabled
     ///   → project::discovery_subscription
     ///   → open_startup_project_subscriptions
-    ///   → RelayCommand::SubscribeProject
+    ///   → RelayCommand::SubscribeProjectDiscovery
     ///   → the socket
     /// ```
     ///
@@ -9445,10 +9727,14 @@ for line in sys.stdin:
     /// bounded request rather than a subscription to the whole relay.
     #[test]
     fn the_production_discovery_filter_is_a_bounded_request() {
-        let (_sub_id, class, filters) = crate::project::discovery_subscription(true)
+        let filters = crate::project::discovery_subscription(true)
             .expect("the flag-on decision must be to open discovery");
         assert!(
-            crate::project::ProjectRequestIdentity::from_filters(class, filters).is_some(),
+            crate::project::ProjectRequestIdentity::from_filters(
+                crate::project::ProjectSubscription::Discovery,
+                filters,
+            )
+            .is_some(),
             "the production discovery filter must constrain events"
         );
     }

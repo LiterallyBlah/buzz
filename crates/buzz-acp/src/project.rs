@@ -298,7 +298,7 @@ mod requests {
             subscription: ProjectSubscription,
             filters: Vec<Value>,
         ) -> Option<Self> {
-            if !filters.iter().all(constrains_events) {
+            if !bounded_filters(&filters) {
                 return None;
             }
             let mut filters = filters.into_iter();
@@ -357,6 +357,23 @@ mod requests {
         pub(crate) fn admits(&self, event: &nostr::Event) -> bool {
             self.filters().any(|filter| filter_admits(filter, event))
         }
+    }
+
+    /// Would this filter list build a bounded request?
+    ///
+    /// **The same rule [`ProjectRequestIdentity::from_filters`] applies, named
+    /// once.** It exists because the watched replacement has to decide whether
+    /// filters are acceptable *before* it allocates the generation that would
+    /// go into the class — and construction needs the class. Validating by
+    /// constructing therefore meant burning first and refusing second, which
+    /// spent a wire identity on a request that was never going to be sent.
+    ///
+    /// This is a predicate, not a second constructor. It builds nothing, so it
+    /// is not the alternative door the fallible constructor exists to close:
+    /// the only way to obtain a `ProjectRequestIdentity` is still
+    /// `from_filters`, and `from_filters` asks this same question.
+    pub(crate) fn bounded_filters(filters: &[Value]) -> bool {
+        !filters.is_empty() && filters.iter().all(constrains_events)
     }
 
     /// Does this filter narrow the set of events a relay may return under it?
@@ -747,19 +764,41 @@ mod requests {
         Replaced { retired: Option<String> },
         /// The successor is byte-identical to what is already live. Nothing was
         /// written, because re-sending an identical REQ churns the relay's
-        /// admission budget to arrive where it already is.
+        /// admission budget to arrive where it already is. **No generation is
+        /// burned**: a request that did not change did not use up a wire
+        /// identity.
         Unchanged,
-        /// The incarnation space is spent. Nothing written, predecessor intact.
-        Exhausted,
         /// The filters would not build a bounded request, so no identity was
-        /// minted. Nothing written, nothing installed, predecessor intact.
+        /// minted. Nothing written, nothing installed, predecessor intact, and
+        /// **no generation burned** — refusal is decided before allocation.
         ///
         /// This decision used to live in the relay command handler, *before*
         /// the registry was called — it warned and returned, so nothing
         /// downstream could observe it and the caller's own bookkeeping had
         /// already advanced. Refusing here makes "installs nothing, leaves the
         /// predecessor current" a fact a test can read.
-        Refused,
+        InvalidFilters,
+        /// The watched generation space is spent. Nothing written, predecessor
+        /// intact.
+        WatchedGenerationExhausted,
+        /// The incarnation space is spent. Nothing written, predecessor intact.
+        ///
+        /// Distinct from [`Self::WatchedGenerationExhausted`] because they are
+        /// different ceilings reached by different allocators, and collapsing
+        /// them made the operator-facing log wrong: incarnation exhaustion was
+        /// reported as "project generations exhausted", which points an
+        /// investigation at the wrong counter.
+        RequestIncarnationExhausted,
+        /// Durable intent holds more than one watched generation, so there is
+        /// no single predecessor to retire.
+        ///
+        /// **Fail closed rather than choose.** Picking one would retire it and
+        /// leave the other durable beside the successor — which is the original
+        /// defect, arrived at from the other direction. Reaching this state
+        /// means something installed a watched intent outside the semantic
+        /// replacement owner; the string names what was found so the report
+        /// identifies the intruder rather than merely the symptom.
+        InvariantViolation(String),
         /// The successor write failed. **The predecessor is intact** — its live
         /// registration and its durable intent are exactly as they were, so the
         /// agent keeps answering on the subscription it already had.
@@ -983,35 +1022,25 @@ mod requests {
         /// not restore the ability to mint authority the process has already
         /// spent.
         incarnations_exhausted: bool,
-        /// The watched generation whose durable intent is **current** — the one
-        /// a successor must name as its predecessor to retire.
-        ///
-        /// Advanced only by a replacement that actually installed. The run loop
-        /// used to hold this and advance it when the command was *enqueued*, so
-        /// a generation that never reached the registry could be named as the
-        /// next predecessor; `replace_request` then retired that nonexistent id
-        /// and left the genuine predecessor durable beside the successor.
-        watched_current: Option<u64>,
         /// Next watched generation to hand out. Only ever increases.
         ///
-        /// Separate from [`Self::watched_current`] on purpose: an *attempt* may
-        /// burn a generation without installing one. Reusing the number after a
-        /// failed write would put a wire identity this process has already used
-        /// back on the wire, which is the reuse hazard the whole checked
-        /// allocator exists to prevent.
+        /// **Allocator state, not current state.** Which generation is
+        /// installed is not stored anywhere: it is read out of `intent` by
+        /// [`Self::current_watched`], because durable intent is what a
+        /// reconnect actually replays and a field beside it is a second copy
+        /// that has to be kept in agreement. Two attempts at that agreement
+        /// have failed so far — the run loop's copy, then this struct's.
+        ///
+        /// This counter is genuinely separate: an *attempt* may burn a
+        /// generation without installing one. Reusing the number after a failed
+        /// write would put a wire identity this process has already used back
+        /// on the wire, which is the reuse hazard the whole checked allocator
+        /// exists to prevent.
         next_watched_generation: u64,
         /// Set once the watched generation space is spent. Never cleared, and
         /// survives [`Self::clear_connection`] for the same reason
         /// [`Self::incarnations_exhausted`] does.
         watched_generations_exhausted: bool,
-        /// Whether an enrolment request has ever been installed.
-        ///
-        /// The enrolment id is fixed, so a replacement names itself as its own
-        /// predecessor once one exists. Held here rather than in the run loop
-        /// because "has this been installed" is the same class of fact as
-        /// [`Self::watched_current`], and splitting it across two owners is how
-        /// the watched half went wrong.
-        enrolment_installed: bool,
     }
 
     impl ProjectRequests {
@@ -1360,9 +1389,94 @@ mod requests {
             Some(taken)
         }
 
-        /// The watched generation currently installed, for tests and logging.
-        pub(crate) fn watched_current(&self) -> Option<u64> {
-            self.watched_current
+        /// The watched generation whose durable intent is current — derived,
+        /// never stored.
+        ///
+        /// **Durable intent is the single record of what is installed.** It is
+        /// what a reconnect replays, so a field claiming to mirror it is a
+        /// second answer to a question that already has one, and the two have
+        /// disagreed twice: first when the run loop advanced its copy on
+        /// *enqueue*, then when this struct advanced its copy without seeing an
+        /// intent installed by a neighbouring command.
+        ///
+        /// `Err` when more than one watched intent is durable. There is no
+        /// correct choice to make there — retiring one leaves the other beside
+        /// the successor, which is the defect this whole design removes — so
+        /// the caller is told the registry cannot answer, and installs nothing.
+        pub(crate) fn current_watched(&self) -> Result<Option<u64>, String> {
+            let mut found: Vec<(&str, u64)> = self
+                .intent
+                .iter()
+                .filter_map(|(id, identity)| match identity.subscription() {
+                    super::ProjectSubscription::Watched { generation } => {
+                        Some((id.as_str(), *generation))
+                    }
+                    _ => None,
+                })
+                .collect();
+            match found.len() {
+                0 => Ok(None),
+                1 => Ok(Some(found[0].1)),
+                _ => {
+                    // Sorted so the report is the same on every run — a
+                    // `HashMap` would otherwise name the intruder in a
+                    // different order each time and the failure would read as
+                    // flaky rather than deterministic.
+                    found.sort_unstable();
+                    let ids: Vec<&str> = found.iter().map(|(id, _)| *id).collect();
+                    Err(format!(
+                        "durable intent holds {} watched generations ({}); \
+                         exactly one may be current",
+                        ids.len(),
+                        ids.join(", ")
+                    ))
+                }
+            }
+        }
+
+        /// Whether an enrolment request's durable intent is current.
+        ///
+        /// Derived for the same reason as [`Self::current_watched`], and by the
+        /// same rule: the id is fixed, so the question is whether *that* id
+        /// holds enrolment intent — not whether a boolean somewhere was set.
+        fn enrolment_current(&self) -> bool {
+            self.intent
+                .get(super::PROJECT_ENROL_SUB_ID)
+                .is_some_and(|identity| {
+                    matches!(
+                        identity.subscription(),
+                        super::ProjectSubscription::Enrolment
+                    )
+                })
+        }
+
+        /// Test hook: install a watched intent outside the semantic owner.
+        ///
+        /// The only way to reach the state a generic subscribe command used to
+        /// make reachable in production. It exists so the fail-closed
+        /// derivation can be proved to fail closed; production has no route to
+        /// it, which is the point of the regression that uses it.
+        #[cfg(test)]
+        pub(crate) fn force_watched_intent(&mut self, generation: u64, filter: Value) {
+            let identity = ProjectRequestIdentity::new(
+                super::ProjectSubscription::Watched { generation },
+                filter,
+            )
+            .expect("test intent filter must be bounded");
+            self.intent
+                .insert(super::watched_sub_id(generation), identity);
+        }
+
+        /// Test hook: remove a watched intent, undoing
+        /// [`Self::force_watched_intent`].
+        ///
+        /// So the fail-closed regression can show the owner recovers once the
+        /// ambiguity is gone. A registry that refused forever afterwards would
+        /// also pass an assertion that it refused once.
+        #[cfg(test)]
+        pub(crate) fn clear_watched_intent(&mut self, generation: u64) {
+            self.intent.remove(&super::watched_sub_id(generation));
+            self.live.remove(&super::watched_sub_id(generation));
         }
 
         /// Test hook: start the allocators near their ceilings.
@@ -1393,31 +1507,62 @@ mod requests {
         /// which is precisely the defect this replaces: the run loop advanced
         /// its own copy when the command was enqueued and then named a
         /// generation the registry had never seen.
+        /// **Order: validate, compare, then burn.** Refusal and a genuine no-op
+        /// both decide before allocation, so neither consumes a generation.
+        /// Only an attempt that will actually be made spends one — and once
+        /// spent it is never handed out again, whatever the attempt returns.
         pub(crate) async fn replace_watched<S: ProjectReqSink>(
             &mut self,
             sink: &mut S,
             filters: Vec<Value>,
         ) -> ReplaceOutcome {
+            if !bounded_filters(&filters) {
+                return ReplaceOutcome::InvalidFilters;
+            }
+            let predecessor = match self.current_watched() {
+                Ok(current) => current.map(super::watched_sub_id),
+                Err(violation) => return ReplaceOutcome::InvariantViolation(violation),
+            };
+            // A no-op is a predecessor whose durable intent already asks these
+            // filters *and* which is live on this connection. Intent alone is
+            // not enough: intent recorded while disconnected has never reached
+            // a socket, and reporting `Unchanged` for it would leave the relay
+            // asked nothing while the registry claimed to be current.
+            if let Some(prior_id) = predecessor.as_deref() {
+                if self.asks_exactly(prior_id, &filters) {
+                    return ReplaceOutcome::Unchanged;
+                }
+            }
             let Some(generation) = self.burn_watched_generation() else {
-                return ReplaceOutcome::Exhausted;
+                return ReplaceOutcome::WatchedGenerationExhausted;
             };
             let Some(identity) = ProjectRequestIdentity::from_filters(
                 super::ProjectSubscription::Watched { generation },
                 filters,
             ) else {
-                return ReplaceOutcome::Refused;
+                // Unreachable: `bounded_filters` above asked the same question
+                // `from_filters` asks. Reported rather than unwrapped, because
+                // a panic here would take down the relay task over a
+                // disagreement between two expressions of one rule.
+                return ReplaceOutcome::InvalidFilters;
             };
             let sub_id = super::watched_sub_id(generation);
-            let predecessor = self.watched_current.map(super::watched_sub_id);
-            let outcome = self
-                .replace_request(sink, predecessor.as_deref(), &sub_id, identity)
-                .await;
-            // Only an install moves the predecessor. The burned generation is
-            // spent either way.
-            if matches!(outcome, ReplaceOutcome::Replaced { .. }) {
-                self.watched_current = Some(generation);
-            }
-            outcome
+            // Nothing to write back afterwards: `replace_request` moves durable
+            // intent, and durable intent *is* the current generation.
+            self.replace_request(sink, predecessor.as_deref(), &sub_id, identity)
+                .await
+        }
+
+        /// Does `sub_id` already ask exactly `filters`, on this connection?
+        ///
+        /// Live rather than intended, and by identity rather than by id: a
+        /// registration under the right id asking a different question is not
+        /// unchanged, and the only thing that makes a REQ redundant is that the
+        /// relay is already answering this exact one.
+        fn asks_exactly(&self, sub_id: &str, filters: &[Value]) -> bool {
+            self.live
+                .get(sub_id)
+                .is_some_and(|live| live.identity.filters().eq(filters.iter()))
         }
 
         /// The offline half of [`Self::replace_watched`].
@@ -1428,19 +1573,37 @@ mod requests {
         /// intent *is* what reconnect installs — there is no later moment at
         /// which this becomes true.
         pub(crate) fn replace_watched_intent(&mut self, filters: Vec<Value>) -> ReplaceOutcome {
+            if !bounded_filters(&filters) {
+                return ReplaceOutcome::InvalidFilters;
+            }
+            let predecessor = match self.current_watched() {
+                Ok(current) => current.map(super::watched_sub_id),
+                Err(violation) => return ReplaceOutcome::InvariantViolation(violation),
+            };
+            // Offline, "unchanged" is a question about intent alone — there is
+            // no connection for anything to be live on, and re-recording the
+            // same intent under a fresh generation would burn one to arrive
+            // where the next reconnect was already going.
+            if let Some(prior_id) = predecessor.as_deref() {
+                if self
+                    .intent
+                    .get(prior_id)
+                    .is_some_and(|held| held.filters().eq(filters.iter()))
+                {
+                    return ReplaceOutcome::Unchanged;
+                }
+            }
             let Some(generation) = self.burn_watched_generation() else {
-                return ReplaceOutcome::Exhausted;
+                return ReplaceOutcome::WatchedGenerationExhausted;
             };
             let Some(identity) = ProjectRequestIdentity::from_filters(
                 super::ProjectSubscription::Watched { generation },
                 filters,
             ) else {
-                return ReplaceOutcome::Refused;
+                return ReplaceOutcome::InvalidFilters;
             };
             let sub_id = super::watched_sub_id(generation);
-            let predecessor = self.watched_current.map(super::watched_sub_id);
             self.replace_intent(predecessor.as_deref(), &sub_id, identity);
-            self.watched_current = Some(generation);
             ReplaceOutcome::Replaced {
                 retired: predecessor,
             }
@@ -1461,18 +1624,11 @@ mod requests {
                 super::ProjectSubscription::Enrolment,
                 filters,
             ) else {
-                return ReplaceOutcome::Refused;
+                return ReplaceOutcome::InvalidFilters;
             };
             let id = super::PROJECT_ENROL_SUB_ID;
-            let predecessor = self.enrolment_installed.then_some(id);
-            let outcome = self.replace_request(sink, predecessor, id, identity).await;
-            if matches!(
-                outcome,
-                ReplaceOutcome::Replaced { .. } | ReplaceOutcome::Unchanged
-            ) {
-                self.enrolment_installed = true;
-            }
-            outcome
+            let predecessor = self.enrolment_current().then_some(id);
+            self.replace_request(sink, predecessor, id, identity).await
         }
 
         /// The offline half of [`Self::replace_enrolment`].
@@ -1481,12 +1637,11 @@ mod requests {
                 super::ProjectSubscription::Enrolment,
                 filters,
             ) else {
-                return ReplaceOutcome::Refused;
+                return ReplaceOutcome::InvalidFilters;
             };
             let id = super::PROJECT_ENROL_SUB_ID;
-            let predecessor = self.enrolment_installed.then_some(id);
+            let predecessor = self.enrolment_current().then_some(id);
             self.replace_intent(predecessor, id, identity);
-            self.enrolment_installed = true;
             ReplaceOutcome::Replaced { retired: None }
         }
 
@@ -1551,7 +1706,7 @@ mod requests {
                 return ReplaceOutcome::Unchanged;
             }
             if self.incarnations_exhausted {
-                return ReplaceOutcome::Exhausted;
+                return ReplaceOutcome::RequestIncarnationExhausted;
             }
 
             let text = match serde_json::to_string(&identity.req_frame(sub_id)) {
@@ -1590,7 +1745,7 @@ mod requests {
                         self.intent.remove(sub_id);
                     }
                 }
-                return ReplaceOutcome::Exhausted;
+                return ReplaceOutcome::RequestIncarnationExhausted;
             };
             self.live.insert(
                 sub_id.to_string(),
@@ -1814,17 +1969,18 @@ pub(crate) fn discovery_sub_id() -> String {
 /// the flag inline at the call site left it provable only by running the whole
 /// startup path, and the control test that stood in for it exercised
 /// [`project_req_frames`] — which no production code calls.
-pub(crate) fn discovery_subscription(
-    enabled: bool,
-) -> Option<(String, ProjectSubscription, Vec<serde_json::Value>)> {
+///
+/// **Filters only.** It returned the id and the class too, which made them
+/// values a caller held and could substitute. They are constants of the
+/// discovery subscription, so the background task stamps them at the point of
+/// registration and nothing carries them across a channel.
+pub(crate) fn discovery_subscription(enabled: bool) -> Option<Vec<serde_json::Value>> {
     if !enabled {
         return None;
     }
-    Some((
-        discovery_sub_id(),
-        ProjectSubscription::Discovery,
-        vec![serde_json::json!({ "kinds": [buzz_core::kind::KIND_GIT_REPO_ANNOUNCEMENT] })],
-    ))
+    Some(vec![
+        serde_json::json!({ "kinds": [buzz_core::kind::KIND_GIT_REPO_ANNOUNCEMENT] }),
+    ])
 }
 
 pub(crate) fn watched_sub_id(generation: u64) -> String {

@@ -2857,23 +2857,23 @@ fn should_report_refusal(degradation: project::Degradation, refused_total: u64) 
 /// Separate from [`ProjectSubscriber`] because startup opens and never
 /// replaces, and the driver replaces and never opens. Merging them would hand
 /// each side a lever it has no business holding.
+/// **Discovery only.** It took a `sub_id` and a `ProjectSubscription` until
+/// that was found to be a second producer of watched generations, reachable by
+/// any crate caller. Startup opens exactly one subscription and has no id or
+/// class to choose; the background task supplies both.
 pub(crate) trait ProjectOpener {
-    fn subscribe_project(
+    fn submit_project_discovery(
         &self,
-        sub_id: &str,
-        class: project::ProjectSubscription,
         filters: Vec<serde_json::Value>,
     ) -> impl std::future::Future<Output = Result<(), relay::RelayError>>;
 }
 
 impl ProjectOpener for relay::HarnessRelay {
-    async fn subscribe_project(
+    async fn submit_project_discovery(
         &self,
-        sub_id: &str,
-        class: project::ProjectSubscription,
         filters: Vec<serde_json::Value>,
     ) -> Result<(), relay::RelayError> {
-        relay::HarnessRelay::subscribe_project(self, sub_id, class, filters).await
+        relay::HarnessRelay::submit_project_discovery(self, filters).await
     }
 }
 
@@ -2889,19 +2889,19 @@ impl ProjectOpener for relay::HarnessRelay {
 /// be opened at startup. Enrolment and watched-root REQs derive their filters
 /// from discovery and enrolment state, so they belong to the driver.
 ///
-/// The class passed here is what every inbound frame on this id will be
-/// classified as; the id's spelling carries no authority. Registration happens
-/// in lockstep with the write inside the relay task.
+/// Startup names neither the id nor the class — it submits filters, and the
+/// relay task stamps both. Registration happens in lockstep with the write
+/// there, so a failed send leaves nothing answerable.
 pub(crate) async fn open_startup_project_subscriptions(
     config: &config::Config,
     opener: &impl ProjectOpener,
 ) {
     match project::discovery_subscription(config.project_routing_enabled) {
-        Some((sub_id, class, filters)) => {
-            if let Err(e) = opener.subscribe_project(&sub_id, class, filters).await {
+        Some(filters) => {
+            if let Err(e) = opener.submit_project_discovery(filters).await {
                 tracing::warn!("repository discovery subscribe error: {e}");
             } else {
-                tracing::info!(sub_id, "subscribed to repository announcements");
+                tracing::info!("submitted the repository-announcement subscription");
             }
         }
         None => {
