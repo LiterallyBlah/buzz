@@ -4536,19 +4536,48 @@ async fn send_project_replay(
     report_project_open(&sub_id, outcome)
 }
 
+/// The registry's outcome as this module's outcome. Nothing else.
+///
+/// **Extracted so the mapping itself can be proved.** Every arm here is a
+/// refusal the registry can make and this module has to report faithfully, and
+/// three of them — exhaustion, an invariant violation, an unbounded filter —
+/// describe states no honest fixture can reach, so the arms had no proof at all
+/// while they were embedded in the logging below. Reporting terminal exhaustion
+/// as a per-request ownership conflict is a diagnostic that sends someone
+/// looking for a disagreement that does not exist, which is the failure this
+/// separation makes visible.
+fn project_send_outcome(outcome: &crate::project::OpenOutcome) -> ProjectSendOutcome {
+    match outcome {
+        crate::project::OpenOutcome::Sent => ProjectSendOutcome::Sent,
+        crate::project::OpenOutcome::AlreadyLive => ProjectSendOutcome::AlreadyOpen,
+        crate::project::OpenOutcome::Exhausted => ProjectSendOutcome::Exhausted,
+        crate::project::OpenOutcome::Conflict { .. } => ProjectSendOutcome::MetadataConflict,
+        crate::project::OpenOutcome::WriteFailed(_) => ProjectSendOutcome::WriteFailed,
+        crate::project::OpenOutcome::UnboundedFilters => ProjectSendOutcome::UnboundedFilters,
+        crate::project::OpenOutcome::InvariantViolation(_) => {
+            ProjectSendOutcome::InvariantViolation
+        }
+    }
+}
+
 /// Turn one registry outcome into the caller-facing outcome, with its log.
+///
+/// The outcome is [`project_send_outcome`]'s, decided before the logging below
+/// and returned unchanged afterwards — so what this reports and what that
+/// function is proved to map cannot drift apart.
 fn report_project_open(sub_id: &str, outcome: crate::project::OpenOutcome) -> ProjectSendOutcome {
+    let reported = project_send_outcome(&outcome);
     match outcome {
         crate::project::OpenOutcome::Sent => {
             debug!(sub_id, "project REQ sent and registered");
-            ProjectSendOutcome::Sent
+            reported
         }
         crate::project::OpenOutcome::AlreadyLive => {
             debug!(
                 sub_id,
                 "project request already live — not re-sending its REQ"
             );
-            ProjectSendOutcome::AlreadyOpen
+            reported
         }
         crate::project::OpenOutcome::Exhausted => {
             // Terminal and local: no REQ is written, the socket is fine, and
@@ -4560,7 +4589,7 @@ fn report_project_open(sub_id: &str, outcome: crate::project::OpenOutcome) -> Pr
                 "project request incarnations exhausted — refusing to reuse one; no further \
                  project subscription can be opened"
             );
-            ProjectSendOutcome::Exhausted
+            reported
         }
         crate::project::OpenOutcome::Conflict { held } => {
             warn!(
@@ -4569,7 +4598,7 @@ fn report_project_open(sub_id: &str, outcome: crate::project::OpenOutcome) -> Pr
                 "refusing project request: this id is owned by a different request — \
                  nothing recorded"
             );
-            ProjectSendOutcome::MetadataConflict
+            reported
         }
         crate::project::OpenOutcome::WriteFailed(e) => {
             // Nothing was registered — installation happens only after a
@@ -4579,7 +4608,7 @@ fn report_project_open(sub_id: &str, outcome: crate::project::OpenOutcome) -> Pr
                 sub_id,
                 "failed to send project REQ — nothing registered: {e}"
             );
-            ProjectSendOutcome::WriteFailed
+            reported
         }
         crate::project::OpenOutcome::UnboundedFilters => {
             // Nothing written, nothing registered, and the socket is fine — a
@@ -4588,7 +4617,7 @@ fn report_project_open(sub_id: &str, outcome: crate::project::OpenOutcome) -> Pr
                 sub_id,
                 "refusing a project subscription whose filters constrain nothing"
             );
-            ProjectSendOutcome::UnboundedFilters
+            reported
         }
         crate::project::OpenOutcome::InvariantViolation(violation) => {
             // The record this request would have joined does not resolve, so
@@ -4600,7 +4629,7 @@ fn report_project_open(sub_id: &str, outcome: crate::project::OpenOutcome) -> Pr
                 %violation,
                 "refusing a project subscription — the durable record does not resolve"
             );
-            ProjectSendOutcome::InvariantViolation
+            reported
         }
     }
 }
@@ -7630,6 +7659,53 @@ mod tests {
     // now, so the gate remains as the rule's last line and its refusal arm is
     // unreachable from any proof. The two properties underneath them that are
     // still reachable are kept below.
+
+    /// **The registry's outcome reaches this module unchanged.**
+    ///
+    /// Each arm is a refusal the registry can make and this module has to
+    /// report faithfully. Three of them describe states no honest fixture can
+    /// reach — exhaustion is 2^64 operations away and a record that does not
+    /// resolve cannot be handed to an owner — so before the mapping was
+    /// extracted they were unreachable code with no proof, and reporting
+    /// terminal exhaustion as a per-request ownership conflict would have sent
+    /// a reader looking for a disagreement that does not exist.
+    ///
+    /// `Conflict` is the one arm not asserted here: its payload is a
+    /// `ProjectRequestIdentity`, which nothing outside the registry can build —
+    /// which is the property that closed the earlier findings, and the reason
+    /// this list is seven long and six deep.
+    #[test]
+    fn every_registry_outcome_maps_to_exactly_one_send_outcome() {
+        for (outcome, expected) in [
+            (crate::project::OpenOutcome::Sent, ProjectSendOutcome::Sent),
+            (
+                crate::project::OpenOutcome::AlreadyLive,
+                ProjectSendOutcome::AlreadyOpen,
+            ),
+            (
+                crate::project::OpenOutcome::Exhausted,
+                ProjectSendOutcome::Exhausted,
+            ),
+            (
+                crate::project::OpenOutcome::WriteFailed("socket closed".to_string()),
+                ProjectSendOutcome::WriteFailed,
+            ),
+            (
+                crate::project::OpenOutcome::UnboundedFilters,
+                ProjectSendOutcome::UnboundedFilters,
+            ),
+            (
+                crate::project::OpenOutcome::InvariantViolation("two watched".to_string()),
+                ProjectSendOutcome::InvariantViolation,
+            ),
+        ] {
+            assert_eq!(
+                project_send_outcome(&outcome),
+                expected,
+                "{outcome:?} must report as {expected:?}"
+            );
+        }
+    }
 
     /// **A replacement retires the predecessor it installed, and only that.**
     ///

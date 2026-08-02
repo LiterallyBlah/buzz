@@ -124,7 +124,7 @@ pub(crate) use requests::{
 /// whose ceiling they exercise. Neither can install anything: the validator
 /// returns a description and the counter has no route into a record.
 #[cfg(test)]
-use requests::{validate_persisted_document, CheckedCounter, CurrentIntent};
+use requests::{plan, validate_persisted_document, AllocatorState, CheckedCounter, CurrentIntent};
 
 /// Named by the replacement wire tests today; the run loop consumes it when
 /// dispatch moves behind the narrow replacement capability. Scoped to this one
@@ -1212,6 +1212,55 @@ mod requests {
         pub(super) fn is_spent(&self) -> bool {
             self.spent
         }
+
+        /// What this counter can still do, as a description rather than a
+        /// counter.
+        ///
+        /// The preflight decisions take one of these: an operation needs to
+        /// know whether an identity can still be minted, and nothing else about
+        /// the allocator. A description can be written down in a proof; a
+        /// counter handed to an owner is provenance a proof chose.
+        pub(super) fn state(&self) -> AllocatorState {
+            if self.spent {
+                AllocatorState::Spent
+            } else {
+                AllocatorState::Available
+            }
+        }
+
+        /// A counter recovered from a persisted pair, or `None` if that pair is
+        /// a state no counter could be in.
+        ///
+        /// **`spent` is a fact about arithmetic, not a flag a writer may set.**
+        /// [`Self::burn`] sets it in exactly one circumstance — `next` was
+        /// `u64::MAX` and `checked_add` refused — so a spent counter always
+        /// reads `u64::MAX`, and any other pairing describes a counter that
+        /// cannot exist. Admitting one is not a harmless inconsistency: `spent`
+        /// is what tells the provenance rule that `next` has stopped advancing,
+        /// so `{ spent: true, next: 0 }` suppressed the check entirely and a
+        /// document could then claim any generation it liked as issued. The
+        /// pair is refused before any member is judged against it.
+        #[cfg(test)]
+        pub(super) fn from_persisted(next: u64, spent: bool) -> Option<Self> {
+            if spent && next != u64::MAX {
+                return None;
+            }
+            Some(Self { next, spent })
+        }
+    }
+
+    /// What an allocator can still do — never how far along it is.
+    ///
+    /// The preflight decisions read this and no more, so a proof can describe
+    /// "the space is spent" without composing an allocator, and describing it
+    /// hands over nothing: there is no route from an `AllocatorState` back to a
+    /// counter, a record or a registry.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum AllocatorState {
+        /// At least one value remains.
+        Available,
+        /// Every value has been handed out. Never reversible.
+        Spent,
     }
 
     impl DurableRecord {
@@ -1438,6 +1487,183 @@ mod requests {
         }
     }
 
+    /// Preflight decisions, as pure functions over descriptions.
+    ///
+    /// **Every refusal an operation can make is decided here, before the
+    /// operation has done anything.** Each function reads descriptions — is the
+    /// record valid, is the allocator spent, is this a no-op — and returns
+    /// either the exact outcome to return or permission to proceed. Production
+    /// consumes the decision and does not re-derive it, so an outcome cannot be
+    /// spelled one way in a proof and another way on the path that runs.
+    ///
+    /// This exists because the refusals it owns are unreachable from any
+    /// honest fixture. A spent allocator is 2^64 operations away and a corrupt
+    /// record cannot be handed to an owner at all, so the branches that handle
+    /// them had no load-bearing proof: a reviewer's mutant turned
+    /// `RequestIncarnationExhausted` into `InvalidFilters` and the whole suite
+    /// still passed. A description of a state is not authority over it —
+    /// nothing here accepts or returns a record, a counter, a generation, a
+    /// registration or a socket — so these can be proved exactly without
+    /// anything being installed.
+    pub(super) mod plan {
+        use super::{
+            AllocatorState, OpenOutcome, PageOpen, ProjectRequestIdentity, ReplaceOutcome,
+        };
+
+        /// What an operation decided before acting.
+        #[derive(Debug, PartialEq)]
+        pub(in crate::project) enum Decision<T> {
+            /// Return this outcome, having done nothing at all: no byte
+            /// written, no identity allocated, no registration installed, no
+            /// predecessor retired, no intent recorded.
+            Refuse(T),
+            /// Nothing refuses it. The operation may go on to its effects.
+            Proceed,
+        }
+
+        /// What the registry already holds under the id an open names.
+        #[derive(Debug)]
+        pub(in crate::project) enum Held {
+            /// Nothing live and nothing intended.
+            Nothing,
+            /// This exact request is already live.
+            SameLive,
+            /// A different request is live under this id.
+            OtherLive(Box<ProjectRequestIdentity>),
+            /// Nothing live, but durable intent under this id asks something
+            /// else.
+            OtherIntent(Box<ProjectRequestIdentity>),
+        }
+
+        /// Opening a request: `open_discovery` and `open_replayed`.
+        ///
+        /// Order matters and is the order production used: the record first,
+        /// because a registry that cannot read its own durable intent may not
+        /// act on any part of it; then what is held under the id, because an
+        /// occupied id is a disagreement about *this* request; then the
+        /// allocator, because exhaustion is terminal and process-wide and
+        /// should not mask a local conflict that could still be resolved.
+        pub(in crate::project) fn open(
+            validity: Result<(), String>,
+            held: Held,
+            incarnations: AllocatorState,
+        ) -> Decision<OpenOutcome> {
+            if let Err(violation) = validity {
+                return Decision::Refuse(OpenOutcome::InvariantViolation(violation));
+            }
+            match held {
+                Held::SameLive => return Decision::Refuse(OpenOutcome::AlreadyLive),
+                Held::OtherLive(held) | Held::OtherIntent(held) => {
+                    return Decision::Refuse(OpenOutcome::Conflict { held })
+                }
+                Held::Nothing => {}
+            }
+            if incarnations == AllocatorState::Spent {
+                return Decision::Refuse(OpenOutcome::Exhausted);
+            }
+            Decision::Proceed
+        }
+
+        /// Replacing the watched subscription, connected or offline.
+        ///
+        /// `current` is the whole-record walk's answer: `Err` refuses, `Ok`
+        /// carries the generation whose intent is current. `unchanged` is the
+        /// no-op question, asked by the caller because it needs the
+        /// predecessor's id to ask it.
+        pub(in crate::project) fn watched_replacement(
+            bounded_filters: bool,
+            current: &Result<Option<u64>, String>,
+            unchanged: bool,
+            generations: AllocatorState,
+        ) -> Decision<ReplaceOutcome> {
+            if !bounded_filters {
+                return Decision::Refuse(ReplaceOutcome::InvalidFilters);
+            }
+            if let Err(violation) = current {
+                return Decision::Refuse(ReplaceOutcome::InvariantViolation(violation.clone()));
+            }
+            if unchanged {
+                return Decision::Refuse(ReplaceOutcome::Unchanged);
+            }
+            if generations == AllocatorState::Spent {
+                return Decision::Refuse(ReplaceOutcome::WatchedGenerationExhausted);
+            }
+            Decision::Proceed
+        }
+
+        /// Replacing the enrolment subscription, whose id is fixed and whose
+        /// generation is not allocated.
+        pub(in crate::project) fn enrolment_replacement(
+            bounded_filters: bool,
+            current: &Result<bool, String>,
+        ) -> Decision<ReplaceOutcome> {
+            if !bounded_filters {
+                return Decision::Refuse(ReplaceOutcome::InvalidFilters);
+            }
+            if let Err(violation) = current {
+                return Decision::Refuse(ReplaceOutcome::InvariantViolation(violation.clone()));
+            }
+            Decision::Proceed
+        }
+
+        /// Writing a replacement, once its class has decided to make one.
+        ///
+        /// The incarnation is what stamps the successor's authority, so a spent
+        /// space refuses here rather than after the write. `already_live` is
+        /// the successor being identical to what is already answering, which is
+        /// a no-op for the same reason an unchanged watched replacement is.
+        pub(in crate::project) fn replacement_write(
+            already_live: bool,
+            incarnations: AllocatorState,
+        ) -> Decision<ReplaceOutcome> {
+            if already_live {
+                return Decision::Refuse(ReplaceOutcome::Unchanged);
+            }
+            if incarnations == AllocatorState::Spent {
+                return Decision::Refuse(ReplaceOutcome::RequestIncarnationExhausted);
+            }
+            Decision::Proceed
+        }
+
+        /// Opening one history page.
+        ///
+        /// A page burns its incarnation *before* the write, because the wire id
+        /// carries it — so the allocator is part of the preflight rather than
+        /// something the write discovers.
+        pub(in crate::project) fn history_page(
+            validity: Result<(), String>,
+            pristine: bool,
+            bounded_filter: bool,
+            incarnations: AllocatorState,
+        ) -> Decision<PageOpen> {
+            if let Err(violation) = validity {
+                return Decision::Refuse(PageOpen::InvariantViolation(violation));
+            }
+            if !pristine {
+                return Decision::Refuse(PageOpen::NotPristine);
+            }
+            if !bounded_filter {
+                return Decision::Refuse(PageOpen::UnboundedFilter);
+            }
+            if incarnations == AllocatorState::Spent {
+                return Decision::Refuse(PageOpen::Exhausted);
+            }
+            Decision::Proceed
+        }
+
+        /// Replaying durable intent onto a connection.
+        ///
+        /// A record that does not resolve replays nothing — not the members
+        /// that happen to look canonical, and not "as much as possible". Replay
+        /// is where durable intent becomes bytes.
+        pub(in crate::project) fn replay(validity: Result<(), String>) -> Decision<String> {
+            match validity {
+                Err(violation) => Decision::Refuse(violation),
+                Ok(()) => Decision::Proceed,
+            }
+        }
+    }
+
     /// Validate a persisted durable document — bytes in, a description out.
     ///
     /// **The proofs' only route to a non-canonical record, and it is not a
@@ -1478,6 +1704,10 @@ mod requests {
             next_watched_generation: u64,
             #[serde(default)]
             watched_generations_spent: bool,
+            #[serde(default)]
+            next_incarnation: u64,
+            #[serde(default)]
+            incarnations_spent: bool,
         }
         #[derive(serde::Deserialize)]
         struct Member {
@@ -1503,10 +1733,36 @@ mod requests {
             }
         }
 
-        let allocator = CheckedCounter {
-            next: document.next_watched_generation,
-            spent: document.watched_generations_spent,
+        // Both allocators, before anything is judged against either. A
+        // persisted counter is two numbers a writer chose, and only some
+        // pairings are states `burn` can produce — the watched pair decides
+        // whether the provenance rule below runs at all, so an impossible one
+        // is a way to switch that rule off from inside the document. The
+        // incarnation pair reaches no rule here, and is checked anyway: a
+        // document that misdescribes one allocator is not a document to trust
+        // about the other.
+        let Some(allocator) = CheckedCounter::from_persisted(
+            document.next_watched_generation,
+            document.watched_generations_spent,
+        ) else {
+            return Err(format!(
+                "persisted watched allocator is spent at {}, which no counter reaches: \
+                 the space is spent only at {}",
+                document.next_watched_generation,
+                u64::MAX
+            ));
         };
+        if CheckedCounter::from_persisted(document.next_incarnation, document.incarnations_spent)
+            .is_none()
+        {
+            return Err(format!(
+                "persisted incarnation allocator is spent at {}, which no counter reaches: \
+                 the space is spent only at {}",
+                document.next_incarnation,
+                u64::MAX
+            ));
+        }
+
         validate_members(
             document
                 .intent
@@ -1792,27 +2048,15 @@ mod requests {
             sink: &mut S,
             collector: HistoryPageCollector,
         ) -> PageOpen {
-            // The whole record first: a page burns an incarnation, writes a REQ
-            // and installs a registration, and none of the three may happen
-            // over a record this registry cannot resolve.
-            if let Err(violation) = self.checked_current() {
-                return PageOpen::InvariantViolation(violation);
-            }
             // Rows that arrived before this registration existed cannot belong
-            // to it. Without this a collector could be filled first and
-            // laundered into the registration opened afterwards.
-            if !collector.is_pristine() {
-                return PageOpen::NotPristine;
-            }
-            // The identity is built — and can be refused — *before* a token is
-            // burned, so a page whose own filter would ask the relay for
-            // everything costs the incarnation space nothing. `ProjectRequests`
-            // has one constructor for identities and it is fallible for every
-            // caller, this one included: an infallible route for "we built this
-            // filter ourselves, it must be fine" is the check-skipping door the
-            // type exists to close, and `catch_up_filter` being correct today is
-            // not the same fact as this operation refusing an incorrect one.
-            let Some(identity) = ProjectRequestIdentity::new(
+            // to it. Without the pristine question a collector could be filled
+            // first and laundered into the registration opened afterwards.
+            //
+            // The identity is built here so the plan can be asked whether it
+            // could be: building one allocates nothing and installs nothing,
+            // and a page whose own filter would ask the relay for everything
+            // must cost the incarnation space nothing.
+            let identity = ProjectRequestIdentity::new(
                 ProjectSubscription::RootCatchUp {
                     root: collector.root().to_string(),
                     stream: collector.stream(),
@@ -1823,10 +2067,29 @@ mod requests {
                     collector.until(),
                     collector.effective_limit(),
                 ),
-            ) else {
+            );
+            if let plan::Decision::Refuse(outcome) = plan::history_page(
+                self.checked_current().map(|_| ()),
+                collector.is_pristine(),
+                identity.is_some(),
+                self.record.incarnations.state(),
+            ) {
+                return outcome;
+            }
+            // The identity is built — and can be refused — *before* a token is
+            // burned, so a page whose own filter would ask the relay for
+            // everything costs the incarnation space nothing. `ProjectRequests`
+            // has one constructor for identities and it is fallible for every
+            // caller, this one included: an infallible route for "we built this
+            // filter ourselves, it must be fine" is the check-skipping door the
+            // type exists to close, and `catch_up_filter` being correct today is
+            // not the same fact as this operation refusing an incorrect one.
+            let Some(identity) = identity else {
+                // Unreachable: the plan refused an unbuildable identity above.
                 return PageOpen::UnboundedFilter;
             };
             let Some(incarnation) = self.burn_incarnation() else {
+                // Unreachable: the plan refused a spent space above.
                 return PageOpen::Exhausted;
             };
             let sub_id = Self::catch_up_wire_id(collector.root(), collector.stream(), incarnation);
@@ -1957,13 +2220,11 @@ mod requests {
             sink: &mut S,
             filters: Vec<Value>,
         ) -> ReplaceOutcome {
-            if !bounded_filters(&filters) {
-                return ReplaceOutcome::InvalidFilters;
-            }
-            let predecessor = match self.current_watched() {
-                Ok(current) => current.map(super::watched_sub_id),
-                Err(violation) => return ReplaceOutcome::InvariantViolation(violation),
-            };
+            let current = self.current_watched();
+            let predecessor = current
+                .as_ref()
+                .ok()
+                .and_then(|c| c.map(super::watched_sub_id));
             // A no-op is a predecessor whose durable intent already asks these
             // filters *and* which is live on this connection asking the same
             // ones. Intent alone is not enough: intent recorded while
@@ -1971,14 +2232,21 @@ mod requests {
             // `Unchanged` for it would leave the relay asked nothing while the
             // registry claimed to be current. Live alone is not enough either —
             // the two are separate maps, and a no-op has to be a no-op in both.
-            if let Some(prior_id) = predecessor.as_deref() {
-                if self.intent_asks_exactly(prior_id, &filters)
+            let unchanged = predecessor.as_deref().is_some_and(|prior_id| {
+                self.intent_asks_exactly(prior_id, &filters)
                     && self.live_asks_exactly(prior_id, &filters)
-                {
-                    return ReplaceOutcome::Unchanged;
-                }
+            });
+            if let plan::Decision::Refuse(outcome) = plan::watched_replacement(
+                bounded_filters(&filters),
+                &current,
+                unchanged,
+                self.record.watched_generations.state(),
+            ) {
+                return outcome;
             }
             let Some(generation) = self.burn_watched_generation() else {
+                // Unreachable: the plan above refused a spent allocator, and
+                // nothing between there and here can spend one.
                 return ReplaceOutcome::WatchedGenerationExhausted;
             };
             let Some(identity) = ProjectRequestIdentity::from_filters(
@@ -2030,23 +2298,28 @@ mod requests {
         /// intent *is* what reconnect installs — there is no later moment at
         /// which this becomes true.
         pub(crate) fn replace_watched_intent(&mut self, filters: Vec<Value>) -> ReplaceOutcome {
-            if !bounded_filters(&filters) {
-                return ReplaceOutcome::InvalidFilters;
-            }
-            let predecessor = match self.current_watched() {
-                Ok(current) => current.map(super::watched_sub_id),
-                Err(violation) => return ReplaceOutcome::InvariantViolation(violation),
-            };
+            let current = self.current_watched();
+            let predecessor = current
+                .as_ref()
+                .ok()
+                .and_then(|c| c.map(super::watched_sub_id));
             // Offline, "unchanged" is a question about intent alone — there is
             // no connection for anything to be live on, and re-recording the
             // same intent under a fresh generation would burn one to arrive
             // where the next reconnect was already going.
-            if let Some(prior_id) = predecessor.as_deref() {
-                if self.intent_asks_exactly(prior_id, &filters) {
-                    return ReplaceOutcome::Unchanged;
-                }
+            let unchanged = predecessor
+                .as_deref()
+                .is_some_and(|prior_id| self.intent_asks_exactly(prior_id, &filters));
+            if let plan::Decision::Refuse(outcome) = plan::watched_replacement(
+                bounded_filters(&filters),
+                &current,
+                unchanged,
+                self.record.watched_generations.state(),
+            ) {
+                return outcome;
             }
             let Some(generation) = self.burn_watched_generation() else {
+                // Unreachable, as above.
                 return ReplaceOutcome::WatchedGenerationExhausted;
             };
             let Some(identity) = ProjectRequestIdentity::from_filters(
@@ -2073,33 +2346,42 @@ mod requests {
             sink: &mut S,
             filters: Vec<Value>,
         ) -> ReplaceOutcome {
+            let current = self.enrolment_current();
+            if let plan::Decision::Refuse(outcome) =
+                plan::enrolment_replacement(bounded_filters(&filters), &current)
+            {
+                return outcome;
+            }
             let Some(identity) = ProjectRequestIdentity::from_filters(
                 super::ProjectSubscription::Enrolment,
                 filters,
             ) else {
+                // Unreachable: the plan asked the same question of the same
+                // filters one call earlier.
                 return ReplaceOutcome::InvalidFilters;
             };
             let id = super::PROJECT_ENROL_SUB_ID;
-            let predecessor = match self.enrolment_current() {
-                Ok(current) => current.then_some(id),
-                Err(violation) => return ReplaceOutcome::InvariantViolation(violation),
-            };
+            let predecessor = current.unwrap_or(false).then_some(id);
             self.replace_request(sink, predecessor, id, identity).await
         }
 
         /// The offline half of [`Self::replace_enrolment`].
         pub(crate) fn replace_enrolment_intent(&mut self, filters: Vec<Value>) -> ReplaceOutcome {
+            let current = self.enrolment_current();
+            if let plan::Decision::Refuse(outcome) =
+                plan::enrolment_replacement(bounded_filters(&filters), &current)
+            {
+                return outcome;
+            }
             let Some(identity) = ProjectRequestIdentity::from_filters(
                 super::ProjectSubscription::Enrolment,
                 filters,
             ) else {
+                // Unreachable, as above.
                 return ReplaceOutcome::InvalidFilters;
             };
             let id = super::PROJECT_ENROL_SUB_ID;
-            let predecessor = match self.enrolment_current() {
-                Ok(current) => current.then_some(id),
-                Err(violation) => return ReplaceOutcome::InvariantViolation(violation),
-            };
+            let predecessor = current.unwrap_or(false).then_some(id);
             self.replace_intent(predecessor, id, identity);
             ReplaceOutcome::Replaced { retired: None }
         }
@@ -2172,15 +2454,13 @@ mod requests {
             sub_id: &str,
             identity: ProjectRequestIdentity,
         ) -> ReplaceOutcome {
-            if self
-                .live
-                .get(sub_id)
-                .is_some_and(|l| l.identity == identity)
-            {
-                return ReplaceOutcome::Unchanged;
-            }
-            if self.record.incarnations.is_spent() {
-                return ReplaceOutcome::RequestIncarnationExhausted;
+            if let plan::Decision::Refuse(outcome) = plan::replacement_write(
+                self.live
+                    .get(sub_id)
+                    .is_some_and(|l| l.identity == identity),
+                self.record.incarnations.state(),
+            ) {
+                return outcome;
             }
 
             let text = match serde_json::to_string(&identity.req_frame(sub_id)) {
@@ -2214,6 +2494,11 @@ mod requests {
             // a write that never landed must not consume an incarnation, so a
             // retry is a genuinely new authority.
             let Some(incarnation) = self.burn_incarnation() else {
+                // Unreachable: the plan refused a spent space before the write,
+                // and `&mut self` is held across it, so nothing else can have
+                // spent the last one meanwhile. The intent is put back anyway,
+                // because an arm that undoes its own effect is the one shape
+                // that stays correct if the reasoning above ever stops holding.
                 match displaced {
                     Some(prior) => {
                         self.record.intent.insert(sub_id.to_string(), prior);
@@ -2331,12 +2616,6 @@ mod requests {
             // `open_replayed` arrives from a record `replayable` has just
             // validated, but `open_discovery` does not, and neither may act on
             // a record that no longer resolves.
-            if let Err(violation) = self.checked_current() {
-                return OpenOutcome::InvariantViolation(violation);
-            }
-
-            // ---- Preflight. Nothing enters `live`. -------------------------
-            //
             // An async operation has three exits, not two: `Ok`, `Err`, and
             // *dropped while suspended*. The previous shape reserved before
             // awaiting, so a cancelled future left a live-but-unsent entry that
@@ -2344,24 +2623,22 @@ mod requests {
             // root would silently never reconstruct. Rather than handle
             // cancellation, this removes the state it could strand: no
             // registration exists until the write has already returned.
-            if let Some(live) = self.live.get(sub_id) {
-                return if live.identity == identity {
-                    OpenOutcome::AlreadyLive
-                } else {
-                    OpenOutcome::Conflict {
-                        held: Box::new(live.identity.clone()),
+            let held = match self.live.get(sub_id) {
+                Some(live) if live.identity == identity => plan::Held::SameLive,
+                Some(live) => plan::Held::OtherLive(Box::new(live.identity.clone())),
+                None => match self.record.intent.get(sub_id) {
+                    Some(intended) if *intended != identity => {
+                        plan::Held::OtherIntent(Box::new(intended.clone()))
                     }
-                };
-            }
-            if let Some(intended) = self.record.intent.get(sub_id) {
-                if *intended != identity {
-                    return OpenOutcome::Conflict {
-                        held: Box::new(intended.clone()),
-                    };
-                }
-            }
-            if self.record.incarnations.is_spent() {
-                return OpenOutcome::Exhausted;
+                    _ => plan::Held::Nothing,
+                },
+            };
+            if let plan::Decision::Refuse(outcome) = plan::open(
+                self.checked_current().map(|_| ()),
+                held,
+                self.record.incarnations.state(),
+            ) {
+                return outcome;
             }
             let text = match serde_json::to_string(&identity.req_frame(sub_id)) {
                 Ok(text) => text,
@@ -2389,6 +2666,7 @@ mod requests {
             // to carry the token, so `open_history_page` burns one first and
             // relies on a burned token conferring nothing.
             let Some(incarnation) = self.burn_incarnation() else {
+                // Unreachable: the plan refused a spent space before the write.
                 return OpenOutcome::Exhausted;
             };
             self.live.insert(
@@ -2437,7 +2715,11 @@ mod requests {
         /// connection has had its suspensions cleared, so everything intended
         /// is offered once.
         pub(crate) fn replayable(&self) -> Result<Vec<ReplayableRequest>, String> {
-            self.checked_current()?;
+            if let plan::Decision::Refuse(violation) =
+                plan::replay(self.checked_current().map(|_| ()))
+            {
+                return Err(violation);
+            }
             let mut out: Vec<ReplayableRequest> = self
                 .record
                 .intent
@@ -7210,6 +7492,15 @@ mod tests {
         assert!(counter.is_spent(), "and the space is now spent");
         for _ in 0..3 {
             assert_eq!(counter.burn(), None, "no wrap, no reuse — a refusal");
+            assert!(
+                counter.is_spent(),
+                "spent is never cleared — no later call revives it"
+            );
+            assert_eq!(
+                counter.state(),
+                AllocatorState::Spent,
+                "and it describes itself as spent to every preflight that asks"
+            );
         }
     }
 
@@ -7671,6 +7962,213 @@ mod tests {
     // refuses is only as good as the routes that go through it, and the new
     // name says what is now being claimed.
 
+    // ── Preflight decisions ──────────────────────────────────────────────────
+    //
+    // Every refusal these operations can make, proved exactly, against
+    // descriptions of states no fixture can honestly reach. `plan::Decision`
+    // carries no effect: `Refuse` *is* "returned this outcome and did nothing",
+    // and production's only use of a refusal is to return it immediately, so
+    // these assertions are assertions about zero bytes, zero allocation, no
+    // registration, no retirement and no recorded intent.
+    //
+    // Nothing here takes or returns a record, a counter, a generation, a
+    // registration or a socket. A test can say "the space is spent" and cannot
+    // make an owner think so.
+
+    /// A violation string standing for "the whole-record walk refused".
+    fn refused_record() -> Result<(), String> {
+        Err("durable intent holds two watched generations".to_string())
+    }
+
+    /// **A spent watched allocator refuses the replacement, exactly.**
+    ///
+    /// The outcome is the whole assertion. Reporting exhaustion as
+    /// `InvalidFilters` — the reviewer's mutant, which the suite could not see
+    /// — says the caller's filters were unusable when the truth is that this
+    /// process can never name another generation, and the difference is
+    /// whether anyone retries.
+    #[test]
+    fn a_spent_watched_allocator_refuses_and_does_nothing() {
+        assert_eq!(
+            plan::watched_replacement(true, &Ok(Some(3)), false, AllocatorState::Spent),
+            plan::Decision::Refuse(ReplaceOutcome::WatchedGenerationExhausted),
+            "a spent generation space is not an invalid filter, a no-op or a conflict"
+        );
+        // The predecessor is untouched because there is no effect to touch it
+        // with: a refusal is the whole of what happens.
+        assert_eq!(
+            plan::watched_replacement(true, &Ok(Some(3)), false, AllocatorState::Available),
+            plan::Decision::Proceed,
+            "and with a value left, the same inputs proceed"
+        );
+    }
+
+    /// **A spent incarnation space refuses the write, exactly.**
+    ///
+    /// This is the arm the reviewer mutated to `InvalidFilters` without a
+    /// single test failing.
+    #[test]
+    fn a_spent_incarnation_space_refuses_the_replacement_write() {
+        assert_eq!(
+            plan::replacement_write(false, AllocatorState::Spent),
+            plan::Decision::Refuse(ReplaceOutcome::RequestIncarnationExhausted),
+        );
+        assert_eq!(
+            plan::replacement_write(false, AllocatorState::Available),
+            plan::Decision::Proceed,
+        );
+        // A no-op decides before the allocator is consulted at all, so an
+        // identical successor over a spent space is still `Unchanged` — the
+        // request that is already answering keeps answering.
+        assert_eq!(
+            plan::replacement_write(true, AllocatorState::Spent),
+            plan::Decision::Refuse(ReplaceOutcome::Unchanged),
+        );
+    }
+
+    /// **A spent incarnation space refuses an open, and does not mask a
+    /// conflict.**
+    ///
+    /// Order is part of the decision: an occupied id is a disagreement about
+    /// this request and could still be resolved, while exhaustion is terminal
+    /// and process-wide. Reporting the terminal one first would hide a fixable
+    /// fault behind an unfixable one.
+    #[test]
+    fn a_spent_incarnation_space_refuses_the_open() {
+        assert_eq!(
+            plan::open(Ok(()), plan::Held::Nothing, AllocatorState::Spent),
+            plan::Decision::Refuse(OpenOutcome::Exhausted),
+        );
+        assert_eq!(
+            plan::open(Ok(()), plan::Held::Nothing, AllocatorState::Available),
+            plan::Decision::Proceed,
+        );
+        assert_eq!(
+            plan::open(Ok(()), plan::Held::SameLive, AllocatorState::Spent),
+            plan::Decision::Refuse(OpenOutcome::AlreadyLive),
+            "an exact request already live is not affected by a spent space"
+        );
+    }
+
+    /// **Exhaustion refuses a new request without disturbing a live one.**
+    ///
+    /// A spent space is a refusal to mint *further* authority, never a
+    /// withdrawal of authority already minted. The id that is already
+    /// answering reports `AlreadyLive` over a spent allocator exactly as it
+    /// does over a fresh one, and a `Refuse` carries no effect that could reach
+    /// the registration anyway.
+    #[test]
+    fn exhaustion_does_not_disturb_a_request_that_is_already_live() {
+        for allocator in [AllocatorState::Available, AllocatorState::Spent] {
+            assert_eq!(
+                plan::open(Ok(()), plan::Held::SameLive, allocator),
+                plan::Decision::Refuse(OpenOutcome::AlreadyLive),
+                "{allocator:?}: a live request is unaffected by the allocator"
+            );
+        }
+        assert_eq!(
+            plan::replacement_write(true, AllocatorState::Spent),
+            plan::Decision::Refuse(ReplaceOutcome::Unchanged),
+            "and an identical successor is a no-op rather than an exhaustion report"
+        );
+    }
+
+    /// **A page over a spent space is refused, and so is one whose own filter
+    /// asks for everything.**
+    ///
+    /// A page burns before it writes, because its wire id carries the
+    /// incarnation — so both are preflight questions here rather than
+    /// discoveries made afterwards.
+    #[test]
+    fn a_page_refuses_before_it_burns_anything() {
+        // `matches!` rather than equality: a page's success variant carries a
+        // registration authority, and a type that can be compared for equality
+        // is a type whose authority can be compared to another's.
+        assert!(matches!(
+            plan::history_page(Ok(()), true, true, AllocatorState::Spent),
+            plan::Decision::Refuse(PageOpen::Exhausted)
+        ));
+        assert!(matches!(
+            plan::history_page(Ok(()), false, true, AllocatorState::Available),
+            plan::Decision::Refuse(PageOpen::NotPristine)
+        ));
+        assert!(matches!(
+            plan::history_page(Ok(()), true, false, AllocatorState::Available),
+            plan::Decision::Refuse(PageOpen::UnboundedFilter)
+        ));
+        assert!(matches!(
+            plan::history_page(Ok(()), true, true, AllocatorState::Available),
+            plan::Decision::Proceed
+        ));
+    }
+
+    /// **A record that does not resolve refuses every operation class, and
+    /// refuses it first.**
+    ///
+    /// Every class, because durable intent is one record: an enrolment
+    /// replacement over a corrupt *watched* entry is a registry writing into a
+    /// record it has just found inconsistent. And first, because a refusal
+    /// decided after an allocator check is a refusal that has already spent
+    /// something.
+    #[test]
+    fn a_record_that_does_not_resolve_refuses_every_operation() {
+        let violation = match refused_record() {
+            Err(v) => v,
+            Ok(()) => unreachable!(),
+        };
+
+        assert_eq!(
+            plan::open(
+                refused_record(),
+                plan::Held::Nothing,
+                AllocatorState::Available
+            ),
+            plan::Decision::Refuse(OpenOutcome::InvariantViolation(violation.clone())),
+        );
+        assert_eq!(
+            plan::watched_replacement(
+                true,
+                &Err(violation.clone()),
+                false,
+                AllocatorState::Available
+            ),
+            plan::Decision::Refuse(ReplaceOutcome::InvariantViolation(violation.clone())),
+        );
+        assert_eq!(
+            plan::enrolment_replacement(true, &Err(violation.clone())),
+            plan::Decision::Refuse(ReplaceOutcome::InvariantViolation(violation.clone())),
+        );
+        assert!(
+            matches!(
+                plan::history_page(refused_record(), true, true, AllocatorState::Available),
+                plan::Decision::Refuse(PageOpen::InvariantViolation(ref v)) if *v == violation
+            ),
+            "a page over a record that does not resolve is refused with the violation"
+        );
+        assert_eq!(
+            plan::replay(refused_record()),
+            plan::Decision::Refuse(violation.clone()),
+            "replay is where durable intent becomes bytes, so it refuses too"
+        );
+
+        // Even with a spent allocator beside it, the record is what refuses:
+        // the violation is the thing a reader has to fix.
+        assert_eq!(
+            plan::open(refused_record(), plan::Held::Nothing, AllocatorState::Spent),
+            plan::Decision::Refuse(OpenOutcome::InvariantViolation(violation)),
+        );
+    }
+
+    /// **A replayable record replays; a refused one replays nothing.**
+    #[test]
+    fn replay_proceeds_only_over_a_record_that_resolves() {
+        assert_eq!(plan::replay(Ok(())), plan::Decision::Proceed);
+        assert!(matches!(
+            plan::replay(refused_record()),
+            plan::Decision::Refuse(_)
+        ));
+    }
+
     // ── The durable document ─────────────────────────────────────────────────
     //
     // A persisted record is the one thing about this subsystem that does not
@@ -7981,6 +8479,113 @@ mod tests {
                  member that happened to survive a collapse: {violation}"
             );
         }
+    }
+
+    /// **A persisted allocator must be in a state a counter could reach.**
+    ///
+    /// `spent` is a fact about arithmetic, not a flag a writer may set:
+    /// `burn` sets it in exactly one circumstance, when `next` was `u64::MAX`
+    /// and `checked_add` refused. A document claiming `spent` at any other
+    /// position describes a counter that cannot exist — and it is not a
+    /// harmless inconsistency, because `spent` is what tells the provenance
+    /// rule that `next` has stopped advancing. `{ spent: true, next: 0 }`
+    /// switched that rule off from inside the document, and generation 99 then
+    /// resolved as current against an allocator that had issued nothing.
+    #[test]
+    fn a_persisted_allocator_in_an_impossible_state_is_refused() {
+        let watched_99 = || {
+            member(
+                &watched_sub_id(99),
+                json!({ "Watched": { "generation": 99 } }),
+            )
+        };
+
+        // The reported defect, exactly.
+        let violation = validate_persisted_document(
+            &json!({
+                "intent": [watched_99()],
+                "next_watched_generation": 0,
+                "watched_generations_spent": true,
+            })
+            .to_string(),
+        )
+        .expect_err("a spent allocator at 0 is a state no counter reaches");
+        assert!(
+            violation.contains("spent"),
+            "the refusal must be about the allocator, not the member: {violation}"
+        );
+
+        // Any non-terminal position, with or without a member to protect.
+        for next in [0u64, 1, 100, u64::MAX - 1] {
+            assert!(
+                validate_persisted_document(
+                    &json!({
+                        "intent": [],
+                        "next_watched_generation": next,
+                        "watched_generations_spent": true,
+                    })
+                    .to_string(),
+                )
+                .is_err(),
+                "spent at {next} must be refused"
+            );
+        }
+
+        // The incarnation allocator is described too, and judged by the same
+        // rule — a document that misdescribes one allocator is not a document
+        // to trust about the other.
+        assert!(
+            validate_persisted_document(
+                &json!({
+                    "intent": [],
+                    "next_incarnation": 7,
+                    "incarnations_spent": true,
+                })
+                .to_string(),
+            )
+            .is_err(),
+            "a spent incarnation space at 7 must be refused"
+        );
+
+        // The genuinely saturated positive control: every generation has been
+        // issued, including `u64::MAX`, so the last one it issued is current.
+        assert_eq!(
+            validate_persisted_document(
+                &json!({
+                    "intent": [member(
+                        &watched_sub_id(u64::MAX),
+                        json!({ "Watched": { "generation": u64::MAX } })
+                    )],
+                    "next_watched_generation": u64::MAX,
+                    "watched_generations_spent": true,
+                    "next_incarnation": u64::MAX,
+                    "incarnations_spent": true,
+                })
+                .to_string(),
+            )
+            .expect("a truly saturated allocator resolves")
+            .watched,
+            Some(u64::MAX),
+            "the last generation a spent allocator issued is still current"
+        );
+
+        // And the same member without the spent flag is refused, because at
+        // `next == u64::MAX` the generation `u64::MAX` has not been issued yet.
+        assert!(
+            validate_persisted_document(
+                &json!({
+                    "intent": [member(
+                        &watched_sub_id(u64::MAX),
+                        json!({ "Watched": { "generation": u64::MAX } })
+                    )],
+                    "next_watched_generation": u64::MAX,
+                    "watched_generations_spent": false,
+                })
+                .to_string(),
+            )
+            .is_err(),
+            "the flag is what distinguishes 'reached and saturated' from 'never reached'"
+        );
     }
 
     /// A request that constrains nothing cannot be built — by any route.
