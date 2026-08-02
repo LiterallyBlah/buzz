@@ -7309,59 +7309,22 @@ mod tests {
         serde_json::json!({ "#e": [format!("{:064x}", root_byte)] })
     }
 
-    /// A `BgState` whose registry is born over `record`.
-    ///
-    /// **The registry has no test-only entry point.** Durable intent and
-    /// allocator position are composed into a
-    /// [`crate::project::DurableRecord`] — which holds no live registration, no
-    /// epoch and no way to mint an authority — and handed to
-    /// `ProjectRequests::over` before a registry exists. The corruption these
-    /// proofs need can therefore only be present from birth; nothing can reach
-    /// into a registry that has already installed something and install,
-    /// remove or renumber durable truth behind it, which is what the five
-    /// mutators this replaces could do.
-    ///
-    /// The cost is that a proof cannot corrupt a registry mid-flight, so
-    /// "refuse, then recover" is shown as two registries over the same
-    /// allocator position rather than one that is patched between the halves.
-    /// That is the stronger form anyway: the recovery no longer depends on a
-    /// hook to undo the corruption.
-    fn state_over(record: crate::project::DurableRecord) -> BgState {
-        let mut state = BgState::new();
-        state.project_requests = crate::project::ProjectRequests::over(record);
-        state
-    }
-
-    /// One entry of a persisted document, in the shape the loader takes them:
-    /// an id, a class and filters, and no capability of any kind.
-    type PersistedIntent = (String, crate::project::ProjectSubscription, Vec<Value>);
-
-    /// A record restored from a persisted document.
-    ///
-    /// **The only route these proofs have to a record**, and the same one
-    /// production restores its empty document through. Nothing here is a
-    /// `cfg(test)` entry point into the owner: the entries are plain data, a
-    /// restored record carries no live registration, no epoch and no
-    /// incarnation, and the registry validates the whole of it before acting on
-    /// any of it. So a document can say what production would never write, and
-    /// what it buys is a refusal.
-    fn restored(
-        entries: Vec<PersistedIntent>,
-        next_watched_generation: u64,
-        next_incarnation: u64,
-    ) -> crate::project::DurableRecord {
-        crate::project::DurableRecord::restore(entries, next_watched_generation, next_incarnation)
-            .expect("these documents' filters are bounded")
-    }
-
-    /// A persisted watched entry for `generation`, under the id it belongs to.
-    fn watched_entry(generation: u64) -> PersistedIntent {
-        (
-            crate::project::watched_sub_id(generation),
-            crate::project::ProjectSubscription::Watched { generation },
-            vec![watched_filter(9)],
-        )
-    }
+    // `state_over`, `restored` and `watched_entry` stood here. They composed a
+    // durable record — ids, classes, filters and both allocator positions — and
+    // installed it into a real `ProjectRequests` inside a real `BgState`. That
+    // is durable authority chosen by a proof rather than produced by an
+    // operation, whatever the composing function is called, and it is how a
+    // generation this process never issued came to be a predecessor that
+    // reached a successor `REQ` and a predecessor `CLOSE`. The registry now has
+    // one constructor and it takes nothing.
+    //
+    // What needed those helpers moved, and the destinations are named at each
+    // deletion below: whole-record refusals are now proved against
+    // `crate::project::validate_persisted_document`, which judges serialised
+    // bytes by the owner's own rule and returns a description rather than a
+    // record; allocator ceilings are proved against the allocator itself.
+    // Predecessors here are installed by the operation that installs them in
+    // production.
 
     /// **A failed generation must never become the retired predecessor.**
     ///
@@ -7634,19 +7597,54 @@ mod tests {
         assert_eq!(close_ids(&frames), vec![crate::project::watched_sub_id(0)]);
     }
 
-    /// **Spent watched generations fail closed, in both build modes.**
-    ///
-    /// Asserts the refusal rather than a panic: the original `g + 1` panicked
-    /// in debug and wrapped to generation zero in release, and release is the
-    /// only mode where the reuse happened. A test that asserted the panic would
-    /// have passed in debug and said nothing about the mode that mattered.
-    #[tokio::test]
-    async fn spent_watched_generations_refuse_rather_than_reuse() {
-        let (mut ws, mut server) = test_ws_pair().await;
-        // Born with the generation allocator at its last usable value.
-        let mut state = state_over(restored(Vec::new(), u64::MAX, 0));
+    // Fifteen proofs stood between here and the end of this block. Each needed
+    // a registry born over a composed record, and that route is gone. Where
+    // each went:
+    //
+    // Whole-record refusals — a discovery class under a foreign id, an
+    // enrolment class under a foreign id and a foreign class under the
+    // enrolment id, a durable root catch-up under every id, a watched id that
+    // disagrees with its own generation, a generation the allocator never
+    // issued, two watched generations at once, and a poisoned record replaying
+    // nothing — are now proved in `crate::project`'s own tests against
+    // `validate_persisted_document`, which judges serialised bytes by the same
+    // walk the owner makes. They are stronger there in one respect and weaker
+    // in another: stronger because the document keeps its member order and
+    // cardinality all the way to the rule, so duplicates and
+    // malformed-before-canonical orderings are now covered too; weaker because
+    // the refusal is no longer observed as "and the socket stayed silent". The
+    // silence followed from the refusal, and the refusal is what a rule can
+    // own.
+    //
+    // Allocator ceilings — `spent_watched_generations_refuse_rather_than_reuse`
+    // and `a_spent_incarnation_space_refuses_the_replacement` — are proved
+    // against `CheckedCounter` in `crate::project`, which nothing can install.
+    // Reaching `u64::MAX` honestly costs 2^64 operations, so what is no longer
+    // proved anywhere is the registry's *handling* of a spent allocator.
+    //
+    // The three proofs added in the previous iteration —
+    // `discovery_intent_is_refused_into_a_record_that_does_not_resolve`,
+    // `a_record_that_does_not_resolve_opens_no_project_request` and
+    // `a_page_over_a_record_that_does_not_resolve_burns_no_incarnation` — were
+    // about the gate refusing over a corrupt record. No registry can hold one
+    // now, so the gate remains as the rule's last line and its refusal arm is
+    // unreachable from any proof. The two properties underneath them that are
+    // still reachable are kept below.
 
-        // The last generation this process can name installs normally.
+    /// **A replacement retires the predecessor it installed, and only that.**
+    ///
+    /// The predecessor is established the way production establishes one: by
+    /// performing the replacement that installs it. Nothing here chooses a
+    /// generation — the registry stamps both — so the `CLOSE` this asserts is a
+    /// `CLOSE` for an id this process actually opened, which is the whole
+    /// property. A composed predecessor could prove the frame was written and
+    /// could not prove that.
+    #[tokio::test]
+    async fn a_watched_replacement_retires_the_predecessor_it_installed() {
+        let (mut ws, mut server) = test_ws_pair().await;
+        let mut state = BgState::new();
+
+        // First replacement: nothing to retire.
         assert!(
             submit_replacement(
                 &mut ws,
@@ -7656,221 +7654,18 @@ mod tests {
             )
             .await
         );
-        assert_eq!(
-            state
-                .project_requests
-                .current_watched()
-                .expect("exactly one watched intent"),
-            Some(u64::MAX)
-        );
-        drain_test_frames(&mut server).await;
-
-        // The space is now spent.
-        assert!(
-            submit_replacement(
-                &mut ws,
-                &mut state,
-                crate::project::ProjectReplacement::Watched,
-                vec![watched_filter(2)],
-            )
-            .await,
-            "exhaustion is terminal, not a transport failure"
-        );
         let frames = drain_test_frames(&mut server).await;
-        assert!(
-            frames.is_empty(),
-            "an exhausted generation space must write nothing: {frames:?}"
-        );
-        assert!(
-            !frames
-                .iter()
-                .any(|f| f[1] == serde_json::json!(crate::project::watched_sub_id(0))),
-            "generation zero was reused: {frames:?}"
-        );
         assert_eq!(
-            state
-                .project_requests
-                .current_watched()
-                .expect("exactly one watched intent"),
-            Some(u64::MAX),
-            "the predecessor must be retained on refusal"
+            req_ids(&frames),
+            vec![crate::project::watched_sub_id(0)],
+            "the first watched generation is 0: {frames:?}"
         );
         assert!(
-            state
-                .project_requests
-                .match_frame(&crate::project::watched_sub_id(u64::MAX))
-                .is_some(),
-            "the agent keeps answering on the subscription it already had"
-        );
-    }
-
-    /// **A spent incarnation space fails closed the same way.**
-    ///
-    /// A second, independent ceiling: the registry may have generations left
-    /// and no authority to stamp them with. The run loop's own checked counter
-    /// could not see this one at all, so an exhausted registry still read as a
-    /// successful replacement upstream.
-    #[tokio::test]
-    async fn a_spent_incarnation_space_refuses_the_replacement() {
-        let (mut ws, mut server) = test_ws_pair().await;
-        // Generations to spare, and one incarnation left. The record supplies
-        // where each allocator begins and nothing else; the space is spent by
-        // burning it, through the same `checked_add` production uses.
-        let mut state = state_over(restored(Vec::new(), 0, u64::MAX));
-
-        // The last authority this process can mint installs normally.
-        assert!(
-            submit_replacement(
-                &mut ws,
-                &mut state,
-                crate::project::ProjectReplacement::Watched,
-                vec![watched_filter(1)],
-            )
-            .await
-        );
-        assert_eq!(
-            state
-                .project_requests
-                .current_watched()
-                .expect("exactly one watched intent"),
-            Some(0)
-        );
-        drain_test_frames(&mut server).await;
-
-        let frames_before = drain_test_frames(&mut server).await;
-        assert!(
-            frames_before.is_empty(),
-            "nothing outstanding before the exhausted attempt: {frames_before:?}"
-        );
-        assert!(
-            submit_replacement(
-                &mut ws,
-                &mut state,
-                crate::project::ProjectReplacement::Watched,
-                vec![watched_filter(3)],
-            )
-            .await,
-            "exhaustion is terminal, not a transport failure"
-        );
-        let frames = drain_test_frames(&mut server).await;
-        assert!(
-            frames.is_empty(),
-            "a spent incarnation space must write nothing: {frames:?}"
-        );
-        assert_eq!(
-            state
-                .project_requests
-                .current_watched()
-                .expect("exactly one watched intent"),
-            Some(0),
-            "the last genuinely installed generation stays current"
-        );
-        assert!(
-            state
-                .project_requests
-                .intent(&crate::project::watched_sub_id(0))
-                .is_some(),
-            "and its durable intent is preserved"
-        );
-    }
-
-    /// **A watched generation nobody allocated makes the owner refuse, not
-    /// guess.**
-    ///
-    /// The counterexample this closes was reachable in production. The relay
-    /// command surface used to carry `SubscribeProject { sub_id, subscription,
-    /// filters }`, so any crate caller could submit
-    /// `ProjectSubscription::Watched { generation: 99 }` under an id of its
-    /// choosing. That installed durable watched intent outside the semantic
-    /// replacement owner:
-    ///
-    /// ```text
-    /// generic SubscribeProject installs proj-roots-99
-    ///   → the owner's next replacement allocates generation 0
-    ///   → its predecessor resolves to None
-    ///   → proj-roots-99 stays durable beside proj-roots-0
-    /// ```
-    ///
-    /// Two things had to change, and this asserts the second. The command is
-    /// gone, so nothing can produce that state; and the predecessor is now read
-    /// out of durable intent rather than held beside it, so if the state
-    /// occurred anyway the owner cannot fail to see it.
-    ///
-    /// **Why this is not a test that the command was deleted.** Asserting the
-    /// absence of a name is a test that matches itself: it passes forever after
-    /// the capability returns under a different spelling, and it would have
-    /// passed against every version of this file that had the defect, since
-    /// none of them contained the string. What is asserted here is the property
-    /// the deletion was *for* — that a second watched generation cannot be
-    /// silently absorbed — and that property is checked against the state
-    /// itself, however it arrived.
-    ///
-    /// The intruder is composed into the record the registry is born over,
-    /// because production has no route to it. That is the claim, not a gap in
-    /// the test.
-    #[tokio::test]
-    async fn a_watched_generation_from_outside_the_owner_fails_the_replacement_closed() {
-        let (mut ws, mut server) = test_ws_pair().await;
-        // One generation the owner would have installed, and beside it a second
-        // that something else did. Both are below the allocator's next value,
-        // so this proves the *ambiguity* refusal rather than the provenance
-        // refusal — they are different invariants and a test that could pass on
-        // either proves neither.
-        let mut state = state_over(restored(vec![watched_entry(0), watched_entry(99)], 100, 1));
-
-        // The owner refuses rather than choosing a predecessor. Choosing would
-        // retire one and leave the other durable beside the successor, which is
-        // the defect arrived at from the other direction.
-        assert!(
-            submit_replacement(
-                &mut ws,
-                &mut state,
-                crate::project::ProjectReplacement::Watched,
-                vec![watched_filter(2)],
-            )
-            .await,
-            "an invariant violation is not a transport failure"
-        );
-        let frames = drain_test_frames(&mut server).await;
-        assert!(
-            frames.is_empty(),
-            "nothing may be written while the predecessor is ambiguous: {frames:?}"
+            close_ids(&frames).is_empty(),
+            "a first install has no predecessor to retire: {frames:?}"
         );
 
-        // Neither intent was retired, and no successor was installed.
-        for id in [
-            crate::project::watched_sub_id(0),
-            crate::project::watched_sub_id(99),
-        ] {
-            assert!(
-                state.project_requests.intent(&id).is_some(),
-                "{id} must survive a refused replacement"
-            );
-        }
-        assert!(
-            state
-                .project_requests
-                .intent(&crate::project::watched_sub_id(1))
-                .is_none(),
-            "no successor may be installed"
-        );
-
-        let violation = state
-            .project_requests
-            .current_watched()
-            .expect_err("two watched intents must not resolve to a single predecessor");
-        assert!(
-            violation.contains(&crate::project::watched_sub_id(0))
-                && violation.contains(&crate::project::watched_sub_id(99)),
-            "the report must name both intents so the intruder is identifiable: {violation}"
-        );
-
-        // And the same record without the intruder proceeds normally, from the
-        // same allocator position — which is what shows the refusal above
-        // burned nothing and poisoned nothing. A hook that removed 99 from the
-        // registry under test would have proved the same thing about a
-        // registry the hook had just written to.
-        let mut state = state_over(restored(vec![watched_entry(0)], 100, 1));
+        // Second: the successor is installed, then generation 0 is retired.
         assert!(
             submit_replacement(
                 &mut ws,
@@ -7883,137 +7678,72 @@ mod tests {
         let frames = drain_test_frames(&mut server).await;
         assert_eq!(
             req_ids(&frames),
-            vec![crate::project::watched_sub_id(100)],
-            "the refusal must have burned no generation, so the successor is \
-             still the allocator's next: {frames:?}"
+            vec![crate::project::watched_sub_id(1)],
+            "the successor takes the next generation: {frames:?}"
         );
         assert_eq!(
             close_ids(&frames),
             vec![crate::project::watched_sub_id(0)],
-            "and the real predecessor is what gets retired: {frames:?}"
-        );
-    }
-
-    /// **A watched generation this owner never allocated is still retired.**
-    ///
-    /// The other half of the capability-leak counterexample, and the half that
-    /// makes the derivation load-bearing rather than merely defensive. With a
-    /// stored `watched_current` field, `proj-roots-99` arriving from outside
-    /// left the field at `None`, so the next replacement named no predecessor
-    /// and 99 stayed durable beside the successor forever.
-    ///
-    /// Reading the predecessor out of durable intent means the owner retires
-    /// whatever is actually there, including something it did not put there.
-    #[tokio::test]
-    async fn a_singly_seeded_watched_intent_becomes_the_predecessor_and_is_retired() {
-        let (mut ws, mut server) = test_ws_pair().await;
-
-        // Generation 99 recorded by something other than the semantic owner —
-        // but a generation this allocator *has* issued, so it passes the
-        // provenance check and the question under test is the one form 1 asks:
-        // does the owner retire intent it did not itself install?
-        //
-        // A generation the allocator had never issued is a different failure,
-        // proved separately below; mixing the two would let this test pass on
-        // the wrong refusal.
-        let mut state = state_over(restored(vec![watched_entry(99)], 100, 0));
-        assert_eq!(
-            state
-                .project_requests
-                .current_watched()
-                .expect("one watched intent resolves"),
-            Some(99),
-            "the derivation must see the intent that is actually there"
-        );
-
-        assert!(
-            submit_replacement(
-                &mut ws,
-                &mut state,
-                crate::project::ProjectReplacement::Watched,
-                vec![watched_filter(1)],
-            )
-            .await
-        );
-
-        let frames = drain_test_frames(&mut server).await;
-        assert_eq!(
-            req_ids(&frames),
-            vec![crate::project::watched_sub_id(100)],
-            "the successor takes this owner's next generation: {frames:?}"
-        );
-        assert_eq!(
-            close_ids(&frames),
-            vec![crate::project::watched_sub_id(99)],
-            "and the seeded generation is what gets retired: {frames:?}"
+            "and the predecessor it installed is the one retired: {frames:?}"
         );
         assert!(
             state
                 .project_requests
-                .intent(&crate::project::watched_sub_id(99))
+                .match_frame(&crate::project::watched_sub_id(0))
                 .is_none(),
-            "no durable trace of 99 may survive the replacement"
+            "the retired generation is no longer live"
+        );
+        assert!(
+            state
+                .project_requests
+                .match_frame(&crate::project::watched_sub_id(1))
+                .is_some(),
+            "and the successor is"
         );
         assert_eq!(
             state
                 .project_requests
                 .current_watched()
                 .expect("one watched intent resolves"),
-            Some(100),
+            Some(1),
+            "durable intent moved with it"
         );
     }
 
-    /// **A generation the allocator never issued fails closed.**
+    /// **The outcomes that decide before allocation spend nothing.**
     ///
-    /// Allocator provenance. Durable intent claiming an identity the only
-    /// component entitled to mint one has no record of is a contradiction, not
-    /// a state to reconcile: retiring it would `CLOSE` an id the relay never
-    /// opened under this process, and treating it as current would let whatever
-    /// wrote it choose the predecessor of the next replacement.
+    /// Proved off the wire rather than at the ceiling: a generation's number is
+    /// in the id the relay receives, so "this refusal burned nothing" is the
+    /// assertion that the next legitimate replacement is still generation 0.
+    /// The ceiling made the same point with a spent allocator, which cost a
+    /// composed one.
     ///
-    /// Distinct from the two-intent case. There the record is internally
-    /// consistent and merely ambiguous; here a single intent is by itself
-    /// impossible.
+    /// Every refusal here is one production can reach. `InvalidFilters` and the
+    /// unchanged no-op are the two that decide before `burn_watched_generation`
+    /// and they are the two that must not consume one — a burned generation is
+    /// gone for good, because the number may already have been on the wire.
     #[tokio::test]
-    async fn a_watched_generation_the_allocator_never_issued_fails_closed() {
+    async fn no_outcome_that_decides_before_allocation_spends_a_generation() {
         let (mut ws, mut server) = test_ws_pair().await;
+        let mut state = BgState::new();
 
-        // The allocator has issued nothing at all, so 99 cannot have come
-        // from it.
-        let mut state = state_over(restored(vec![watched_entry(99)], 0, 0));
+        // Filters that constrain nothing: refused before allocation.
+        for unbounded in [Vec::new(), vec![serde_json::json!({})]] {
+            assert!(
+                submit_replacement(
+                    &mut ws,
+                    &mut state,
+                    crate::project::ProjectReplacement::Watched,
+                    unbounded.clone(),
+                )
+                .await,
+                "an unusable filter is not a transport failure: {unbounded:?}"
+            );
+            let frames = drain_test_frames(&mut server).await;
+            assert!(frames.is_empty(), "nothing may be written: {frames:?}");
+        }
 
-        assert!(
-            submit_replacement(
-                &mut ws,
-                &mut state,
-                crate::project::ProjectReplacement::Watched,
-                vec![watched_filter(1)],
-            )
-            .await,
-            "an invariant violation is not a transport failure"
-        );
-        let frames = drain_test_frames(&mut server).await;
-        assert!(frames.is_empty(), "nothing may be written: {frames:?}");
-        assert!(
-            state
-                .project_requests
-                .intent(&crate::project::watched_sub_id(99))
-                .is_some(),
-            "the unissued intent is not silently retired either"
-        );
-
-        let violation = state
-            .project_requests
-            .current_watched()
-            .expect_err("an unissued generation must not resolve");
-        assert!(
-            violation.contains("never issued"),
-            "the report must name provenance as the reason: {violation}"
-        );
-
-        // And the allocator is untouched: over the same record without the
-        // unissued intent, the next valid attempt still takes 0.
-        let mut state = state_over(crate::project::DurableRecord::empty());
+        // So the first generation this process names is still 0.
         assert!(
             submit_replacement(
                 &mut ws,
@@ -8026,31 +7756,11 @@ mod tests {
         assert_eq!(
             req_ids(&drain_test_frames(&mut server).await),
             vec![crate::project::watched_sub_id(0)],
-            "the refused attempt must have burned no generation"
+            "two refusals must have burned no generation"
         );
-    }
 
-    /// **A watched id and the generation its identity carries must agree.**
-    ///
-    /// The key is what goes on the wire; the class is what admits inbound
-    /// frames. A pair that disagrees asks the relay one question and admits the
-    /// answers to another — and it would resolve as a predecessor under the
-    /// wrong id, so the CLOSE would retire a subscription the relay never
-    /// opened while the real one stayed live.
-    #[tokio::test]
-    async fn a_watched_intent_whose_id_disagrees_with_its_generation_is_refused() {
-        let (mut ws, mut server) = test_ws_pair().await;
-
-        let mut state = state_over(restored(
-            vec![(
-                crate::project::watched_sub_id(3),
-                crate::project::ProjectSubscription::Watched { generation: 7 },
-                vec![watched_filter(9)],
-            )],
-            0,
-            0,
-        ));
-
+        // A genuine no-op — same filters, still live — decides before
+        // allocation too.
         assert!(
             submit_replacement(
                 &mut ws,
@@ -8058,430 +7768,72 @@ mod tests {
                 crate::project::ProjectReplacement::Watched,
                 vec![watched_filter(1)],
             )
-            .await,
-            "an invariant violation is not a transport failure"
+            .await
         );
         let frames = drain_test_frames(&mut server).await;
-        assert!(frames.is_empty(), "nothing may be written: {frames:?}");
-
-        let violation = state
-            .project_requests
-            .current_watched()
-            .expect_err("a disagreeing id and generation must not resolve");
         assert!(
-            violation.contains(&crate::project::watched_sub_id(3))
-                && violation.contains(&crate::project::watched_sub_id(7)),
-            "the report must name both the id it found and the id the class implies: {violation}"
+            frames.is_empty(),
+            "an unchanged replacement writes nothing: {frames:?}"
         );
-    }
 
-    /// **Enrolment intent lives under the enrolment id, and nothing else does.**
-    ///
-    /// Both directions are refused. An enrolment class under a foreign id would
-    /// never be retired, because the enrolment replacement only ever names its
-    /// own fixed id; a foreign class under the enrolment id would be retired by
-    /// an enrolment replacement that never installed it.
-    #[tokio::test]
-    async fn enrolment_intent_that_is_not_under_the_enrolment_id_is_refused() {
-        for (id, class) in [
-            (
-                "proj-enrol-elsewhere".to_string(),
-                crate::project::ProjectSubscription::Enrolment,
-            ),
-            (
-                crate::project::PROJECT_ENROL_SUB_ID.to_string(),
-                crate::project::ProjectSubscription::Discovery,
-            ),
-        ] {
-            let (mut ws, mut server) = test_ws_pair().await;
-            let mut state = state_over(restored(
-                vec![(id.clone(), class.clone(), vec![watched_filter(9)])],
-                0,
-                0,
-            ));
-
-            // Both replacements refuse: durable intent is one record, and a
-            // registry that writes into a record it has just found inconsistent
-            // is reconciling corruption by ignoring it.
-            for replacement in [
+        // And the next real one is 1, not 2.
+        assert!(
+            submit_replacement(
+                &mut ws,
+                &mut state,
                 crate::project::ProjectReplacement::Watched,
-                crate::project::ProjectReplacement::Enrolment,
-            ] {
-                assert!(
-                    submit_replacement(&mut ws, &mut state, replacement, vec![watched_filter(1)],)
-                        .await,
-                    "{id}/{class:?}: an invariant violation is not a transport failure"
-                );
-                let frames = drain_test_frames(&mut server).await;
-                assert!(
-                    frames.is_empty(),
-                    "{id}/{class:?}: nothing may be written: {frames:?}"
-                );
-            }
-
-            assert!(
-                state.project_requests.current_watched().is_err(),
-                "{id}/{class:?}: the derivation must refuse"
-            );
-        }
-    }
-
-    /// **Discovery intent lives under the discovery id, and nothing else does.**
-    ///
-    /// The class `derive_current` used to fall through. Discovery has no
-    /// generation, so it was read as "not the disagreement this function exists
-    /// to catch" — but the disagreement is the same one: the key is what goes
-    /// on the wire, and a discovery class under a key no replacement names is
-    /// an entry nothing will ever retire and every reconnect will re-ask.
-    #[tokio::test]
-    async fn discovery_intent_that_is_not_under_the_discovery_id_is_refused() {
-        for id in [
-            "proj-discovery-elsewhere".to_string(),
-            crate::project::watched_sub_id(0),
-            crate::project::PROJECT_ENROL_SUB_ID.to_string(),
-        ] {
-            let (mut ws, mut server) = test_ws_pair().await;
-            let mut state = state_over(restored(
-                vec![(
-                    id.clone(),
-                    crate::project::ProjectSubscription::Discovery,
-                    vec![watched_filter(9)],
-                )],
-                0,
-                0,
-            ));
-
-            for replacement in [
-                crate::project::ProjectReplacement::Watched,
-                crate::project::ProjectReplacement::Enrolment,
-            ] {
-                assert!(
-                    submit_replacement(&mut ws, &mut state, replacement, vec![watched_filter(1)])
-                        .await,
-                    "{id}: an invariant violation is not a transport failure"
-                );
-                let frames = drain_test_frames(&mut server).await;
-                assert!(
-                    frames.is_empty(),
-                    "{id}: nothing may be written: {frames:?}"
-                );
-            }
-
-            let violation = state
-                .project_requests
-                .current_watched()
-                .expect_err("a discovery class under a foreign id must not resolve");
-            assert!(
-                violation.contains(&id) && violation.contains(&crate::project::discovery_sub_id()),
-                "the report must name the id it found and the id the class implies: {violation}"
-            );
-        }
-    }
-
-    /// **A root catch-up is never durable, under any id.**
-    ///
-    /// Its filter carries the page bound its cursor is currently at, and the
-    /// cursor walks that bound backwards; its wire id names one transport
-    /// attempt that ended with the connection. So there is no id under which a
-    /// durable catch-up is correct — the class is refused rather than its key
-    /// checked. Recorded, it would have been re-asked on every reconnect for a
-    /// page the reconstruction had already walked past.
-    #[tokio::test]
-    async fn a_durable_root_catch_up_is_refused_under_every_id() {
-        let root = test_root_id();
-        for id in [
-            format!("proj-catchup-c-{root}-0"),
-            crate::project::discovery_sub_id(),
-            "proj-anything".to_string(),
-        ] {
-            let (mut ws, mut server) = test_ws_pair().await;
-            let mut state = state_over(restored(
-                vec![(
-                    id.clone(),
-                    crate::project::ProjectSubscription::RootCatchUp {
-                        root: root.clone(),
-                        stream: crate::project::HistoryStream::Comments,
-                    },
-                    vec![watched_filter(9)],
-                )],
-                0,
-                0,
-            ));
-
-            assert!(
-                submit_replacement(
-                    &mut ws,
-                    &mut state,
-                    crate::project::ProjectReplacement::Watched,
-                    vec![watched_filter(1)],
-                )
-                .await,
-                "{id}: an invariant violation is not a transport failure"
-            );
-            let frames = drain_test_frames(&mut server).await;
-            assert!(
-                frames.is_empty(),
-                "{id}: nothing may be written: {frames:?}"
-            );
-            assert!(
-                state.project_requests.current_watched().is_err(),
-                "{id}: a durable catch-up must not resolve"
-            );
-        }
-    }
-
-    /// **A record the registry cannot validate replays nothing.**
-    ///
-    /// Replay is where durable intent becomes bytes, so it is the last place a
-    /// non-canonical entry can be caught. `replayable()` used to hand back
-    /// every unsuspended entry without asking, so an entry that could not pass
-    /// a replacement was still re-asked verbatim on the next connection — the
-    /// checks and the bytes disagreed about the same record.
-    ///
-    /// Each case pairs the intruder with a *canonical* discovery entry, so the
-    /// refusal cannot be passing because the record was empty: with the
-    /// intruder removed, the same connection replays that entry.
-    #[tokio::test]
-    async fn an_inconsistent_durable_record_replays_no_project_request() {
-        let root = test_root_id();
-        let intruders = [
-            (
-                "a discovery class under a foreign id",
-                "proj-discovery-elsewhere".to_string(),
-                crate::project::ProjectSubscription::Discovery,
-            ),
-            (
-                "a durable root catch-up",
-                format!("proj-catchup-c-{root}-0"),
-                crate::project::ProjectSubscription::RootCatchUp {
-                    root: root.clone(),
-                    stream: crate::project::HistoryStream::Comments,
-                },
-            ),
-            (
-                "an enrolment class under a foreign id",
-                "proj-enrol-elsewhere".to_string(),
-                crate::project::ProjectSubscription::Enrolment,
-            ),
-            (
-                "a watched generation this allocator never issued",
-                crate::project::watched_sub_id(9),
-                crate::project::ProjectSubscription::Watched { generation: 9 },
-            ),
-        ];
-
-        for (why, id, class) in intruders {
-            let canonical = || {
-                (
-                    crate::project::discovery_sub_id(),
-                    crate::project::ProjectSubscription::Discovery,
-                    vec![watched_filter(9)],
-                )
-            };
-
-            let mut poisoned = state_over(restored(
-                vec![canonical(), (id.clone(), class, vec![watched_filter(8)])],
-                0,
-                0,
-            ));
-            assert!(
-                poisoned.project_requests.replayable().is_err(),
-                "{why}: the record must not resolve"
-            );
-
-            let (ws, mut server) = test_ws_pair().await;
-            assert!(
-                matches!(
-                    reconnect_onto(&mut poisoned, ws).await,
-                    ResubscribeResult::Ok
-                ),
-                "{why}: a local inconsistency is not a transport failure"
-            );
-            let frames = drain_test_frames(&mut server).await;
-            assert!(
-                frames.is_empty(),
-                "{why}: a reconnect must write no project REQ: {frames:?}"
-            );
-            assert_eq!(
-                poisoned.project_requests.live_len(),
-                0,
-                "{why}: and register nothing"
-            );
-
-            // The positive control, over the same canonical entry: with the
-            // intruder gone, this connection does replay.
-            let mut clean = state_over(restored(vec![canonical()], 0, 0));
-            let (ws, mut server) = test_ws_pair().await;
-            assert!(matches!(
-                reconnect_onto(&mut clean, ws).await,
-                ResubscribeResult::Ok
-            ));
-            assert_eq!(
-                req_ids(&drain_test_frames(&mut server).await),
-                vec![crate::project::discovery_sub_id()],
-                "{why}: the canonical entry on its own is replayed"
-            );
-        }
-    }
-
-    /// **Stamping the canonical id does not make the record it joins
-    /// canonical.**
-    ///
-    /// The shipped defect, and the narrowest one in this family. Recording
-    /// discovery intent derives its own id and class, so the *entry* it writes
-    /// is always canonical — and that read as safety. It is not: the check that
-    /// followed asked only whether the canonical id was vacant. Over a record
-    /// already holding a discovery class under a foreign id it was, so a second
-    /// discovery entry was written beside the first and the command reported
-    /// `Recorded`. The record went from one violation to two, on the way to a
-    /// reconnect that would replay neither.
-    ///
-    /// Driven through `apply_command_to_state`, which is the disconnected
-    /// command path in production, rather than through the registry method it
-    /// calls.
-    #[tokio::test]
-    async fn discovery_intent_is_refused_into_a_record_that_does_not_resolve() {
-        let intruder = || {
-            (
-                "proj-discovery-elsewhere".to_string(),
-                crate::project::ProjectSubscription::Discovery,
-                vec![watched_filter(9)],
+                vec![watched_filter(2)],
             )
-        };
-
-        let mut poisoned = state_over(restored(vec![intruder()], 0, 0));
-        apply_command_to_state(
-            &mut poisoned,
-            RelayCommand::SubscribeProjectDiscovery {
-                filters: discovery_filters(),
-            },
-        );
-        assert!(
-            poisoned
-                .project_requests
-                .intent(&crate::project::discovery_sub_id())
-                .is_none(),
-            "nothing may be recorded under the canonical id"
-        );
-        assert_eq!(
-            poisoned.project_requests.intent_len(),
-            1,
-            "and the record is exactly as it was — refusal is not repair"
-        );
-
-        // The positive control, over the same command: with the intruder gone
-        // the entry is recorded, so the refusal above is about the record and
-        // not about the command.
-        let mut clean = BgState::new();
-        apply_command_to_state(
-            &mut clean,
-            RelayCommand::SubscribeProjectDiscovery {
-                filters: discovery_filters(),
-            },
-        );
-        assert!(
-            intent_asks(
-                &clean,
-                &crate::project::discovery_sub_id(),
-                &discovery_filters()
-            ),
-            "the canonical record takes the same entry"
-        );
-    }
-
-    /// **A record that does not resolve opens nothing on a live socket.**
-    ///
-    /// The connected half of the refusal above. `open_discovery` stamps its own
-    /// id and class too, and went on to write a REQ and install a registration
-    /// over a record no replacement or replay could resolve — bytes on the wire
-    /// carrying authority derived from a record the owner had already decided
-    /// it could not read.
-    #[tokio::test]
-    async fn a_record_that_does_not_resolve_opens_no_project_request() {
-        let (mut ws, mut server) = test_ws_pair().await;
-        let mut state = state_over(restored(
-            vec![(
-                crate::project::watched_sub_id(3),
-                crate::project::ProjectSubscription::Watched { generation: 7 },
-                vec![watched_filter(9)],
-            )],
-            8,
-            0,
-        ));
-
-        assert!(
-            matches!(
-                send_project_discovery(&mut ws, &mut state, discovery_filters()).await,
-                ProjectSendOutcome::InvariantViolation
-            ),
-            "the record does not resolve, so no request may be opened"
+            .await
         );
         let frames = drain_test_frames(&mut server).await;
-        assert!(frames.is_empty(), "nothing may be written: {frames:?}");
         assert_eq!(
-            state.project_requests.live_len(),
-            0,
-            "and nothing may be registered"
+            req_ids(&frames),
+            vec![crate::project::watched_sub_id(1)],
+            "the no-op must have spent no generation: {frames:?}"
         );
-        assert!(
-            state
-                .project_requests
-                .intent(&crate::project::discovery_sub_id())
-                .is_none(),
-            "and nothing recorded"
-        );
+        assert_eq!(close_ids(&frames), vec![crate::project::watched_sub_id(0)]);
     }
 
     /// **A refused page burns no incarnation.**
     ///
     /// A catch-up's wire id carries the incarnation it was minted under, so the
-    /// allocator's position is readable off the socket — which makes "the
-    /// refusal consumed nothing" an assertion about bytes rather than about an
-    /// accessor. The refused attempt below happens first; the page that follows
-    /// it, over the same document minus the intruder, still takes incarnation
-    /// zero.
+    /// allocator's position is readable off the socket. The refusal used here
+    /// is one production can reach — a collector that has already observed
+    /// something cannot be laundered into a fresh registration — and the page
+    /// that follows it still takes incarnation zero.
     #[tokio::test]
-    async fn a_page_over_a_record_that_does_not_resolve_burns_no_incarnation() {
+    async fn a_refused_page_burns_no_incarnation() {
         use crate::project::HistoryStream;
 
         let root = test_root_id();
-        let cursor =
-            || crate::project::HistoryCursor::new(&root, HistoryStream::Comments, 1_000, 4, 1_000);
-        let intruder = || {
-            (
-                crate::project::PROJECT_ENROL_SUB_ID.to_string(),
-                crate::project::ProjectSubscription::Discovery,
-                vec![watched_filter(9)],
-            )
-        };
-
         let (mut ws, mut server) = test_ws_pair().await;
-        let mut poisoned = state_over(restored(vec![intruder()], 0, 0));
+        let mut state = BgState::new();
+
+        let mut cursor =
+            crate::project::HistoryCursor::new(&root, HistoryStream::Comments, 1_000, 4, 1_000);
+        let mut used = cursor.begin_request();
+        used.observe_malformed("a row that arrived before any registration existed");
         assert!(
             matches!(
-                poisoned
+                state
                     .project_requests
-                    .open_history_page(&mut ws, cursor().begin_request())
+                    .open_history_page(&mut ws, used)
                     .await,
-                crate::project::PageOpen::InvariantViolation(_)
+                crate::project::PageOpen::NotPristine
             ),
-            "a page may not be opened over a record that does not resolve"
+            "a collector that has already observed something opens no page"
         );
         let frames = drain_test_frames(&mut server).await;
         assert!(frames.is_empty(), "nothing may be written: {frames:?}");
 
-        // The same document without the intruder, at the same allocator
-        // position: the first page this process opens still names incarnation
-        // zero, so the refusal above took nothing with it.
-        let (mut ws, mut server) = test_ws_pair().await;
-        let mut clean = state_over(restored(Vec::new(), 0, 0));
-        let page = match clean
+        let page = match state
             .project_requests
-            .open_history_page(&mut ws, cursor().begin_request())
+            .open_history_page(&mut ws, cursor.begin_request())
             .await
         {
             crate::project::PageOpen::Opened(page) => page,
-            other => panic!("a resolvable record must open a page: {other:?}"),
+            other => panic!("a pristine collector must open a page: {other:?}"),
         };
         assert!(
             page.sub_id().ends_with("-0"),
@@ -8489,152 +7841,6 @@ mod tests {
             page.sub_id()
         );
         let _ = drain_test_frames(&mut server).await;
-    }
-
-    /// **The outcomes that decide before allocation spend nothing — proved at
-    /// the ceiling.**
-    ///
-    /// Asserting "the successor is 1, not 2" proves a single refusal burned
-    /// nothing. This proves it for every non-allocating outcome at once, and
-    /// proves it where the evidence is unambiguous: with exactly one generation
-    /// left, anything that burns one leaves the next valid replacement with
-    /// none, and `WatchedGenerationExhausted` is a very different result from
-    /// `Replaced`.
-    ///
-    /// A counter that merely *looked* right would still pass a
-    /// successor-number assertion in the middle of the range. At the ceiling
-    /// there is no room for it to be nearly right.
-    #[tokio::test]
-    async fn no_outcome_that_decides_before_allocation_spends_a_generation() {
-        let (mut ws, mut server) = test_ws_pair().await;
-        // Born one below the ceiling, so the install below takes the
-        // second-to-last generation and exactly one remains for the final
-        // attempt to prove is still there.
-        let mut state = state_over(restored(Vec::new(), u64::MAX - 1, 0));
-
-        // One generation installed, and exactly one left unallocated.
-        assert!(
-            submit_replacement(
-                &mut ws,
-                &mut state,
-                crate::project::ProjectReplacement::Watched,
-                vec![watched_filter(1)],
-            )
-            .await
-        );
-        drain_test_frames(&mut server).await;
-
-        // 1. InvalidFilters — a limit constrains nothing about which events.
-        assert!(
-            submit_replacement(
-                &mut ws,
-                &mut state,
-                crate::project::ProjectReplacement::Watched,
-                vec![serde_json::json!({ "limit": 500 })],
-            )
-            .await
-        );
-
-        // 2. A true no-op — the same question already live.
-        assert!(
-            submit_replacement(
-                &mut ws,
-                &mut state,
-                crate::project::ProjectReplacement::Watched,
-                vec![watched_filter(1)],
-            )
-            .await
-        );
-
-        let frames = drain_test_frames(&mut server).await;
-        assert!(frames.is_empty(), "neither may write anything: {frames:?}");
-
-        // The ceiling is intact: the last generation is still there to take.
-        assert!(
-            submit_replacement(
-                &mut ws,
-                &mut state,
-                crate::project::ProjectReplacement::Watched,
-                vec![watched_filter(2)],
-            )
-            .await
-        );
-        let frames = drain_test_frames(&mut server).await;
-        assert_eq!(
-            req_ids(&frames),
-            vec![crate::project::watched_sub_id(u64::MAX)],
-            "the maximum generation must still be unspent: {frames:?}"
-        );
-        assert_eq!(
-            state
-                .project_requests
-                .current_watched()
-                .expect("one watched intent resolves"),
-            Some(u64::MAX),
-        );
-    }
-
-    /// **The third outcome that decides before allocation spends nothing
-    /// either.**
-    ///
-    /// Split from the two above because reaching an invariant violation needs a
-    /// durable record production cannot produce, and a registry is born over
-    /// one rather than having one planted in it after it has installed things.
-    ///
-    /// The refusal and the recovery are two registries over the same record
-    /// minus the intruder, at the same allocator position. If the refusal had
-    /// burned the last generation, the second half would have nothing to take.
-    #[tokio::test]
-    async fn an_invariant_violation_spends_no_generation() {
-        let ceiling = |extra: Vec<PersistedIntent>| {
-            let mut entries = vec![watched_entry(0)];
-            entries.extend(extra);
-            restored(entries, u64::MAX, 1)
-        };
-
-        // Two watched intents, both issued by this allocator, so the refusal is
-        // the ambiguity one and not provenance.
-        let (mut ws, mut server) = test_ws_pair().await;
-        let mut state = state_over(ceiling(vec![watched_entry(99)]));
-        assert!(
-            submit_replacement(
-                &mut ws,
-                &mut state,
-                crate::project::ProjectReplacement::Watched,
-                vec![watched_filter(2)],
-            )
-            .await,
-            "an invariant violation is not a transport failure"
-        );
-        let frames = drain_test_frames(&mut server).await;
-        assert!(
-            frames.is_empty(),
-            "an invariant violation may write nothing: {frames:?}"
-        );
-
-        // The same record without the intruder still has the last generation.
-        let (mut ws, mut server) = test_ws_pair().await;
-        let mut state = state_over(ceiling(Vec::new()));
-        assert!(
-            submit_replacement(
-                &mut ws,
-                &mut state,
-                crate::project::ProjectReplacement::Watched,
-                vec![watched_filter(2)],
-            )
-            .await
-        );
-        let frames = drain_test_frames(&mut server).await;
-        assert_eq!(
-            req_ids(&frames),
-            vec![crate::project::watched_sub_id(u64::MAX)],
-            "the refused attempt must have burned no generation: {frames:?}"
-        );
-        assert_eq!(
-            close_ids(&frames),
-            vec![crate::project::watched_sub_id(0)],
-            "and the real predecessor is what gets retired: {frames:?}"
-        );
     }
 
     #[tokio::test]
@@ -9153,58 +8359,14 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn an_exhausted_incarnation_space_writes_nothing_and_keeps_the_socket() {
-        // Terminal, local, and none of the other three things it could be
-        // mistaken for. Previously this surfaced as `MetadataConflict`, which
-        // made the reconnect path report a request-ownership disagreement that
-        // did not exist — a diagnostic pointing at the wrong subsystem.
-        let (mut ws, mut server) = test_ws_pair().await;
-        // Born with one incarnation left; the burner below spends it, through
-        // the same `checked_add` production uses.
-        let mut state = state_over(restored(Vec::new(), 0, u64::MAX));
-        let agent = nostr::Keys::generate().public_key().to_hex();
-        let sub_id = crate::project::discovery_sub_id();
-
-        // The burner is the watched replacement, which is the only route a
-        // watched subscription has. It spends the last incarnation.
-        let burner = open_watched(&mut state).await;
-        let _ = burner;
-
-        // Now nothing further can be opened.
-        assert_eq!(
-            send_project_discovery(&mut ws, &mut state, discovery_filters()).await,
-            ProjectSendOutcome::Exhausted,
-            "reported as itself, not as a conflict"
-        );
-        assert!(
-            timeout(Duration::from_millis(200), server.next())
-                .await
-                .is_err(),
-            "no wire frame"
-        );
-        assert!(
-            state.project_requests.match_frame(&sub_id).is_none(),
-            "no live registration"
-        );
-
-        // The command path keeps the socket: this is not a transport failure.
-        assert!(
-            execute_connected_command(
-                &mut ws,
-                &mut state,
-                &agent,
-                RelayCommand::SubscribeProjectDiscovery {
-                    filters: vec![test_filter()],
-                },
-            )
-            .await,
-            "exhaustion must not be reported as a dead socket"
-        );
-
-        // And the request opened before exhaustion still works.
-        assert!(state.project_requests.match_frame(&burner).is_some());
-    }
+    // `an_exhausted_incarnation_space_writes_nothing_and_keeps_the_socket`
+    // stood here. It proved that a spent incarnation space surfaces as
+    // `ProjectSendOutcome::Exhausted` rather than `MetadataConflict` — a
+    // diagnostic pointing at the right subsystem — and it needed a registry
+    // whose allocator was composed at `u64::MAX`. The arithmetic is proved
+    // against `CheckedCounter` in `crate::project`; the mapping from a spent
+    // allocator to that outcome is not proved anywhere now, because reaching
+    // the state honestly costs 2^64 registrations.
 
     // Deleted 2026-08-01: `a_consumer_can_name_and_store_the_incarnation_it_opened_under`.
     //

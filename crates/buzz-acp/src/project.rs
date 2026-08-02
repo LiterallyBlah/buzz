@@ -65,7 +65,7 @@ pub(crate) const PROJECT_ROOTS_SUB_ID: &str = "proj-roots-0";
 /// enrolment, watched generations and root catch-up share it: an unrecognised
 /// `proj-…` would slide into whichever branch happened to be first. Unknown ids
 /// are refused rather than guessed.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
 pub(crate) enum ProjectSubscription {
     /// `kind:30617` announcements. Produces discovery state, **not** a root
     /// route — an announcement has no root and must never be pushed through
@@ -120,12 +120,11 @@ pub(crate) use requests::{
     IntentAdmission, OpenOutcome, OpenedHistoryPage, ProjectRequests, ReplayableRequest,
 };
 
-/// Named by the fail-closed proofs, which compose the durable record a registry
-/// is born over. Production reaches it through `ProjectRequests::new` without
-/// naming it, so the export is scoped rather than allowed module-wide — a
-/// genuinely dead export still surfaces.
-#[allow(unused_imports)]
-pub(crate) use requests::DurableRecord;
+/// The pure validator the durable-record proofs go through, and the allocator
+/// whose ceiling they exercise. Neither can install anything: the validator
+/// returns a description and the counter has no route into a record.
+#[cfg(test)]
+use requests::{validate_persisted_document, CheckedCounter, CurrentIntent};
 
 /// Named by the replacement wire tests today; the run loop consumes it when
 /// dispatch moves behind the narrow replacement capability. Scoped to this one
@@ -653,7 +652,7 @@ mod requests {
         WriteFailed(String),
         /// The durable record does not resolve, so this registry acted on
         /// nothing: no intent, no incarnation, no registration, no byte. Carries
-        /// the violation [`super::DurableRecord::derive_current`] reported.
+        /// the violation [`DurableRecord::derive_current`] reported.
         InvariantViolation(String),
     }
 
@@ -863,11 +862,12 @@ mod requests {
     /// Not stored anywhere. It is the return of one validating walk, so the two
     /// facts a replacement needs cannot be answered from a tree that was found
     /// consistent for one of them and never checked for the other.
-    struct CurrentIntent {
+    #[derive(Debug, PartialEq, Eq)]
+    pub(super) struct CurrentIntent {
         /// The generation whose durable intent is current, if any.
-        watched: Option<u64>,
+        pub(super) watched: Option<u64>,
         /// Whether enrolment intent is current under its fixed id.
-        enrolment: bool,
+        pub(super) enrolment: bool,
     }
 
     /// What [`ProjectRequests::record_discovery_intent`] decided.
@@ -1101,36 +1101,41 @@ mod requests {
     /// only operation is [`Self::derive_current`], which reads and refuses and
     /// changes nothing.
     ///
-    /// That is why the fail-closed proofs live against it. They need a record
-    /// production cannot produce — two watched intents, a class under the wrong
-    /// id, a generation this allocator never issued — and they reach one
-    /// through [`Self::restore`], the same loader production restores its empty
-    /// document through. There is no `cfg(test)` route in: the two builders
-    /// that used to be here composed durable intent for the real owner out of
-    /// an id and a class a test chose, which is the shape that made "the
-    /// registry is the sole producer of installed-current truth" true only
-    /// modulo `cfg(test)`, and before them five mutators could install, remove
-    /// or renumber durable truth on a registry that had already installed
-    /// things.
+    /// **Nothing outside this module can compose one.** There is no builder,
+    /// no loader and no `cfg(test)` constructor: a record begins empty at
+    /// [`ProjectRequests::new`] and is advanced only by that registry's own
+    /// semantic operations. Three shapes have been removed to arrive here —
+    /// five mutators that could renumber durable truth behind a live registry,
+    /// two `cfg(test)` builders that composed intent for the real owner out of
+    /// an id and a class a test chose, and a `restore`/`over` pair that did the
+    /// same thing in production spelling, complete with a caller-chosen
+    /// allocator position. Each made "the registry is the sole producer of
+    /// installed-current truth" conditional, and the condition is what the
+    /// defects lived in.
     ///
-    /// A restored record is **not** trusted for having been restored. It is a
-    /// document from outside this process, so the owner validates the whole of
-    /// it before every operation that could act on it, and a record that fails
-    /// buys the caller nothing at all — see [`Self::derive_current`].
+    /// So a record production cannot produce is now a record that cannot
+    /// exist, and the fail-closed rule is proved where such a thing still can:
+    /// [`validate_persisted_document`] judges serialised bytes by
+    /// [`validate_members`], the same walk [`Self::derive_current`] makes, and
+    /// returns a description rather than a record.
+    ///
+    /// A record is still **not** trusted for existing — every operation that
+    /// could act on one validates the whole of it first, see
+    /// [`Self::derive_current`] — but with one producer that gate now guards a
+    /// state nothing can reach. It is kept as the rule's last line, not as a
+    /// proof obligation.
     #[derive(Debug, Default, Clone)]
     pub(crate) struct DurableRecord {
         /// Local policy. It outlives connections, and only local action removes
         /// it.
         intent: HashMap<String, ProjectRequestIdentity>,
-        /// Next incarnation to hand out. Only ever increases.
-        next_incarnation: u64,
-        /// Set once the incarnation space is spent. Never cleared.
+        /// The incarnation allocator. Only ever advances, and never wraps.
         ///
         /// Deliberately survives [`ProjectRequests::clear_connection`]: a
         /// reconnect must not restore the ability to mint authority the process
         /// has already spent.
-        incarnations_exhausted: bool,
-        /// Next watched generation to hand out. Only ever increases.
+        incarnations: CheckedCounter,
+        /// The watched-generation allocator.
         ///
         /// **Allocator state, not current state.** Which generation is
         /// installed is not stored anywhere: it is read out of `intent` by
@@ -1144,77 +1149,72 @@ mod requests {
         /// write would put a wire identity this process has already used back
         /// on the wire, which is the reuse hazard the whole checked allocator
         /// exists to prevent.
-        next_watched_generation: u64,
-        /// Set once the watched generation space is spent. Never cleared, and
-        /// survives [`ProjectRequests::clear_connection`] for the same reason
-        /// [`Self::incarnations_exhausted`] does.
-        watched_generations_exhausted: bool,
+        watched_generations: CheckedCounter,
+    }
+
+    /// A counter that hands out each value once, and stops rather than wraps.
+    ///
+    /// **Extracted so its ceiling can be proved without a registry.** The
+    /// arithmetic at the top of the space is the whole of what is interesting
+    /// here — `u64::MAX` is handed out exactly once and every later call
+    /// refuses — and reaching it by burning is not something a test can do.
+    /// The previous shape let a proof *start* an allocator wherever it liked
+    /// and hand that to the real owner, which is provenance a production
+    /// operation could never have written. This type has no route into a
+    /// [`DurableRecord`]: records are default-constructed and only the owner's
+    /// own operations advance them, so [`Self::at`] can compose a saturated
+    /// counter for a pure proof and cannot install one anywhere.
+    #[derive(Debug, Default, Clone)]
+    pub(super) struct CheckedCounter {
+        /// The next value to hand out, meaningful only while not `spent`.
+        next: u64,
+        /// Set once the space is exhausted. Never cleared.
+        spent: bool,
+    }
+
+    impl CheckedCounter {
+        /// A counter positioned at `next`, for proofs about the arithmetic.
+        ///
+        /// Pure and non-installable: nothing accepts one of these, so a
+        /// composed counter can be burned and asked what it did, and can reach
+        /// no registry, record, registration or socket.
+        #[cfg(test)]
+        pub(super) fn at(next: u64) -> Self {
+            Self { next, spent: false }
+        }
+
+        /// Take the next value, or `None` once the space is spent.
+        ///
+        /// `checked_add` and a sticky flag, because a wrapping counter would
+        /// hand a future request the authority of an ancient one — in release
+        /// builds only, where no debug panic could warn anyone. The last value
+        /// is genuinely handed out: saturation is what makes `next` stop
+        /// meaning anything, which is why the flag exists rather than a
+        /// comparison against `u64::MAX`.
+        pub(super) fn burn(&mut self) -> Option<u64> {
+            if self.spent {
+                return None;
+            }
+            let taken = self.next;
+            match self.next.checked_add(1) {
+                Some(next) => self.next = next,
+                None => self.spent = true,
+            }
+            Some(taken)
+        }
+
+        /// The value this counter would hand out next.
+        pub(super) fn next_value(&self) -> u64 {
+            self.next
+        }
+
+        /// Whether every value has been handed out.
+        pub(super) fn is_spent(&self) -> bool {
+            self.spent
+        }
     }
 
     impl DurableRecord {
-        /// What a registry starts life over in production: nothing recorded,
-        /// both allocators at zero.
-        ///
-        /// Restored like any other document, through the one entry below,
-        /// rather than assembled beside it — the empty document is a document.
-        /// `unwrap_or_default` rather than an `expect`: a restore with no entry
-        /// to refuse cannot fail, and if it ever did, the value it would have
-        /// returned is this one.
-        pub(crate) fn empty() -> Self {
-            Self::restore(Vec::new(), 0, 0).unwrap_or_default()
-        }
-
-        /// Restore a record this process did not write.
-        ///
-        /// **The canonical loader, and the only way a non-empty record
-        /// exists.** Durable intent outlives a connection, so something has to
-        /// be able to present a record that was composed elsewhere — a
-        /// persisted document, or a proof about one. What that something must
-        /// never be is a door into a registry that has already installed
-        /// things: the five mutators this replaced could install, remove or
-        /// renumber durable truth behind a live registry, and the two builders
-        /// after them could still hand the real owner an entry no production
-        /// operation would have written.
-        ///
-        /// So the entries arrive as plain data — an id, a class, filters —
-        /// carrying no live registration, no epoch, no incarnation and no
-        /// authority, and a restored record is *not* trusted for being
-        /// restored. It is exactly as suspect as a file on disk, and every
-        /// operation that could mutate intent, allocate an identity, install or
-        /// retire authority, replay, or write bytes validates the whole of it
-        /// first and refuses it whole — see [`Self::derive_current`] and the
-        /// callers listed there.
-        ///
-        /// The one thing refused *here* is a filter that constrains nothing:
-        /// [`ProjectRequestIdentity`] has a single fallible constructor by
-        /// design, an entry it cannot express is an entry this record cannot
-        /// hold, and a document containing one is refused entire rather than
-        /// silently shortened.
-        pub(crate) fn restore(
-            entries: Vec<(String, super::ProjectSubscription, Vec<Value>)>,
-            next_watched_generation: u64,
-            next_incarnation: u64,
-        ) -> Result<Self, String> {
-            let mut intent = HashMap::with_capacity(entries.len());
-            for (sub_id, subscription, filters) in entries {
-                let Some(identity) = ProjectRequestIdentity::from_filters(subscription, filters)
-                else {
-                    return Err(format!(
-                        "persisted intent under id {sub_id} carries filters that constrain \
-                         nothing; a record holding one is not restored"
-                    ));
-                };
-                intent.insert(sub_id, identity);
-            }
-            Ok(Self {
-                intent,
-                next_incarnation,
-                incarnations_exhausted: false,
-                next_watched_generation,
-                watched_generations_exhausted: false,
-            })
-        }
-
         /// Read the whole of current project state out of durable intent, or
         /// refuse.
         ///
@@ -1296,125 +1296,244 @@ mod requests {
         /// relay has already refused, which is the fail-*open* direction. They
         /// touch no durable state, allocate nothing and write nothing.
         fn derive_current(&self) -> Result<CurrentIntent, String> {
-            let mut watched: Vec<(&str, u64)> = Vec::new();
-            let mut enrolment = false;
+            validate_members(
+                self.intent
+                    .iter()
+                    .map(|(id, identity)| (id.as_str(), identity.subscription())),
+                &self.watched_generations,
+            )
+        }
+    }
 
-            for (id, identity) in &self.intent {
-                match identity.subscription() {
-                    super::ProjectSubscription::Discovery => {
-                        let expected = super::discovery_sub_id();
-                        if id != &expected {
-                            return Err(format!(
-                                "discovery intent is held under id {id} rather than {expected}"
-                            ));
-                        }
-                    }
-                    super::ProjectSubscription::RootCatchUp { root, stream } => {
-                        // A catch-up filter carries the page bound the cursor
-                        // is currently at, and the cursor walks it backwards.
-                        // Replaying one re-asks for a page already collected,
-                        // under an id minted for a transport attempt that ended
-                        // with the connection. There is no id under which this
-                        // is a correct durable record, so the class is refused
-                        // rather than its key checked.
+    /// The rule, over an ordered sequence of members.
+    ///
+    /// **One implementation, two callers with very different inputs.** The
+    /// owner's own record is a map, so its keys are unique by construction and
+    /// its order is arbitrary; a persisted document is a list, so it can say
+    /// the same id twice and the order it says things in is evidence. Writing
+    /// the rule against a sequence rather than against either container is
+    /// what keeps a document from being judged by a weaker rule than the record
+    /// it wants to become — and the duplicate check below is a no-op for the
+    /// map rather than a branch the map is exempt from.
+    ///
+    /// Nothing here mutates, allocates or writes, and nothing it returns is a
+    /// capability: [`CurrentIntent`] is two facts about what is installed.
+    fn validate_members<'a, I>(
+        members: I,
+        watched_allocator: &CheckedCounter,
+    ) -> Result<CurrentIntent, String>
+    where
+        I: IntoIterator<Item = (&'a str, &'a super::ProjectSubscription)>,
+    {
+        let mut seen: Vec<&str> = Vec::new();
+        let mut watched: Vec<(&str, u64)> = Vec::new();
+        let mut enrolment = false;
+
+        for (id, subscription) in members {
+            // Two members under one id are two claims about the same slot.
+            // Whether they agree is not the question: a record that says a
+            // thing twice was not written by an owner that holds one value per
+            // id, so the disagreement is with the writer, not between the
+            // members.
+            if seen.contains(&id) {
+                return Err(format!(
+                    "durable intent holds more than one member under id {id}; \
+                     one id names one request"
+                ));
+            }
+            seen.push(id);
+
+            match subscription {
+                super::ProjectSubscription::Discovery => {
+                    let expected = super::discovery_sub_id();
+                    if id != expected {
                         return Err(format!(
-                            "durable intent holds a root catch-up under id {id} \
-                             (root {root}, {stream:?}); catch-up pages are re-derived from \
-                             their own cursor and are never durable"
+                            "discovery intent is held under id {id} rather than {expected}"
                         ));
                     }
-                    super::ProjectSubscription::Watched { generation } => {
-                        let expected = super::watched_sub_id(*generation);
-                        if id != &expected {
-                            return Err(format!(
-                                "watched intent under id {id} carries generation {generation}, \
-                                 whose id is {expected}"
-                            ));
-                        }
-                        // Allocator provenance. A generation at or above the
-                        // allocator's next value was never handed out by this
-                        // registry, so durable intent is claiming an identity
-                        // the only thing entitled to mint one has no record of.
-                        // Retiring it would CLOSE an id the relay never opened
-                        // under this process; treating it as current would let
-                        // an outside writer choose the predecessor. Neither is
-                        // a reconciliation, so neither is done.
-                        //
-                        // Once the space is spent the allocator has issued
-                        // every generation including `u64::MAX`, and `next`
-                        // stops advancing — so the comparison alone would
-                        // reject the last legitimately issued generation. The
-                        // exhausted flag is what distinguishes "never reached"
-                        // from "reached and saturated".
-                        if !self.watched_generations_exhausted
-                            && *generation >= self.next_watched_generation
-                        {
-                            return Err(format!(
-                                "watched intent {id} carries generation {generation}, which this \
-                                 allocator has never issued (next is {})",
-                                self.next_watched_generation
-                            ));
-                        }
-                        watched.push((id.as_str(), *generation));
+                }
+                super::ProjectSubscription::RootCatchUp { root, stream } => {
+                    // A catch-up filter carries the page bound the cursor is
+                    // currently at, and the cursor walks it backwards.
+                    // Replaying one re-asks for a page already collected, under
+                    // an id minted for a transport attempt that ended with the
+                    // connection. There is no id under which this is a correct
+                    // durable record, so the class is refused rather than its
+                    // key checked.
+                    return Err(format!(
+                        "durable intent holds a root catch-up under id {id} \
+                         (root {root}, {stream:?}); catch-up pages are re-derived from \
+                         their own cursor and are never durable"
+                    ));
+                }
+                super::ProjectSubscription::Watched { generation } => {
+                    let expected = super::watched_sub_id(*generation);
+                    if id != expected {
+                        return Err(format!(
+                            "watched intent under id {id} carries generation {generation}, \
+                             whose id is {expected}"
+                        ));
                     }
-                    super::ProjectSubscription::Enrolment => {
-                        if id != super::PROJECT_ENROL_SUB_ID {
-                            return Err(format!(
-                                "enrolment intent is held under id {id} rather than {}",
-                                super::PROJECT_ENROL_SUB_ID
-                            ));
-                        }
-                        enrolment = true;
+                    // Allocator provenance. A generation at or above the
+                    // allocator's next value was never handed out by this
+                    // registry, so durable intent is claiming an identity the
+                    // only thing entitled to mint one has no record of.
+                    // Retiring it would CLOSE an id the relay never opened
+                    // under this process; treating it as current would let an
+                    // outside writer choose the predecessor. Neither is a
+                    // reconciliation, so neither is done.
+                    //
+                    // Once the space is spent the allocator has issued every
+                    // generation including `u64::MAX`, and `next` stops
+                    // advancing — so the comparison alone would reject the last
+                    // legitimately issued generation. The spent flag is what
+                    // distinguishes "never reached" from "reached and
+                    // saturated".
+                    if !watched_allocator.is_spent()
+                        && *generation >= watched_allocator.next_value()
+                    {
+                        return Err(format!(
+                            "watched intent {id} carries generation {generation}, which this \
+                             allocator has never issued (next is {})",
+                            watched_allocator.next_value()
+                        ));
                     }
+                    watched.push((id, *generation));
+                }
+                super::ProjectSubscription::Enrolment => {
+                    if id != super::PROJECT_ENROL_SUB_ID {
+                        return Err(format!(
+                            "enrolment intent is held under id {id} rather than {}",
+                            super::PROJECT_ENROL_SUB_ID
+                        ));
+                    }
+                    enrolment = true;
                 }
             }
+        }
 
-            match watched.len() {
-                0 => Ok(CurrentIntent {
-                    watched: None,
-                    enrolment,
-                }),
-                1 => Ok(CurrentIntent {
-                    watched: Some(watched[0].1),
-                    enrolment,
-                }),
-                _ => {
-                    // Sorted so the report is the same on every run — a
-                    // `HashMap` would otherwise name the intruder in a
-                    // different order each time and the failure would read as
-                    // flaky rather than deterministic.
-                    watched.sort_unstable();
-                    let ids: Vec<&str> = watched.iter().map(|(id, _)| *id).collect();
-                    Err(format!(
-                        "durable intent holds {} watched generations ({}); \
-                         exactly one may be current",
-                        ids.len(),
-                        ids.join(", ")
-                    ))
-                }
+        match watched.len() {
+            0 => Ok(CurrentIntent {
+                watched: None,
+                enrolment,
+            }),
+            1 => Ok(CurrentIntent {
+                watched: Some(watched[0].1),
+                enrolment,
+            }),
+            _ => {
+                // Sorted so the report is the same on every run — a `HashMap`
+                // would otherwise name the intruder in a different order each
+                // time and the failure would read as flaky rather than
+                // deterministic.
+                watched.sort_unstable();
+                let ids: Vec<&str> = watched.iter().map(|(id, _)| *id).collect();
+                Err(format!(
+                    "durable intent holds {} watched generations ({}); \
+                     exactly one may be current",
+                    ids.len(),
+                    ids.join(", ")
+                ))
             }
         }
     }
 
-    impl ProjectRequests {
-        /// A registry over an empty record.
-        pub(crate) fn new() -> Self {
-            Self::over(DurableRecord::empty())
+    /// Validate a persisted durable document — bytes in, a description out.
+    ///
+    /// **The proofs' only route to a non-canonical record, and it is not a
+    /// route into anything.** What arrives is the serialised form a store would
+    /// hold; what leaves is [`CurrentIntent`], two facts about what such a
+    /// document would install. There is no `DurableRecord` on either side of
+    /// it, so a document cannot become a registry, a registration, a
+    /// replacement, a replay or a byte on a socket, whatever it says.
+    ///
+    /// The rule it applies is the owner's: [`validate_members`], the same walk
+    /// [`DurableRecord::derive_current`] makes. That is the point of it. A
+    /// proof about a document only says something about a record if the two
+    /// are judged identically.
+    ///
+    /// **Members are examined in the order the document lists them, and none
+    /// is discarded on the way.** An earlier revision inserted entries into a
+    /// map first: a document naming one id twice arrived at the rule already
+    /// shortened, with the earlier member — the malformed one, in the ordering
+    /// that mattered — overwritten by the later one, so a document that should
+    /// have been refused entire passed as the record its last writer wanted.
+    /// Cardinality and order are evidence, and they survive to the rule here.
+    ///
+    /// Structure is refused before semantics: a member whose filters constrain
+    /// nothing cannot be expressed at all, and a document holding one is
+    /// refused entire rather than shortened to the members that could be read.
+    ///
+    /// `#[cfg(test)]` because nothing in production has a document to validate
+    /// — the harness holds its record in memory for the process's lifetime and
+    /// there is no store behind it. Its judgement is production's all the same,
+    /// because the rule is.
+    #[cfg(test)]
+    pub(crate) fn validate_persisted_document(json: &str) -> Result<CurrentIntent, String> {
+        #[derive(serde::Deserialize)]
+        struct Document {
+            #[serde(default)]
+            intent: Vec<Member>,
+            #[serde(default)]
+            next_watched_generation: u64,
+            #[serde(default)]
+            watched_generations_spent: bool,
+        }
+        #[derive(serde::Deserialize)]
+        struct Member {
+            sub_id: String,
+            class: super::ProjectSubscription,
+            filters: Vec<Value>,
         }
 
-        /// A registry over `record`.
-        ///
-        /// Production reaches this only through [`Self::new`], because nothing
-        /// in production has a non-empty record to hand it. What a caller may
-        /// supply is durable *intent* and allocator position — never a live
-        /// registration, never an epoch, never an authority — so a registry
-        /// born over a corrupt record still has to decide what to do about it,
-        /// which is the thing being proved.
-        pub(crate) fn over(record: DurableRecord) -> Self {
-            Self {
-                record,
-                ..Self::default()
+        let document: Document =
+            serde_json::from_str(json).map_err(|e| format!("undecodable durable document: {e}"))?;
+
+        // Every member, in order, structurally — before any of them is judged
+        // against the others, and without dropping one.
+        for member in &document.intent {
+            if ProjectRequestIdentity::from_filters(member.class.clone(), member.filters.clone())
+                .is_none()
+            {
+                return Err(format!(
+                    "persisted intent under id {} carries filters that constrain nothing; \
+                     a document holding one is refused entire",
+                    member.sub_id
+                ));
             }
+        }
+
+        let allocator = CheckedCounter {
+            next: document.next_watched_generation,
+            spent: document.watched_generations_spent,
+        };
+        validate_members(
+            document
+                .intent
+                .iter()
+                .map(|member| (member.sub_id.as_str(), &member.class)),
+            &allocator,
+        )
+    }
+
+    impl ProjectRequests {
+        /// A registry over an empty record. The only constructor there is.
+        ///
+        /// **Nothing can hand this type a record.** The `over(record)` that
+        /// used to sit here took a composed one, and a composed record is
+        /// durable authority chosen by its caller: a generation the allocator
+        /// never issued, an allocator positioned wherever the caller liked, a
+        /// predecessor that reached a successor `REQ` and a predecessor
+        /// `CLOSE` without any operation ever having installed it. Records now
+        /// start empty and are advanced only by this registry's own semantic
+        /// operations, so durable authority has exactly one producer.
+        ///
+        /// What that costs is the ability to *place* a registry over a corrupt
+        /// record, and the refusals that needed one moved to
+        /// [`validate_persisted_document`], which applies this same rule to
+        /// bytes and hands back a description rather than a record.
+        pub(crate) fn new() -> Self {
+            Self::default()
         }
 
         /// The whole durable record, validated, before this registry acts on
@@ -1779,15 +1898,7 @@ mod requests {
         /// ancient one — in release builds only, where no debug panic could
         /// warn anyone.
         fn burn_incarnation(&mut self) -> Option<RequestIncarnation> {
-            if self.record.incarnations_exhausted {
-                return None;
-            }
-            let taken = RequestIncarnation(self.record.next_incarnation);
-            match self.record.next_incarnation.checked_add(1) {
-                Some(next) => self.record.next_incarnation = next,
-                None => self.record.incarnations_exhausted = true,
-            }
-            Some(taken)
+            self.record.incarnations.burn().map(RequestIncarnation)
         }
 
         /// Take the next watched generation, or `None` once the space is spent.
@@ -1797,15 +1908,7 @@ mod requests {
         /// *attempt*: a failed write consumes it and it is never handed out
         /// again, because the number may already have been seen on the wire.
         fn burn_watched_generation(&mut self) -> Option<u64> {
-            if self.record.watched_generations_exhausted {
-                return None;
-            }
-            let taken = self.record.next_watched_generation;
-            match self.record.next_watched_generation.checked_add(1) {
-                Some(next) => self.record.next_watched_generation = next,
-                None => self.record.watched_generations_exhausted = true,
-            }
-            Some(taken)
+            self.record.watched_generations.burn()
         }
 
         /// The watched generation whose durable intent is current — derived,
@@ -2076,7 +2179,7 @@ mod requests {
             {
                 return ReplaceOutcome::Unchanged;
             }
-            if self.record.incarnations_exhausted {
+            if self.record.incarnations.is_spent() {
                 return ReplaceOutcome::RequestIncarnationExhausted;
             }
 
@@ -2257,7 +2360,7 @@ mod requests {
                     };
                 }
             }
-            if self.record.incarnations_exhausted {
+            if self.record.incarnations.is_spent() {
                 return OpenOutcome::Exhausted;
             }
             let text = match serde_json::to_string(&identity.req_frame(sub_id)) {
@@ -3853,7 +3956,7 @@ pub(crate) fn lifecycle_actor_allowed(
 /// per-filter, so a REQ carrying several filters and deduplicating the results
 /// into one page produces an aggregate count that proves exhaustion for none of
 /// them.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Deserialize)]
 pub(crate) enum HistoryStream {
     /// Comments and lifecycle, by lowercase `#e`.
     Comments,
@@ -7077,93 +7180,60 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn an_exhausted_incarnation_space_refuses_rather_than_wrapping() {
-        // `+= 1` on a u64 panics in debug and wraps in release. Wrapping is the
-        // dangerous half: incarnation 0 would come round again and authenticate
-        // a boundary minted an eternity earlier — the exact substitution this
-        // type exists to prevent — and it would happen only in the build where
-        // no panic could warn anyone.
-        // Born at the last usable value: exhaustion needs 2^64 registrations to
-        // reach honestly, which is not a test anyone can run. The allocator
-        // position is all the record supplies — nothing here is installed,
-        // registered or minted.
-        let mut requests = ProjectRequests::over(
-            DurableRecord::restore(Vec::new(), 0, u64::MAX).expect("an empty document restores"),
-        );
-        let sub_id = discovery_sub_id();
-        assert!(matches!(
-            open_discovery_on_test_socket(&mut requests, discovery_filters()).await,
-            OpenOutcome::Sent
-        ));
-        let last = requests.live_incarnation(&sub_id).expect("live");
-        let final_witness = requests
-            .witness_end_of_stored_events(&sub_id)
-            .expect("live");
+    // `an_exhausted_incarnation_space_refuses_rather_than_wrapping` and
+    // `exhaustion_does_not_disturb_requests_already_live` stood here. Both
+    // needed a registry whose allocator was already at `u64::MAX`, and the only
+    // way to produce one was to hand the real owner a composed allocator
+    // position — provenance no production operation could have written, which
+    // is what a caller-chosen predecessor was made of. The arithmetic they were
+    // really about is proved below against the allocator itself, which nothing
+    // can install; what is no longer proved at the registry is its *handling*
+    // of a spent allocator — `OpenOutcome::Exhausted`, an untouched live
+    // registration beside a refused one — because reaching that state honestly
+    // costs 2^64 registrations.
 
-        // The space is now spent. The next registration must refuse.
-        requests.clear_connection();
+    /// **The last value is handed out exactly once, and then never again.**
+    ///
+    /// `+= 1` on a `u64` panics in debug and wraps in release. Wrapping is the
+    /// dangerous half: incarnation 0 would come round again and authenticate a
+    /// boundary minted an eternity earlier — the exact substitution the
+    /// incarnation exists to prevent — and it would happen only in the build
+    /// where no panic could warn anyone.
+    #[test]
+    fn a_spent_allocator_refuses_rather_than_wrapping() {
+        let mut counter = CheckedCounter::at(u64::MAX);
         assert_eq!(
-            open_discovery_on_test_socket(&mut requests, discovery_filters()).await,
-            OpenOutcome::Exhausted,
-            "no wrap, no reuse — a refusal"
+            counter.burn(),
+            Some(u64::MAX),
+            "the last value is legitimately issued"
         );
-        assert!(
-            requests.match_frame(&sub_id).is_none(),
-            "and nothing became live"
-        );
-
-        // The old witness cannot be revived by a later registration, because
-        // there is no later registration.
-        assert!(!requests.is_live_boundary(&final_witness));
-
-        // A reconnect must not restore spent authority.
-        requests.clear_connection();
-        assert_eq!(
-            open_discovery_on_test_socket(&mut requests, discovery_filters()).await,
-            OpenOutcome::Exhausted,
-            "exhaustion survives reconnect"
-        );
-        assert_eq!(
-            requests.live_incarnation(&sub_id),
-            None,
-            "and no incarnation is handed out at all"
-        );
-        let _ = last;
+        assert!(counter.is_spent(), "and the space is now spent");
+        for _ in 0..3 {
+            assert_eq!(counter.burn(), None, "no wrap, no reuse — a refusal");
+        }
     }
 
-    #[tokio::test]
-    async fn exhaustion_does_not_disturb_requests_already_live() {
-        // Refusing new registrations must not retroactively invalidate one that
-        // was legitimately opened before the space ran out.
-        let mut requests = ProjectRequests::over(
-            DurableRecord::restore(Vec::new(), 0, u64::MAX).expect("an empty document restores"),
-        );
-        let discovery = discovery_sub_id();
-        let watched = watched_sub_id(0);
-
-        open_discovery_on_test_socket(&mut requests, discovery_filters()).await;
-        let witness = requests
-            .witness_end_of_stored_events(&discovery)
-            .expect("live");
-
-        // A different request, refused by the same spent allocator. It goes
-        // through the watched replacement because that is the only route a
-        // watched subscription has.
-        let mut socket = test_socket().await;
-        assert_eq!(
-            requests
-                .replace_watched(&mut socket.client, watched_filters_for(&[ROOT]))
-                .await,
-            ReplaceOutcome::RequestIncarnationExhausted
-        );
-
+    /// The saturating step, from one below the ceiling: two values, then stop.
+    #[test]
+    fn an_allocator_at_the_ceiling_issues_both_remaining_values() {
+        let mut counter = CheckedCounter::at(u64::MAX - 1);
+        assert_eq!(counter.burn(), Some(u64::MAX - 1));
         assert!(
-            requests.is_live_boundary(&witness),
-            "the request opened before exhaustion is untouched"
+            !counter.is_spent(),
+            "one value remains, so the space is not yet spent"
         );
-        assert!(requests.match_frame(&discovery).is_some());
-        assert!(requests.match_frame(&watched).is_none());
+        assert_eq!(counter.next_value(), u64::MAX);
+        assert_eq!(counter.burn(), Some(u64::MAX));
+        assert_eq!(counter.burn(), None);
+    }
+
+    /// A fresh allocator hands out `0`, then `1`, and only ever increases.
+    #[test]
+    fn an_allocator_only_ever_increases() {
+        let mut counter = CheckedCounter::default();
+        let taken: Vec<u64> = (0..8).filter_map(|_| counter.burn()).collect();
+        assert_eq!(taken, (0..8).collect::<Vec<u64>>());
+        assert!(!counter.is_spent());
     }
 
     #[tokio::test]
@@ -7601,6 +7671,318 @@ mod tests {
     // refuses is only as good as the routes that go through it, and the new
     // name says what is now being claimed.
 
+    // ── The durable document ─────────────────────────────────────────────────
+    //
+    // A persisted record is the one thing about this subsystem that does not
+    // come from the owner. These proofs give the rule documents the owner would
+    // never have written and assert that it refuses them — against
+    // `validate_persisted_document`, which decodes bytes, keeps every member in
+    // the order it was given, applies the owner's own walk and hands back a
+    // description. There is no `DurableRecord` on either side of it, so nothing
+    // proved here can be installed, replayed, registered or written.
+
+    /// A bounded filter, so a member's refusal is never about its filters.
+    fn document_filter() -> Value {
+        json!({ "#e": [ROOT] })
+    }
+
+    /// One member of a persisted document.
+    fn member(sub_id: &str, class: Value) -> Value {
+        json!({ "sub_id": sub_id, "class": class, "filters": [document_filter()] })
+    }
+
+    /// A document holding `members`, with the watched allocator at `next`.
+    fn document(members: Vec<Value>, next_watched_generation: u64) -> String {
+        json!({
+            "intent": members,
+            "next_watched_generation": next_watched_generation,
+        })
+        .to_string()
+    }
+
+    /// **Discovery intent lives under the discovery id, and nothing else
+    /// does.**
+    ///
+    /// The class the rule used to let fall through. Discovery has no
+    /// generation, so it read as "not the disagreement this walk exists to
+    /// catch" — but the disagreement is the same one: the key is what goes on
+    /// the wire, and a discovery class under a key no replacement names is an
+    /// entry nothing will ever retire and every reconnect would re-ask.
+    #[test]
+    fn a_discovery_class_under_a_foreign_id_is_refused() {
+        for id in [
+            "proj-discovery-elsewhere".to_string(),
+            watched_sub_id(0),
+            PROJECT_ENROL_SUB_ID.to_string(),
+        ] {
+            let violation =
+                validate_persisted_document(&document(vec![member(&id, json!("Discovery"))], 1))
+                    .expect_err("a discovery class under a foreign id must not validate");
+            assert!(
+                violation.contains(&id) && violation.contains(&discovery_sub_id()),
+                "the report must name the id it found and the id the class implies: {violation}"
+            );
+        }
+
+        // The positive control: under its own id it resolves.
+        assert_eq!(
+            validate_persisted_document(&document(
+                vec![member(&discovery_sub_id(), json!("Discovery"))],
+                0
+            ))
+            .expect("the canonical id resolves"),
+            CurrentIntent {
+                watched: None,
+                enrolment: false,
+            }
+        );
+    }
+
+    /// **Enrolment intent lives under the enrolment id, and nothing else
+    /// does.**
+    ///
+    /// Both directions are refused. An enrolment class under a foreign id would
+    /// never be retired, because the enrolment replacement only ever names its
+    /// own fixed id; a foreign class under the enrolment id would be retired by
+    /// an enrolment replacement that never installed it.
+    #[test]
+    fn the_enrolment_id_and_the_enrolment_class_imply_each_other() {
+        for (id, class) in [
+            ("proj-enrol-elsewhere".to_string(), json!("Enrolment")),
+            (PROJECT_ENROL_SUB_ID.to_string(), json!("Discovery")),
+        ] {
+            assert!(
+                validate_persisted_document(&document(vec![member(&id, class.clone())], 1))
+                    .is_err(),
+                "{id}/{class}: the pair must not validate"
+            );
+        }
+
+        assert_eq!(
+            validate_persisted_document(&document(
+                vec![member(PROJECT_ENROL_SUB_ID, json!("Enrolment"))],
+                0
+            ))
+            .expect("the canonical pair resolves"),
+            CurrentIntent {
+                watched: None,
+                enrolment: true,
+            }
+        );
+    }
+
+    /// **A watched id and the generation its identity carries must agree.**
+    ///
+    /// The key is what goes on the wire; the class is what admits inbound
+    /// frames. A pair that disagrees asks the relay one question and admits the
+    /// answers to another — and it would resolve as a predecessor under the
+    /// wrong id, so the `CLOSE` would retire a subscription the relay never
+    /// opened while the real one stayed live.
+    #[test]
+    fn a_watched_id_that_disagrees_with_its_generation_is_refused() {
+        let violation = validate_persisted_document(&document(
+            vec![member(
+                &watched_sub_id(3),
+                json!({ "Watched": { "generation": 7 } }),
+            )],
+            8,
+        ))
+        .expect_err("a disagreeing id and generation must not validate");
+        assert!(
+            violation.contains(&watched_sub_id(3)) && violation.contains(&watched_sub_id(7)),
+            "the report must name both the id it found and the id the class implies: {violation}"
+        );
+    }
+
+    /// **A watched generation must be one this allocator issued.**
+    ///
+    /// A generation at or above the allocator's next value was never handed
+    /// out here. Retiring it would `CLOSE` an id the relay never opened under
+    /// this process; treating it as current would let an outside writer choose
+    /// the predecessor.
+    #[test]
+    fn a_watched_generation_the_allocator_never_issued_is_refused() {
+        let unissued = document(
+            vec![member(
+                &watched_sub_id(9),
+                json!({ "Watched": { "generation": 9 } }),
+            )],
+            5,
+        );
+        let violation = validate_persisted_document(&unissued)
+            .expect_err("an unissued generation must not validate");
+        assert!(
+            violation.contains(&watched_sub_id(9)) && violation.contains('5'),
+            "the report must name the generation and the allocator's position: {violation}"
+        );
+
+        // The same member under an allocator that did issue it resolves — so
+        // the refusal is about provenance and not about the member's shape.
+        assert_eq!(
+            validate_persisted_document(&document(
+                vec![member(
+                    &watched_sub_id(9),
+                    json!({ "Watched": { "generation": 9 } })
+                )],
+                10,
+            ))
+            .expect("an issued generation resolves")
+            .watched,
+            Some(9)
+        );
+    }
+
+    /// **At most one watched generation may be current.**
+    ///
+    /// More than one has no single predecessor, and choosing between them
+    /// retires one and leaves the other durable beside the successor — which is
+    /// the defect the whole design removes, arrived at from the other
+    /// direction. Both generations here were issued by the allocator, so this
+    /// is the ambiguity refusal and not the provenance one.
+    #[test]
+    fn two_watched_generations_have_no_predecessor_and_are_refused() {
+        let violation = validate_persisted_document(&document(
+            vec![
+                member(
+                    &watched_sub_id(0),
+                    json!({ "Watched": { "generation": 0 } }),
+                ),
+                member(
+                    &watched_sub_id(99),
+                    json!({ "Watched": { "generation": 99 } }),
+                ),
+            ],
+            100,
+        ))
+        .expect_err("two watched generations must not validate");
+        assert!(
+            violation.contains(&watched_sub_id(0)) && violation.contains(&watched_sub_id(99)),
+            "the report must name both: {violation}"
+        );
+    }
+
+    /// **A root catch-up is never durable, under any id.**
+    ///
+    /// Its filter carries the page bound its cursor is currently at, and the
+    /// cursor walks that bound backwards; its wire id names one transport
+    /// attempt that ended with the connection. There is no id under which a
+    /// durable catch-up is correct, so the class is refused rather than its key
+    /// checked.
+    #[test]
+    fn a_durable_root_catch_up_is_refused_under_every_id() {
+        for id in [
+            format!("proj-catchup-c-{ROOT}-0"),
+            discovery_sub_id(),
+            "proj-anything".to_string(),
+        ] {
+            let violation = validate_persisted_document(&document(
+                vec![member(
+                    &id,
+                    json!({ "RootCatchUp": { "root": ROOT, "stream": "Comments" } }),
+                )],
+                1,
+            ))
+            .expect_err("a durable catch-up must not validate");
+            assert!(
+                violation.contains(&id),
+                "{id}: the report must name it: {violation}"
+            );
+        }
+    }
+
+    /// **One id names one member, and a document that says otherwise is
+    /// refused whole.**
+    ///
+    /// The shipped defect in the previous iteration: members were inserted into
+    /// a map on the way to the rule, so a document naming an id twice arrived
+    /// already shortened — the later member silently overwriting the earlier
+    /// one — and whatever the last writer wanted was what got judged. Both
+    /// duplicates are covered, because "they happen to agree" is not the
+    /// question: a record that says a thing twice was not written by an owner
+    /// that holds one value per id.
+    #[test]
+    fn a_document_naming_one_id_twice_is_refused() {
+        let identical = document(
+            vec![
+                member(&discovery_sub_id(), json!("Discovery")),
+                member(&discovery_sub_id(), json!("Discovery")),
+            ],
+            0,
+        );
+        let violation = validate_persisted_document(&identical)
+            .expect_err("identical duplicates must not validate");
+        assert!(
+            violation.contains(&discovery_sub_id()),
+            "the report must name the id said twice: {violation}"
+        );
+
+        // Conflicting: a second member under the same id carrying a different
+        // class. Collapsing this one kept whichever class came last.
+        let conflicting = json!({
+            "intent": [
+                { "sub_id": discovery_sub_id(), "class": "Discovery",
+                  "filters": [document_filter()] },
+                { "sub_id": discovery_sub_id(), "class": "Enrolment",
+                  "filters": [document_filter()] },
+            ],
+        })
+        .to_string();
+        assert!(
+            validate_persisted_document(&conflicting).is_err(),
+            "conflicting duplicates must not validate"
+        );
+
+        // Two watched members under one id, agreeing on their generation. The
+        // watched count alone would see one member and resolve.
+        let duplicate_watched = document(
+            vec![
+                member(
+                    &watched_sub_id(0),
+                    json!({ "Watched": { "generation": 0 } }),
+                ),
+                member(
+                    &watched_sub_id(0),
+                    json!({ "Watched": { "generation": 0 } }),
+                ),
+            ],
+            1,
+        );
+        assert!(
+            validate_persisted_document(&duplicate_watched).is_err(),
+            "a repeated watched member must not validate"
+        );
+    }
+
+    /// **A malformed member is refused wherever it sits in the document.**
+    ///
+    /// Ordering was the other half of the collapse: a malformed member followed
+    /// by a canonical one under the same id was erased by it, and the document
+    /// validated as the canonical member alone. Structure is now checked across
+    /// every member before any of them is judged, so neither ordering survives.
+    #[test]
+    fn a_malformed_member_refuses_the_document_in_either_order() {
+        let unbounded = json!({
+            "sub_id": discovery_sub_id(), "class": "Discovery", "filters": [{}]
+        });
+        let canonical = member(&discovery_sub_id(), json!("Discovery"));
+
+        for (why, members) in [
+            (
+                "malformed first",
+                vec![unbounded.clone(), canonical.clone()],
+            ),
+            ("malformed second", vec![canonical, unbounded]),
+        ] {
+            let violation = validate_persisted_document(&document(members, 0))
+                .expect_err("a document holding a malformed member must not validate");
+            assert!(
+                violation.contains("constrain nothing"),
+                "{why}: the malformed member must be what refuses it, not the \
+                 member that happened to survive a collapse: {violation}"
+            );
+        }
+    }
+
     /// A request that constrains nothing cannot be built — by any route.
     ///
     /// Every shape here asks the relay for its whole store, and each is a
@@ -7683,30 +8065,24 @@ mod tests {
                 "four refusals must not have burned a generation: {unbounded:?}"
             );
 
-            // And the loader, which is the fifth route in: a persisted
-            // document holding one of these is refused *entire*, so there is
-            // no record for a registry to be born over and nothing is
-            // silently shortened to the entries that were readable.
-            let violation = DurableRecord::restore(
-                vec![
-                    (
-                        discovery_sub_id(),
-                        ProjectSubscription::Discovery,
-                        unbounded.clone(),
-                    ),
-                    (
-                        PROJECT_ENROL_SUB_ID.to_string(),
-                        ProjectSubscription::Enrolment,
-                        watched_filters_for(&[ROOT]),
-                    ),
+            // And a persisted document, which is the fifth route in: one
+            // holding a member like this is refused entire, so there is no
+            // record to be born over and nothing is silently shortened to the
+            // members that could be read.
+            let document = serde_json::json!({
+                "intent": [
+                    { "sub_id": discovery_sub_id(), "class": "Discovery",
+                      "filters": unbounded },
+                    { "sub_id": PROJECT_ENROL_SUB_ID, "class": "Enrolment",
+                      "filters": watched_filters_for(&[ROOT]) },
                 ],
-                0,
-                0,
-            )
-            .expect_err("a document holding an unbounded filter must not restore");
+            })
+            .to_string();
+            let violation = validate_persisted_document(&document)
+                .expect_err("a document holding an unbounded filter must not validate");
             assert!(
                 violation.contains(&discovery_sub_id()),
-                "the refusal must name the entry it refused: {violation}"
+                "the refusal must name the member it refused: {violation}"
             );
         }
     }
