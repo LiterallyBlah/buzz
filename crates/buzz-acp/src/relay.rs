@@ -5983,6 +5983,55 @@ mod tests {
         assert!(keep_going, "dispatch must not signal connection loss");
     }
 
+    /// Deliver a signed EVENT the way a relay does: the retained peer writes
+    /// the raw frame, and the **same registered connection** reads it back off
+    /// the wire and hands it to production frame handling.
+    ///
+    /// Deliberately not [`deliver_frame`]. That builds a fresh socket per
+    /// event and passes a constructed `Message::Text` straight into
+    /// `handle_ws_message`, so the bytes never cross a connection and the
+    /// socket a request was registered on is not the socket its answer arrives
+    /// on. Every boundary between "a relay sent this" and "the gate saw it" was
+    /// therefore assumed rather than crossed — which is what let a prepared
+    /// midpoint survive three rounds of review.
+    async fn deliver_over_connection(
+        server: &mut WebSocketStream<tokio::net::TcpStream>,
+        state: &mut BgState,
+        ws: &mut WsStream,
+        sub_id: &str,
+        event: &Event,
+        event_tx: &mpsc::Sender<Option<BuzzEvent>>,
+        keys: &nostr::Keys,
+    ) {
+        use futures_util::SinkExt;
+        let text = serde_json::to_string(&json!(["EVENT", sub_id, event])).expect("encode frame");
+        server
+            .send(Message::Text(text.into()))
+            .await
+            .expect("the relay peer writes the EVENT");
+
+        let message = timeout(Duration::from_secs(2), ws.next())
+            .await
+            .expect("timed out reading the EVENT off the connection")
+            .expect("the connection closed before the EVENT arrived")
+            .expect("read the EVENT frame");
+
+        let (observer_tx, _observer_rx) = mpsc::channel(8);
+        let keep_going = handle_ws_message(
+            message,
+            ws,
+            event_tx,
+            &observer_tx,
+            state,
+            keys,
+            "ws://test",
+            &keys.public_key().to_hex(),
+            None,
+        )
+        .await;
+        assert!(keep_going, "dispatch must not signal connection loss");
+    }
+
     /// Open a project request the way production must: recorded before any
     /// frame for it is accepted. Returns the subscription id to deliver on.
     ///
@@ -8677,10 +8726,16 @@ mod tests {
                 }};
             }
 
+            // Every EVENT below crosses the retained connection: the relay peer
+            // writes it, and the socket the requests were registered on reads
+            // it. No fresh socket, and no `Message::Text` handed directly to
+            // `handle_ws_message`.
             macro_rules! deliver {
                 ($sub_id:expr, $event:expr) => {{
                     let mut guard = subscriber.inner.lock().await;
-                    deliver_frame(&mut guard.0, $sub_id, $event, &tx).await;
+                    let (state, ws) = &mut *guard;
+                    deliver_over_connection(&mut server, state, ws, $sub_id, $event, &tx, &agent)
+                        .await;
                 }};
             }
 
@@ -8826,6 +8881,67 @@ mod tests {
             );
             assert_eq!(seen[1][0], "CLOSE", "the predecessor is closed second");
             assert_eq!(seen[1][1], crate::project::watched_sub_id(0));
+
+            // ── 5. reconnect, and read what the new connection re-asks ───────
+            //
+            // Inside this scenario, on the state these steps actually built.
+            // The `clear_connection()`/`replayable()` unit test remains useful,
+            // but it works on a registry a test assembled — it cannot show that
+            // the intent left behind by a real replacement sequence is the
+            // intent a real reconnect replays.
+            let (replacement_client, replacement_server) = test_ws_pair().await;
+            {
+                let mut guard = subscriber.inner.lock().await;
+                let (state, ws) = &mut *guard;
+                assert!(
+                    install_replacement_with(state, ws, replacement_client, VecDeque::new()).await,
+                    "the replacement connection installs"
+                );
+                let (_reconnect_tx, mut reconnect_rx) = mpsc::channel(1);
+                assert!(matches!(
+                    resubscribe_after_reconnect(ws, &mut reconnect_rx, state, &agent_hex, true)
+                        .await,
+                    ResubscribeResult::Ok
+                ));
+            }
+            // The dead socket's peer goes with it; everything after this reads
+            // the replacement.
+            server = replacement_server;
+            let replayed = readable_frames(&mut server).await;
+            let replayed_ids: Vec<String> = replayed
+                .iter()
+                .filter(|f| f[0] == "REQ")
+                .filter_map(|f| f[1].as_str().map(str::to_string))
+                .collect();
+
+            // Exactly the three current intents, and generation 0 is not among
+            // them. A retired generation coming back here is the defect this
+            // whole iteration exists for, arriving by a different door.
+            assert_eq!(
+                replayed_ids.len(),
+                3,
+                "reconnect must re-ask discovery, enrolment and the current watch: {replayed:?}"
+            );
+            for expected in [
+                discovery_id.as_str(),
+                crate::project::PROJECT_ENROL_SUB_ID,
+                &crate::project::watched_sub_id(1),
+            ] {
+                assert!(
+                    replayed_ids.iter().any(|id| id == expected),
+                    "reconnect did not re-ask {expected}: {replayed_ids:?}"
+                );
+            }
+            assert!(
+                !replayed_ids.contains(&crate::project::watched_sub_id(0)),
+                "a retired watched generation was replayed: {replayed_ids:?}"
+            );
+            assert!(
+                replayed.iter().any(|f| f[1]
+                    == serde_json::json!(crate::project::watched_sub_id(1))
+                    && f.to_string().contains(&second.id.to_hex())),
+                "the replayed watch must carry the roots the scenario enrolled: {replayed:?}"
+            );
 
             // ── the batch the pool claims is the batch the queue produced ────
             let batch = queue.flush_next().expect("the queued turn flushes");
