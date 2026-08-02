@@ -8142,11 +8142,43 @@ mod tests {
         }
     }
 
-    /// **Phase A end to end: relay bytes to the agent's stdin.**
+    /// The libtest filter that selects [`project_comment_cli_helper`].
     ///
-    /// One scenario, not two green halves. The batch the pool claims is the
-    /// batch the relay-byte path produced — nothing here builds a `FlushBatch`,
-    /// a `ProjectOrigin`, or a classification.
+    /// A typo here does not silently pass: libtest exits 0 when a filter
+    /// matches nothing, but the scenario asserts a captured submission, which
+    /// only a helper that actually ran can produce.
+    const CLI_HELPER_TEST: &str = "relay::tests::project_comment_cli_helper";
+
+    /// Helper mode — this test *is* the `buzz` CLI when the harness asks.
+    ///
+    /// The Phase A scenario has the agent's child process re-invoke this test
+    /// executable with `BUZZ_ACP_TEST_CLI_ARGV` set, so the argv the agent read
+    /// out of its prompt runs through [`buzz_cli::run_from_args`] — the real
+    /// parser and the real dispatch. Calling `issues::dispatch` from the
+    /// harness instead would prove only that a function the harness picked does
+    /// what the harness expects, which is the prepared-midpoint mistake moved
+    /// to the outbound side.
+    ///
+    /// Unset — every ordinary run — this returns immediately.
+    #[tokio::test]
+    async fn project_comment_cli_helper() {
+        let Ok(argv) = std::env::var("BUZZ_ACP_TEST_CLI_ARGV") else {
+            return;
+        };
+        let argv: Vec<String> =
+            serde_json::from_str(&argv).expect("helper argv must be a JSON array of strings");
+        let code = buzz_cli::run_from_args(argv).await;
+        // The exit code is what the parent reads. Returning normally would
+        // report libtest's verdict in place of the CLI's.
+        std::process::exit(code);
+    }
+
+    /// **Phase A end to end: a mention on a root becomes a comment on it.**
+    ///
+    /// One scenario, not green halves. The batch the pool claims is the batch
+    /// the relay-byte path produced, and the command the child runs is the one
+    /// the prompt gave it — nothing here builds a `FlushBatch`, a
+    /// `ProjectOrigin`, a classification, or an argv.
     ///
     /// ```text
     /// discovery REQ on a real socket → announcement EVENT on that id
@@ -8154,7 +8186,9 @@ mod tests {
     /// → authority gate → enrol → queue under the root's UUIDv5
     /// → queue.flush_next() → pool.try_claim(root key) → run_prompt_task
     /// → AcpClient drives initialize / session/new / session/prompt
-    /// → the child writes what it received to a capture file
+    /// → the child reads the reply command out of that prompt
+    /// → buzz_cli::run_from_args signs and POSTs the comment
+    /// → the capture endpoint accepts it
     /// ```
     #[tokio::test]
     async fn phase_a_end_to_end_relay_bytes_reach_the_agents_stdin() {
@@ -8372,17 +8406,78 @@ mod tests {
                 "the flushed batch carries its project origin"
             );
 
+            // ── the endpoint the agent's reply is submitted to ───────────────
+            //
+            // Scope, stated so it is not overread: this receives the signed
+            // event and returns acceptance. It is the transport boundary, not
+            // independent relay validation — nothing here checks the event
+            // against relay policy. What it buys is that the reply must be
+            // really built, really signed and really sent to be observed.
+            let submissions: std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>> =
+                std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let events_url = {
+                let sink = submissions.clone();
+                let app = axum::Router::new().route(
+                    "/events",
+                    axum::routing::post(move |body: String| {
+                        let sink = sink.clone();
+                        async move {
+                            let event: serde_json::Value =
+                                serde_json::from_str(&body).unwrap_or(serde_json::Value::Null);
+                            let id = event["id"].as_str().unwrap_or_default().to_string();
+                            sink.lock().expect("submission sink").push(event);
+                            axum::Json(serde_json::json!({
+                                "event_id": id,
+                                "accepted": true,
+                                "message": "",
+                            }))
+                        }
+                    }),
+                );
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                    .await
+                    .expect("bind the capture endpoint");
+                let addr = listener.local_addr().expect("capture endpoint address");
+                tokio::spawn(async move {
+                    let _ = axum::serve(listener, app).await;
+                });
+                format!("http://{addr}")
+            };
+
             // ── a stub agent, entered through the production spawn path ──────
             //
             // Every method it receives is journalled in arrival order, so the
             // harness can assert the protocol sequence rather than assume it.
+            //
+            // On `session/prompt` it does what an agent does: reads the command
+            // out of the prompt it was given and runs it. It does not receive
+            // the argv from the harness — it parses the same text the model
+            // would read, so a prompt that describes an unrunnable command
+            // fails here rather than passing on a technicality.
             let capture =
                 std::env::temp_dir().join(format!("buzz-acp-e2e-{}.json", Uuid::new_v4()));
             let _ = std::fs::remove_file(&capture);
+            let reply_body = "Looked at it — the enrolment path is the culprit.";
             let stub = format!(
                 r#"
-import sys, json
+import sys, json, os, shlex, subprocess
+
 cap = open({path:?}, "w")
+
+def reply_argv(text):
+    lines = text.splitlines()
+    start = next(i for i, l in enumerate(lines)
+                 if l.strip().startswith("buzz issues comment"))
+    parts = []
+    for l in lines[start:]:
+        s = l.strip()
+        if s.endswith("\\"):
+            parts.append(s[:-1])
+            continue
+        parts.append(s)
+        break
+    return shlex.split(" ".join(parts))
+
 for line in sys.stdin:
     line = line.strip()
     if not line:
@@ -8400,24 +8495,84 @@ for line in sys.stdin:
     elif method == "session/new":
         result = {{"sessionId": "project-test-session"}}
     elif method == "session/prompt":
+        text = "".join(b.get("text", "")
+                       for b in (msg["params"].get("prompt") or []))
+        argv = reply_argv(text)
+        env = dict(os.environ)
+        env["BUZZ_ACP_TEST_CLI_ARGV"] = json.dumps(argv)
+        # Set here, not inherited: see the note on `child_env` below.
+        env["BUZZ_RELAY_URL"] = os.environ["BUZZ_ACP_TEST_RELAY_URL"]
+        env["BUZZ_PRIVATE_KEY"] = os.environ["BUZZ_ACP_TEST_KEY"]
+        proc = subprocess.run(
+            [os.environ["BUZZ_ACP_TEST_EXE"], "--exact",
+             os.environ["BUZZ_ACP_TEST_CLI_HELPER"], "--nocapture"],
+            input={reply:?}.encode(),
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
+        cap.write(json.dumps({{"cli": {{
+            "argv": argv,
+            "code": proc.returncode,
+            "stdout": proc.stdout.decode("utf-8", "replace")[-4000:],
+            "stderr": proc.stderr.decode("utf-8", "replace")[-4000:],
+        }}}}) + "\n")
+        cap.flush()
         result = {{"stopReason": "end_turn"}}
     else:
         result = {{}}
     sys.stdout.write(json.dumps({{"jsonrpc": "2.0", "id": msg["id"], "result": result}}) + "\n")
     sys.stdout.flush()
 "#,
-                path = capture.to_string_lossy()
+                path = capture.to_string_lossy(),
+                reply = reply_body,
             );
+
+            // The child is given only what a real agent process is given: where
+            // the relay is and which key is its own. The argv comes from the
+            // prompt.
+            //
+            // **These names are harness-specific on purpose — do not "simplify"
+            // them to `BUZZ_RELAY_URL` and `BUZZ_PRIVATE_KEY`.** `AcpClient::spawn`
+            // injects `extra_env` only for keys absent from the parent
+            // environment (operator precedence, `acp.rs`). A developer or agent
+            // runtime with those two set therefore has this scenario silently
+            // ignore the capture endpoint below, sign with the operator's real
+            // key, and publish to their real relay. That is not a hypothetical:
+            // it happened on the first run of this step. The stub copies these
+            // into the CLI's own names for the helper process, where nothing
+            // overrides them.
+            let child_env = vec![
+                (
+                    "BUZZ_ACP_TEST_EXE".to_string(),
+                    std::env::current_exe()
+                        .expect("this test executable's own path")
+                        .to_string_lossy()
+                        .into_owned(),
+                ),
+                (
+                    "BUZZ_ACP_TEST_CLI_HELPER".to_string(),
+                    CLI_HELPER_TEST.to_string(),
+                ),
+                ("BUZZ_ACP_TEST_RELAY_URL".to_string(), events_url.clone()),
+                (
+                    "BUZZ_ACP_TEST_KEY".to_string(),
+                    agent.secret_key().to_secret_hex(),
+                ),
+            ];
 
             // **The production spawn and initialise path, not a stamped state.**
             // `protocol_version` and `agent_name` come from the child's own
             // `initialize` response here. Constructing an `OwnedAgent` with them
             // hard-coded — as this harness previously did — skipped the
             // handshake entirely and left the stub's `initialize` branch dead.
-            let (acp, protocol_version, agent_name) =
-                crate::spawn_and_init("python3", &["-c".to_string(), stub], &[], false, 0, None)
-                    .await
-                    .expect("spawn and initialise the stub agent");
+            let (acp, protocol_version, agent_name) = crate::spawn_and_init(
+                "python3",
+                &["-c".to_string(), stub],
+                &child_env,
+                false,
+                0,
+                None,
+            )
+            .await
+            .expect("spawn and initialise the stub agent");
             assert_eq!(
                 protocol_version, 2,
                 "protocol version must come from the child's initialize response"
@@ -8534,6 +8689,116 @@ for line in sys.stdin:
             assert!(
                 !text.contains("[Context]"),
                 "the prompt carries synthetic channel metadata"
+            );
+
+            // ── the command the child actually ran ───────────────────────────
+            let cli = journal
+                .iter()
+                .find_map(|e| e.get("cli"))
+                .expect("the child journalled no CLI invocation");
+            let argv: Vec<String> = cli["argv"]
+                .as_array()
+                .expect("argv array")
+                .iter()
+                .filter_map(|a| a.as_str().map(str::to_string))
+                .collect();
+            assert_eq!(
+                cli["code"].as_i64(),
+                Some(0),
+                "the real CLI rejected the command the prompt gave it\n\
+                 argv:   {argv:?}\n\
+                 stdout: {}\n\
+                 stderr: {}",
+                cli["stdout"].as_str().unwrap_or_default(),
+                cli["stderr"].as_str().unwrap_or_default()
+            );
+            assert_eq!(
+                argv.first().map(String::as_str),
+                Some("buzz"),
+                "the child did not invoke the buzz CLI: {argv:?}"
+            );
+
+            // ── the submission, as the endpoint received it ──────────────────
+            let submitted = submissions.lock().expect("submission sink").clone();
+            assert_eq!(
+                submitted.len(),
+                1,
+                "expected exactly one comment; a wake must not fan out into \
+                 several submissions, and zero means the child never reached \
+                 the relay — note that libtest exits 0 when the filter \
+                 {CLI_HELPER_TEST} matches nothing, so the child's own output \
+                 is the thing to read here\n\
+                 argv:   {argv:?}\n\
+                 stdout: {}\n\
+                 stderr: {}",
+                cli["stdout"].as_str().unwrap_or_default(),
+                cli["stderr"].as_str().unwrap_or_default()
+            );
+            let event = &submitted[0];
+
+            assert_eq!(
+                event["kind"].as_u64(),
+                Some(1),
+                "a project comment is a kind:1 text note"
+            );
+            assert_eq!(
+                event["pubkey"].as_str(),
+                Some(agent_hex.as_str()),
+                "the comment is not signed by the woken agent"
+            );
+            assert_eq!(
+                event["content"].as_str(),
+                Some(reply_body),
+                "the published body is not what the agent wrote"
+            );
+
+            let tags: Vec<Vec<String>> = event["tags"]
+                .as_array()
+                .expect("tags array")
+                .iter()
+                .map(|t| {
+                    t.as_array()
+                        .expect("tag array")
+                        .iter()
+                        .filter_map(|v| v.as_str().map(str::to_string))
+                        .collect()
+                })
+                .collect();
+            let values_of = |name: &str| -> Vec<String> {
+                tags.iter()
+                    .filter(|t| t.first().map(String::as_str) == Some(name))
+                    .filter_map(|t| t.get(1).cloned())
+                    .collect()
+            };
+
+            // The addressing, exactly. These four are the whole claim: the
+            // comment lands on *this* repository and *this* root, notifies the
+            // person who asked rather than the agent itself, and carries no
+            // channel scope — the route key is a UUIDv5 of a root and names no
+            // channel, so an `h` tag here would be a fabricated one.
+            assert_eq!(
+                values_of("a"),
+                vec![coordinate.clone()],
+                "wrong repository coordinate"
+            );
+            assert_eq!(
+                values_of("e"),
+                vec![root.id.to_hex()],
+                "the comment is not attached to the root that woke the agent"
+            );
+            assert_eq!(
+                values_of("p"),
+                vec![owner_hex.clone()],
+                "the comment does not notify the human who asked"
+            );
+            assert_ne!(
+                values_of("p"),
+                vec![agent_hex.clone()],
+                "the agent notified itself"
+            );
+            assert!(
+                values_of("h").is_empty(),
+                "the comment carries a channel scope: {tags:?}"
             );
         })
         .await

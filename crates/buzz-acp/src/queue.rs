@@ -1284,7 +1284,18 @@ fn resolve_reply_anchor(
 ///
 /// `triggering` is the event id of the last event in the batch — the one being
 /// answered — so a reply can be threaded under it rather than only at the root.
-fn format_project_context(project: &crate::project::ProjectOrigin, triggering: &str) -> String {
+///
+/// `triggering_author` is that event's signer, emitted as `--to` so the reply
+/// carries a `p` tag naming the person who asked. It is emitted rather than
+/// merely offered: a comment on an issue root reaches nobody's mentions
+/// otherwise, and a suggestion in prose is a thing the agent may or may not
+/// act on. A self-authored wake is refused upstream, so this participant is
+/// never the replying agent itself.
+fn format_project_context(
+    project: &crate::project::ProjectOrigin,
+    triggering: &str,
+    triggering_author: &str,
+) -> String {
     let coordinate = project.coordinate();
     let root = project.root();
     let class = project.class_noun();
@@ -1304,19 +1315,21 @@ fn format_project_context(project: &crate::project::ProjectOrigin, triggering: &
          root — there is no channel to post in.\n\n\
          Repository: {coordinate}\n\
          Root event: {root}\n\
-         Triggering event: {triggering}\n\n\
+         Triggering event: {triggering}\n\
+         Asked by: {triggering_author}\n\n\
          To reply on this {class}:\n\n\
          ```bash\n\
          buzz issues comment \\\n  \
            --repo-owner {repo_owner} \\\n  \
            --repo-id {repo_id} \\\n  \
            --root {root} \\\n  \
+           --to {triggering_author} \\\n  \
            --content -\n\
          ```\n\n\
-         Pass the body on stdin. Add `--to <pubkey>` to notify a participant, \
-         and `--reply-to <event-id>` to answer a specific comment rather than \
-         the root. The ordinary channel-message command cannot be used here — \
-         it requires a channel id, and this conversation has none."
+         Pass the body on stdin. `--to` notifies whoever asked; add \
+         `--reply-to <event-id>` to answer a specific comment rather than the \
+         root. The ordinary channel-message command cannot be used here — it \
+         requires a channel id, and this conversation has none."
     )
 }
 
@@ -1592,6 +1605,7 @@ pub fn format_prompt(batch: &FlushBatch, args: &FormatPromptArgs<'_>) -> Vec<Str
         sections.push(format_project_context(
             project,
             &last_event.event.id.to_hex(),
+            &sender_pubkey,
         ));
     } else {
         sections.push(format_context_hints(
@@ -1822,6 +1836,7 @@ mod tests {
             false,
         );
         let event = make_event("please look at this");
+        let asker = event.pubkey.to_hex();
         let batch = FlushBatch {
             channel_id: Uuid::new_v4(),
             events: vec![BatchEvent {
@@ -1863,6 +1878,13 @@ mod tests {
         assert!(
             prompt.contains(&format!("--root {root}")),
             "reply command lacks the root"
+        );
+        // `--to` has to be *in the command*, not offered in the prose beneath
+        // it. A comment carrying no `p` tag reaches nobody's mentions, and the
+        // person who asked is the one participant we always know.
+        assert!(
+            prompt.contains(&format!("--to {asker}")),
+            "reply command does not notify the asker: {prompt}"
         );
     }
 
