@@ -3060,11 +3060,23 @@ async fn handle_ws_message(
                         // having the second delivery refused as a replay of the
                         // first.
                         let Some(channel_uuid) = extract_h_tag_uuid(&event) else {
-                            debug!(
-                                kind = kind_u32,
-                                event_id = %event.id.to_hex(),
-                                "peer-call envelope with no channel route — left to the project path"
-                            );
+                            // A project-routed envelope: `a` + rooted `e`, no
+                            // `h`. It used to be dropped here on the assumption
+                            // that the watched-root REQ owned it. That holds
+                            // only while the root is already enrolled *and* a
+                            // watched generation is live — so a call arriving
+                            // before enrolment, or inside a REQ replacement
+                            // window, was discarded by both paths and the pair
+                            // never began.
+                            //
+                            // The peer subscription is a **transport source and
+                            // nothing more**. It carries the event to the same
+                            // project entry the watched stream uses, where
+                            // enrolment, lifecycle, trusted-peer, caller/callee,
+                            // ledger, replay, hop and visited rules all still
+                            // decide. Arriving here grants no authority; it only
+                            // means the event arrived.
+                            route_project_peer_call(state, event_tx, *event).await;
                             return true;
                         };
 
@@ -5129,6 +5141,87 @@ fn channel_id_from_sub_id(sub_id: &str) -> Option<Uuid> {
 ///
 /// Nothing here is deduplicated either. The live surfaces share one
 /// `project_seen_ids` set, and putting page rows through it would suppress
+/// Deliver a project-routed peer-call envelope that arrived on the peer-call
+/// subscription.
+///
+/// The peer REQ and the watched-root REQ can both carry the same signed call —
+/// the first by `#p`/`authors`, the second by `#e` — and which one wins is a
+/// race. Both therefore end in the same place and spend the same
+/// `project_seen_ids` slot, so whichever arrives first acts and the other is an
+/// exact no-op rather than a second turn on one issue.
+///
+/// Order is the security property, and it is the same order the watched path
+/// uses: verify id and signature, derive one unambiguous route, *then* spend
+/// the dedup slot. Verifying before dedup is what stops a forged event claiming
+/// a genuine event's id and suppressing it; deriving before dedup is what stops
+/// an envelope with two roots — which belongs to neither — spending a slot at
+/// all.
+///
+/// What this function deliberately does not do is decide anything. Enrolment,
+/// lifecycle, trusted-peer classification, caller/callee binding, the call
+/// ledger, replay, hop and visited limits are all downstream in
+/// `dispatch_project_event`, unchanged and unaware of which REQ carried the
+/// event here.
+async fn route_project_peer_call(
+    state: &mut BgState,
+    event_tx: &mpsc::Sender<Option<BuzzEvent>>,
+    event: Event,
+) {
+    let verified = match crate::project::VerifiedProjectEvent::verify(event).await {
+        Ok(v) => v,
+        Err(e) => {
+            warn!("peer-call project envelope failed verification — dropping: {e}");
+            return;
+        }
+    };
+
+    let Some(route) = crate::project::ProjectRoute::derive(&verified) else {
+        debug!(
+            kind = verified.kind(),
+            event_id = %verified.id(),
+            "peer-call envelope resolves to no project root — dropping"
+        );
+        return;
+    };
+
+    let event_id_hex = verified.id();
+    let ts = verified.event().created_at.as_secs();
+
+    // The shared slot. A call delivered here and again on the watched stream is
+    // one call.
+    if !state.project_seen_ids.insert(event_id_hex.clone()) {
+        debug!(
+            event_id = %event_id_hex,
+            "peer-call envelope already delivered on another project subscription — skipping"
+        );
+        return;
+    }
+
+    let project_event = crate::project::ProjectEvent::Routed {
+        source: crate::project::ProjectSubscription::PeerCall,
+        route,
+        event: verified,
+    };
+
+    match event_tx.try_send(Some(BuzzEvent::Project(project_event))) {
+        Ok(()) => {}
+        Err(mpsc::error::TrySendError::Full(_)) => {
+            // Same contract as every other project delivery: release the slot
+            // so a replay can re-deliver an event that never reached the
+            // harness, and move the project replay floor — not the channel one.
+            state.project_seen_ids.remove(&event_id_hex);
+            state.project_dropped_since =
+                Some(state.project_dropped_since.map_or(ts, |d| d.min(ts)));
+            state.proactive_resubscribe_needed = true;
+            warn!(
+                ts,
+                "peer-call project envelope dropped (backpressure) — proactive resubscribe queued"
+            );
+        }
+        Err(mpsc::error::TrySendError::Closed(_)) => {}
+    }
+}
+
 /// exactly those events the agent had already been delivered live — shortening
 /// the page for the second time, by the same mechanism, for a different reason.
 async fn route_catch_up_frame(
@@ -9129,14 +9222,17 @@ mod tests {
             .expect("sign")
     }
 
-    /// A channel-routed envelope is delivered on the channel it names; a
-    /// project-routed one is left to the watched-root REQ that owns its root.
+    /// A channel-routed envelope takes the channel path; a project-routed one
+    /// now takes the project path instead of being dropped.
     ///
-    /// The split is what stops a project call arriving twice — once down each
-    /// path — with the second delivery refused as a replay of the first, which
-    /// would read in the logs as a loop control firing on an honest call.
+    /// It used to be dropped here, on the assumption that the watched-root REQ
+    /// owned it. That holds only while the root is already enrolled and a
+    /// watched generation is live, so a call arriving before enrolment or
+    /// inside a REQ replacement window was discarded by both paths — which is
+    /// exactly what the Phase 6 runtime observed: the call ingested, both
+    /// agents received it on this subscription, and both logged it away.
     #[tokio::test]
-    async fn the_peer_call_subscription_delivers_the_channel_route_and_defers_the_project_one() {
+    async fn the_peer_call_subscription_routes_the_channel_and_the_project_envelope() {
         let keys = nostr::Keys::generate();
         let channel_id = Uuid::new_v4();
         let root = "48be1cc2000000000000000000000000000000000000000000000000000000ab";
@@ -9155,10 +9251,13 @@ mod tests {
             BuzzEvent::Channel { channel_id: ch, .. } => assert_eq!(*ch, channel_id),
             other => panic!("expected a channel delivery: {other:?}"),
         }
+        assert!(
+            !state.project_seen_ids.contains(&channel_routed.id.to_hex()),
+            "a channel call must not spend the project dedup slot"
+        );
 
-        // The same subscription, a project route: no `h`, so nothing is
-        // delivered and no dedup slot is spent — the watched REQ still gets to
-        // carry it.
+        // The same subscription, a project route: no `h`, so it reaches the
+        // project gate — which is where every authority question is asked.
         let project_routed = peer_call_frame(
             &keys,
             &[
@@ -9171,8 +9270,87 @@ mod tests {
         let mut state = BgState::new();
         let (tx, mut rx) = mpsc::channel(16);
         deliver_frame(&mut state, PEER_CALL_SUB_ID, &project_routed, &tx).await;
+        let delivered = drain(&mut rx);
+        assert_eq!(delivered.len(), 1, "the project envelope was dropped again");
+        match &delivered[0] {
+            BuzzEvent::Project(crate::project::ProjectEvent::Routed { source, route, .. }) => {
+                assert_eq!(
+                    *source,
+                    crate::project::ProjectSubscription::PeerCall,
+                    "the source must name the transport it arrived on, not a watched generation"
+                );
+                assert_eq!(route.root(), root);
+            }
+            other => panic!("expected a project delivery: {other:?}"),
+        }
+        assert!(
+            state.project_seen_ids.contains(&project_routed.id.to_hex()),
+            "the project slot must be spent so the watched REQ's copy is a no-op"
+        );
+        assert!(
+            !state.seen_ids.contains(&project_routed.id.to_hex()),
+            "a project call must not spend a channel slot"
+        );
+    }
+
+    /// One call, two subscriptions, one delivery.
+    ///
+    /// The peer REQ matches by `#p`/`authors` and the watched REQ by `#e`, so
+    /// both can carry the same signed call and which arrives first is a race.
+    /// They share `project_seen_ids` precisely so the loser is an exact no-op
+    /// rather than a second turn on one issue.
+    #[tokio::test]
+    async fn the_same_call_on_the_peer_and_watched_subscriptions_is_delivered_once() {
+        let keys = nostr::Keys::generate();
+        let root = "48be1cc2000000000000000000000000000000000000000000000000000000ab";
+        let call = peer_call_frame(
+            &keys,
+            &[
+                &["p", &"cd".repeat(32)],
+                &["a", &format!("30617:{}:buzz", "ef".repeat(32))],
+                &["e", root, "", "root"],
+            ],
+            KIND_PEER_CALL,
+        );
+
+        let mut state = BgState::new();
+        let (tx, mut rx) = mpsc::channel(16);
+        deliver_frame(&mut state, PEER_CALL_SUB_ID, &call, &tx).await;
+        assert_eq!(drain(&mut rx).len(), 1, "the first delivery must act");
+
+        // The watched REQ's copy of the identical event.
+        deliver_frame(&mut state, PEER_CALL_SUB_ID, &call, &tx).await;
+        assert!(
+            drain(&mut rx).is_empty(),
+            "the second delivery of one call must be an exact no-op"
+        );
+    }
+
+    /// An envelope that names no single root spends nothing.
+    ///
+    /// Two `e` tags marked root belong to neither, and a dedup slot spent by
+    /// one would suppress the genuine event that owns the id.
+    #[tokio::test]
+    async fn a_peer_call_with_no_unambiguous_root_is_dropped_without_spending_a_slot() {
+        let keys = nostr::Keys::generate();
+        let a = format!("30617:{}:buzz", "ef".repeat(32));
+        let ambiguous = peer_call_frame(
+            &keys,
+            &[
+                &["p", &"cd".repeat(32)],
+                &["a", &a],
+                &["e", &"11".repeat(32), "", "root"],
+                &["e", &"22".repeat(32), "", "root"],
+            ],
+            KIND_PEER_CALL,
+        );
+
+        let mut state = BgState::new();
+        let (tx, mut rx) = mpsc::channel(16);
+        deliver_frame(&mut state, PEER_CALL_SUB_ID, &ambiguous, &tx).await;
+
         assert!(drain(&mut rx).is_empty());
-        assert!(!state.seen_ids.contains(&project_routed.id.to_hex()));
+        assert!(!state.project_seen_ids.contains(&ambiguous.id.to_hex()));
     }
 
     /// A kind this REQ never asked for is refused before it can spend a dedup

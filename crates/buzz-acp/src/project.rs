@@ -76,6 +76,18 @@ pub(crate) enum ProjectSubscription {
     Enrolment,
     /// `#e` / `#E` over enrolled roots, one generation per REQ replacement.
     Watched { generation: u64 },
+    /// The NIP-PC peer-call REQ, carrying a project-routed envelope.
+    ///
+    /// A transport source, not a grant. It exists so a call that arrives before
+    /// its root is enrolled — or during a watched-REQ replacement — reaches the
+    /// project gate at all, rather than being dropped by both paths. Every
+    /// authority question is still asked downstream, and the answer does not
+    /// depend on which subscription carried the event.
+    ///
+    /// Deliberately distinct from `Watched`: naming a generation this frame
+    /// never had would put a false provenance into the record that decides
+    /// which REQ to retire.
+    PeerCall,
     /// Historical reconstruction for one newly enrolled root.
     ///
     /// The full root id is carried in the id, not a prefix, so the arriving
@@ -1414,6 +1426,16 @@ mod requests {
                         "durable intent holds a root catch-up under id {id} \
                          (root {root}, {stream:?}); catch-up pages are re-derived from \
                          their own cursor and are never durable"
+                    ));
+                }
+                super::ProjectSubscription::PeerCall => {
+                    // The peer-call REQ is not a project request. It is opened
+                    // by the relay task under its own fixed id and carries no
+                    // project intent to persist; a durable record claiming this
+                    // class was written by something that does not hold the
+                    // registry's meaning of the word.
+                    return Err(format!(
+                        "durable intent holds a peer-call source under id {id};                          the peer subscription is a transport source and is never                          a project request"
                     ));
                 }
                 super::ProjectSubscription::Watched { generation } => {
