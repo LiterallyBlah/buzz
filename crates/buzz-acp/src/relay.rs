@@ -8208,7 +8208,10 @@ mod tests {
                 "the flushed batch carries its project origin"
             );
 
-            // ── a stub agent that speaks just enough ACP ─────────────────────
+            // ── a stub agent, entered through the production spawn path ──────
+            //
+            // Every method it receives is journalled in arrival order, so the
+            // harness can assert the protocol sequence rather than assume it.
             let capture =
                 std::env::temp_dir().join(format!("buzz-acp-e2e-{}.json", Uuid::new_v4()));
             let _ = std::fs::remove_file(&capture);
@@ -8222,8 +8225,8 @@ for line in sys.stdin:
         continue
     msg = json.loads(line)
     method = msg.get("method")
-    if method == "session/prompt":
-        cap.write(json.dumps(msg["params"]) + "\n")
+    if method:
+        cap.write(json.dumps({{"method": method, "params": msg.get("params")}}) + "\n")
         cap.flush()
     if "id" not in msg:
         continue
@@ -8241,13 +8244,34 @@ for line in sys.stdin:
 "#,
                 path = capture.to_string_lossy()
             );
-            let acp =
-                crate::acp::AcpClient::spawn("python3", &["-c".to_string(), stub], &[], false)
+
+            // **The production spawn and initialise path, not a stamped state.**
+            // `protocol_version` and `agent_name` come from the child's own
+            // `initialize` response here. Constructing an `OwnedAgent` with them
+            // hard-coded — as this harness previously did — skipped the
+            // handshake entirely and left the stub's `initialize` branch dead.
+            let (acp, protocol_version, agent_name) =
+                crate::spawn_and_init("python3", &["-c".to_string(), stub], &[], false, 0, None)
                     .await
-                    .expect("spawn stub");
-            let mut pool = crate::pool::AgentPool::from_slots(vec![Some(
-                crate::pool::OwnedAgent::for_test(acp),
-            )]);
+                    .expect("spawn and initialise the stub agent");
+            assert_eq!(
+                protocol_version, 2,
+                "protocol version must come from the child's initialize response"
+            );
+            assert_eq!(agent_name, "buzz-acp-test-stub");
+
+            let mut pool =
+                crate::pool::AgentPool::from_slots(vec![Some(crate::pool::OwnedAgent {
+                    index: 0,
+                    acp,
+                    state: crate::pool::SessionState::default(),
+                    model_capabilities: None,
+                    desired_model: None,
+                    model_overridden: false,
+                    agent_name,
+                    goose_system_prompt_supported: None,
+                    protocol_version,
+                })]);
 
             // ── the ordinary claim, by root key ──────────────────────────────
             let claimed = pool
@@ -8291,15 +8315,34 @@ for line in sys.stdin:
             reclaimed.acp.shutdown().await;
 
             // ── what the child was actually told ─────────────────────────────
-            let captured = std::fs::read_to_string(&capture).expect("the stub captured a prompt");
+            let captured = std::fs::read_to_string(&capture).expect("the stub captured a journal");
             let _ = std::fs::remove_file(&capture);
+
+            let journal: Vec<serde_json::Value> = captured
+                .lines()
+                .filter(|l| !l.trim().is_empty())
+                .map(|l| serde_json::from_str(l).expect("valid journal line"))
+                .collect();
+            let methods: Vec<&str> = journal
+                .iter()
+                .filter_map(|e| e["method"].as_str())
+                .collect();
+
+            // **The protocol sequence, asserted rather than assumed.**
+            // Each exactly once and in this order. Anything else — a second
+            // `session/new`, a prompt before initialisation — is a different
+            // conversation with the agent than the one production has.
             assert_eq!(
-                captured.lines().count(),
-                1,
-                "exactly one session/prompt reached the child"
+                methods,
+                vec!["initialize", "session/new", "session/prompt"],
+                "unexpected ACP sequence: {methods:?}"
             );
-            let params: serde_json::Value =
-                serde_json::from_str(captured.trim()).expect("valid prompt params");
+
+            let params = journal
+                .iter()
+                .find(|e| e["method"] == "session/prompt")
+                .expect("a session/prompt was journalled")["params"]
+                .clone();
             let text: String = params["prompt"]
                 .as_array()
                 .expect("prompt blocks")

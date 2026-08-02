@@ -596,24 +596,6 @@ impl PromptContext {
     }
 }
 
-#[cfg(test)]
-impl OwnedAgent {
-    /// Wrap a spawned client as slot 0 with default session state.
-    pub(crate) fn for_test(acp: crate::acp::AcpClient) -> Self {
-        Self {
-            index: 0,
-            acp,
-            state: SessionState::default(),
-            model_capabilities: None,
-            desired_model: None,
-            model_overridden: false,
-            agent_name: "buzz-acp-test-stub".into(),
-            goose_system_prompt_supported: None,
-            protocol_version: 2,
-        }
-    }
-}
-
 impl AgentPool {
     /// Create a pool from pre-indexed slots (may contain None for failed startups).
     ///
