@@ -18,6 +18,10 @@ use buzz_core::{
         content_looks_like_nip44, OBSERVER_AGENT_TAG, OBSERVER_FRAME_CONTROL, OBSERVER_FRAME_TAG,
         OBSERVER_FRAME_TELEMETRY,
     },
+    peer_call::{
+        derive_call_id, is_lowercase_hex, PeerCallRoute, KIND_PEER_CALL, KIND_PEER_CALL_RESULT,
+        MAX_CALL_CONTENT_BYTES, MAX_HOP, NONCE_HEX_LEN,
+    },
 };
 use nostr::{EventBuilder, Kind, Tag};
 use uuid::Uuid;
@@ -1512,6 +1516,176 @@ pub fn build_git_pr_update(
     }
 
     Ok(EventBuilder::new(Kind::Custom(KIND_GIT_PR_UPDATE as u16), content).tags(tags))
+}
+
+// ── NIP-PC: peer agent calls ──────────────────────────────────────────────────
+
+/// Everything a call envelope carries besides its task text (NIP-PC, kind 43001).
+///
+/// The call id is deliberately **absent**: it is derived from the other fields
+/// by [`build_peer_call`], never supplied. A caller that could hand in an id
+/// could hand in one belonging to somebody else's call, and the derivation
+/// exists precisely so that an id and its envelope cannot disagree.
+#[derive(Debug, Clone)]
+pub struct PeerCallMeta {
+    /// The agent being called, 64-char hex.
+    pub callee: String,
+    /// The surface this call is made from, and where the result must land.
+    pub route: PeerCallRoute,
+    /// 32 lowercase hex chars. Distinguishes two otherwise identical calls.
+    pub nonce: String,
+    /// Depth of this call: `1` when the caller was not itself called.
+    pub hop: u32,
+    /// Every agent already in the call path, including the caller.
+    pub visited: Vec<String>,
+}
+
+/// Build a peer call envelope (kind 43001, NIP-PC).
+///
+/// `caller` is the pubkey that will sign the event. It is a parameter rather
+/// than something read back off the built event because the call id must be
+/// derived *before* signing, and a builder cannot see the key it will be signed
+/// with. Publishing a call whose `caller` is not the signing key produces an
+/// envelope every receiver refuses at the id recomputation step — which is the
+/// intended outcome, not a gap: the wire rule is that the caller *is* the
+/// author, and this argument cannot make it otherwise.
+pub fn build_peer_call(
+    caller: &str,
+    content: &str,
+    meta: &PeerCallMeta,
+) -> Result<EventBuilder, SdkError> {
+    check_content(content, MAX_CALL_CONTENT_BYTES)?;
+    if content.trim().is_empty() {
+        return Err(SdkError::InvalidInput(
+            "call content must not be empty".into(),
+        ));
+    }
+
+    let caller = check_pubkey_hex(caller, "caller")?;
+    let callee = check_pubkey_hex(&meta.callee, "callee")?;
+    if caller == callee {
+        return Err(SdkError::InvalidInput("an agent cannot call itself".into()));
+    }
+
+    if !is_lowercase_hex(&meta.nonce, NONCE_HEX_LEN) {
+        return Err(SdkError::InvalidInput(format!(
+            "nonce must be {NONCE_HEX_LEN} lowercase hex characters"
+        )));
+    }
+    if !(1..=MAX_HOP).contains(&meta.hop) {
+        return Err(SdkError::InvalidInput(format!(
+            "hop must be between 1 and {MAX_HOP}"
+        )));
+    }
+
+    // `visited` must contain the caller and must agree with `hop`. Both are
+    // checked here rather than left to the receiver so that a malformed call is
+    // never published in the first place — an envelope refused on arrival is
+    // indistinguishable, to the operator who sent it, from an agent that simply
+    // ignored them.
+    let mut visited = Vec::with_capacity(meta.visited.len());
+    for entry in &meta.visited {
+        let pk = check_pubkey_hex(entry, "visited")?;
+        if visited.contains(&pk) {
+            return Err(SdkError::InvalidInput(
+                "visited must not repeat an agent".into(),
+            ));
+        }
+        visited.push(pk);
+    }
+    if !visited.contains(&caller) {
+        return Err(SdkError::InvalidInput(
+            "visited must include the caller".into(),
+        ));
+    }
+    if visited.contains(&callee) {
+        return Err(SdkError::InvalidInput(
+            "callee is already in the call path".into(),
+        ));
+    }
+    if visited.len() != meta.hop as usize {
+        return Err(SdkError::InvalidInput(format!(
+            "visited has {} entries but hop is {}",
+            visited.len(),
+            meta.hop
+        )));
+    }
+
+    let call_id = derive_call_id(&caller, &callee, &meta.route, &meta.nonce);
+
+    let mut tags = vec![
+        tag(&["p", &callee])?,
+        tag(&["call", &call_id])?,
+        tag(&["nonce", &meta.nonce])?,
+        tag(&["hop", &meta.hop.to_string()])?,
+    ];
+    for entry in &visited {
+        tags.push(tag(&["visited", entry])?);
+    }
+    tags.extend(route_tags(&meta.route)?);
+
+    Ok(EventBuilder::new(Kind::Custom(KIND_PEER_CALL as u16), content).tags(tags))
+}
+
+/// Build a correlated result for a call (kind 43004, NIP-PC).
+///
+/// `content` may be empty: an agent that finished a task with nothing to report
+/// still owes its caller a result, and withholding one leaves the caller's
+/// outstanding call open forever.
+pub fn build_peer_call_result(
+    caller: &str,
+    call_id: &str,
+    content: &str,
+    route: &PeerCallRoute,
+) -> Result<EventBuilder, SdkError> {
+    check_content(content, MAX_CALL_CONTENT_BYTES)?;
+    let caller = check_pubkey_hex(caller, "caller")?;
+    if !is_lowercase_hex(call_id, 64) {
+        return Err(SdkError::InvalidInput(
+            "call_id must be 64 lowercase hex characters".into(),
+        ));
+    }
+
+    let mut tags = vec![tag(&["p", &caller])?, tag(&["call", call_id])?];
+    tags.extend(route_tags(route)?);
+
+    Ok(EventBuilder::new(Kind::Custom(KIND_PEER_CALL_RESULT as u16), content).tags(tags))
+}
+
+/// The route tags for an envelope, in the one form NIP-PC permits.
+///
+/// Shared by the call and the result so that a result's route is written by the
+/// same code that wrote the call's. The spec requires the two to be identical,
+/// and the cheapest way to keep them identical is to have one producer.
+fn route_tags(route: &PeerCallRoute) -> Result<Vec<Tag>, SdkError> {
+    match route {
+        PeerCallRoute::Channel {
+            channel,
+            thread_root,
+        } => {
+            let channel = Uuid::parse_str(channel)
+                .map_err(|_| SdkError::InvalidInput("channel must be a UUID".into()))?
+                .to_string();
+            let mut tags = vec![tag(&["h", &channel])?];
+            if let Some(root) = thread_root {
+                let root = check_hex_exact(root, 64, "thread_root")?;
+                tags.push(tag(&["e", &root, "", "root"])?);
+            }
+            Ok(tags)
+        }
+        PeerCallRoute::Project { coordinate, root } => {
+            if coordinate.split(':').count() != 3 || !coordinate.starts_with("30617:") {
+                return Err(SdkError::InvalidInput(
+                    "coordinate must be 30617:<owner>:<identifier>".into(),
+                ));
+            }
+            let root = check_hex_exact(root, 64, "root")?;
+            Ok(vec![
+                tag(&["a", coordinate])?,
+                tag(&["e", &root, "", "root"])?,
+            ])
+        }
+    }
 }
 
 /// Build a workflow definition event (kind 30620).

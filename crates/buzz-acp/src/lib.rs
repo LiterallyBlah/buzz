@@ -5,6 +5,7 @@ mod config;
 mod engram_fetch;
 mod filter;
 mod observer;
+mod peer_call;
 mod pool;
 mod pool_lifecycle;
 mod project;
@@ -283,6 +284,47 @@ pub(crate) async fn is_dm_channel(
                 "channel type unresolved — treating as DM for author gate (fail closed)"
             );
             true
+        }
+    }
+}
+
+/// Resolve how far a peer-call author is trusted, for NIP-PC admission.
+///
+/// Deliberately **not** [`author_allowed`]. The channel gate answers "may this
+/// author's message reach the agent at all", and two of its modes are broad by
+/// design: `RespondTo::Anyone` accepts the whole relay, and an allowlist entry
+/// is an approval for a *person*. Invocation is a narrower grant, so it asks its
+/// own question: the owner, a cryptographically verified NIP-OA same-owner
+/// sibling, or a pubkey the owner explicitly listed as an external agent —
+/// nothing else, whatever the channel policy says.
+async fn resolve_peer_trust(
+    author: &str,
+    agent_hex: &str,
+    approved_external_agents: &std::collections::BTreeSet<String>,
+    owner_cache: &OwnerCache,
+    rest_client: &relay::RestClient,
+) -> peer_call::PeerTrust {
+    let author = author.to_ascii_lowercase();
+    if author.eq_ignore_ascii_case(agent_hex) {
+        return peer_call::PeerTrust::SelfAuthored;
+    }
+    // An explicit external-agent listing is an operator decision and does not
+    // depend on a resolved owner: it is the one grant that survives an agent
+    // with no NIP-OA owner at all.
+    if approved_external_agents.contains(&author) {
+        return peer_call::PeerTrust::TrustedAgent;
+    }
+    match owner_cache.get() {
+        Some(owner) if author == owner => peer_call::PeerTrust::Owner,
+        // No owner configured — fail closed. An unowned agent has no siblings,
+        // and there is nothing left for a caller to be verified against.
+        None => peer_call::PeerTrust::Untrusted,
+        Some(_) => {
+            if is_owner_or_sibling(&author, owner_cache, rest_client).await {
+                peer_call::PeerTrust::TrustedAgent
+            } else {
+                peer_call::PeerTrust::Untrusted
+            }
         }
     }
 }
@@ -1360,6 +1402,17 @@ async fn tokio_main() -> Result<()> {
         .map_err(|e| anyhow::anyhow!("membership notification subscribe error: {e}"))?;
     tracing::info!("subscribed to membership notifications");
 
+    // NIP-PC peer calls. Global and unconditional: a call is delivered on its
+    // own subscription rather than through channel rules, because whether one
+    // trusted agent can reach another must not depend on how `--subscribe-mode`
+    // and `--kinds` happen to be set. Admission is still gated — an untrusted
+    // relay identity's call is refused after delivery, not before it.
+    relay
+        .subscribe_peer_calls()
+        .await
+        .map_err(|e| anyhow::anyhow!("peer call subscribe error: {e}"))?;
+    tracing::info!("subscribed to peer calls");
+
     // Repository discovery, behind the flag. This is the one project
     // subscription that depends on no prior state — `kind:30617` announcements
     // are what *produces* the discovered set, so it can be opened at startup.
@@ -1713,6 +1766,17 @@ async fn tokio_main() -> Result<()> {
     // phase's job and is deliberately absent here rather than half-present.
     let mut project_enrolments = project::ProjectEnrolments::new();
 
+    // NIP-PC call state for this process: which call ids have been admitted,
+    // and which of this agent's own calls are still awaiting a result. One
+    // ledger for both surfaces — a call id is derived from its route, so a
+    // channel call and a project call can never collide, but two ledgers could
+    // disagree about having seen the same id and answer it twice.
+    //
+    // In-process only. A restart legitimately forgets outstanding calls: their
+    // results then fail to correlate and are ignored rather than arriving as
+    // unsolicited prompts, which is the safe direction to lose state in.
+    let mut call_ledger = peer_call::CallLedger::new();
+
     // No project-subscription state is held here. What is installed, which
     // generation it carries and which predecessor it retires all live in the
     // background registry, because that is the only component that knows.
@@ -1736,10 +1800,17 @@ async fn tokio_main() -> Result<()> {
         .filter_map(|p| project::canonical_root_id(p))
         .collect();
 
-    // Empty in this phase: peer-agent calls are Phase C, and an external agent
-    // in this set could not wake anything anyway while `CallMarker` is `None`.
-    let project_approved_external_agents: std::collections::BTreeSet<String> =
-        std::collections::BTreeSet::new();
+    // Agents under a *different* owner that this owner has explicitly approved
+    // to call this one. Same-owner NIP-OA siblings are trusted without being
+    // listed (locked decision 2); everything else has to be named, which is why
+    // this set is populated from its own option rather than from
+    // `respond_to_allowlist` — that list approves *people*, and inheriting it
+    // here would turn "may talk to the agent" into "may invoke the agent".
+    let project_approved_external_agents: std::collections::BTreeSet<String> = config
+        .peer_agents
+        .iter()
+        .filter_map(|p| project::canonical_root_id(p))
+        .collect();
 
     let mut crash_history: Vec<SlotCircuit> = (0..config.agents as usize)
         .map(|_| SlotCircuit {
@@ -1980,6 +2051,15 @@ async fn tokio_main() -> Result<()> {
                             // to issue a REQ was unreachable from any test, and
                             // that is exactly where the enrolment-widening
                             // defect lived.
+                            // Resolved before the gate, because the NIP-OA
+                            // lookup is async and the gate is not.
+                            let project_sibling = attest_project_sibling(
+                                &project_event,
+                                owner_cache.get(),
+                                &owner_cache,
+                                &ctx.rest_client,
+                            )
+                            .await;
                             let dispatched = dispatch_project_event(
                                 &mut ProjectDispatch {
                                     identity: project::ProjectIdentity {
@@ -1992,6 +2072,8 @@ async fn tokio_main() -> Result<()> {
                                     discovered: &mut discovered_repositories,
                                     enrolments: &mut project_enrolments,
                                     queue: &mut queue,
+                                    sibling: project_sibling,
+                                    ledger: &mut call_ledger,
                                 },
                                 &relay,
                                 &pubkey_hex,
@@ -2117,6 +2199,66 @@ async fn tokio_main() -> Result<()> {
                                             "cleaned up after membership removal"
                                         );
                                     }
+                                }
+                                continue;
+                            }
+
+                            // ── NIP-PC: channel-routed peer calls ────────────
+                            //
+                            // Ahead of `ignore_self` on purpose. This agent's
+                            // *own* calls have to be seen here: the harness
+                            // never publishes one — the agent subprocess runs
+                            // `buzz agents call` — so its own event coming back
+                            // off the wire is the only place the outstanding-
+                            // call ledger can learn the call exists. Dropped as
+                            // self-authored, every returned result would
+                            // correlate to nothing.
+                            //
+                            // Ahead of the channel author gate for the same
+                            // reason it does not reuse it: invocation is a
+                            // narrower grant than "may speak to this agent",
+                            // and `RespondTo::Anyone` must not confer it.
+                            if is_peer_call_kind(kind_u32) {
+                                let author = buzz_event.event.pubkey.to_hex();
+                                let trust = resolve_peer_trust(
+                                    &author,
+                                    &pubkey_hex,
+                                    &project_approved_external_agents,
+                                    &owner_cache,
+                                    &ctx.rest_client,
+                                )
+                                .await;
+                                match decide_channel_peer_event(
+                                    &buzz_event.event,
+                                    buzz_event.channel_id,
+                                    &pubkey_hex,
+                                    trust,
+                                    &mut call_ledger,
+                                ) {
+                                    ChannelPeerOutcome::Turn {
+                                        channel_id,
+                                        prompt_tag,
+                                    } => {
+                                        let event_id_hex = buzz_event.event.id.to_hex();
+                                        let accepted = queue.push(QueuedEvent {
+                                            channel_id,
+                                            event: buzz_event.event,
+                                            received_at: std::time::Instant::now(),
+                                            prompt_tag: prompt_tag.into(),
+                                            // A channel call keys on the
+                                            // channel, exactly as an ordinary
+                                            // message does.
+                                            project: None,
+                                        });
+                                        if accepted {
+                                            let rc = ctx.rest_client.clone();
+                                            tokio::spawn(async move {
+                                                pool::reaction_add(&rc, &event_id_hex, "👀").await;
+                                            });
+                                        }
+                                    }
+                                    ChannelPeerOutcome::Consumed
+                                    | ChannelPeerOutcome::NotPeerCall => {}
                                 }
                                 continue;
                             }
@@ -3024,6 +3166,413 @@ struct ProjectDispatch<'a> {
     discovered: &'a mut project::DiscoveredRepositories,
     enrolments: &'a mut project::ProjectEnrolments,
     queue: &'a mut queue::EventQueue,
+    /// The NIP-OA attestation for *this event's* author, resolved before
+    /// dispatch.
+    ///
+    /// Phase 1 passed `None` here and said so: the lookup is async, and a phase
+    /// that admitted no trusted-agent wake gained nothing from an authority it
+    /// refused to use. Phase 1b needs it, because "a trusted agent may call
+    /// another" is exactly the grant that `None` withholds — without an
+    /// attestation every sibling classifies as `Untrusted` and every peer call
+    /// becomes untrusted context.
+    ///
+    /// Resolved in the async caller rather than here so `handle_project_event`
+    /// stays synchronous and directly testable. The proof binds the author and
+    /// owner it was computed for, so carrying it per event is not a way to
+    /// reuse one lookup for a different author.
+    sibling: Option<project::VerifiedSibling>,
+    /// This process's NIP-PC ledger: which call ids it has admitted, and which
+    /// of its own calls are still awaiting a result.
+    ///
+    /// Shared with the channel path rather than owned per surface. A call id is
+    /// derived from its route, so two ledgers could not collide — but an agent
+    /// that answered the same call twice because two halves of one process
+    /// disagreed about having seen it is exactly the loop this phase exists to
+    /// prevent, and one ledger is the cheapest way for them not to disagree.
+    ledger: &'a mut peer_call::CallLedger,
+}
+
+/// A NIP-OA lookup that already happened, in the shape [`project::SiblingResolver`]
+/// requires.
+///
+/// The trait is synchronous and the lookup is not, so the boolean is carried in
+/// rather than fetched here. This is not a way to manufacture a proof: the
+/// resolver answers `true` only for the exact `(author, owner)` pair the lookup
+/// was performed for, so a caller holding one for author A cannot obtain a
+/// `VerifiedSibling` for author B, and `attest` remains private to `project`.
+struct ProjectSiblingLookup {
+    author: String,
+    owner: String,
+    verified: bool,
+}
+
+impl project::SiblingResolver for ProjectSiblingLookup {
+    fn is_same_owner_sibling(&self, author: &str, owner: &str) -> bool {
+        self.verified
+            && self.author.eq_ignore_ascii_case(author)
+            && self.owner.eq_ignore_ascii_case(owner)
+    }
+}
+
+/// Resolve the sibling attestation for a routed project event's author.
+///
+/// Returns `None` for discovery events (no author decision to make), when no
+/// agent owner is configured (fail closed — an unowned agent has no siblings),
+/// and for the owner itself, whose authority comes from being the owner and is
+/// classified before any sibling check.
+async fn attest_project_sibling(
+    project_event: &project::ProjectEvent,
+    agent_owner: Option<&str>,
+    owner_cache: &OwnerCache,
+    rest_client: &relay::RestClient,
+) -> Option<project::VerifiedSibling> {
+    use project::SiblingResolver as _;
+
+    let project::ProjectEvent::Routed { event, .. } = project_event else {
+        return None;
+    };
+    let owner = agent_owner?.to_ascii_lowercase();
+    let author = event.author().to_ascii_lowercase();
+    if author == owner {
+        return None;
+    }
+
+    // `is_owner_or_sibling` also returns true for the owner, which is why the
+    // owner is excluded above: a `true` reaching here means a genuine NIP-OA
+    // same-owner sibling and nothing else.
+    let verified = is_owner_or_sibling(&author, owner_cache, rest_client).await;
+    ProjectSiblingLookup {
+        author: author.clone(),
+        owner: owner.clone(),
+        verified,
+    }
+    .resolve(&author, &owner)
+}
+
+/// The prompt label an event is queued under.
+///
+/// A call and a result read very differently to the agent receiving them — one
+/// is work to do, the other is an answer to work it asked for — so they are not
+/// both flattened into `@mention`. The label is presentation only; nothing
+/// downstream branches on it.
+fn peer_prompt_tag(kind: u32) -> &'static str {
+    match kind {
+        buzz_core::peer_call::KIND_PEER_CALL => "@call",
+        buzz_core::peer_call::KIND_PEER_CALL_RESULT => "@call-result",
+        _ => "@mention",
+    }
+}
+
+/// Record a call **this agent published** in the outstanding-call ledger.
+///
+/// The harness does not publish calls itself: the agent subprocess runs
+/// `buzz agents call`, and the only place this process can learn that a call
+/// exists is its own event coming back off the wire. Without this the ledger
+/// would be empty, every returned result would correlate to nothing, and the
+/// fan-out ceiling would bound a set that was always empty — a control in name
+/// only.
+///
+/// A refusal here is a real effect, not a log line: an unregistered call is one
+/// whose result will not resume anything, which is precisely what "bounded
+/// fan-out" has to mean for a caller that publishes through a separate process.
+fn register_outgoing_call(
+    ledger: &mut peer_call::CallLedger,
+    peer: &peer_call::VerifiedPeerEvent,
+    agent_hex: &str,
+) {
+    if peer.kind() != buzz_core::peer_call::KIND_PEER_CALL {
+        return;
+    }
+    let Ok(envelope) = peer_call::CallEnvelope::parse(peer) else {
+        tracing::debug!(
+            event_id = %peer.id(),
+            "own kind:43001 event is not a well-formed call — not registered"
+        );
+        return;
+    };
+    if !envelope.caller().eq_ignore_ascii_case(agent_hex) {
+        return;
+    }
+    match ledger.register_outgoing(envelope.call_id(), envelope.callee(), envelope.route()) {
+        Ok(()) => tracing::debug!(
+            call_id = %envelope.call_id(),
+            callee = %envelope.callee(),
+            outstanding = ledger.outstanding_count(),
+            "outgoing peer call registered"
+        ),
+        Err(refusal) => tracing::warn!(
+            call_id = %envelope.call_id(),
+            callee = %envelope.callee(),
+            ?refusal,
+            "outgoing peer call not registered — its result will not correlate"
+        ),
+    }
+}
+
+/// Map the project authority gate's verdict onto the peer-call trust classes.
+///
+/// The two enums stay separate because they answer different questions —
+/// `ProjectAuthor` also decides enrolment, `PeerTrust` only decides invocation —
+/// but there is exactly one gate, and this is the seam. Deriving trust a second
+/// time from the same inputs would be a second place for the answer to differ
+/// from the one the effect was chosen by.
+fn peer_trust_of(author: project::ProjectAuthor) -> peer_call::PeerTrust {
+    match author {
+        project::ProjectAuthor::SelfAuthored => peer_call::PeerTrust::SelfAuthored,
+        project::ProjectAuthor::AuthorisedHuman => peer_call::PeerTrust::Owner,
+        project::ProjectAuthor::TrustedAgent => peer_call::PeerTrust::TrustedAgent,
+        project::ProjectAuthor::Untrusted => peer_call::PeerTrust::Untrusted,
+    }
+}
+
+/// Is this one of the two NIP-PC kinds?
+fn is_peer_call_kind(kind: u32) -> bool {
+    matches!(
+        kind,
+        buzz_core::peer_call::KIND_PEER_CALL | buzz_core::peer_call::KIND_PEER_CALL_RESULT
+    )
+}
+
+/// What a channel-routed NIP-PC event resolves to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChannelPeerOutcome {
+    /// Not a peer-call kind. The ordinary channel path owns this event.
+    NotPeerCall,
+    /// Handled without a turn: this agent's own call was registered, or the
+    /// envelope was refused. Either way the channel path must not see it — a
+    /// call is not a message and has no rule to match.
+    Consumed,
+    /// Queue a turn for this event on `channel_id`.
+    Turn {
+        channel_id: uuid::Uuid,
+        prompt_tag: &'static str,
+    },
+}
+
+/// Decide a channel-routed peer call or result.
+///
+/// Synchronous and total: trust is resolved by the caller (the NIP-OA lookup is
+/// async) and handed in, so everything this function does is a function of the
+/// event, this agent's identity and the ledger. That is what makes the loop
+/// controls testable against the same code production runs, rather than against
+/// a reconstruction of it.
+fn decide_channel_peer_event(
+    event: &nostr::Event,
+    channel_id: uuid::Uuid,
+    agent_hex: &str,
+    trust: peer_call::PeerTrust,
+    ledger: &mut peer_call::CallLedger,
+) -> ChannelPeerOutcome {
+    if !is_peer_call_kind(u32::from(event.kind.as_u16())) {
+        return ChannelPeerOutcome::NotPeerCall;
+    }
+
+    // Verified here rather than trusted from the transport. The relay is not
+    // an authority on who signed anything, and "the caller is the author" is
+    // the one fact the whole envelope rests on.
+    let Some(peer) = peer_call::VerifiedPeerEvent::verify(event.clone()) else {
+        tracing::warn!(
+            event_id = %event.id.to_hex(),
+            "peer-call event failed signature verification — dropping"
+        );
+        return ChannelPeerOutcome::Consumed;
+    };
+
+    if trust == peer_call::PeerTrust::SelfAuthored || peer.author().eq_ignore_ascii_case(agent_hex)
+    {
+        register_outgoing_call(ledger, &peer, agent_hex);
+        return ChannelPeerOutcome::Consumed;
+    }
+
+    match peer_call::call_marker(&peer, agent_hex) {
+        // Malformed, or addressed to another agent. The peer-call REQ also
+        // carries this agent's own authored calls, and a channel it shares with
+        // two peers will show it traffic that is not its to answer.
+        project::CallMarker::None => ChannelPeerOutcome::Consumed,
+
+        project::CallMarker::Invocation => {
+            let Ok(envelope) = peer_call::CallEnvelope::parse(&peer) else {
+                return ChannelPeerOutcome::Consumed;
+            };
+            match peer_call::admit_call(envelope, agent_hex, trust, ledger) {
+                Ok(call) => {
+                    // The route the envelope declares must be the channel it
+                    // was delivered on. They are derived from the same `h`, so
+                    // a mismatch means the transport and the envelope disagree
+                    // — and the envelope is the thing the result will be sent
+                    // back against.
+                    if call.session_key() != channel_id {
+                        tracing::warn!(
+                            call_id = %call.envelope().call_id(),
+                            delivered_on = %channel_id,
+                            declared = %call.session_key(),
+                            "peer call route does not match its delivery channel — refusing"
+                        );
+                        return ChannelPeerOutcome::Consumed;
+                    }
+                    tracing::info!(
+                        call_id = %call.envelope().call_id(),
+                        caller = %call.envelope().caller(),
+                        hop = call.envelope().hop(),
+                        path = %call.envelope().visited().join(","),
+                        channel_id = %channel_id,
+                        "peer call admitted on a channel route"
+                    );
+                    ledger.record_admitted(&call);
+                    ChannelPeerOutcome::Turn {
+                        channel_id,
+                        prompt_tag: peer_prompt_tag(buzz_core::peer_call::KIND_PEER_CALL),
+                    }
+                }
+                Err(refusal) => {
+                    tracing::info!(?refusal, "peer call refused by a loop control");
+                    ChannelPeerOutcome::Consumed
+                }
+            }
+        }
+
+        project::CallMarker::Result => {
+            let Ok(envelope) = peer_call::ResultEnvelope::parse(&peer) else {
+                return ChannelPeerOutcome::Consumed;
+            };
+            match peer_call::admit_result(envelope, agent_hex, ledger) {
+                Ok(result) => {
+                    if result.session_key() != channel_id {
+                        tracing::warn!(
+                            call_id = %result.envelope().call_id(),
+                            "peer call result route does not match its delivery channel — refusing"
+                        );
+                        return ChannelPeerOutcome::Consumed;
+                    }
+                    tracing::info!(
+                        call_id = %result.envelope().call_id(),
+                        callee = %result.envelope().callee(),
+                        channel_id = %channel_id,
+                        "peer call result correlated on a channel route"
+                    );
+                    ledger.record_answered(&result);
+                    ChannelPeerOutcome::Turn {
+                        channel_id,
+                        prompt_tag: peer_prompt_tag(buzz_core::peer_call::KIND_PEER_CALL_RESULT),
+                    }
+                }
+                Err(refusal) => {
+                    tracing::info!(?refusal, "peer call result refused");
+                    ChannelPeerOutcome::Consumed
+                }
+            }
+        }
+    }
+}
+
+/// What the NIP-PC loop controls decided about a project-routed event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PeerAdmission {
+    /// Not a peer-call envelope addressed to this agent, or one the authority
+    /// gate already declined. The project decision stands untouched.
+    NotPeerCall,
+    /// A call or result this agent accepted. The ledger has been written.
+    Admitted,
+    /// A peer-call envelope refused by a loop control. Nothing was written —
+    /// a refused call must not consume the replay slot that would then refuse
+    /// the honest retry.
+    Refused,
+}
+
+/// Run the NIP-PC loop controls over a project-routed event.
+///
+/// The authority gate that ran before this decided *whether this author may
+/// direct us*. It says nothing about whether this particular call has already
+/// been answered, or whether it loops back to an agent already in its own path.
+/// Those are properties of the call and of what this process has seen, so they
+/// are checked here, against the ledger, before anything is queued.
+///
+/// Engaging only on effects the marker actually produced is deliberate: an
+/// untrusted author's call is already `UntrustedContext` by the time it arrives
+/// here, and turning that into a peer-call refusal would change what Phase 1
+/// does with an ordinary untrusted comment.
+fn admit_peer_call_event(
+    dispatch: &mut ProjectDispatch<'_>,
+    decision: &project::ProjectDecision,
+    event: &project::VerifiedProjectEvent,
+) -> PeerAdmission {
+    let peer = peer_call::VerifiedPeerEvent::from_project(event);
+    let agent_hex = dispatch.identity.agent.hex().to_ascii_lowercase();
+
+    if peer.author().eq_ignore_ascii_case(&agent_hex) {
+        register_outgoing_call(dispatch.ledger, &peer, &agent_hex);
+        return PeerAdmission::NotPeerCall;
+    }
+
+    match peer_call::call_marker(&peer, &agent_hex) {
+        project::CallMarker::None => PeerAdmission::NotPeerCall,
+
+        project::CallMarker::Invocation => {
+            if !matches!(
+                decision.effect,
+                project::ProjectEffect::Wake | project::ProjectEffect::EnrolAndWake
+            ) {
+                return PeerAdmission::NotPeerCall;
+            }
+            // The marker is `Invocation` only because the envelope already
+            // parsed and named this agent, so this arm is unreachable; it
+            // refuses rather than unwrapping because "unreachable" is a claim
+            // about two functions agreeing, and the safe answer if they ever
+            // stop agreeing is no turn.
+            let Ok(envelope) = peer_call::CallEnvelope::parse(&peer) else {
+                return PeerAdmission::Refused;
+            };
+            match peer_call::admit_call(
+                envelope,
+                &agent_hex,
+                peer_trust_of(decision.author),
+                dispatch.ledger,
+            ) {
+                Ok(call) => {
+                    tracing::info!(
+                        call_id = %call.envelope().call_id(),
+                        caller = %call.envelope().caller(),
+                        hop = call.envelope().hop(),
+                        // The path is the diagnostic that makes a later
+                        // `Revisit` refusal readable: without it the refusal
+                        // names a rule but not the chain that tripped it.
+                        path = %call.envelope().visited().join(","),
+                        "peer call admitted on a project route"
+                    );
+                    dispatch.ledger.record_admitted(&call);
+                    PeerAdmission::Admitted
+                }
+                Err(refusal) => {
+                    tracing::info!(?refusal, "peer call refused by a loop control");
+                    PeerAdmission::Refused
+                }
+            }
+        }
+
+        project::CallMarker::Result => {
+            if !matches!(decision.effect, project::ProjectEffect::ResumeCall) {
+                return PeerAdmission::NotPeerCall;
+            }
+            let Ok(envelope) = peer_call::ResultEnvelope::parse(&peer) else {
+                return PeerAdmission::Refused;
+            };
+            match peer_call::admit_result(envelope, &agent_hex, dispatch.ledger) {
+                Ok(result) => {
+                    tracing::info!(
+                        call_id = %result.envelope().call_id(),
+                        callee = %result.envelope().callee(),
+                        "peer call result correlated on a project route"
+                    );
+                    dispatch.ledger.record_answered(&result);
+                    PeerAdmission::Admitted
+                }
+                Err(refusal) => {
+                    tracing::info!(?refusal, "peer call result refused");
+                    PeerAdmission::Refused
+                }
+            }
+        }
+    }
 }
 
 /// What dispatch did, for the caller to act on and for tests to observe.
@@ -3165,9 +3714,9 @@ fn handle_project_event(
             // and stays honest about it. `resolve_addressing` reads that
             // conservatively, which is the intended direction to be wrong in.
             //
-            // Sibling attestation is `None`: the NIP-OA lookup is async and
-            // Phase A admits no trusted-agent wake, so a resolver here would
-            // buy an authority this phase refuses to grant anyway.
+            // The sibling attestation was resolved by the async caller for this
+            // event's author. It is what makes a NIP-PC call from a same-owner
+            // sibling classify as `TrustedAgent` instead of `Untrusted`.
             let decision = project::decide_project_event(
                 source,
                 route,
@@ -3177,9 +3726,26 @@ fn handle_project_event(
                     discovered: dispatch.discovered,
                     enrolments: dispatch.enrolments,
                     readiness: &project::RootHistoryReadiness::Unknown,
-                    sibling: None,
+                    sibling: dispatch.sibling.as_ref(),
                 },
             );
+
+            // ── NIP-PC loop controls ─────────────────────────────────────────
+            //
+            // The authority gate above decided *whether this author may direct
+            // us*. It says nothing about whether this particular call is one we
+            // have already answered, or whether it loops back to an agent
+            // already in its own path. Those are properties of the call and of
+            // what this process has seen, so they are checked here, against the
+            // ledger, before anything is queued or recorded.
+            //
+            // Refusals return `Ignored` and write nothing: a refused call must
+            // not consume the replay slot that would then refuse the honest
+            // retry.
+            let peer_admission = admit_peer_call_event(dispatch, &decision, event);
+            if matches!(peer_admission, PeerAdmission::Refused) {
+                return ProjectDispatched::Ignored;
+            }
 
             let Some(origin) = decision.origin.clone() else {
                 tracing::debug!(
@@ -3234,13 +3800,21 @@ fn handle_project_event(
                     );
                     ProjectDispatched::Enrolled
                 }
-                project::ProjectEffect::EnrolAndWake | project::ProjectEffect::Wake => {
+                // `ResumeCall` queues beside the wakes. A correlated result is
+                // the answer to work this agent asked for, so it must reach the
+                // session that asked — leaving it in the "not implemented"
+                // arm below meant a result was admitted by the ledger and then
+                // silently dropped, and the caller's outstanding call closed
+                // without the agent ever seeing the answer.
+                project::ProjectEffect::EnrolAndWake
+                | project::ProjectEffect::Wake
+                | project::ProjectEffect::ResumeCall => {
                     let key = route.key();
                     let queued = dispatch.queue.push(queue::QueuedEvent {
                         channel_id: key,
                         event: event.event().clone(),
                         received_at: std::time::Instant::now(),
-                        prompt_tag: "@mention".into(),
+                        prompt_tag: peer_prompt_tag(event.kind()).into(),
                         project: Some(origin.clone()),
                     });
                     tracing::info!(
@@ -4196,6 +4770,7 @@ mod project_discovery_ingestion_tests {
     /// Build a dispatch context over the given state, the way the run loop
     /// does. Test-local so every test names the same production entry point;
     /// nothing here classifies or decides.
+    #[allow(clippy::too_many_arguments)]
     fn dispatch_over<'a>(
         agent: &'a project::AgentIdentity,
         owner: Option<&'a str>,
@@ -4204,6 +4779,7 @@ mod project_discovery_ingestion_tests {
         discovered: &'a mut project::DiscoveredRepositories,
         enrolments: &'a mut project::ProjectEnrolments,
         queue: &'a mut EventQueue,
+        ledger: &'a mut peer_call::CallLedger,
     ) -> ProjectDispatch<'a> {
         ProjectDispatch {
             identity: project::ProjectIdentity {
@@ -4215,6 +4791,43 @@ mod project_discovery_ingestion_tests {
             discovered,
             enrolments,
             queue,
+            // No attestation: an agent author is untrusted here, which is what
+            // every pre-Phase-1b case in this module was written against.
+            // `dispatch_over_sibling` is the variant for peer-call cases.
+            sibling: None,
+            ledger,
+        }
+    }
+
+    /// [`dispatch_over`] with a NIP-OA attestation in hand.
+    ///
+    /// Separate rather than an extra parameter on `dispatch_over` so the
+    /// dozens of existing cases keep asserting against the untrusted default,
+    /// and so a case that grants trust has to say so at its call site.
+    #[allow(clippy::too_many_arguments)]
+    fn dispatch_over_sibling<'a>(
+        agent: &'a project::AgentIdentity,
+        owner: Option<&'a str>,
+        humans: &'a std::collections::BTreeSet<String>,
+        externals: &'a std::collections::BTreeSet<String>,
+        discovered: &'a mut project::DiscoveredRepositories,
+        enrolments: &'a mut project::ProjectEnrolments,
+        queue: &'a mut EventQueue,
+        ledger: &'a mut peer_call::CallLedger,
+        sibling: Option<project::VerifiedSibling>,
+    ) -> ProjectDispatch<'a> {
+        ProjectDispatch {
+            identity: project::ProjectIdentity {
+                agent,
+                agent_owner: owner,
+                approved_humans: humans,
+                approved_external_agents: externals,
+            },
+            discovered,
+            enrolments,
+            queue,
+            sibling,
+            ledger,
         }
     }
 
@@ -4229,6 +4842,7 @@ mod project_discovery_ingestion_tests {
         let externals = std::collections::BTreeSet::new();
         let mut enrolments = project::ProjectEnrolments::new();
         let mut queue = EventQueue::new(config::DedupMode::Queue);
+        let mut ledger = peer_call::CallLedger::new();
         handle_project_event(
             &mut dispatch_over(
                 &agent,
@@ -4238,6 +4852,7 @@ mod project_discovery_ingestion_tests {
                 discovered,
                 &mut enrolments,
                 &mut queue,
+                &mut ledger,
             ),
             event,
         )
@@ -4264,6 +4879,7 @@ mod project_discovery_ingestion_tests {
         let mut discovered = project::DiscoveredRepositories::new();
         let mut enrolments = project::ProjectEnrolments::new();
         let mut queue = EventQueue::new(config::DedupMode::Queue);
+        let mut ledger = peer_call::CallLedger::new();
 
         handle_project_event(
             &mut dispatch_over(
@@ -4274,6 +4890,7 @@ mod project_discovery_ingestion_tests {
                 &mut discovered,
                 &mut enrolments,
                 &mut queue,
+                &mut ledger,
             ),
             &project::ProjectEvent::Discovery {
                 announcement: proven_announcement(owner, repo_id).await,
@@ -4298,6 +4915,7 @@ mod project_discovery_ingestion_tests {
                     &mut discovered,
                     &mut enrolments,
                     &mut queue,
+                    &mut ledger,
                 ),
                 &project::ProjectEvent::Routed {
                     source: project::ProjectSubscription::Enrolment,
@@ -4320,6 +4938,7 @@ mod project_discovery_ingestion_tests {
                 &mut discovered,
                 &mut enrolments,
                 &mut queue,
+                &mut ledger,
             ),
             &project::ProjectEvent::Routed {
                 source,
@@ -4346,6 +4965,522 @@ mod project_discovery_ingestion_tests {
             .expect("sign")
     }
 
+    /// Mint a sibling attestation the way production does.
+    ///
+    /// Goes through [`ProjectSiblingLookup`] — the same resolver the run loop
+    /// uses — rather than around it, because `VerifiedSibling`'s constructor is
+    /// private to `project` and a test that could fabricate one would prove
+    /// nothing about the path that grants trust.
+    fn attested(author: &str, owner: &str) -> Option<project::VerifiedSibling> {
+        use project::SiblingResolver as _;
+        ProjectSiblingLookup {
+            author: author.to_ascii_lowercase(),
+            owner: owner.to_ascii_lowercase(),
+            verified: true,
+        }
+        .resolve(author, owner)
+    }
+
+    /// NIP-PC, end to end on the project surface: a call from a verified
+    /// same-owner sibling, on a root the agent is enrolled in, becomes a queued
+    /// turn under that root's session key.
+    ///
+    /// This is the production path, not a neighbouring one: the event is built
+    /// by the same `buzz-sdk` builder `buzz agents call` uses, and it is
+    /// dispatched through `handle_project_event` — the function the run loop
+    /// calls — against live discovery and enrolment state.
+    ///
+    /// Three controls travel with it, because "a call woke the agent" is only
+    /// meaningful if the neighbouring cases do not:
+    ///
+    /// - the identical call with **no attestation** is refused, so the wake is
+    ///   attributable to verified sibling trust rather than to the envelope
+    ///   merely being well-formed;
+    /// - an ordinary `kind:1` reply from the same trusted agent, `p`-tagging
+    ///   the agent exactly as Desktop writes it, is refused — this is the reply
+    ///   loop the envelope exists to prevent;
+    /// - a call from an attested sibling addressed to **somebody else** is
+    ///   refused, so `p` is doing real work.
+    #[tokio::test]
+    async fn a_sibling_call_on_an_enrolled_root_becomes_a_turn_on_that_root() {
+        use buzz_sdk::builders::{build_peer_call, PeerCallMeta};
+
+        let owner = Keys::generate();
+        let agent = Keys::generate();
+        let peer = Keys::generate();
+        let agent_identity = project::AgentIdentity::new(&agent.public_key()).unwrap();
+        let owner_hex = owner.public_key().to_hex();
+        let agent_hex = agent.public_key().to_hex().to_ascii_lowercase();
+        let peer_hex = peer.public_key().to_hex().to_ascii_lowercase();
+        let humans = std::collections::BTreeSet::new();
+        let externals = std::collections::BTreeSet::new();
+        let mut discovered = project::DiscoveredRepositories::new();
+        let mut enrolments = project::ProjectEnrolments::new();
+        let mut queue = EventQueue::new(config::DedupMode::Queue);
+        let mut ledger = peer_call::CallLedger::new();
+
+        handle_project_event(
+            &mut dispatch_over(
+                &agent_identity,
+                Some(&owner_hex),
+                &humans,
+                &externals,
+                &mut discovered,
+                &mut enrolments,
+                &mut queue,
+                &mut ledger,
+            ),
+            &project::ProjectEvent::Discovery {
+                announcement: proven_announcement(&owner, "proj").await,
+            },
+        );
+
+        // The owner opens an issue naming the agent, which is what enrols it.
+        let root = root_event(
+            &owner,
+            &agent,
+            "proj",
+            buzz_core::kind::KIND_GIT_ISSUE,
+            "please look at this",
+        );
+        let root_id = root.id.to_hex().to_ascii_lowercase();
+        let coordinate = format!("30617:{owner_hex}:proj");
+        let verified = project::VerifiedProjectEvent::verify(root)
+            .await
+            .expect("valid");
+        let route = project::ProjectRoute::derive(&verified).expect("routes");
+        let enrolled = handle_project_event(
+            &mut dispatch_over(
+                &agent_identity,
+                Some(&owner_hex),
+                &humans,
+                &externals,
+                &mut discovered,
+                &mut enrolments,
+                &mut queue,
+                &mut ledger,
+            ),
+            &project::ProjectEvent::Routed {
+                source: project::ProjectSubscription::Enrolment,
+                route,
+                event: verified,
+            },
+        );
+        assert!(
+            matches!(enrolled, ProjectDispatched::Queued { .. }),
+            "the owner's mention must enrol the root, got {enrolled:?}"
+        );
+
+        let peer_route = buzz_core::peer_call::PeerCallRoute::Project {
+            coordinate: coordinate.clone(),
+            root: root_id.clone(),
+        };
+        let call = |callee: &str, nonce: &str| {
+            build_peer_call(
+                &peer_hex,
+                "summarise the discussion so far",
+                &PeerCallMeta {
+                    callee: callee.to_string(),
+                    route: peer_route.clone(),
+                    nonce: nonce.to_string(),
+                    hop: 1,
+                    visited: vec![peer_hex.clone()],
+                },
+            )
+            .expect("well-formed call")
+            .sign_with_keys(&peer)
+            .expect("sign")
+        };
+
+        // ── The outcome ──────────────────────────────────────────────────────
+        let verified = project::VerifiedProjectEvent::verify(call(
+            &agent_hex,
+            "0123456789abcdef0123456789abcdef",
+        ))
+        .await
+        .expect("valid");
+        let route = project::ProjectRoute::derive(&verified).expect("a call routes to its root");
+        let expected_key = route.key();
+        let dispatched = handle_project_event(
+            &mut dispatch_over_sibling(
+                &agent_identity,
+                Some(&owner_hex),
+                &humans,
+                &externals,
+                &mut discovered,
+                &mut enrolments,
+                &mut queue,
+                &mut ledger,
+                attested(&peer_hex, &owner_hex),
+            ),
+            &project::ProjectEvent::Routed {
+                source: project::ProjectSubscription::Watched { generation: 0 },
+                route,
+                event: verified,
+            },
+        );
+        match dispatched {
+            ProjectDispatched::Queued { queued, .. } => assert!(
+                queued,
+                "the call was accepted but nothing was queued for the agent to run"
+            ),
+            other => panic!("a trusted sibling's call must wake the agent, got {other:?}"),
+        }
+        assert_eq!(
+            expected_key,
+            project::project_route_key(&root_id).expect("root keys"),
+            "the turn must run under the issue's own session, not a new one"
+        );
+
+        // ── Control: the same call, unattested ───────────────────────────────
+        let verified = project::VerifiedProjectEvent::verify(call(
+            &agent_hex,
+            "fedcba9876543210fedcba9876543210",
+        ))
+        .await
+        .expect("valid");
+        let route = project::ProjectRoute::derive(&verified).expect("routes");
+        let unattested = handle_project_event(
+            &mut dispatch_over(
+                &agent_identity,
+                Some(&owner_hex),
+                &humans,
+                &externals,
+                &mut discovered,
+                &mut enrolments,
+                &mut queue,
+                &mut ledger,
+            ),
+            &project::ProjectEvent::Routed {
+                source: project::ProjectSubscription::Watched { generation: 0 },
+                route,
+                event: verified,
+            },
+        );
+        assert_eq!(
+            unattested,
+            ProjectDispatched::Ignored,
+            "without a NIP-OA attestation the caller is an untrusted relay identity"
+        );
+
+        // ── Control: an ordinary reply from the same trusted agent ───────────
+        let reply = EventBuilder::new(nostr::Kind::Custom(1), "thanks, taking a look")
+            .tags([
+                nostr::Tag::parse(["a", &coordinate]).unwrap(),
+                nostr::Tag::parse(["e", &root_id, "", "root"]).unwrap(),
+                nostr::Tag::parse(["p", &agent_hex]).unwrap(),
+            ])
+            .sign_with_keys(&peer)
+            .expect("sign");
+        let verified = project::VerifiedProjectEvent::verify(reply)
+            .await
+            .expect("valid");
+        let route = project::ProjectRoute::derive(&verified).expect("routes");
+        let ordinary = handle_project_event(
+            &mut dispatch_over_sibling(
+                &agent_identity,
+                Some(&owner_hex),
+                &humans,
+                &externals,
+                &mut discovered,
+                &mut enrolments,
+                &mut queue,
+                &mut ledger,
+                attested(&peer_hex, &owner_hex),
+            ),
+            &project::ProjectEvent::Routed {
+                source: project::ProjectSubscription::Watched { generation: 0 },
+                route,
+                event: verified,
+            },
+        );
+        assert_eq!(
+            ordinary,
+            ProjectDispatched::Ignored,
+            "a trusted agent's bare p-tagged reply must never become an invocation"
+        );
+
+        // ── Control: a call addressed to a third party ───────────────────────
+        let elsewhere = Keys::generate().public_key().to_hex().to_ascii_lowercase();
+        let verified = project::VerifiedProjectEvent::verify(call(
+            &elsewhere,
+            "00112233445566778899aabbccddeeff",
+        ))
+        .await
+        .expect("valid");
+        let route = project::ProjectRoute::derive(&verified).expect("routes");
+        let not_ours = handle_project_event(
+            &mut dispatch_over_sibling(
+                &agent_identity,
+                Some(&owner_hex),
+                &humans,
+                &externals,
+                &mut discovered,
+                &mut enrolments,
+                &mut queue,
+                &mut ledger,
+                attested(&peer_hex, &owner_hex),
+            ),
+            &project::ProjectEvent::Routed {
+                source: project::ProjectSubscription::Watched { generation: 0 },
+                route,
+                event: verified,
+            },
+        );
+        assert_eq!(
+            not_ours,
+            ProjectDispatched::Ignored,
+            "a call naming another agent is not this agent's to answer"
+        );
+    }
+
+    /// The other half of the loop on the project surface: the agent's own call
+    /// is registered from the watched-root stream, and the callee's correlated
+    /// result comes back as a turn under the *same* issue session.
+    ///
+    /// Controls travel with it, because "a result woke the agent" would be a
+    /// much worse outcome than no result at all if any of these also woke it:
+    ///
+    /// - a result for a call this agent never made resumes nothing;
+    /// - a second result for the same call is refused;
+    /// - a result from somebody other than the callee is refused, so holding a
+    ///   call id does not let a third party answer for the agent that was asked.
+    #[tokio::test]
+    async fn our_own_project_call_is_registered_and_its_result_resumes_the_issue() {
+        use buzz_sdk::builders::{build_peer_call, build_peer_call_result, PeerCallMeta};
+
+        let owner = Keys::generate();
+        let agent = Keys::generate();
+        let peer = Keys::generate();
+        let agent_identity = project::AgentIdentity::new(&agent.public_key()).unwrap();
+        let owner_hex = owner.public_key().to_hex();
+        let agent_hex = agent.public_key().to_hex().to_ascii_lowercase();
+        let peer_hex = peer.public_key().to_hex().to_ascii_lowercase();
+        let humans = std::collections::BTreeSet::new();
+        let externals = std::collections::BTreeSet::new();
+        let mut discovered = project::DiscoveredRepositories::new();
+        let mut enrolments = project::ProjectEnrolments::new();
+        let mut queue = EventQueue::new(config::DedupMode::Queue);
+        let mut ledger = peer_call::CallLedger::new();
+
+        handle_project_event(
+            &mut dispatch_over(
+                &agent_identity,
+                Some(&owner_hex),
+                &humans,
+                &externals,
+                &mut discovered,
+                &mut enrolments,
+                &mut queue,
+                &mut ledger,
+            ),
+            &project::ProjectEvent::Discovery {
+                announcement: proven_announcement(&owner, "proj").await,
+            },
+        );
+
+        let root = root_event(
+            &owner,
+            &agent,
+            "proj",
+            buzz_core::kind::KIND_GIT_ISSUE,
+            "please look at this",
+        );
+        let root_id = root.id.to_hex().to_ascii_lowercase();
+        let coordinate = format!("30617:{owner_hex}:proj");
+        let verified = project::VerifiedProjectEvent::verify(root)
+            .await
+            .expect("valid");
+        let route = project::ProjectRoute::derive(&verified).expect("routes");
+        let expected_key = route.key();
+        handle_project_event(
+            &mut dispatch_over(
+                &agent_identity,
+                Some(&owner_hex),
+                &humans,
+                &externals,
+                &mut discovered,
+                &mut enrolments,
+                &mut queue,
+                &mut ledger,
+            ),
+            &project::ProjectEvent::Routed {
+                source: project::ProjectSubscription::Enrolment,
+                route,
+                event: verified,
+            },
+        );
+
+        let peer_route = buzz_core::peer_call::PeerCallRoute::Project {
+            coordinate,
+            root: root_id.clone(),
+        };
+        let (hop, visited) = buzz_core::peer_call::onward_context(&[], &agent_hex);
+        let ours = build_peer_call(
+            &agent_hex,
+            "check the failing test for me",
+            &PeerCallMeta {
+                callee: peer_hex.clone(),
+                route: peer_route.clone(),
+                nonce: "0123456789abcdef0123456789abcdef".into(),
+                hop,
+                visited,
+            },
+        )
+        .expect("well-formed call")
+        .sign_with_keys(&agent)
+        .expect("sign");
+        let call_id = ours
+            .tags
+            .iter()
+            .find_map(|t| {
+                let s = t.as_slice();
+                (s.first().map(String::as_str) == Some("call")).then(|| s[1].clone())
+            })
+            .expect("a call carries its id");
+
+        // Our own call comes back down the watched-root REQ. It must not wake
+        // us, and it must be registered.
+        let verified = project::VerifiedProjectEvent::verify(ours)
+            .await
+            .expect("valid");
+        let route = project::ProjectRoute::derive(&verified).expect("routes");
+        let own = handle_project_event(
+            &mut dispatch_over(
+                &agent_identity,
+                Some(&owner_hex),
+                &humans,
+                &externals,
+                &mut discovered,
+                &mut enrolments,
+                &mut queue,
+                &mut ledger,
+            ),
+            &project::ProjectEvent::Routed {
+                source: project::ProjectSubscription::Watched { generation: 0 },
+                route,
+                event: verified,
+            },
+        );
+        assert_eq!(
+            own,
+            ProjectDispatched::Ignored,
+            "an agent's own call must not wake it"
+        );
+        assert_eq!(
+            ledger.outstanding_count(),
+            1,
+            "the call must be registered from the wire, or its result correlates to nothing"
+        );
+
+        // ── Control: a result nobody asked for ───────────────────────────────
+        let unasked = build_peer_call_result(&agent_hex, &"ab".repeat(32), "unasked", &peer_route)
+            .expect("well-formed")
+            .sign_with_keys(&peer)
+            .expect("sign");
+        let verified = project::VerifiedProjectEvent::verify(unasked)
+            .await
+            .expect("valid");
+        let route = project::ProjectRoute::derive(&verified).expect("routes");
+        assert_eq!(
+            handle_project_event(
+                &mut dispatch_over_sibling(
+                    &agent_identity,
+                    Some(&owner_hex),
+                    &humans,
+                    &externals,
+                    &mut discovered,
+                    &mut enrolments,
+                    &mut queue,
+                    &mut ledger,
+                    attested(&peer_hex, &owner_hex),
+                ),
+                &project::ProjectEvent::Routed {
+                    source: project::ProjectSubscription::Watched { generation: 0 },
+                    route,
+                    event: verified,
+                },
+            ),
+            ProjectDispatched::Ignored,
+            "a result correlating to no outstanding call is not a prompt"
+        );
+
+        // ── Control: a third party answering for the callee ──────────────────
+        let impostor = Keys::generate();
+        let forged = build_peer_call_result(&agent_hex, &call_id, "me instead", &peer_route)
+            .expect("well-formed")
+            .sign_with_keys(&impostor)
+            .expect("sign");
+        let impostor_hex = impostor.public_key().to_hex().to_ascii_lowercase();
+        let verified = project::VerifiedProjectEvent::verify(forged)
+            .await
+            .expect("valid");
+        let route = project::ProjectRoute::derive(&verified).expect("routes");
+        assert_eq!(
+            handle_project_event(
+                &mut dispatch_over_sibling(
+                    &agent_identity,
+                    Some(&owner_hex),
+                    &humans,
+                    &externals,
+                    &mut discovered,
+                    &mut enrolments,
+                    &mut queue,
+                    &mut ledger,
+                    attested(&impostor_hex, &owner_hex),
+                ),
+                &project::ProjectEvent::Routed {
+                    source: project::ProjectSubscription::Watched { generation: 0 },
+                    route,
+                    event: verified,
+                },
+            ),
+            ProjectDispatched::Ignored,
+            "only the agent the call was addressed to may answer it"
+        );
+        assert_eq!(ledger.outstanding_count(), 1, "the call is still open");
+
+        // ── The outcome: the callee's result resumes the issue ───────────────
+        let answer =
+            build_peer_call_result(&agent_hex, &call_id, "it was the fixture", &peer_route)
+                .expect("well-formed")
+                .sign_with_keys(&peer)
+                .expect("sign");
+        let verified = project::VerifiedProjectEvent::verify(answer)
+            .await
+            .expect("valid");
+        let route = project::ProjectRoute::derive(&verified).expect("routes");
+        let resumed = handle_project_event(
+            &mut dispatch_over_sibling(
+                &agent_identity,
+                Some(&owner_hex),
+                &humans,
+                &externals,
+                &mut discovered,
+                &mut enrolments,
+                &mut queue,
+                &mut ledger,
+                attested(&peer_hex, &owner_hex),
+            ),
+            &project::ProjectEvent::Routed {
+                source: project::ProjectSubscription::Watched { generation: 0 },
+                route,
+                event: verified,
+            },
+        );
+        match resumed {
+            ProjectDispatched::Queued { key, queued, .. } => {
+                assert!(queued, "the result was correlated but nothing was queued");
+                assert_eq!(
+                    key, expected_key,
+                    "the result must resume the issue's own session, not a new one"
+                );
+            }
+            other => panic!("a correlated result must resume the call, got {other:?}"),
+        }
+        assert_eq!(ledger.outstanding_count(), 0, "the call is closed");
+    }
+
     /// The watched-root REQ is replaced only when the watched set actually
     /// changed. Without this, a `watch_changed` that never became true would
     /// leave the subscription unissued and nothing would fail — and a
@@ -4362,6 +5497,7 @@ mod project_discovery_ingestion_tests {
         let mut discovered = project::DiscoveredRepositories::new();
         let mut enrolments = project::ProjectEnrolments::new();
         let mut queue = EventQueue::new(config::DedupMode::Queue);
+        let mut ledger = peer_call::CallLedger::new();
 
         handle_project_event(
             &mut dispatch_over(
@@ -4372,6 +5508,7 @@ mod project_discovery_ingestion_tests {
                 &mut discovered,
                 &mut enrolments,
                 &mut queue,
+                &mut ledger,
             ),
             &project::ProjectEvent::Discovery {
                 announcement: proven_announcement(&owner, "proj").await,
@@ -4399,6 +5536,7 @@ mod project_discovery_ingestion_tests {
                 &mut discovered,
                 &mut enrolments,
                 &mut queue,
+                &mut ledger,
             ),
             &project::ProjectEvent::Routed {
                 source: project::ProjectSubscription::Enrolment,
@@ -4430,6 +5568,7 @@ mod project_discovery_ingestion_tests {
                 &mut discovered,
                 &mut enrolments,
                 &mut queue,
+                &mut ledger,
             ),
             &project::ProjectEvent::Routed {
                 source: project::ProjectSubscription::Enrolment,
@@ -4496,6 +5635,7 @@ mod project_discovery_ingestion_tests {
         let mut discovered = project::DiscoveredRepositories::new();
         let mut enrolments = project::ProjectEnrolments::new();
         let mut queue = EventQueue::new(config::DedupMode::Queue);
+        let mut ledger = peer_call::CallLedger::new();
         let subscriber = RecordingSubscriber::default();
 
         for keys in [&owner_a, &owner_b] {
@@ -4509,6 +5649,7 @@ mod project_discovery_ingestion_tests {
                     &mut discovered,
                     &mut enrolments,
                     &mut queue,
+                    &mut ledger,
                 ),
                 &subscriber,
                 &agent_hex,
@@ -4559,6 +5700,7 @@ mod project_discovery_ingestion_tests {
         let mut discovered = project::DiscoveredRepositories::new();
         let mut enrolments = project::ProjectEnrolments::new();
         let mut queue = EventQueue::new(config::DedupMode::Queue);
+        let mut ledger = peer_call::CallLedger::new();
         let subscriber = RecordingSubscriber::default();
 
         macro_rules! drive {
@@ -4572,6 +5714,7 @@ mod project_discovery_ingestion_tests {
                         &mut discovered,
                         &mut enrolments,
                         &mut queue,
+                        &mut ledger,
                     ),
                     &subscriber,
                     &agent_hex,
@@ -6447,6 +7590,7 @@ mod build_mcp_servers_tests {
             relay_observer: false,
             lazy_pool: false,
             project_routing_enabled: false,
+            peer_agents: HashSet::new(),
             agent_owner: None,
             no_base_prompt: false,
             base_prompt_content: None,
@@ -6669,6 +7813,7 @@ mod error_outcome_emission_tests {
             relay_observer: false,
             lazy_pool: false,
             project_routing_enabled: false,
+            peer_agents: HashSet::new(),
             agent_owner: None,
             no_base_prompt: false,
             base_prompt_content: None,
@@ -8096,5 +9241,547 @@ mod observer_payload_trim_tests {
         assert!(leaf.starts_with('…'));
         assert!(leaf.ends_with('…'));
         assert!(leaf.contains("[elided"));
+    }
+}
+
+/// NIP-PC on the channel surface.
+///
+/// These exercise [`decide_channel_peer_event`] and [`resolve_peer_trust`] —
+/// the two functions the run loop actually calls for a channel-routed call —
+/// against events built by the same `buzz-sdk` builders `buzz agents call`
+/// uses. Nothing here reconstructs the decision: the ledger is the production
+/// one, and the only thing supplied from outside is the trust class, because
+/// resolving it is async and the decision is not.
+#[cfg(test)]
+mod peer_call_channel_tests {
+    use super::*;
+    use buzz_core::peer_call::{onward_context, PeerCallRoute, MAX_FANOUT};
+    use buzz_sdk::builders::{build_peer_call, build_peer_call_result, PeerCallMeta};
+    use nostr::{EventBuilder, JsonUtil, Keys};
+
+    /// A `RestClient` that is never used: every trust decision asserted here
+    /// resolves from the owner pubkey, the external list or the sibling cache
+    /// before any HTTP call is attempted.
+    fn dummy_rest_client() -> relay::RestClient {
+        relay::RestClient {
+            http: reqwest::Client::new(),
+            base_url: "http://localhost:0".into(),
+            keys: Keys::generate(),
+            auth_tag_json: None,
+        }
+    }
+
+    fn hex_of(k: &Keys) -> String {
+        k.public_key().to_hex().to_ascii_lowercase()
+    }
+
+    fn channel_route(channel: uuid::Uuid) -> PeerCallRoute {
+        PeerCallRoute::Channel {
+            channel: channel.to_string(),
+            thread_root: None,
+        }
+    }
+
+    /// A signed call, built the way the CLI builds one.
+    fn call(caller: &Keys, callee_hex: &str, route: &PeerCallRoute, nonce: &str) -> nostr::Event {
+        let (hop, visited) = onward_context(&[], &hex_of(caller));
+        build_peer_call(
+            &hex_of(caller),
+            "summarise the thread",
+            &PeerCallMeta {
+                callee: callee_hex.to_string(),
+                route: route.clone(),
+                nonce: nonce.into(),
+                hop,
+                visited,
+            },
+        )
+        .expect("well-formed call")
+        .sign_with_keys(caller)
+        .expect("sign")
+    }
+
+    fn call_id_of(event: &nostr::Event) -> String {
+        event
+            .tags
+            .iter()
+            .find_map(|t| {
+                let s = t.as_slice();
+                (s.first().map(String::as_str) == Some("call")).then(|| s[1].clone())
+            })
+            .expect("a call carries its id")
+    }
+
+    fn result(
+        callee: &Keys,
+        caller_hex: &str,
+        call_id: &str,
+        route: &PeerCallRoute,
+        body: &str,
+    ) -> nostr::Event {
+        build_peer_call_result(caller_hex, call_id, body, route)
+            .expect("well-formed result")
+            .sign_with_keys(callee)
+            .expect("sign")
+    }
+
+    /// The outcome: one explicit trusted call becomes exactly one turn, on the
+    /// channel it was made from — and the three neighbouring events that must
+    /// not.
+    #[test]
+    fn a_trusted_call_in_a_channel_becomes_one_turn_on_that_channel() {
+        let agent = Keys::generate();
+        let peer = Keys::generate();
+        let channel = uuid::Uuid::new_v4();
+        let route = channel_route(channel);
+        let mut ledger = peer_call::CallLedger::new();
+
+        let event = call(
+            &peer,
+            &hex_of(&agent),
+            &route,
+            "0123456789abcdef0123456789abcdef",
+        );
+        assert_eq!(
+            decide_channel_peer_event(
+                &event,
+                channel,
+                &hex_of(&agent),
+                peer_call::PeerTrust::TrustedAgent,
+                &mut ledger,
+            ),
+            ChannelPeerOutcome::Turn {
+                channel_id: channel,
+                prompt_tag: "@call",
+            },
+        );
+
+        // Once. The identical delivery — a reconnect replay, or a caller that
+        // retries — must not run the task a second time.
+        assert_eq!(
+            decide_channel_peer_event(
+                &event,
+                channel,
+                &hex_of(&agent),
+                peer_call::PeerTrust::TrustedAgent,
+                &mut ledger,
+            ),
+            ChannelPeerOutcome::Consumed,
+            "a replayed call id must not produce a second turn"
+        );
+
+        // An ordinary message from the same trusted agent, p-tagging the agent
+        // exactly as a client writes a reply, is not a call at all — it leaves
+        // this path untouched for the ordinary channel rules to judge.
+        let reply = EventBuilder::new(nostr::Kind::Custom(9), "thanks, looking")
+            .tags([nostr::Tag::parse(["p", &hex_of(&agent)]).unwrap()])
+            .sign_with_keys(&peer)
+            .expect("sign");
+        assert_eq!(
+            decide_channel_peer_event(
+                &reply,
+                channel,
+                &hex_of(&agent),
+                peer_call::PeerTrust::TrustedAgent,
+                &mut ledger,
+            ),
+            ChannelPeerOutcome::NotPeerCall,
+        );
+
+        // A call naming a third agent arrives here too — the peer-call REQ
+        // carries a channel's traffic, not only ours — and is not ours to run.
+        let elsewhere = Keys::generate();
+        let not_ours = call(
+            &peer,
+            &hex_of(&elsewhere),
+            &route,
+            "fedcba9876543210fedcba9876543210",
+        );
+        assert_eq!(
+            decide_channel_peer_event(
+                &not_ours,
+                channel,
+                &hex_of(&agent),
+                peer_call::PeerTrust::TrustedAgent,
+                &mut ledger,
+            ),
+            ChannelPeerOutcome::Consumed,
+        );
+    }
+
+    /// The refusal is about trust and nothing else: the identical envelope from
+    /// a trusted author is admitted. Without the control this would also pass
+    /// if the envelope were simply malformed.
+    #[test]
+    fn an_untrusted_relay_identity_cannot_invoke_through_the_channel_path() {
+        let agent = Keys::generate();
+        let stranger = Keys::generate();
+        let channel = uuid::Uuid::new_v4();
+        let route = channel_route(channel);
+        let event = call(
+            &stranger,
+            &hex_of(&agent),
+            &route,
+            "0123456789abcdef0123456789abcdef",
+        );
+
+        let mut refused = peer_call::CallLedger::new();
+        assert_eq!(
+            decide_channel_peer_event(
+                &event,
+                channel,
+                &hex_of(&agent),
+                peer_call::PeerTrust::Untrusted,
+                &mut refused,
+            ),
+            ChannelPeerOutcome::Consumed,
+        );
+
+        let mut admitted = peer_call::CallLedger::new();
+        assert_eq!(
+            decide_channel_peer_event(
+                &event,
+                channel,
+                &hex_of(&agent),
+                peer_call::PeerTrust::TrustedAgent,
+                &mut admitted,
+            ),
+            ChannelPeerOutcome::Turn {
+                channel_id: channel,
+                prompt_tag: "@call",
+            },
+        );
+    }
+
+    /// The caller half, end to end through the production decision function:
+    /// this agent's own published call is registered from the wire, and the
+    /// callee's result comes back as a correlated turn.
+    ///
+    /// This is the half that cannot work without the `authors` filter on the
+    /// peer-call REQ: nothing else tells the harness a call was made, because
+    /// the harness never publishes one.
+    #[test]
+    fn our_own_call_is_registered_from_the_wire_and_its_result_returns() {
+        let agent = Keys::generate();
+        let callee = Keys::generate();
+        let channel = uuid::Uuid::new_v4();
+        let route = channel_route(channel);
+        let mut ledger = peer_call::CallLedger::new();
+
+        let ours = call(
+            &agent,
+            &hex_of(&callee),
+            &route,
+            "0123456789abcdef0123456789abcdef",
+        );
+        assert_eq!(
+            decide_channel_peer_event(
+                &ours,
+                channel,
+                &hex_of(&agent),
+                peer_call::PeerTrust::SelfAuthored,
+                &mut ledger,
+            ),
+            ChannelPeerOutcome::Consumed,
+            "our own call is not a turn for us"
+        );
+        assert_eq!(
+            ledger.outstanding_count(),
+            1,
+            "the call must be registered, or its result correlates to nothing"
+        );
+
+        let call_id = call_id_of(&ours);
+        let answer = result(
+            &callee,
+            &hex_of(&agent),
+            &call_id,
+            &route,
+            "it was the fixture",
+        );
+        assert_eq!(
+            decide_channel_peer_event(
+                &answer,
+                channel,
+                &hex_of(&agent),
+                peer_call::PeerTrust::TrustedAgent,
+                &mut ledger,
+            ),
+            ChannelPeerOutcome::Turn {
+                channel_id: channel,
+                prompt_tag: "@call-result",
+            },
+        );
+        assert_eq!(ledger.outstanding_count(), 0, "the call is closed");
+
+        // Exactly one result per call.
+        assert_eq!(
+            decide_channel_peer_event(
+                &answer,
+                channel,
+                &hex_of(&agent),
+                peer_call::PeerTrust::TrustedAgent,
+                &mut ledger,
+            ),
+            ChannelPeerOutcome::Consumed,
+        );
+
+        // And a third party holding the call id cannot answer for the callee.
+        let impostor = Keys::generate();
+        let forged = result(&impostor, &hex_of(&agent), &call_id, &route, "me instead");
+        let mut fresh = peer_call::CallLedger::new();
+        decide_channel_peer_event(
+            &ours,
+            channel,
+            &hex_of(&agent),
+            peer_call::PeerTrust::SelfAuthored,
+            &mut fresh,
+        );
+        assert_eq!(
+            decide_channel_peer_event(
+                &forged,
+                channel,
+                &hex_of(&agent),
+                peer_call::PeerTrust::TrustedAgent,
+                &mut fresh,
+            ),
+            ChannelPeerOutcome::Consumed,
+        );
+    }
+
+    /// A result correlating to nothing is not a prompt. This is the case that
+    /// makes an outstanding-call ledger necessary rather than decorative: a
+    /// trusted peer can publish a well-formed result at any time.
+    #[test]
+    fn a_result_for_a_call_we_never_made_is_not_a_turn() {
+        let agent = Keys::generate();
+        let peer = Keys::generate();
+        let channel = uuid::Uuid::new_v4();
+        let route = channel_route(channel);
+        let mut ledger = peer_call::CallLedger::new();
+
+        let answer = result(&peer, &hex_of(&agent), &"ab".repeat(32), &route, "unasked");
+        assert_eq!(
+            decide_channel_peer_event(
+                &answer,
+                channel,
+                &hex_of(&agent),
+                peer_call::PeerTrust::TrustedAgent,
+                &mut ledger,
+            ),
+            ChannelPeerOutcome::Consumed,
+        );
+    }
+
+    /// Fan-out is bounded where it is issued, through the same path production
+    /// registers calls on. The eleventh concurrent call on one route is not
+    /// registered, and its result therefore correlates to nothing — which is
+    /// what makes the ceiling an effect rather than a log line.
+    #[test]
+    fn fan_out_is_bounded_at_ten_outstanding_calls_on_one_route() {
+        let agent = Keys::generate();
+        let channel = uuid::Uuid::new_v4();
+        let route = channel_route(channel);
+        let mut ledger = peer_call::CallLedger::new();
+
+        let mut over_the_line = None;
+        for i in 0..=MAX_FANOUT {
+            let callee = Keys::generate();
+            let nonce = format!("{i:032x}");
+            let ours = call(&agent, &hex_of(&callee), &route, &nonce);
+            decide_channel_peer_event(
+                &ours,
+                channel,
+                &hex_of(&agent),
+                peer_call::PeerTrust::SelfAuthored,
+                &mut ledger,
+            );
+            if i == MAX_FANOUT {
+                over_the_line = Some((callee, ours));
+            }
+        }
+        assert_eq!(ledger.outstanding_count(), MAX_FANOUT);
+
+        let (callee, refused_call) = over_the_line.expect("the eleventh call");
+        let answer = result(
+            &callee,
+            &hex_of(&agent),
+            &call_id_of(&refused_call),
+            &route,
+            "done anyway",
+        );
+        assert_eq!(
+            decide_channel_peer_event(
+                &answer,
+                channel,
+                &hex_of(&agent),
+                peer_call::PeerTrust::TrustedAgent,
+                &mut ledger,
+            ),
+            ChannelPeerOutcome::Consumed,
+            "a call past the fan-out ceiling was never registered, so nothing resumes"
+        );
+    }
+
+    /// The envelope's declared route must be the channel it arrived on. A
+    /// project-routed envelope reaching the channel path is the same failure in
+    /// its sharpest form: its route resolves to an issue's session key, not to
+    /// any channel.
+    #[test]
+    fn a_call_whose_route_is_not_its_delivery_channel_is_refused() {
+        let agent = Keys::generate();
+        let peer = Keys::generate();
+        let declared = uuid::Uuid::new_v4();
+        let delivered_on = uuid::Uuid::new_v4();
+        let mut ledger = peer_call::CallLedger::new();
+
+        let event = call(
+            &peer,
+            &hex_of(&agent),
+            &channel_route(declared),
+            "0123456789abcdef0123456789abcdef",
+        );
+        assert_eq!(
+            decide_channel_peer_event(
+                &event,
+                delivered_on,
+                &hex_of(&agent),
+                peer_call::PeerTrust::TrustedAgent,
+                &mut ledger,
+            ),
+            ChannelPeerOutcome::Consumed,
+        );
+
+        let project = call(
+            &peer,
+            &hex_of(&agent),
+            &PeerCallRoute::Project {
+                coordinate: format!("30617:{}:buzz", hex_of(&peer)),
+                root: "48be1cc2000000000000000000000000000000000000000000000000000000ab".into(),
+            },
+            "0123456789abcdef0123456789abcdef",
+        );
+        assert_eq!(
+            decide_channel_peer_event(
+                &project,
+                delivered_on,
+                &hex_of(&agent),
+                peer_call::PeerTrust::TrustedAgent,
+                &mut ledger,
+            ),
+            ChannelPeerOutcome::Consumed,
+        );
+    }
+
+    /// A tampered event never reaches the envelope parser: verification is done
+    /// here, not inherited from the transport.
+    #[test]
+    fn a_tampered_call_is_not_admitted() {
+        let agent = Keys::generate();
+        let peer = Keys::generate();
+        let channel = uuid::Uuid::new_v4();
+        let route = channel_route(channel);
+        let mut ledger = peer_call::CallLedger::new();
+
+        let honest = call(
+            &peer,
+            &hex_of(&agent),
+            &route,
+            "0123456789abcdef0123456789abcdef",
+        );
+        let mut json: serde_json::Value =
+            serde_json::from_str(&honest.as_json()).expect("event json");
+        json["content"] = serde_json::json!("rm -rf /");
+        let tampered: nostr::Event =
+            serde_json::from_value(json).expect("still a syntactically valid event");
+
+        assert_eq!(
+            decide_channel_peer_event(
+                &tampered,
+                channel,
+                &hex_of(&agent),
+                peer_call::PeerTrust::TrustedAgent,
+                &mut ledger,
+            ),
+            ChannelPeerOutcome::Consumed,
+        );
+        assert_eq!(ledger.outstanding_count(), 0);
+    }
+
+    /// Invocation trust is its own question. `RespondTo::Anyone` and the
+    /// respond-to allowlist do not appear in this function at all, which is the
+    /// point: a channel may be permissive without that conferring the right to
+    /// invoke.
+    #[tokio::test]
+    async fn invocation_trust_comes_from_ownership_not_from_channel_policy() {
+        let agent = "aa".repeat(32);
+        let owner = "bb".repeat(32);
+        let sibling = "cc".repeat(32);
+        let external = "dd".repeat(32);
+        let stranger = "ee".repeat(32);
+
+        let cache = OwnerCache::new(Some(owner.clone()));
+        cache.cache_sibling(sibling.clone(), true);
+        cache.cache_sibling(stranger.clone(), false);
+        cache.cache_sibling(external.clone(), false);
+        let approved: std::collections::BTreeSet<String> = [external.clone()].into_iter().collect();
+        let rest = dummy_rest_client();
+
+        let trust = |who: String, approved: std::collections::BTreeSet<String>| {
+            let cache = &cache;
+            let rest = &rest;
+            let agent = agent.clone();
+            async move { resolve_peer_trust(&who, &agent, &approved, cache, rest).await }
+        };
+
+        assert_eq!(
+            trust(agent.clone(), approved.clone()).await,
+            peer_call::PeerTrust::SelfAuthored
+        );
+        assert_eq!(
+            trust(owner.clone(), approved.clone()).await,
+            peer_call::PeerTrust::Owner
+        );
+        assert_eq!(
+            trust(sibling.clone(), approved.clone()).await,
+            peer_call::PeerTrust::TrustedAgent,
+            "a verified same-owner sibling may call without being listed"
+        );
+        assert_eq!(
+            trust(external.clone(), approved.clone()).await,
+            peer_call::PeerTrust::TrustedAgent,
+            "an owner-approved external agent may call"
+        );
+        assert_eq!(
+            trust(external.clone(), std::collections::BTreeSet::new()).await,
+            peer_call::PeerTrust::Untrusted,
+            "the same external agent is untrusted once the owner stops listing it"
+        );
+        assert_eq!(
+            trust(stranger.clone(), approved.clone()).await,
+            peer_call::PeerTrust::Untrusted
+        );
+    }
+
+    /// No owner, no siblings. An agent that cannot verify anyone must not fall
+    /// back to trusting everyone.
+    #[tokio::test]
+    async fn an_agent_with_no_owner_trusts_no_sibling() {
+        let agent = "aa".repeat(32);
+        let caller = "cc".repeat(32);
+        let cache = OwnerCache::new(None);
+        cache.cache_sibling(caller.clone(), true);
+
+        assert_eq!(
+            resolve_peer_trust(
+                &caller,
+                &agent,
+                &std::collections::BTreeSet::new(),
+                &cache,
+                &dummy_rest_client(),
+            )
+            .await,
+            peer_call::PeerTrust::Untrusted,
+        );
     }
 }

@@ -117,6 +117,7 @@ use buzz_core::kind::{
     KIND_AGENT_OBSERVER_FRAME, KIND_MEMBER_ADDED_NOTIFICATION, KIND_MEMBER_REMOVED_NOTIFICATION,
     KIND_TYPING_INDICATOR,
 };
+use buzz_core::peer_call::{KIND_PEER_CALL, KIND_PEER_CALL_RESULT};
 use futures_util::{SinkExt, StreamExt};
 use nostr::{Event, EventBuilder, Keys, Kind, RelayUrl, Tag};
 use serde_json::{json, Value};
@@ -522,6 +523,15 @@ enum RelayMessage {
 const MEMBERSHIP_NOTIF_SUB_ID: &str = "membership-notif";
 /// Subscription ID for encrypted owner-to-agent observer control frames.
 const OBSERVER_CONTROL_SUB_ID: &str = "agent-observer-control";
+/// Subscription ID for NIP-PC peer agent calls and their results.
+///
+/// Global rather than per-channel because a call's delivery must not depend on
+/// how the operator configured channel subscriptions. `--subscribe-mode` can set
+/// `kinds` to a list that omits `43001`, and `require_mention` puts `#p:[agent]`
+/// on the whole filter — under which this agent's *own* outgoing calls (whose
+/// `p` names the callee) are never echoed back, and the ledger that correlates
+/// results would never learn the call was made.
+const PEER_CALL_SUB_ID: &str = "peer-call";
 
 /// Commands sent from `HarnessRelay` to the background WebSocket task.
 enum RelayCommand {
@@ -541,6 +551,9 @@ enum RelayCommand {
     SubscribeMembership,
     /// Subscribe to encrypted observer control frames addressed to this agent.
     SubscribeObserverControls,
+    /// Subscribe to NIP-PC peer calls addressed to this agent, and to the
+    /// calls this agent itself publishes.
+    SubscribePeerCalls,
     /// Publish a signed event to the relay (for typing indicators, etc.).
     PublishEvent { event: Box<Event> },
     /// Floor `since` for membership notification replay; events before startup are never re-delivered.
@@ -840,6 +853,15 @@ impl HarnessRelay {
     pub async fn subscribe_observer_controls(&mut self) -> Result<(), RelayError> {
         self.cmd_tx
             .send(RelayCommand::SubscribeObserverControls)
+            .await
+            .map_err(|_| RelayError::ConnectionClosed)?;
+        Ok(())
+    }
+
+    /// Subscribe to NIP-PC peer calls (kind 43001) and results (kind 43004).
+    pub async fn subscribe_peer_calls(&mut self) -> Result<(), RelayError> {
+        self.cmd_tx
+            .send(RelayCommand::SubscribePeerCalls)
             .await
             .map_err(|_| RelayError::ConnectionClosed)?;
         Ok(())
@@ -1161,6 +1183,8 @@ struct BgState {
     membership_sub_active: bool,
     /// Whether the observer control subscription is active.
     observer_control_sub_active: bool,
+    /// Whether the NIP-PC peer-call subscription is active.
+    peer_call_sub_active: bool,
     /// Oldest dropped channel-event timestamp per channel, keyed by channel_id.
     /// Mirrors `membership_dropped_since` but for ordinary channel events.
     /// On reconnect resubscribe, `since` = min(last_seen, channel_dropped_since).
@@ -1201,6 +1225,10 @@ struct BgState {
     /// subscription. The main-loop drain re-sends the REQ once the gate clears,
     /// even when `rate_limited_pending` is empty.
     observer_resub_needed: bool,
+    /// Set when a rate-limited CLOSED arrives for the peer-call subscription,
+    /// or when its REQ could not be written. The main-loop drain re-sends it
+    /// once the gate clears.
+    peer_call_resub_needed: bool,
     /// Observer telemetry frames (kind 24200) parked while the rate-limit gate
     /// is armed. Unlike typing indicators, these frames are durable telemetry:
     /// dropping them silently loses turn history in the Desktop observer.
@@ -1297,6 +1325,7 @@ impl BgState {
             membership_last_seen: None,
             membership_sub_active: false,
             observer_control_sub_active: false,
+            peer_call_sub_active: false,
             channel_dropped_since: HashMap::new(),
             proactive_resubscribe_needed: false,
             startup_watermark: None,
@@ -1305,6 +1334,7 @@ impl BgState {
             rate_limited_pending: HashMap::new(),
             membership_resub_needed: false,
             observer_resub_needed: false,
+            peer_call_resub_needed: false,
             gated_observer_pending: VecDeque::new(),
             observer_in_flight: VecDeque::new(),
             gated_observer_dropped: 0,
@@ -1608,6 +1638,9 @@ fn apply_command_to_state(state: &mut BgState, cmd: RelayCommand) {
         RelayCommand::SubscribeObserverControls => {
             state.observer_control_sub_active = true;
         }
+        RelayCommand::SubscribePeerCalls => {
+            state.peer_call_sub_active = true;
+        }
         RelayCommand::SetStartupWatermark { ts } => {
             state.startup_watermark = Some(ts);
             if state.membership_last_seen.is_none() {
@@ -1899,6 +1932,23 @@ async fn execute_connected_command(
                 false
             }
         }
+        RelayCommand::SubscribePeerCalls => {
+            state.peer_call_sub_active = true;
+            if state.check_rate_gate().is_some() {
+                debug!("rate-gated: deferring peer-call subscription");
+                state.peer_call_resub_needed = true;
+                return true;
+            }
+            let sent = send_peer_call_subscribe(ws, agent_pubkey_hex).await;
+            if sent {
+                state.peer_call_resub_needed = false;
+                true
+            } else {
+                warn!("peer-call subscribe REQ failed — recording intent for reconnect");
+                state.peer_call_resub_needed = true;
+                false
+            }
+        }
         RelayCommand::PublishEvent { event } => {
             // Observer telemetry frames (kind 24200) are durable telemetry, not
             // droppable ephemera: park them while the rate-limit gate is armed —
@@ -2173,6 +2223,15 @@ async fn run_background_task(
                         warn!(
                             "observer control resub after rate-limit failed — will retry next drain"
                         );
+                    }
+                }
+                if state.peer_call_resub_needed && budget > 0 {
+                    if send_peer_call_subscribe(&mut ws, &agent_pubkey_hex).await {
+                        state.peer_call_resub_needed = false;
+                        budget = budget.saturating_sub(1);
+                        any_sent = true;
+                    } else {
+                        warn!("peer-call resub after rate-limit failed — will retry next drain");
                     }
                 }
             }
@@ -2976,6 +3035,71 @@ async fn handle_ws_message(
                             }
                             Err(mpsc::error::TrySendError::Closed(_)) => return false,
                         }
+                    } else if subscription_id == PEER_CALL_SUB_ID {
+                        // Shape gate first, as on the membership subscription:
+                        // this REQ asks for exactly two kinds, so anything else
+                        // is the relay off its own contract and is refused
+                        // before it can spend a dedup slot.
+                        let kind_u32 = event.kind.as_u16() as u32;
+                        if !matches!(kind_u32, KIND_PEER_CALL | KIND_PEER_CALL_RESULT) {
+                            warn!(
+                                kind = kind_u32,
+                                event_id = %event.id.to_hex(),
+                                "non-peer-call kind on the peer-call subscription — refusing"
+                            );
+                            return true;
+                        }
+
+                        // Only the channel route travels this way. A
+                        // project-routed envelope carries `a` + `e` and no `h`,
+                        // and it is delivered by the watched-root REQ that
+                        // already owns that root — enrolment state, session key
+                        // and lifecycle all live there. Splitting on the route
+                        // the envelope itself declares is what keeps a project
+                        // call from arriving twice, once down each path, and
+                        // having the second delivery refused as a replay of the
+                        // first.
+                        let Some(channel_uuid) = extract_h_tag_uuid(&event) else {
+                            debug!(
+                                kind = kind_u32,
+                                event_id = %event.id.to_hex(),
+                                "peer-call envelope with no channel route — left to the project path"
+                            );
+                            return true;
+                        };
+
+                        // Dedup through `seen_ids` directly rather than
+                        // `record_event`, for the same reason membership does:
+                        // this subscription's `since` is its own, and letting a
+                        // peer call advance a channel's replay watermark would
+                        // lose ordinary channel events across a reconnect.
+                        let event_id_hex = event.id.to_hex();
+                        if !state.seen_ids.insert(event_id_hex.clone()) {
+                            debug!(
+                                event_id = %event_id_hex,
+                                "duplicate peer-call event — skipping"
+                            );
+                            return true;
+                        }
+
+                        let buzz_event = BuzzEvent::Channel {
+                            channel_id: channel_uuid,
+                            event: *event,
+                        };
+                        match event_tx.try_send(Some(buzz_event)) {
+                            Ok(()) => {}
+                            Err(mpsc::error::TrySendError::Full(_)) => {
+                                // Release the id so a replay can re-deliver it:
+                                // it never reached the harness.
+                                state.seen_ids.remove(&event_id_hex);
+                                state.proactive_resubscribe_needed = true;
+                                warn!(
+                                    channel_id = %channel_uuid,
+                                    "peer-call event dropped (backpressure) — proactive resubscribe queued"
+                                );
+                            }
+                            Err(mpsc::error::TrySendError::Closed(_)) => return false,
+                        }
                     } else if let Some(admission) =
                         state.project_requests.admit_frame(&subscription_id)
                     {
@@ -3415,6 +3539,8 @@ async fn handle_ws_message(
                             state.membership_resub_needed = true;
                         } else if subscription_id == OBSERVER_CONTROL_SUB_ID {
                             state.observer_resub_needed = true;
+                        } else if subscription_id == PEER_CALL_SUB_ID {
+                            state.peer_call_resub_needed = true;
                         }
                         return true; // keep the socket
                     }
@@ -3447,6 +3573,15 @@ async fn handle_ws_message(
                             state.observer_control_sub_active = true;
                         } else {
                             warn!("observer control resubscribe failed after CLOSED — triggering reconnect");
+                            return false;
+                        }
+                    } else if subscription_id == PEER_CALL_SUB_ID {
+                        if send_peer_call_subscribe(ws, agent_pubkey_hex).await {
+                            state.peer_call_resub_needed = false;
+                        } else {
+                            warn!(
+                                "peer-call resubscribe failed after CLOSED — triggering reconnect"
+                            );
                             return false;
                         }
                     } else if subscription_id == MEMBERSHIP_NOTIF_SUB_ID {
@@ -3843,6 +3978,23 @@ async fn resubscribe_after_reconnect(
         }
     }
 
+    if state.peer_call_sub_active {
+        if state.check_rate_gate().is_some() {
+            debug!("rate-gated: parking peer-call resubscribe after reconnect");
+            state.peer_call_resub_needed = true;
+        } else {
+            if !pacing_sleep(cmd_rx, &mut deferred_commands, REQ_PACING_INTERVAL).await {
+                return ResubscribeResult::Shutdown;
+            }
+            if !send_peer_call_subscribe(ws, agent_pubkey_hex).await {
+                warn!("failed to resubscribe peer calls after reconnect");
+                retain_deferred_command_intent(state, &mut deferred_commands);
+                return ResubscribeResult::RetryConnection;
+            }
+            state.peer_call_resub_needed = false;
+        }
+    }
+
     match drain_commands(ws, cmd_rx, &mut deferred_commands, state, agent_pubkey_hex).await {
         ReconnectOutcome::Ok => ResubscribeResult::Ok,
         ReconnectOutcome::Failed => ResubscribeResult::RetryConnection,
@@ -4079,7 +4231,8 @@ async fn drain_commands(
             }
             RelayCommand::Subscribe { .. }
             | RelayCommand::SubscribeMembership
-            | RelayCommand::SubscribeObserverControls => {
+            | RelayCommand::SubscribeObserverControls
+            | RelayCommand::SubscribePeerCalls => {
                 // A gated subscription is only parked in state; pace only an
                 // actual live send attempt.
                 let pace_after = state.check_rate_gate().is_none();
@@ -4674,6 +4827,67 @@ async fn send_membership_subscribe(
         }
         Err(e) => {
             warn!("failed to serialize membership notification REQ: {e}");
+            false
+        }
+    }
+}
+
+/// Build the NIP-PC peer-call REQ's filter list, in wire order.
+///
+/// Two filters, ORed by the relay, because the subscription answers two
+/// different questions and neither one covers the other:
+///
+/// 1. `#p` — calls and results addressed to this agent. This is the inbound
+///    half: what another agent asked us to do, and what a callee returned.
+/// 2. `authors` — calls **this agent published**. This is what makes the
+///    outstanding-call ledger real. The harness does not publish calls itself;
+///    the agent subprocess runs `buzz agents call`, so the only place this
+///    process can learn that a call exists is the wire. Without this filter a
+///    result would arrive correlating to nothing and be refused as `Unknown`,
+///    and the fan-out ceiling would bound a set that was always empty.
+///
+/// Results this agent publishes are deliberately not requested: a callee's own
+/// result closes nothing on its side, and echoing it back would only spend
+/// dedup slots.
+fn peer_call_filters(agent_pubkey_hex: &str, since_ts: u64) -> Vec<Value> {
+    vec![
+        json!({
+            "kinds": [KIND_PEER_CALL, KIND_PEER_CALL_RESULT],
+            "#p": [agent_pubkey_hex],
+            "since": since_ts,
+        }),
+        json!({
+            "kinds": [KIND_PEER_CALL],
+            "authors": [agent_pubkey_hex],
+            "since": since_ts,
+        }),
+    ]
+}
+
+/// Send the NIP-01 REQ for NIP-PC peer calls and results.
+async fn send_peer_call_subscribe(ws: &mut WsStream, agent_pubkey_hex: &str) -> bool {
+    let since_ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let mut req = vec![json!("REQ"), json!(PEER_CALL_SUB_ID)];
+    req.extend(peer_call_filters(agent_pubkey_hex, since_ts));
+
+    match serde_json::to_string(&Value::Array(req)) {
+        Ok(text) => {
+            match ws_send_timeout(ws, Message::Text(text.into()), WS_SEND_TIMEOUT_SECS).await {
+                Ok(()) => {
+                    debug!("subscribed to peer calls (since={since_ts})");
+                    true
+                }
+                Err(e) => {
+                    warn!("failed to send peer-call REQ: {e}");
+                    false
+                }
+            }
+        }
+        Err(e) => {
+            warn!("failed to serialize peer-call REQ: {e}");
             false
         }
     }
@@ -8867,6 +9081,137 @@ mod tests {
         }
     }
 
+    // ── NIP-PC peer calls ────────────────────────────────────────────────────
+
+    /// The REQ that has to exist for any of this to be reachable.
+    ///
+    /// Asserted on the filters the subscription actually sends, not on observed
+    /// behaviour: a subscription that asks the wrong question fails by delivering
+    /// nothing, which is indistinguishable from a quiet relay and passes every
+    /// test written downstream of it.
+    #[test]
+    fn the_peer_call_request_asks_for_calls_to_us_and_the_calls_we_made() {
+        let agent = "ab".repeat(32);
+        let filters = peer_call_filters(&agent, 1_000);
+        assert_eq!(
+            filters.len(),
+            2,
+            "inbound and own-authored are two questions"
+        );
+
+        // Inbound: a call for us, and a result addressed to us.
+        assert_eq!(
+            filters[0]["kinds"],
+            json!([KIND_PEER_CALL, KIND_PEER_CALL_RESULT])
+        );
+        assert_eq!(filters[0]["#p"], json!([agent]));
+        assert!(filters[0].get("authors").is_none());
+
+        // Our own calls. Without this the ledger never learns a call was made,
+        // because the harness does not publish calls — the agent subprocess
+        // does — and every returned result would correlate to nothing.
+        assert_eq!(filters[1]["kinds"], json!([KIND_PEER_CALL]));
+        assert_eq!(filters[1]["authors"], json!([agent]));
+        assert!(filters[1].get("#p").is_none());
+
+        for f in &filters {
+            assert_eq!(f["since"], json!(1_000));
+        }
+    }
+
+    fn peer_call_frame(keys: &nostr::Keys, tags: &[&[&str]], kind: u32) -> Event {
+        EventBuilder::new(nostr::Kind::Custom(kind as u16), "do the thing")
+            .tags(
+                tags.iter()
+                    .map(|t| nostr::Tag::parse(t.iter().copied()).expect("tag")),
+            )
+            .sign_with_keys(keys)
+            .expect("sign")
+    }
+
+    /// A channel-routed envelope is delivered on the channel it names; a
+    /// project-routed one is left to the watched-root REQ that owns its root.
+    ///
+    /// The split is what stops a project call arriving twice — once down each
+    /// path — with the second delivery refused as a replay of the first, which
+    /// would read in the logs as a loop control firing on an honest call.
+    #[tokio::test]
+    async fn the_peer_call_subscription_delivers_the_channel_route_and_defers_the_project_one() {
+        let keys = nostr::Keys::generate();
+        let channel_id = Uuid::new_v4();
+        let root = "48be1cc2000000000000000000000000000000000000000000000000000000ab";
+
+        let channel_routed = peer_call_frame(
+            &keys,
+            &[&["p", &"cd".repeat(32)], &["h", &channel_id.to_string()]],
+            KIND_PEER_CALL,
+        );
+        let mut state = BgState::new();
+        let (tx, mut rx) = mpsc::channel(16);
+        deliver_frame(&mut state, PEER_CALL_SUB_ID, &channel_routed, &tx).await;
+        let delivered = drain(&mut rx);
+        assert_eq!(delivered.len(), 1);
+        match &delivered[0] {
+            BuzzEvent::Channel { channel_id: ch, .. } => assert_eq!(*ch, channel_id),
+            other => panic!("expected a channel delivery: {other:?}"),
+        }
+
+        // The same subscription, a project route: no `h`, so nothing is
+        // delivered and no dedup slot is spent — the watched REQ still gets to
+        // carry it.
+        let project_routed = peer_call_frame(
+            &keys,
+            &[
+                &["p", &"cd".repeat(32)],
+                &["a", &format!("30617:{}:buzz", "ef".repeat(32))],
+                &["e", root, "", "root"],
+            ],
+            KIND_PEER_CALL,
+        );
+        let mut state = BgState::new();
+        let (tx, mut rx) = mpsc::channel(16);
+        deliver_frame(&mut state, PEER_CALL_SUB_ID, &project_routed, &tx).await;
+        assert!(drain(&mut rx).is_empty());
+        assert!(!state.seen_ids.contains(&project_routed.id.to_hex()));
+    }
+
+    /// A kind this REQ never asked for is refused before it can spend a dedup
+    /// slot — the same shape gate the membership subscription has, and for the
+    /// same reason: a slot spent here suppresses the delivery that was entitled
+    /// to it.
+    #[tokio::test]
+    async fn a_kind_the_peer_call_request_never_asked_for_is_refused() {
+        let keys = nostr::Keys::generate();
+        let channel_id = Uuid::new_v4();
+        let intruder = peer_call_frame(&keys, &[&["h", &channel_id.to_string()]], 9);
+
+        let mut state = BgState::new();
+        let (tx, mut rx) = mpsc::channel(16);
+        deliver_frame(&mut state, PEER_CALL_SUB_ID, &intruder, &tx).await;
+
+        assert!(drain(&mut rx).is_empty());
+        assert!(!state.seen_ids.contains(&intruder.id.to_hex()));
+    }
+
+    /// Replay across a reconnect delivers the call once.
+    #[tokio::test]
+    async fn a_peer_call_redelivered_after_a_reconnect_is_deduplicated() {
+        let keys = nostr::Keys::generate();
+        let channel_id = Uuid::new_v4();
+        let event = peer_call_frame(
+            &keys,
+            &[&["p", &"cd".repeat(32)], &["h", &channel_id.to_string()]],
+            KIND_PEER_CALL_RESULT,
+        );
+
+        let mut state = BgState::new();
+        let (tx, mut rx) = mpsc::channel(16);
+        deliver_frame(&mut state, PEER_CALL_SUB_ID, &event, &tx).await;
+        deliver_frame(&mut state, PEER_CALL_SUB_ID, &event, &tx).await;
+
+        assert_eq!(drain(&mut rx).len(), 1);
+    }
+
     // ── Project sources validate before spending the dedup slot ──────────────
 
     fn announcement_with(keys: &nostr::Keys, ts: u64, tags: &[&[&str]]) -> Event {
@@ -9043,6 +9388,7 @@ mod tests {
         let mut discovered = crate::project::DiscoveredRepositories::new();
         let mut enrolments = crate::project::ProjectEnrolments::new();
         let mut queue = crate::queue::EventQueue::new(crate::config::DedupMode::Queue);
+        let mut ledger = crate::peer_call::CallLedger::new();
         let humans = std::collections::BTreeSet::new();
         let externals = std::collections::BTreeSet::new();
 
@@ -9058,6 +9404,12 @@ mod tests {
                     discovered: &mut discovered,
                     enrolments: &mut enrolments,
                     queue: &mut queue,
+                    // These harnesses exercise routing and enrolment, not peer
+                    // trust: no attestation means an agent author classifies as
+                    // untrusted, which is the conservative reading and the one
+                    // these cases were written against.
+                    sibling: None,
+                    ledger: &mut ledger,
                 };
                 crate::handle_project_event(&mut d, $ev)
             }};
@@ -9245,6 +9597,7 @@ mod tests {
         let mut discovered = crate::project::DiscoveredRepositories::new();
         let mut enrolments = crate::project::ProjectEnrolments::new();
         let mut queue = crate::queue::EventQueue::new(crate::config::DedupMode::Queue);
+        let mut ledger = crate::peer_call::CallLedger::new();
         let humans = std::collections::BTreeSet::new();
         let externals = std::collections::BTreeSet::new();
 
@@ -9260,6 +9613,12 @@ mod tests {
                     discovered: &mut discovered,
                     enrolments: &mut enrolments,
                     queue: &mut queue,
+                    // These harnesses exercise routing and enrolment, not peer
+                    // trust: no attestation means an agent author classifies as
+                    // untrusted, which is the conservative reading and the one
+                    // these cases were written against.
+                    sibling: None,
+                    ledger: &mut ledger,
                 };
                 crate::handle_project_event(&mut d, $ev)
             }};
@@ -9741,6 +10100,7 @@ mod tests {
             let mut discovered = crate::project::DiscoveredRepositories::new();
             let mut enrolments = crate::project::ProjectEnrolments::new();
             let mut queue = crate::queue::EventQueue::new(crate::config::DedupMode::Queue);
+            let mut ledger = crate::peer_call::CallLedger::new();
             let humans = std::collections::BTreeSet::new();
             let externals = std::collections::BTreeSet::new();
 
@@ -9777,6 +10137,8 @@ mod tests {
                                     discovered: &mut discovered,
                                     enrolments: &mut enrolments,
                                     queue: &mut queue,
+                                    sibling: None,
+                                    ledger: &mut ledger,
                                 },
                                 &subscriber,
                                 &agent_hex,

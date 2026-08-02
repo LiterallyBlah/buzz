@@ -493,6 +493,16 @@ pub struct CliArgs {
         default_value_t = false
     )]
     pub project_routing_enabled: bool,
+
+    /// Comma-separated 64-char hex pubkeys of **external** agents this agent's
+    /// owner has approved to call it (NIP-PC).
+    ///
+    /// Same-owner NIP-OA siblings are trusted without being listed, so this is
+    /// only for agents under a different owner. Deliberately separate from
+    /// `--respond-to-allowlist`: that list approves people to *talk to* the
+    /// agent, and invocation is a narrower grant than conversation.
+    #[arg(long, env = "BUZZ_ACP_PEER_AGENTS", value_delimiter = ',')]
+    pub peer_agents: Option<Vec<String>>,
 }
 
 /// Merged NIP-01 subscription filter for a single channel.
@@ -573,6 +583,9 @@ pub struct Config {
     /// subscription, run no project discovery, and reconstruct no enrolments —
     /// channel routing behaves exactly as before.
     pub project_routing_enabled: bool,
+    /// External agent pubkeys the owner approved to make NIP-PC calls to this
+    /// agent. Same-owner NIP-OA siblings are trusted without appearing here.
+    pub peer_agents: HashSet<String>,
     /// Agent owner pubkey (hex). Used for `--respond-to=owner-only` gate.
     /// Replaces the old REST-based owner lookup.
     pub agent_owner: Option<String>,
@@ -647,13 +660,13 @@ pub(crate) fn compose_session_title(agent: &str, channel_name: Option<&str>) -> 
 }
 
 /// Validate and deduplicate allowlist entries: each must be exactly 64 hex chars.
-fn validate_allowlist(entries: &[String]) -> Result<HashSet<String>, ConfigError> {
+fn validate_allowlist(entries: &[String], option: &str) -> Result<HashSet<String>, ConfigError> {
     let mut validated = HashSet::new();
     for entry in entries {
         let trimmed = entry.trim().to_ascii_lowercase();
         if trimmed.len() != 64 || !trimmed.chars().all(|c| c.is_ascii_hexdigit()) {
             return Err(ConfigError::ConfigFile(format!(
-                "invalid pubkey in --respond-to-allowlist: '{entry}' \
+                "invalid pubkey in {option}: '{entry}' \
                  (must be exactly 64 hex characters)"
             )));
         }
@@ -1021,7 +1034,7 @@ impl Config {
                     "--respond-to=allowlist requires --respond-to-allowlist with at least one pubkey".into(),
                 ));
             }
-            validate_allowlist(&raw)?
+            validate_allowlist(&raw, "--respond-to-allowlist")?
         } else {
             if args.respond_to_allowlist.is_some() {
                 tracing::warn!(
@@ -1029,6 +1042,14 @@ impl Config {
                 );
             }
             HashSet::new()
+        };
+
+        // External agents approved to invoke this one (NIP-PC). Validated even
+        // when empty is the common case: a typo here fails closed and silently,
+        // because an unparseable pubkey simply never matches an author.
+        let peer_agents = match args.peer_agents {
+            Some(raw) => validate_allowlist(&raw, "--peer-agents")?,
+            None => HashSet::new(),
         };
 
         // Validate respond_to against the allowed set.
@@ -1121,6 +1142,7 @@ impl Config {
             relay_observer: args.relay_observer,
             lazy_pool: args.lazy_pool,
             project_routing_enabled: args.project_routing_enabled,
+            peer_agents,
             agent_owner: args.agent_owner.map(|s| s.trim().to_ascii_lowercase()),
             no_base_prompt: args.no_base_prompt,
             base_prompt_content,
@@ -1494,6 +1516,7 @@ pub(crate) fn test_config(mode: SubscribeMode) -> Config {
         relay_observer: false,
         lazy_pool: false,
         project_routing_enabled: false,
+        peer_agents: HashSet::new(),
         agent_owner: None,
         no_base_prompt: false,
         base_prompt_content: None,
@@ -2555,7 +2578,7 @@ channels = "ALL"
     #[test]
     fn test_validate_allowlist_valid_entries() {
         let entries = vec!["ab".repeat(32), "cd".repeat(32)];
-        let result = validate_allowlist(&entries).unwrap();
+        let result = validate_allowlist(&entries, "--respond-to-allowlist").unwrap();
         assert_eq!(result.len(), 2);
     }
 
@@ -2563,7 +2586,7 @@ channels = "ALL"
     fn test_validate_allowlist_deduplicates() {
         let pk = "ab".repeat(32);
         let entries = vec![pk.clone(), pk.clone(), pk];
-        let result = validate_allowlist(&entries).unwrap();
+        let result = validate_allowlist(&entries, "--respond-to-allowlist").unwrap();
         assert_eq!(result.len(), 1);
     }
 
@@ -2572,7 +2595,7 @@ channels = "ALL"
         let upper = "AB".repeat(32);
         let lower = "ab".repeat(32);
         let entries = vec![upper, lower];
-        let result = validate_allowlist(&entries).unwrap();
+        let result = validate_allowlist(&entries, "--respond-to-allowlist").unwrap();
         assert_eq!(result.len(), 1);
         assert!(result.contains(&"ab".repeat(32)));
     }
@@ -2580,7 +2603,7 @@ channels = "ALL"
     #[test]
     fn test_validate_allowlist_trims_whitespace() {
         let entries = vec![format!("  {}  ", "ab".repeat(32))];
-        let result = validate_allowlist(&entries).unwrap();
+        let result = validate_allowlist(&entries, "--respond-to-allowlist").unwrap();
         assert_eq!(result.len(), 1);
         assert!(result.contains(&"ab".repeat(32)));
     }
@@ -2588,7 +2611,7 @@ channels = "ALL"
     #[test]
     fn test_validate_allowlist_rejects_short() {
         let entries = vec!["abcd".to_string()];
-        let err = validate_allowlist(&entries).unwrap_err();
+        let err = validate_allowlist(&entries, "--respond-to-allowlist").unwrap_err();
         assert!(
             err.to_string()
                 .contains("must be exactly 64 hex characters"),
@@ -2599,7 +2622,7 @@ channels = "ALL"
     #[test]
     fn test_validate_allowlist_rejects_non_hex() {
         let entries = vec!["zz".repeat(32)];
-        let err = validate_allowlist(&entries).unwrap_err();
+        let err = validate_allowlist(&entries, "--respond-to-allowlist").unwrap_err();
         assert!(
             err.to_string()
                 .contains("must be exactly 64 hex characters"),
@@ -2610,7 +2633,7 @@ channels = "ALL"
     #[test]
     fn test_validate_allowlist_rejects_too_long() {
         let entries = vec!["ab".repeat(33)]; // 66 chars
-        let err = validate_allowlist(&entries).unwrap_err();
+        let err = validate_allowlist(&entries, "--respond-to-allowlist").unwrap_err();
         assert!(
             err.to_string()
                 .contains("must be exactly 64 hex characters"),
@@ -2620,7 +2643,7 @@ channels = "ALL"
 
     #[test]
     fn test_validate_allowlist_empty_is_ok() {
-        let result = validate_allowlist(&[]).unwrap();
+        let result = validate_allowlist(&[], "--respond-to-allowlist").unwrap();
         assert!(result.is_empty());
     }
 

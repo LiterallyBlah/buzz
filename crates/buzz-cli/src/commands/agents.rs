@@ -1,16 +1,157 @@
 use buzz_core::kind::KIND_IA_ARCHIVED_LIST;
-use buzz_sdk::builders::{build_archive_identity_request, build_unarchive_identity_request};
+use buzz_core::peer_call::{derive_call_id, onward_context, PeerCallRoute};
+use buzz_sdk::builders::{
+    build_archive_identity_request, build_peer_call, build_peer_call_result,
+    build_unarchive_identity_request, PeerCallMeta,
+};
 use nostr::PublicKey;
 use serde_json::json;
+use uuid::Uuid;
 
 use crate::agent_management::{build_create, build_update, CreateAgentDraft, UpdateAgentDraft};
 use crate::client::BuzzClient;
 use crate::error::CliError;
-use crate::validate::{read_or_stdin, validate_hex64};
+use crate::validate::{read_or_stdin, validate_hex64, validate_uuid};
 use crate::{AgentsCmd, RespondToArg};
+
+/// Resolve the one route form NIP-PC permits from the CLI's four options.
+///
+/// Clap already refuses `--channel` together with `--project`, and ties
+/// `--thread` to `--channel` and `--root` to `--project`. What it cannot
+/// express is that *one* of the two must be present, so that is checked here.
+/// Returning an error rather than defaulting to anything is deliberate: a call
+/// with no route names no conversation, and guessing one would publish a call
+/// whose result lands somewhere the operator never asked for.
+fn resolve_route(
+    channel: Option<String>,
+    thread: Option<String>,
+    project: Option<String>,
+    root: Option<String>,
+) -> Result<PeerCallRoute, CliError> {
+    match (channel, project, root) {
+        (Some(channel), None, _) => {
+            validate_uuid(&channel)?;
+            if let Some(ref t) = thread {
+                validate_hex64(t)?;
+            }
+            Ok(PeerCallRoute::Channel {
+                channel: channel.to_ascii_lowercase(),
+                thread_root: thread.map(|t| t.to_ascii_lowercase()),
+            })
+        }
+        (None, Some(coordinate), Some(root)) => {
+            validate_hex64(&root)?;
+            Ok(PeerCallRoute::Project {
+                coordinate,
+                root: root.to_ascii_lowercase(),
+            })
+        }
+        _ => Err(CliError::Usage(
+            "give exactly one route: --channel [--thread], or --project --root".into(),
+        )),
+    }
+}
 
 pub async fn dispatch(command: AgentsCmd, client: &BuzzClient) -> Result<(), CliError> {
     match command {
+        AgentsCmd::Call {
+            to,
+            task,
+            channel,
+            thread,
+            project,
+            root,
+            visited,
+            nonce,
+        } => {
+            validate_hex64(&to)?;
+            let caller = client.keys().public_key().to_hex().to_ascii_lowercase();
+            let callee = to.to_ascii_lowercase();
+            let route = resolve_route(channel, thread, project, root)?;
+
+            // A v4 UUID is 16 random bytes, which is exactly the nonce width.
+            // Reusing it avoids adding a second source of randomness to a crate
+            // that already has one that is fit for the purpose.
+            let nonce = match nonce {
+                Some(n) => n.to_ascii_lowercase(),
+                None => Uuid::new_v4().simple().to_string(),
+            };
+
+            // The caller is always in its own call path, and the hop count is
+            // the size of that path. Both come from the one shared derivation
+            // rather than from operator input: a hand-written call that omits
+            // itself, or states a hop that disagrees with its path, is refused
+            // by every callee for a reason invisible from the command typed.
+            for entry in &visited {
+                validate_hex64(entry)?;
+            }
+            let (hop, path) = onward_context(&visited, &caller);
+
+            let builder = build_peer_call(
+                &caller,
+                &read_or_stdin(&task)?,
+                &PeerCallMeta {
+                    callee: callee.clone(),
+                    route: route.clone(),
+                    nonce: nonce.clone(),
+                    hop,
+                    visited: path,
+                },
+            )
+            .map_err(|e| CliError::Usage(format!("invalid call: {e}")))?;
+
+            let event = client.sign_event_unchecked(builder)?;
+            let event_id = event.id.to_hex();
+            let call_id = derive_call_id(&caller, &callee, &route, &nonce);
+            client.submit_event(event).await?;
+            println!(
+                "{}",
+                json!({
+                    "ok": true,
+                    "event_id": event_id,
+                    "call_id": call_id,
+                    "callee": callee,
+                    "hop": hop,
+                })
+            );
+            Ok(())
+        }
+
+        AgentsCmd::CallResult {
+            to,
+            call,
+            body,
+            channel,
+            thread,
+            project,
+            root,
+        } => {
+            validate_hex64(&to)?;
+            validate_hex64(&call)?;
+            let route = resolve_route(channel, thread, project, root)?;
+            let builder = build_peer_call_result(
+                &to.to_ascii_lowercase(),
+                &call.to_ascii_lowercase(),
+                &read_or_stdin(&body)?,
+                &route,
+            )
+            .map_err(|e| CliError::Usage(format!("invalid result: {e}")))?;
+
+            let event = client.sign_event_unchecked(builder)?;
+            let event_id = event.id.to_hex();
+            client.submit_event(event).await?;
+            println!(
+                "{}",
+                json!({
+                    "ok": true,
+                    "event_id": event_id,
+                    "call_id": call.to_ascii_lowercase(),
+                    "to": to.to_ascii_lowercase(),
+                })
+            );
+            Ok(())
+        }
+
         AgentsCmd::DraftCreate {
             channel,
             display_name,
@@ -714,5 +855,74 @@ mod tests {
             .expect("sign");
         let result = verify_archived_event(&event, &self_hex).expect("should pass");
         assert!(result.is_empty());
+    }
+
+    // ── NIP-PC route resolution ──────────────────────────────────────────────
+
+    const CHANNEL: &str = "8f377516-7391-47bf-bcc4-249a1028b212";
+
+    #[test]
+    fn a_channel_route_carries_its_optional_thread() {
+        assert_eq!(
+            resolve_route(Some(CHANNEL.into()), None, None, None).unwrap(),
+            PeerCallRoute::Channel {
+                channel: CHANNEL.into(),
+                thread_root: None,
+            }
+        );
+        assert_eq!(
+            resolve_route(
+                Some(CHANNEL.into()),
+                Some(hex64('b').to_uppercase()),
+                None,
+                None
+            )
+            .unwrap(),
+            PeerCallRoute::Channel {
+                channel: CHANNEL.into(),
+                thread_root: Some(hex64('b')),
+            },
+            "a thread root is normalised, because the call id is derived from it"
+        );
+    }
+
+    #[test]
+    fn a_project_route_needs_its_root() {
+        let coordinate = format!("30617:{}:buzz", hex64('a'));
+        assert_eq!(
+            resolve_route(None, None, Some(coordinate.clone()), Some(hex64('c'))).unwrap(),
+            PeerCallRoute::Project {
+                coordinate,
+                root: hex64('c'),
+            }
+        );
+    }
+
+    /// No route names no conversation. Clap refuses `--channel` with
+    /// `--project`; what it cannot express is that one of them is required, so
+    /// the absence of both has to fail here rather than default to anything.
+    #[test]
+    fn a_call_with_no_route_is_a_usage_error() {
+        assert!(matches!(
+            resolve_route(None, None, None, None),
+            Err(CliError::Usage(_))
+        ));
+        assert!(matches!(
+            resolve_route(None, None, Some("30617:x:buzz".into()), None),
+            Err(CliError::Usage(_))
+        ));
+    }
+
+    #[test]
+    fn a_malformed_route_component_is_refused_before_anything_is_published() {
+        assert!(resolve_route(Some("not-a-uuid".into()), None, None, None).is_err());
+        assert!(resolve_route(Some(CHANNEL.into()), Some("short".into()), None, None).is_err());
+        assert!(resolve_route(
+            None,
+            None,
+            Some(format!("30617:{}:buzz", hex64('a'))),
+            Some("short".into())
+        )
+        .is_err());
     }
 }

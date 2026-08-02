@@ -332,6 +332,83 @@ buzz agents unarchive <PUBKEY> --reason returned")]
         #[arg(long, default_value = "")]
         content: String,
     },
+    /// Call another trusted agent to perform one bounded task (NIP-PC, kind 43001)
+    #[command(
+        after_help = "The call is bound to the surface it is made from, and the callee's \
+result returns there. Give exactly one route: --channel (optionally with \
+--thread), or --project with --root.\n\n\
+The call id is derived from caller, callee, route and nonce — it is never \
+supplied. A nonce is generated unless you pass one, so repeating a command \
+with an explicit --nonce reproduces the same call id and is refused by the \
+callee as a replay.\n\n\
+Depth is derived too: the hop count is the size of the call path, so passing \
+the --visited values of a call you are answering is all that is needed to \
+carry the chain onward. Maximum depth is 3.\n\n\
+Only a verified same-owner sibling, an owner-approved external agent, or the \
+owner may invoke an agent. A call delegates a bounded task, not owner \
+authority.\n\n\
+Examples:\n  \
+buzz agents call --to <PUBKEY> --channel <UUID> --task 'summarise the thread'\n  \
+buzz agents call --to <PUBKEY> --project 30617:<OWNER>:buzz --root <EVENT_ID> --task -"
+    )]
+    Call {
+        /// Callee agent pubkey (64-char hex)
+        #[arg(long)]
+        to: String,
+        /// The task; use '-' to read from stdin
+        #[arg(long)]
+        task: String,
+        /// Channel route: channel UUID
+        #[arg(long, conflicts_with = "project")]
+        channel: Option<String>,
+        /// Channel route: thread root event id (optional)
+        #[arg(long, requires = "channel")]
+        thread: Option<String>,
+        /// Project route: 30617:<owner>:<identifier> repo coordinate
+        #[arg(long, requires = "root")]
+        project: Option<String>,
+        /// Project route: issue or PR root event id
+        #[arg(long, requires = "project")]
+        root: Option<String>,
+        /// An agent already in the call path; repeat per agent. Pass the
+        /// `visited` values of the call you are answering. The caller is added
+        /// automatically, and the hop count is derived from the result.
+        #[arg(long = "visited")]
+        visited: Vec<String>,
+        /// 32 lowercase hex chars. Generated when omitted.
+        #[arg(long)]
+        nonce: Option<String>,
+    },
+    /// Return the correlated result of a call you accepted (NIP-PC, kind 43004)
+    #[command(
+        after_help = "The route must match the call's route exactly, or the caller refuses \
+the result as delivered to the wrong surface.\n\n\
+Examples:\n  \
+buzz agents call-result --to <CALLER> --call <CALL_ID> --channel <UUID> --body 'done'"
+    )]
+    CallResult {
+        /// The original caller's pubkey (64-char hex)
+        #[arg(long)]
+        to: String,
+        /// The call id being answered (64-char hex)
+        #[arg(long)]
+        call: String,
+        /// The result; use '-' to read from stdin. May be empty.
+        #[arg(long, default_value = "")]
+        body: String,
+        /// Channel route: channel UUID
+        #[arg(long, conflicts_with = "project")]
+        channel: Option<String>,
+        /// Channel route: thread root event id (optional)
+        #[arg(long, requires = "channel")]
+        thread: Option<String>,
+        /// Project route: 30617:<owner>:<identifier> repo coordinate
+        #[arg(long, requires = "root")]
+        project: Option<String>,
+        /// Project route: issue or PR root event id
+        #[arg(long, requires = "project")]
+        root: Option<String>,
+    },
     /// Read the relay's current NIP-IA archive snapshot (kind 13535)
     #[command(
         after_help = "Verifies the snapshot's NIP-11 `self` authorship, event id, signature, \
@@ -1983,6 +2060,8 @@ mod tests {
             vec![
                 "archive",
                 "archived",
+                "call",
+                "call-result",
                 "draft-create",
                 "draft-update",
                 "unarchive"
@@ -2108,10 +2187,96 @@ mod tests {
         );
     }
 
+    /// The call surface parses, and its route/depth arguments behave as the
+    /// wire contract needs them to.
+    ///
+    /// Parsed from an argv, not constructed as a struct: the thing that can be
+    /// wrong here is the clap definition, and building the variant by hand
+    /// would test only that the fields exist.
+    #[test]
+    fn the_peer_call_command_parses_a_channel_route() {
+        let cli = Cli::parse_from([
+            "buzz",
+            "agents",
+            "call",
+            "--to",
+            &"cd".repeat(32),
+            "--channel",
+            "8f377516-7391-47bf-bcc4-249a1028b212",
+            "--task",
+            "summarise the thread",
+        ]);
+        match cli.command {
+            Cmd::Agents(AgentsCmd::Call {
+                to,
+                task,
+                channel,
+                thread,
+                project,
+                root,
+                visited,
+                nonce,
+            }) => {
+                assert_eq!(to, "cd".repeat(32));
+                assert_eq!(task, "summarise the thread");
+                assert_eq!(
+                    channel.as_deref(),
+                    Some("8f377516-7391-47bf-bcc4-249a1028b212")
+                );
+                assert!(thread.is_none() && project.is_none() && root.is_none());
+                assert!(visited.is_empty(), "the caller is added, never typed");
+                assert!(nonce.is_none(), "a nonce is generated when omitted");
+            }
+            _ => panic!("expected `agents call`"),
+        }
+    }
+
+    /// `--channel` and `--project` name two different conversations, so clap
+    /// refuses the pair rather than letting a precedence rule decide where a
+    /// result lands.
+    #[test]
+    fn a_call_cannot_name_two_routes() {
+        assert!(Cli::try_parse_from([
+            "buzz",
+            "agents",
+            "call",
+            "--to",
+            &"cd".repeat(32),
+            "--channel",
+            "8f377516-7391-47bf-bcc4-249a1028b212",
+            "--project",
+            "30617:ab:buzz",
+            "--root",
+            &"ef".repeat(32),
+            "--task",
+            "t",
+        ])
+        .is_err());
+    }
+
+    /// Depth is derived from the call path, so there is no `--hop` to state it
+    /// inconsistently with.
+    #[test]
+    fn a_call_has_no_hop_argument_to_get_wrong() {
+        use clap::CommandFactory;
+        let cmd = Cli::command();
+        let agents = cmd
+            .get_subcommands()
+            .find(|s| s.get_name() == "agents")
+            .expect("agents command");
+        let call = agents
+            .get_subcommands()
+            .find(|s| s.get_name() == "call")
+            .expect("call command");
+        let args: Vec<&str> = call.get_arguments().map(|a| a.get_id().as_str()).collect();
+        assert!(args.contains(&"visited"));
+        assert!(!args.contains(&"hop"));
+    }
+
     #[test]
     fn subcommand_counts_are_stable() {
         let expected: Vec<(&str, usize)> = vec![
-            ("agents", 5),
+            ("agents", 7),
             ("canvas", 2),
             ("channels", 16),
             ("dms", 4),

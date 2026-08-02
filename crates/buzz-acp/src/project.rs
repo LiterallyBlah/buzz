@@ -35,6 +35,7 @@ use buzz_core::kind::{
     KIND_GIT_STATUS_CLOSED, KIND_GIT_STATUS_DRAFT, KIND_GIT_STATUS_MERGED, KIND_GIT_STATUS_OPEN,
     KIND_TEXT_NOTE,
 };
+use buzz_core::peer_call::{KIND_PEER_CALL, KIND_PEER_CALL_RESULT};
 
 // ── Route key ─────────────────────────────────────────────────────────────────
 
@@ -2832,7 +2833,13 @@ where
         | KIND_GIT_STATUS_OPEN
         | KIND_GIT_STATUS_MERGED
         | KIND_GIT_STATUS_CLOSED
-        | KIND_GIT_STATUS_DRAFT => sole_reference(tags, "e"),
+        | KIND_GIT_STATUS_DRAFT
+        // A NIP-PC call or result on a project route carries the same marked
+        // `["e", root, "", "root"]` every comment does, so it resolves to a
+        // root the same way. Its `a` coordinate is read separately as a claim,
+        // exactly as for a comment.
+        | KIND_PEER_CALL
+        | KIND_PEER_CALL_RESULT => sole_reference(tags, "e"),
         _ => None,
     }
 }
@@ -3455,6 +3462,13 @@ pub(crate) struct ProjectState<'a> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ProjectDecision {
     pub effect: ProjectEffect,
+    /// The author class this decision was taken under.
+    ///
+    /// Returned rather than recomputed by callers that need it. A peer call's
+    /// loop controls run after this gate, and deriving the caller's trust a
+    /// second time from the same inputs would be a second place for the answer
+    /// to differ from the one the effect was actually chosen by.
+    pub author: ProjectAuthor,
     /// Present only when the effect is one that queues or enrols. An effect
     /// that never reaches the queue carries no origin, so a caller cannot
     /// queue a refused event by reading a binding off the decision anyway.
@@ -3483,6 +3497,7 @@ pub(crate) fn decide_project_event(
     let ignored = ProjectDecision {
         effect: ProjectEffect::Ignore,
         origin: None,
+        author: ProjectAuthor::Untrusted,
     };
 
     // Addressing first, because a discovery-sourced event has no addressing at
@@ -3526,9 +3541,11 @@ pub(crate) fn decide_project_event(
     let effect = classify_project_event(
         kind_effect,
         author,
-        // Phase A does not implement peer calls, so no event can present as an
-        // invocation or a result. This is a phase boundary, not a default.
-        CallMarker::None,
+        // NIP-PC: what the event *is*, never whether it is allowed. A call from
+        // an untrusted stranger still reports `Invocation` here and is refused
+        // by the author arm below, which is what keeps the authority decision
+        // in one place instead of half-hidden in a parser.
+        project_call_marker(event, identity.agent),
         root_state,
         addressing,
         lifecycle_authorised,
@@ -3538,13 +3555,17 @@ pub(crate) fn decide_project_event(
         ProjectEffect::Enrol | ProjectEffect::EnrolAndWake => {
             candidate.as_ref().map(ProjectOrigin::from_candidate)
         }
-        ProjectEffect::Wake | ProjectEffect::RefreshContext => stored
+        // `ResumeCall` sits here with `Wake`: a result resumes a call on a root
+        // this agent is already enrolled in, so its binding is the stored
+        // enrolment. Leaving it originless meant every result was dropped by
+        // the origin guard before the loop controls could see it, which made
+        // correlation unreachable in production.
+        ProjectEffect::Wake | ProjectEffect::RefreshContext | ProjectEffect::ResumeCall => stored
             .map(|enrolment| ProjectOrigin::from_enrolment(route.root(), enrolment))
             .or_else(|| candidate.as_ref().map(ProjectOrigin::from_candidate)),
-        ProjectEffect::Ignore
-        | ProjectEffect::UntrustedContext
-        | ProjectEffect::ApplyLifecycle
-        | ProjectEffect::ResumeCall => None,
+        ProjectEffect::Ignore | ProjectEffect::UntrustedContext | ProjectEffect::ApplyLifecycle => {
+            None
+        }
     };
 
     // An effect that needs a binding and has none cannot proceed. This is the
@@ -3559,7 +3580,11 @@ pub(crate) fn decide_project_event(
         return ignored;
     }
 
-    ProjectDecision { effect, origin }
+    ProjectDecision {
+        effect,
+        origin,
+        author,
+    }
 }
 
 /// Where a queued project event came from, carried beside the UUIDv5 queue key.
@@ -4202,6 +4227,14 @@ pub(crate) fn classify_kind(kind: u32) -> KindEffect {
         | KIND_GIT_STATUS_CLOSED
         | KIND_GIT_STATUS_DRAFT => KindEffect::Lifecycle,
         KIND_GIT_PR_UPDATE => KindEffect::ContextRefresh,
+        // NIP-PC peer calls and results land on a project root as ordinary
+        // conversation about it, so they classify as `Comment` and are then
+        // decided by [`classify_project_event`] on their [`CallMarker`]. They
+        // are deliberately *not* a class of their own: a call from an untrusted
+        // author must fall through the same untrusted-context arm every other
+        // comment does, and a separate class would be a second place for that
+        // rule to be got wrong.
+        KIND_PEER_CALL | KIND_PEER_CALL_RESULT => KindEffect::Comment,
         _ => KindEffect::Ignore,
     }
 }
@@ -4273,6 +4306,18 @@ impl HistoryStream {
                 KIND_GIT_STATUS_MERGED,
                 KIND_GIT_STATUS_CLOSED,
                 KIND_GIT_STATUS_DRAFT,
+                // NIP-PC traffic rides the `#e` stream because that is where it
+                // lives: a project-routed call is an event about the root, keyed
+                // on the root, and omitting it here would mean the live watched
+                // REQ never delivers a call on an enrolled issue at all.
+                //
+                // Catch-up therefore replays calls too, which is correct rather
+                // than merely consistent: `apply_processing_mode` maps a
+                // replayed `ResumeCall` to `Ignore` and a replayed `Wake` to
+                // `RefreshContext`, so restoring history cannot re-run a call
+                // the agent already answered.
+                KIND_PEER_CALL,
+                KIND_PEER_CALL_RESULT,
             ],
             HistoryStream::PullRequestUpdates => &[KIND_GIT_PR_UPDATE],
         }
@@ -6262,13 +6307,26 @@ pub(crate) fn apply_processing_mode(effect: ProjectEffect, mode: ProcessingMode)
     }
 }
 
-/// The call marker for a project event during Phase 1.
+/// The call marker for a project event.
 ///
-/// Always [`CallMarker::None`]. Normalising a visible `@Agent` into an
-/// invocation here would implement half of Phase 1b through the human
-/// addressing heuristic, in the exact place the reply loop lives.
-pub(crate) fn project_call_marker() -> CallMarker {
-    CallMarker::None
+/// Delegates to the NIP-PC parser rather than inspecting tags here. A visible
+/// `@Agent` is deliberately still **not** normalised into an invocation: doing
+/// so would route invocation through the human addressing heuristic, in the
+/// exact place the reply loop lives, and Desktop copies every prior
+/// participant into every later comment's `p` tags. An agent that wants to
+/// invoke another publishes an envelope.
+///
+/// Verification is not repeated. A [`VerifiedProjectEvent`] is already proof
+/// that this process checked the signature and id, so the peer-call wrapper is
+/// built from that proof instead of re-running a Schnorr check on the hot path.
+pub(crate) fn project_call_marker(
+    event: &VerifiedProjectEvent,
+    agent: &AgentIdentity,
+) -> CallMarker {
+    crate::peer_call::call_marker(
+        &crate::peer_call::VerifiedPeerEvent::from_project(event),
+        agent.hex(),
+    )
 }
 
 // ── Author gate ───────────────────────────────────────────────────────────────
@@ -11954,7 +12012,14 @@ mod tests {
         let filters = watched_roots_filters(&e, 100);
         assert_eq!(filters.len(), 2);
 
-        assert_eq!(filters[0]["kinds"], json!([1, 1630, 1631, 1632, 1633]));
+        // `43001`/`43004` are the NIP-PC call and result. Without them in this
+        // list the live watched REQ never delivers a peer call on an enrolled
+        // root, so the whole project half of Phase 1b would be unreachable
+        // while every unit test around it still passed.
+        assert_eq!(
+            filters[0]["kinds"],
+            json!([1, 1630, 1631, 1632, 1633, 43001, 43004])
+        );
         assert_eq!(filters[0]["#e"], json!([ROOT, OTHER_ROOT]));
         assert!(filters[0].get("#E").is_none());
 
@@ -13405,7 +13470,7 @@ mod tests {
         let effect = classify_project_event(
             classify_kind(KIND_TEXT_NOTE),
             ProjectAuthor::AuthorisedHuman,
-            project_call_marker(),
+            CallMarker::None,
             RootState::Unknown,
             Addressing::ExplicitMention,
             false,
@@ -13457,7 +13522,7 @@ mod tests {
         let effect = classify_project_event(
             classify_kind(KIND_TEXT_NOTE),
             ProjectAuthor::AuthorisedHuman,
-            project_call_marker(),
+            CallMarker::None,
             RootState::Active,
             Addressing::InheritedParticipant,
             false,
@@ -14012,7 +14077,7 @@ mod tests {
                 let effect = classify_project_event(
                     classify_kind(KIND_TEXT_NOTE),
                     ProjectAuthor::Untrusted,
-                    project_call_marker(),
+                    CallMarker::None,
                     state,
                     addressing,
                     false,
@@ -14100,7 +14165,7 @@ mod tests {
             let effect = classify_project_event(
                 classify_kind(KIND_GIT_ISSUE),
                 author,
-                project_call_marker(),
+                CallMarker::None,
                 RootState::Unknown,
                 addressing,
                 false,

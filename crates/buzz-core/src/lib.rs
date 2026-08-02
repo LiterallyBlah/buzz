@@ -30,6 +30,8 @@ pub mod network;
 pub mod observer;
 /// NIP-AB device pairing — crypto primitives, message types, and errors.
 pub mod pairing;
+/// NIP-PC peer agent calls — canonical route token, call-id derivation, limits.
+pub mod peer_call;
 /// Presence status types shared across crates.
 pub mod presence;
 /// Canonical relay runtime identities.
