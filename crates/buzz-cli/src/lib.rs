@@ -218,6 +218,9 @@ enum Cmd {
     /// Create, get, list, and set status on git issues (NIP-34)
     #[command(subcommand)]
     Issues(IssuesCmd),
+    /// Read project conversations — issue/PR roots and their history
+    #[command(subcommand)]
+    Projects(ProjectsCmd),
     /// Open, update, list, and set status on git pull requests (NIP-34)
     #[command(subcommand)]
     Pr(PrCmd),
@@ -409,6 +412,58 @@ buzz agents call-result --to <CALLER> --call <CALL_ID> --channel <UUID> --body '
         #[arg(long, requires = "project")]
         root: Option<String>,
     },
+    /// Announce that you are working on a project root, or have stopped
+    /// (NIP-PA, kind 20003)
+    #[command(
+        after_help = "Ephemeral and unencrypted: it says only that an agent is working on \
+this issue or pull request, which is already visible to anyone who can read \
+it. The transcript stays in the owner-scoped NIP-AO frames.\n\n\
+An issue is not a channel, so no `h` tag is emitted and none may be added. \
+Consumers filter by the repository `a` tag and the marked root `e` tag.\n\n\
+--turn names the turn this signal belongs to. An `idle` carrying the wrong \
+turn id clears an indicator for work that is still running, so it is required \
+on both states rather than only on the one that sets the indicator.\n\n\
+Examples:\n  \
+buzz agents activity --project 30617:<OWNER>:buzz --root <EVENT_ID> \
+--state working --turn <TURN_ID>\n  \
+buzz agents activity --project 30617:<OWNER>:buzz --root <EVENT_ID> \
+--state idle --turn <TURN_ID>"
+    )]
+    Activity {
+        /// 30617:<owner>:<identifier> repo coordinate
+        #[arg(long)]
+        project: String,
+        /// Issue or pull-request root event id (64-char hex)
+        #[arg(long)]
+        root: String,
+        /// Whether a turn is running on this root, or has ended
+        #[arg(long, value_parser = ["working", "idle"])]
+        state: String,
+        /// The turn this signal belongs to
+        #[arg(long)]
+        turn: String,
+        /// Short human-readable label, e.g. "reading files" (max 80 chars)
+        #[arg(long)]
+        stage: Option<String>,
+    },
+    /// Ask whether other agents share your NIP-OA owner (kind 0 `auth` tag)
+    #[command(
+        after_help = "Answers the one question a peer call has to ask before it may invoke \
+you: is this caller a verified same-owner sibling. The attestation is checked \
+here — the queried profile's `auth` tag must name your owner and carry a valid \
+BIP-340 signature over the NIP-OA preimage — so a relay that returns an \
+unsigned or mis-owned profile produces `false`, never a trusted answer.\n\n\
+An agent running without BUZZ_AUTH_TAG has no owner and therefore no siblings: \
+every pubkey comes back `false` with a null owner, rather than an error.\n\n\
+Examples:\n  \
+buzz agents siblings --pubkey <PUBKEY>\n  \
+buzz agents siblings --pubkey <PUBKEY> --pubkey <OTHER_PUBKEY>"
+    )]
+    Siblings {
+        /// Agent pubkey to check (64-char hex); repeat for several
+        #[arg(long = "pubkey", required = true)]
+        pubkeys: Vec<String>,
+    },
     /// Read the relay's current NIP-IA archive snapshot (kind 13535)
     #[command(
         after_help = "Verifies the snapshot's NIP-11 `self` authorship, event id, signature, \
@@ -419,6 +474,55 @@ Examples:\n  \
 buzz agents archived"
     )]
     Archived,
+}
+
+/// Subcommands for `buzz projects` — the relay reads a project-routed agent
+/// runtime needs and no existing group exposes.
+///
+/// Deliberately raw signed events rather than a rendered view. Both callers are
+/// runtimes that verify id and signature themselves before acting on an event's
+/// author, and a summarised row cannot be verified: the fields authority rests
+/// on would be ones this command asserted rather than ones the signer did.
+#[derive(Subcommand)]
+pub enum ProjectsCmd {
+    /// List issue and pull-request roots that mention an agent
+    #[command(
+        after_help = "Scoped to repositories you name, and to roots that `p`-tag the given \
+agent. Both scopes are required: an unscoped version of this query is \"every \
+project event on the relay\", which is a different question.\n\n\
+Returns the raw signed root events, newest first, so the caller can verify \
+them.\n\n\
+Examples:\n  \
+buzz projects roots --project 30617:<OWNER>:buzz --mention <AGENT_PUBKEY>"
+    )]
+    Roots {
+        /// 30617:<owner>:<identifier> repo coordinate; repeat for several
+        #[arg(long = "project", required = true)]
+        projects: Vec<String>,
+        /// Only roots that `p`-tag this pubkey (64-char hex)
+        #[arg(long)]
+        mention: String,
+        /// Maximum roots to return (default 200, maximum 500)
+        #[arg(long)]
+        limit: Option<u32>,
+    },
+    /// Read a root's comments, lifecycle events and pull-request updates
+    #[command(after_help = "Two queries, because the two reference styles are not \
+interchangeable: comments, peer-call envelopes and status events point at the \
+root with lowercase `e`, while a pull-request revision points at it with \
+uppercase `E`. A single lowercase query silently drops every revision.\n\n\
+Returns the raw signed events for the caller to verify and order.\n\n\
+Examples:\n  \
+buzz projects history --root <EVENT_ID>\n  \
+buzz projects history --root <EVENT_ID> --root <OTHER_EVENT_ID> --limit 50")]
+    History {
+        /// Issue or pull-request root event id (64-char hex); repeat for several
+        #[arg(long = "root", required = true)]
+        roots: Vec<String>,
+        /// Maximum events to return per query (default 200, maximum 500)
+        #[arg(long)]
+        limit: Option<u32>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1946,6 +2050,7 @@ async fn run(cli: Cli) -> Result<(), CliError> {
         Cmd::Repos(sub) => commands::repos::dispatch(sub, &client).await,
         Cmd::Patches(sub) => commands::patches::dispatch(sub, &client).await,
         Cmd::Issues(sub) => commands::issues::dispatch(sub, &client).await,
+        Cmd::Projects(sub) => commands::projects::dispatch(sub, &client).await,
         Cmd::Pr(sub) => commands::pr::dispatch(sub, &client).await,
         Cmd::Media(sub) => commands::upload::dispatch_media(sub, &client).await,
         Cmd::Upload(sub) => commands::upload::dispatch(sub, &client).await,
@@ -2008,6 +2113,7 @@ mod tests {
             "pack",
             "patches",
             "pr",
+            "projects",
             "reactions",
             "repos",
             "social",
@@ -2058,12 +2164,14 @@ mod tests {
         assert_eq!(
             names(&cmd, "agents"),
             vec![
+                "activity",
                 "archive",
                 "archived",
                 "call",
                 "call-result",
                 "draft-create",
                 "draft-update",
+                "siblings",
                 "unarchive"
             ]
         );
@@ -2276,7 +2384,7 @@ mod tests {
     #[test]
     fn subcommand_counts_are_stable() {
         let expected: Vec<(&str, usize)> = vec![
-            ("agents", 7),
+            ("agents", 9),
             ("canvas", 2),
             ("channels", 16),
             ("dms", 4),
@@ -2288,6 +2396,7 @@ mod tests {
             ("pack", 2),
             ("patches", 4),
             ("pr", 6),
+            ("projects", 2),
             ("reactions", 3),
             ("repos", 5),
             ("social", 7),

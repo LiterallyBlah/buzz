@@ -12,6 +12,7 @@ pub mod notes;
 pub mod pack;
 pub mod patches;
 pub mod pr;
+pub mod projects;
 pub mod reactions;
 pub mod repos;
 pub mod social;

@@ -5,7 +5,7 @@ use buzz_core::peer_call::{
 };
 use buzz_sdk::builders::{
     build_archive_identity_request, build_peer_call, build_peer_call_result,
-    build_unarchive_identity_request, PeerCallMeta,
+    build_project_activity, build_unarchive_identity_request, PeerCallMeta, ProjectActivityState,
 };
 use nostr::PublicKey;
 use serde_json::json;
@@ -198,6 +198,123 @@ async fn issuing_gate(
     Ok(())
 }
 
+// ── NIP-OA sibling verification ───────────────────────────────────────────────
+
+/// Ceiling on one `agents siblings` question. Callers ask about the authors
+/// they have actually seen, and a runtime that needs more than this in one
+/// breath is asking a different question.
+const MAX_SIBLING_QUERY: usize = 50;
+
+/// Does this profile carry an owner-signed NIP-OA attestation for `agent`?
+///
+/// The preimage covers the agent pubkey, so a relay cannot lift a valid
+/// attestation from one agent onto another: the signature is verified against
+/// the pubkey *asked about*, not the one the event claims. Withholding the
+/// profile produces `false`, which is the fail-closed direction — an
+/// unverifiable caller is untrusted, not trusted-by-default.
+fn profile_attests(profiles: &[serde_json::Value], agent: &str, owner: &str) -> bool {
+    let Ok(agent_pk) = PublicKey::from_hex(agent) else {
+        return false;
+    };
+    let Some(event) = profiles.iter().find(|e| {
+        e.get("pubkey")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|author| author.eq_ignore_ascii_case(agent))
+    }) else {
+        return false;
+    };
+    let Some(tags) = event.get("tags").and_then(serde_json::Value::as_array) else {
+        return false;
+    };
+    tags.iter().any(|tag| {
+        let Some(parts) = tag.as_array() else {
+            return false;
+        };
+        if parts.len() < 4 || parts[0].as_str() != Some("auth") {
+            return false;
+        }
+        // Only an attestation naming *our* owner is worth a signature check;
+        // a valid attestation to somebody else's owner is not a sibling.
+        if !parts[1]
+            .as_str()
+            .is_some_and(|claimed| claimed.eq_ignore_ascii_case(owner))
+        {
+            return false;
+        }
+        let tag_json = serde_json::to_string(tag).unwrap_or_default();
+        buzz_sdk::nip_oa::verify_auth_tag(&tag_json, &agent_pk).is_ok()
+    })
+}
+
+/// Answer, for each pubkey, whether it is a verified same-owner sibling.
+///
+/// The owner is this process's own — the one its verified `BUZZ_AUTH_TAG`
+/// names — so the question is always "sibling of me", never "sibling of a
+/// pubkey the caller supplied". An agent with no auth tag has no owner and
+/// therefore no siblings; it answers `false` for everything without asking the
+/// relay anything, because there is nothing the answer could be checked
+/// against.
+async fn siblings_report(
+    client: &BuzzClient,
+    pubkeys: &[String],
+) -> Result<serde_json::Value, CliError> {
+    if pubkeys.is_empty() || pubkeys.len() > MAX_SIBLING_QUERY {
+        return Err(CliError::Usage(format!(
+            "--pubkey: give 1 to {MAX_SIBLING_QUERY} pubkeys"
+        )));
+    }
+    let mut wanted: Vec<String> = Vec::with_capacity(pubkeys.len());
+    for pubkey in pubkeys {
+        validate_hex64(pubkey)?;
+        let pubkey = pubkey.to_ascii_lowercase();
+        if !wanted.contains(&pubkey) {
+            wanted.push(pubkey);
+        }
+    }
+
+    let me = client.keys().public_key().to_hex().to_ascii_lowercase();
+    let owner = client.auth_tag_owner_hex().map(|o| o.to_ascii_lowercase());
+
+    let profiles: Vec<serde_json::Value> = match owner {
+        None => Vec::new(),
+        Some(_) => {
+            let raw = client
+                .query(&json!({
+                    "kinds": [0],
+                    "authors": wanted,
+                    "limit": wanted.len(),
+                }))
+                .await?;
+            serde_json::from_str(&raw)
+                .map_err(|e| CliError::Other(format!("could not read profiles: {e}")))?
+        }
+    };
+
+    let results: Vec<serde_json::Value> = wanted
+        .iter()
+        .map(|pubkey| {
+            // An agent is not its own sibling. Its own attestation verifies,
+            // so without this it would report itself as a peer it may accept
+            // calls from — the one caller class every runtime refuses first.
+            let sibling = pubkey.as_str() != me.as_str()
+                && owner
+                    .as_deref()
+                    .is_some_and(|owner| profile_attests(&profiles, pubkey, owner));
+            json!({"pubkey": pubkey, "sibling": sibling})
+        })
+        .collect();
+
+    Ok(json!({"owner": owner, "results": results}))
+}
+
+/// The command: the report above, printed. Kept this thin deliberately — a
+/// test that asserts on the report is asserting on what the caller receives,
+/// not on a parallel reconstruction of it.
+async fn cmd_siblings(client: &BuzzClient, pubkeys: &[String]) -> Result<(), CliError> {
+    println!("{}", siblings_report(client, pubkeys).await?);
+    Ok(())
+}
+
 pub async fn dispatch(command: AgentsCmd, client: &BuzzClient) -> Result<(), CliError> {
     match command {
         AgentsCmd::Call {
@@ -302,6 +419,74 @@ pub async fn dispatch(command: AgentsCmd, client: &BuzzClient) -> Result<(), Cli
             );
             Ok(())
         }
+
+        AgentsCmd::Activity {
+            project,
+            root,
+            state,
+            turn,
+            stage,
+        } => {
+            validate_hex64(&root)?;
+            let repo = buzz_sdk::GitRepoCoord::from_a_tag_value(&project).ok_or_else(|| {
+                CliError::Usage(format!(
+                    "--project must be 30617:<owner>:<identifier> (got {project:?})"
+                ))
+            })?;
+            // Clap's value parser is the only source of these two spellings, so
+            // an unknown one cannot arrive here; refusing rather than
+            // defaulting keeps it that way if the parser ever widens.
+            let state = match state.as_str() {
+                "working" => ProjectActivityState::Working,
+                "idle" => ProjectActivityState::Idle,
+                other => {
+                    return Err(CliError::Usage(format!(
+                        "--state must be working or idle (got {other:?})"
+                    )))
+                }
+            };
+
+            // The signer *is* the agent the signal is about. Taking it from the
+            // keys rather than from a flag is what stops one agent announcing
+            // that another is working: the `agent` tag and the authorship
+            // cannot disagree, so a consumer that checks either is checking
+            // both.
+            let agent = client.keys().public_key().to_hex().to_ascii_lowercase();
+            let builder = build_project_activity(
+                &repo,
+                &root.to_ascii_lowercase(),
+                &agent,
+                state,
+                &turn,
+                stage.as_deref(),
+            )
+            .map_err(|e| CliError::Usage(format!("invalid activity: {e}")))?;
+
+            // `sign_event_unchecked`, like the peer-call envelopes beside it:
+            // an activity signal is published to everyone who can read the
+            // issue, and the ambient NIP-OA auth tag is an owner attestation
+            // that belongs on the agent's own profile, not stamped onto every
+            // ephemeral frame.
+            let event = client.sign_event_unchecked(builder)?;
+            let event_id = event.id.to_hex();
+            client.submit_event(event).await?;
+            println!(
+                "{}",
+                json!({
+                    "ok": true,
+                    "event_id": event_id,
+                    "root": root.to_ascii_lowercase(),
+                    "state": match state {
+                        ProjectActivityState::Working => "working",
+                        ProjectActivityState::Idle => "idle",
+                    },
+                    "turn": turn,
+                })
+            );
+            Ok(())
+        }
+
+        AgentsCmd::Siblings { pubkeys } => cmd_siblings(client, &pubkeys).await,
 
         AgentsCmd::DraftCreate {
             channel,
@@ -1327,5 +1512,366 @@ mod issuing_gate_tests {
             .await
             .expect_err("an unanswerable query must not publish");
         assert_eq!(published.load(Ordering::SeqCst), 0);
+    }
+}
+
+/// NIP-PA activity and NIP-OA sibling verification, proved on the wire.
+///
+/// The activity tests read the **published event**, not the builder's return
+/// value: the tag shape is the whole product here, and an `h` tag or a missing
+/// marked root would leave every consumer keyed on the wrong thing while the
+/// command still exited zero.
+#[cfg(test)]
+mod activity_tests {
+    use std::net::SocketAddr;
+    use std::sync::{Arc, Mutex};
+
+    use axum::extract::State;
+    use axum::routing::post;
+    use axum::{Json, Router};
+    use buzz_sdk::nip_oa::compute_auth_tag;
+    use nostr::Keys;
+    use serde_json::Value;
+    use tokio::net::TcpListener;
+
+    use super::*;
+    use crate::AgentsCmd;
+
+    const ROOT: &str = "3333333333333333333333333333333333333333333333333333333333333333";
+    const TURN: &str = "turn-7";
+
+    #[derive(Clone)]
+    struct Relay {
+        stored: Arc<Vec<Value>>,
+        published: Arc<Mutex<Vec<Value>>>,
+    }
+
+    /// A relay that answers `/query` from a fixed history and keeps every event
+    /// submitted to `/events`.
+    async fn relay_with(stored: Vec<Value>) -> (String, Arc<Mutex<Vec<Value>>>) {
+        let published = Arc::new(Mutex::new(Vec::new()));
+        let state = Relay {
+            stored: Arc::new(stored),
+            published: published.clone(),
+        };
+        let app = Router::new()
+            .route(
+                "/query",
+                post(|State(s): State<Relay>, _body: String| async move {
+                    Json(Value::Array(s.stored.as_ref().clone()))
+                }),
+            )
+            .route(
+                "/events",
+                post(|State(s): State<Relay>, body: String| async move {
+                    if let Ok(event) = serde_json::from_str::<Value>(&body) {
+                        s.published.lock().expect("lock").push(event);
+                    }
+                    Json(serde_json::json!({"accepted": true, "message": ""}))
+                }),
+            )
+            .with_state(state);
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr: SocketAddr = listener.local_addr().expect("addr");
+        tokio::spawn(async move { axum::serve(listener, app).await.expect("serve") });
+        (format!("http://{addr}"), published)
+    }
+
+    fn coordinate(owner: &Keys) -> String {
+        format!("30617:{}:demo", owner.public_key().to_hex())
+    }
+
+    fn tag_values(event: &Value, name: &str) -> Vec<String> {
+        event
+            .get("tags")
+            .and_then(Value::as_array)
+            .map(|tags| {
+                tags.iter()
+                    .filter_map(|t| {
+                        let parts = t.as_array()?;
+                        (parts.first()?.as_str()? == name)
+                            .then(|| parts.get(1)?.as_str().map(str::to_owned))?
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn activity_command(owner: &Keys, state: &str, stage: Option<&str>) -> AgentsCmd {
+        AgentsCmd::Activity {
+            project: coordinate(owner),
+            root: ROOT.to_string(),
+            state: state.to_string(),
+            turn: TURN.to_string(),
+            stage: stage.map(str::to_owned),
+        }
+    }
+
+    /// The exact event shape NIP-PA pins, read off the wire.
+    #[tokio::test]
+    async fn activity_publishes_the_repository_root_agent_state_and_turn() {
+        let agent = Keys::generate();
+        let owner = Keys::generate();
+        let (url, published) = relay_with(vec![]).await;
+        let client = BuzzClient::new(url, agent.clone(), None, None).expect("client");
+
+        dispatch(activity_command(&owner, "working", None), &client)
+            .await
+            .expect("publishes");
+
+        let published = published.lock().expect("lock");
+        assert_eq!(published.len(), 1, "one activity event");
+        let event = &published[0];
+        assert_eq!(event["kind"], serde_json::json!(20003));
+        assert_eq!(tag_values(event, "a"), vec![coordinate(&owner)]);
+        assert_eq!(tag_values(event, "e"), vec![ROOT.to_string()]);
+        assert_eq!(
+            tag_values(event, "agent"),
+            vec![agent.public_key().to_hex()],
+            "the agent tag must be the signer, not a caller-supplied pubkey"
+        );
+        assert_eq!(tag_values(event, "state"), vec!["working".to_string()]);
+        assert_eq!(tag_values(event, "turn"), vec![TURN.to_string()]);
+        assert!(
+            tag_values(event, "stage").is_empty(),
+            "no stage was given, so none may be invented"
+        );
+        assert!(
+            tag_values(event, "h").is_empty(),
+            "an issue is not a channel — an h tag would key every consumer on a channel that does not exist"
+        );
+        // The `e` tag must be *marked* root, or a client that groups a thread
+        // by its root marker never sees this signal.
+        let marked: Vec<&Value> = event["tags"]
+            .as_array()
+            .expect("tags")
+            .iter()
+            .filter(|t| t[0] == serde_json::json!("e"))
+            .collect();
+        assert_eq!(marked.len(), 1);
+        assert_eq!(marked[0][3], serde_json::json!("root"));
+    }
+
+    #[tokio::test]
+    async fn activity_carries_an_optional_stage_label() {
+        let agent = Keys::generate();
+        let owner = Keys::generate();
+        let (url, published) = relay_with(vec![]).await;
+        let client = BuzzClient::new(url, agent, None, None).expect("client");
+
+        dispatch(
+            activity_command(&owner, "idle", Some("reading files")),
+            &client,
+        )
+        .await
+        .expect("publishes");
+
+        let published = published.lock().expect("lock");
+        let event = &published[0];
+        assert_eq!(tag_values(event, "state"), vec!["idle".to_string()]);
+        assert_eq!(
+            tag_values(event, "stage"),
+            vec!["reading files".to_string()]
+        );
+    }
+
+    /// A refused activity publishes nothing. An indicator raised by a malformed
+    /// coordinate would point at a repository nobody can resolve.
+    #[tokio::test]
+    async fn a_malformed_activity_never_reaches_the_relay() {
+        let agent = Keys::generate();
+        let owner = Keys::generate();
+        let (url, published) = relay_with(vec![]).await;
+        let client = BuzzClient::new(url, agent, None, None).expect("client");
+
+        for command in [
+            AgentsCmd::Activity {
+                project: "not-a-coordinate".into(),
+                root: ROOT.into(),
+                state: "working".into(),
+                turn: TURN.into(),
+                stage: None,
+            },
+            AgentsCmd::Activity {
+                project: coordinate(&owner),
+                root: "nope".into(),
+                state: "working".into(),
+                turn: TURN.into(),
+                stage: None,
+            },
+            AgentsCmd::Activity {
+                project: coordinate(&owner),
+                root: ROOT.into(),
+                state: "working".into(),
+                turn: "   ".into(),
+                stage: None,
+            },
+        ] {
+            dispatch(command, &client)
+                .await
+                .expect_err("a malformed activity must be refused");
+        }
+        assert!(published.lock().expect("lock").is_empty());
+    }
+
+    // ── Siblings ──────────────────────────────────────────────────────────
+
+    /// A kind:0 profile carrying a NIP-OA attestation from `owner`.
+    fn profile_with_auth(agent: &Keys, owner: &Keys) -> Value {
+        let tag_json = compute_auth_tag(owner, &agent.public_key(), "").expect("attestation");
+        let tag: Value = serde_json::from_str(&tag_json).expect("tag json");
+        serde_json::json!({
+            "pubkey": agent.public_key().to_hex(),
+            "kind": 0,
+            "content": "{}",
+            "tags": [tag],
+        })
+    }
+
+    /// The real command's report, verbatim: `cmd_siblings` is nothing but a
+    /// `println!` of this, so what is asserted here is what a caller receives.
+    async fn siblings_response(
+        me: &Keys,
+        owner: Option<&Keys>,
+        stored: Vec<Value>,
+        asked: &[&Keys],
+    ) -> Vec<(String, bool)> {
+        let (url, _published) = relay_with(stored).await;
+        let auth = owner.map(|owner| {
+            let json = compute_auth_tag(owner, &me.public_key(), "").expect("attestation");
+            (buzz_sdk::nip_oa::parse_auth_tag(&json).expect("tag"), json)
+        });
+        let client = BuzzClient::new(
+            url,
+            me.clone(),
+            auth.as_ref().map(|(tag, _)| tag.clone()),
+            auth.as_ref().map(|(_, json)| json.clone()),
+        )
+        .expect("client");
+
+        let pubkeys: Vec<String> = asked.iter().map(|k| k.public_key().to_hex()).collect();
+        let report = siblings_report(&client, &pubkeys)
+            .await
+            .expect("siblings report");
+        assert_eq!(
+            report["owner"],
+            owner
+                .map(|o| Value::String(o.public_key().to_hex()))
+                .unwrap_or(Value::Null),
+            "the report must name the owner it verified against"
+        );
+        report["results"]
+            .as_array()
+            .expect("results")
+            .iter()
+            .map(|row| {
+                (
+                    row["pubkey"].as_str().unwrap_or_default().to_string(),
+                    row["sibling"].as_bool().unwrap_or_default(),
+                )
+            })
+            .collect()
+    }
+
+    /// The enum wiring: `buzz agents siblings` reaches the report at all.
+    #[tokio::test]
+    async fn the_siblings_subcommand_is_wired_to_the_report() {
+        let owner = Keys::generate();
+        let me = Keys::generate();
+        let peer = Keys::generate();
+        let (url, _published) = relay_with(vec![profile_with_auth(&peer, &owner)]).await;
+        let client = BuzzClient::new(url, me, None, None).expect("client");
+        dispatch(
+            AgentsCmd::Siblings {
+                pubkeys: vec![peer.public_key().to_hex()],
+            },
+            &client,
+        )
+        .await
+        .expect("siblings");
+
+        dispatch(AgentsCmd::Siblings { pubkeys: vec![] }, &client)
+            .await
+            .expect_err("a question about nobody is not a question");
+    }
+
+    #[tokio::test]
+    async fn a_same_owner_attestation_makes_a_sibling() {
+        let owner = Keys::generate();
+        let me = Keys::generate();
+        let peer = Keys::generate();
+        let results = siblings_response(
+            &me,
+            Some(&owner),
+            vec![profile_with_auth(&peer, &owner)],
+            &[&peer],
+        )
+        .await;
+        assert_eq!(results, vec![(peer.public_key().to_hex(), true)]);
+    }
+
+    #[tokio::test]
+    async fn an_attestation_from_a_different_owner_is_not_a_sibling() {
+        let owner = Keys::generate();
+        let stranger_owner = Keys::generate();
+        let me = Keys::generate();
+        let peer = Keys::generate();
+        let results = siblings_response(
+            &me,
+            Some(&owner),
+            vec![profile_with_auth(&peer, &stranger_owner)],
+            &[&peer],
+        )
+        .await;
+        assert_eq!(results, vec![(peer.public_key().to_hex(), false)]);
+    }
+
+    /// The forgery the preimage exists to stop: a valid attestation for one
+    /// agent, served on another agent's profile.
+    #[tokio::test]
+    async fn an_attestation_lifted_onto_another_agents_profile_is_refused() {
+        let owner = Keys::generate();
+        let me = Keys::generate();
+        let real = Keys::generate();
+        let impostor = Keys::generate();
+        let lifted = compute_auth_tag(&owner, &real.public_key(), "").expect("attestation");
+        let tag: Value = serde_json::from_str(&lifted).expect("tag json");
+        let profile = serde_json::json!({
+            "pubkey": impostor.public_key().to_hex(),
+            "kind": 0,
+            "content": "{}",
+            "tags": [tag],
+        });
+
+        let results = siblings_response(&me, Some(&owner), vec![profile], &[&impostor]).await;
+        assert_eq!(results, vec![(impostor.public_key().to_hex(), false)]);
+    }
+
+    /// No owner, no siblings. An unowned agent has nothing for a caller to be
+    /// verified against, so the answer is `false` rather than an error.
+    #[tokio::test]
+    async fn an_agent_without_an_auth_tag_has_no_siblings() {
+        let owner = Keys::generate();
+        let me = Keys::generate();
+        let peer = Keys::generate();
+        let results =
+            siblings_response(&me, None, vec![profile_with_auth(&peer, &owner)], &[&peer]).await;
+        assert_eq!(results, vec![(peer.public_key().to_hex(), false)]);
+    }
+
+    /// An agent is not its own sibling: its own attestation verifies, and
+    /// reporting it would name the one caller class every runtime refuses first.
+    #[tokio::test]
+    async fn an_agent_is_not_its_own_sibling() {
+        let owner = Keys::generate();
+        let me = Keys::generate();
+        let results = siblings_response(
+            &me,
+            Some(&owner),
+            vec![profile_with_auth(&me, &owner)],
+            &[&me],
+        )
+        .await;
+        assert_eq!(results, vec![(me.public_key().to_hex(), false)]);
     }
 }
