@@ -236,6 +236,34 @@ pub enum PromptSource {
     Heartbeat,
 }
 
+/// Where a turn actually came from, for the observer bus.
+///
+/// A project batch runs under a route key that is a UUIDv5 of its root, and
+/// reporting that as a channel id is what made the desktop create a turn under a
+/// channel that does not exist while the issue's own panel stayed empty. The
+/// batch already carries the validated binding, so the route is read from it
+/// rather than inferred from the shape of the key — a UUID cannot be asked
+/// whether it names a channel.
+///
+/// Split out of `run_prompt_task` so the mapping is reachable without driving a
+/// whole turn: this one function decides which surface an agent's activity
+/// appears on, and it should not only be observable through a spawned process.
+pub(crate) fn observer_route_for(
+    source: &PromptSource,
+    batch: Option<&FlushBatch>,
+) -> observer::TurnRoute {
+    match (source, batch.and_then(|b| b.project_origin())) {
+        (PromptSource::Channel(_), Some(origin)) => {
+            observer::TurnRoute::Project(observer::ProjectRouteRef {
+                coordinate: origin.coordinate().to_string(),
+                root: origin.root().to_string(),
+            })
+        }
+        (PromptSource::Channel(channel_id), None) => observer::TurnRoute::Channel(*channel_id),
+        (PromptSource::Heartbeat, _) => observer::TurnRoute::None,
+    }
+}
+
 /// Apply state effects for Race 1, where a control signal arrives just after the
 /// prompt completed naturally. The prompt result has already been consumed by
 /// `select!`, so the harness must synthesize a successful result while still
@@ -1394,13 +1422,17 @@ pub async fn run_prompt_task(
         Some(b) => PromptSource::Channel(b.channel_id),
         None => PromptSource::Heartbeat,
     };
+    let observer_route = observer_route_for(&source, batch.as_ref());
+    // Kept for the NIP-AM turn metric only, whose `channelId` field is an
+    // existing published contract this phase does not renegotiate. Every
+    // *observer* path now takes `observer_route` instead.
     let observer_channel_id = match &source {
         PromptSource::Channel(channel_id) => Some(*channel_id),
         PromptSource::Heartbeat => None,
     };
     let turn_started_at = chrono::Utc::now().to_rfc3339();
     agent.acp.set_observer_context(observer::context_for_turn(
-        observer_channel_id,
+        observer_route.clone(),
         None,
         turn_id.clone(),
         turn_started_at.clone(),
@@ -1427,7 +1459,7 @@ pub async fn run_prompt_task(
     let _turn_guard = TurnCompletionGuard::new(
         agent.acp.observer_handle(),
         agent.acp.observer_agent_index(),
-        observer_channel_id,
+        observer_route.clone(),
         turn_id.clone(),
     );
 
@@ -1448,7 +1480,7 @@ pub async fn run_prompt_task(
         agent.acp.observer_handle(),
         agent.acp.observer_agent_index(),
         observer::context_for_turn(
-            observer_channel_id,
+            observer_route.clone(),
             None,
             turn_id.clone(),
             turn_started_at.clone(),
@@ -1685,7 +1717,7 @@ pub async fn run_prompt_task(
         }
     };
     agent.acp.set_observer_context(observer::context_for_turn(
-        observer_channel_id,
+        observer_route.clone(),
         Some(session_id.clone()),
         turn_id.clone(),
         turn_started_at,
@@ -3606,7 +3638,13 @@ impl Drop for LivenessGuard {
 struct TurnCompletionGuard {
     observer: Option<observer::ObserverHandle>,
     agent_index: Option<usize>,
-    channel_id: Option<uuid::Uuid>,
+    /// The turn's route, not merely its channel.
+    ///
+    /// This guard emits the *terminal* frame, and the terminal frame is what
+    /// clears a project root's activity. A guard that knew only about channels
+    /// would end every project turn on a route nobody is watching, leaving the
+    /// issue showing an agent that stopped working minutes ago.
+    route: observer::TurnRoute,
     turn_id: String,
 }
 
@@ -3614,13 +3652,13 @@ impl TurnCompletionGuard {
     fn new(
         observer: Option<observer::ObserverHandle>,
         agent_index: Option<usize>,
-        channel_id: Option<uuid::Uuid>,
+        route: observer::TurnRoute,
         turn_id: String,
     ) -> Self {
         Self {
             observer,
             agent_index,
-            channel_id,
+            route,
             turn_id,
         }
     }
@@ -3629,7 +3667,12 @@ impl TurnCompletionGuard {
 impl Drop for TurnCompletionGuard {
     fn drop(&mut self) {
         if let Some(observer) = self.observer.take() {
-            let context = observer::context_for(self.channel_id, None, Some(self.turn_id.clone()));
+            let context = observer::context_for_turn(
+                self.route.clone(),
+                None,
+                self.turn_id.clone(),
+                String::new(),
+            );
             observer.emit(
                 "turn_completed",
                 self.agent_index,
@@ -5627,8 +5670,12 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn test_liveness_stops_before_completion_frame() {
         let observer = observer::ObserverHandle::in_process();
-        let context =
-            observer::context_for_turn(None, None, "t-1".into(), "2026-07-14T21:00:00Z".into());
+        let context = observer::context_for_turn(
+            observer::TurnRoute::None,
+            None,
+            "t-1".into(),
+            "2026-07-14T21:00:00Z".into(),
+        );
         let completion_context = observer::context_for(None, None, Some("t-1".into()));
         let completion_observer = observer.clone();
         let completion_handle = tokio::spawn(async move {
@@ -5681,7 +5728,12 @@ mod tests {
     async fn test_liveness_fires_until_guard_drops() {
         let observer = observer::ObserverHandle::in_process();
         let started_at = "2026-07-14T21:00:00Z".to_string();
-        let context = observer::context_for_turn(None, None, "t-1".into(), started_at.clone());
+        let context = observer::context_for_turn(
+            observer::TurnRoute::None,
+            None,
+            "t-1".into(),
+            started_at.clone(),
+        );
         let state = open_liveness_state();
         let guard = LivenessGuard::new(
             tokio::spawn(run_turn_liveness(
@@ -5732,8 +5784,12 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn test_liveness_backfills_session_id_after_resolution() {
         let observer = observer::ObserverHandle::in_process();
-        let context =
-            observer::context_for_turn(None, None, "t-1".into(), "2026-07-14T21:00:00Z".into());
+        let context = observer::context_for_turn(
+            observer::TurnRoute::None,
+            None,
+            "t-1".into(),
+            "2026-07-14T21:00:00Z".into(),
+        );
         let state = open_liveness_state();
         let guard = LivenessGuard::new(
             tokio::spawn(run_turn_liveness(
@@ -5832,8 +5888,12 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn test_liveness_emits_nothing_once_closed_flag_is_set() {
         let observer = observer::ObserverHandle::in_process();
-        let context =
-            observer::context_for_turn(None, None, "t-1".into(), "2026-07-14T21:00:00Z".into());
+        let context = observer::context_for_turn(
+            observer::TurnRoute::None,
+            None,
+            "t-1".into(),
+            "2026-07-14T21:00:00Z".into(),
+        );
         // Set directly, bypassing `LivenessGuard` — isolates the read side of
         // the contract: the check under the lock must gate the emit on its own.
         let state = Arc::new(Mutex::new(LivenessState {

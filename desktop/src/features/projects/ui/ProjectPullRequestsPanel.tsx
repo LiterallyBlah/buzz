@@ -49,6 +49,7 @@ import {
   ProfileAuthorName,
   ProfileIdentityButton,
 } from "./ProjectProfileIdentity";
+import { ProjectActivityIndicator } from "./ProjectActivityIndicator";
 import { ProjectRichContent } from "./ProjectRichContent";
 import { PullRequestReviewersRow } from "./PullRequestReviewersRow";
 import { PullRequestReviewCard } from "./PullRequestReviewCard";
@@ -655,6 +656,11 @@ export function ProjectPullRequestDetail({
           />
         </header>
       ) : null}
+
+      <ProjectActivityIndicator
+        profiles={profiles}
+        rootEventId={pullRequest.id}
+      />
 
       {pullRequest.updates.length > 0 ? (
         <section className="space-y-3 border-border/50 border-t p-4">

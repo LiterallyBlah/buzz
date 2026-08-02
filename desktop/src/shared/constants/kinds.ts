@@ -34,6 +34,10 @@ export const KIND_APPROVAL_REQUEST = 46010;
 export const KIND_MEMBER_ADDED_NOTIFICATION = 44100;
 export const KIND_MEMBER_REMOVED_NOTIFICATION = 44101;
 export const KIND_TYPING_INDICATOR = 20002;
+// NIP-PA: ephemeral agent activity on a project issue or pull request. Bound to
+// the repository `a` and the root `e`; carries no `h`, because an issue is not
+// a channel.
+export const KIND_PROJECT_ACTIVITY = 20003;
 export const KIND_HUDDLE_REACTION = 24810;
 export const KIND_HUDDLE_STARTED = 48100;
 export const KIND_HUDDLE_PARTICIPANT_JOINED = 48101;

@@ -452,6 +452,13 @@ pub const KIND_PRESENCE_UPDATE: u32 = 20001;
 pub const KIND_PAIRING: u32 = 24134;
 /// Ephemeral: typing indicator for a channel.
 pub const KIND_TYPING_INDICATOR: u32 = 20002;
+/// NIP-PA: Ephemeral agent activity on a project issue or pull request.
+///
+/// The project-routed counterpart of [`KIND_TYPING_INDICATOR`]. It is bound to
+/// a repository coordinate (`a`) and a root (`e`) and carries **no `h`** — an
+/// issue is not a channel, and a channel tag here would either be a lie or
+/// route the signal somewhere nobody is looking. See `docs/nips/NIP-PA.md`.
+pub const KIND_PROJECT_ACTIVITY: u32 = 20003;
 /// Ephemeral: owner-scoped encrypted agent observer telemetry and control frame.
 pub const KIND_AGENT_OBSERVER_FRAME: u32 = 24200;
 /// Ephemeral: huddle emoji reaction burst. Channel-scoped to the ephemeral
@@ -671,6 +678,7 @@ pub const ALL_KINDS: &[u32] = &[
     KIND_WINDOW_BOUNDS,
     KIND_PRESENCE_UPDATE,
     KIND_TYPING_INDICATOR,
+    KIND_PROJECT_ACTIVITY,
     KIND_HUDDLE_REACTION,
     KIND_BLOSSOM_AUTH,
     KIND_PAIRING,

@@ -17,11 +17,33 @@ use tokio::sync::broadcast;
 
 const OBSERVER_BUFFER_CAP: usize = 1_000;
 
+/// The project root a turn belongs to, when it is not a channel turn.
+///
+/// Carried beside `channel_id` rather than encoded into it. A project turn runs
+/// under a route key that is a UUIDv5 of the root, and the previous code passed
+/// that UUID as `channel_id` — so every channel-keyed consumer created state
+/// for a channel that does not exist, and the panel for the issue that caused
+/// the work rendered empty. The two are different kinds of place and are now
+/// different fields.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectRouteRef {
+    /// `30617:<owner>:<identifier>` repository coordinate.
+    pub coordinate: String,
+    /// Issue or pull-request root event id.
+    pub root: String,
+}
+
 /// Best-effort metadata attached to observer events.
 #[derive(Clone, Debug, Default)]
 pub struct ObserverContext {
     /// Buzz channel UUID for the current turn, when channel-scoped.
+    ///
+    /// `None` for a project turn. A route key is not a channel id, and naming
+    /// one here is the defect this field's emptiness now records honestly.
     pub channel_id: Option<String>,
+    /// The project root for the current turn, when project-scoped.
+    pub project: Option<ProjectRouteRef>,
     /// ACP session ID associated with the current turn, once known.
     pub session_id: Option<String>,
     /// Local UUID for one prompt turn.
@@ -65,8 +87,14 @@ pub struct ObserverEvent {
     pub kind: String,
     /// Pool slot index for the agent process that emitted the event.
     pub agent_index: Option<usize>,
-    /// Buzz channel UUID for channel-scoped events.
+    /// Buzz channel UUID for channel-scoped events. `None` on a project turn.
     pub channel_id: Option<String>,
+    /// The project root for project-scoped events (NIP-PA / NIP-AO).
+    ///
+    /// Omitted entirely for a channel turn, so a consumer that has never heard
+    /// of project routing reads exactly the payload it read before.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub project: Option<ProjectRouteRef>,
     /// ACP session ID when known.
     pub session_id: Option<String>,
     /// Local UUID for one prompt turn.
@@ -114,6 +142,7 @@ impl ObserverHandle {
             kind: kind.into(),
             agent_index,
             channel_id: context.channel_id.clone(),
+            project: context.project.clone(),
             session_id: context.session_id.clone(),
             turn_id: context.turn_id.clone(),
             started_at: context.started_at.clone(),
@@ -144,6 +173,7 @@ pub fn context_for(
 ) -> ObserverContext {
     ObserverContext {
         channel_id: channel_id.map(|id| id.to_string()),
+        project: None,
         session_id,
         turn_id,
         started_at: None,
@@ -152,15 +182,37 @@ pub fn context_for(
 
 /// Attach the authoritative start timestamp to every observer frame for a turn.
 pub fn context_for_turn(
-    channel_id: Option<uuid::Uuid>,
+    route: TurnRoute,
     session_id: Option<String>,
     turn_id: String,
     started_at: String,
 ) -> ObserverContext {
+    let (channel_id, project) = match route {
+        TurnRoute::Channel(id) => (Some(id.to_string()), None),
+        TurnRoute::Project(route) => (None, Some(route)),
+        TurnRoute::None => (None, None),
+    };
     ObserverContext {
-        channel_id: channel_id.map(|id| id.to_string()),
+        channel_id,
+        project,
         session_id,
         turn_id: Some(turn_id),
         started_at: Some(started_at),
     }
+}
+
+/// Where a turn came from, as one value.
+///
+/// A channel and a project root are alternatives, so they are variants rather
+/// than two optional fields a caller could set both of — "a turn in a channel
+/// and on an issue" is not a state the harness has, and making it
+/// unrepresentable is cheaper than deciding which one wins downstream.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TurnRoute {
+    /// An ordinary Buzz channel.
+    Channel(uuid::Uuid),
+    /// A project issue or pull-request root.
+    Project(ProjectRouteRef),
+    /// Neither — a heartbeat, which belongs to no conversation.
+    None,
 }

@@ -451,6 +451,261 @@ impl ObserverPublishPacer {
     }
 }
 
+// ── NIP-PA: project activity ──────────────────────────────────────────────────
+
+/// How often a live turn re-announces `working` while it runs.
+///
+/// Kind 20003 is ephemeral, so a desktop that opens an issue mid-turn has
+/// already missed every frame sent before it subscribed. Without a refresh the
+/// indicator only ever appears for a client that was watching when the turn
+/// began, which is the minority case.
+const PROJECT_ACTIVITY_REFRESH: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Observer kinds that end a turn.
+///
+/// `turn_ending` is deliberately absent: it is emitted while the agent is still
+/// finishing, and clearing on it would blank the indicator for the last part of
+/// every turn.
+const TURN_TERMINAL_KINDS: &[&str] = &["turn_completed", "turn_error"];
+
+/// What this agent is currently announcing on one project root.
+struct LiveProjectTurn {
+    turn_id: String,
+    coordinate: String,
+    stage: Option<String>,
+    announced_at: tokio::time::Instant,
+}
+
+/// Publish NIP-PA activity for project-routed turns.
+///
+/// Reads the same in-process observer bus the encrypted NIP-AO frames are built
+/// from, which is what keeps the two accounts of a turn from drifting: there is
+/// one lifecycle, and this is a projection of it rather than a second set of
+/// emit calls sprinkled through the pool that somebody will forget to update.
+///
+/// Runs as its own subscriber rather than inside the NIP-AO publisher, because
+/// project activity is public-to-the-project and NIP-AO is owner-scoped
+/// telemetry behind its own flag. Making the visible indicator depend on
+/// `--relay-observer` would mean an issue silently shows nothing whenever
+/// telemetry happens to be off.
+struct ProjectActivityPublisher {
+    keys: nostr::Keys,
+    agent_hex: String,
+    live: std::collections::HashMap<String, LiveProjectTurn>,
+}
+
+impl ProjectActivityPublisher {
+    fn new(keys: nostr::Keys, agent_hex: String) -> Self {
+        Self {
+            keys,
+            agent_hex,
+            live: std::collections::HashMap::new(),
+        }
+    }
+
+    /// A short label for what the agent is doing, or `None` for frames that
+    /// say nothing a person would want read aloud.
+    ///
+    /// Deliberately a small allowlist rather than the raw observer kind. The
+    /// observer bus carries every ACP JSON-RPC message, and most of them are
+    /// transport noise whose names would read as gibberish on an issue.
+    fn stage_for(kind: &str) -> Option<&'static str> {
+        match kind {
+            "turn_started" => Some("starting"),
+            "session_resolved" => Some("thinking"),
+            "acp_read" => Some("reading files"),
+            "acp_write" => Some("editing files"),
+            "tool_call" => Some("running a tool"),
+            _ => None,
+        }
+    }
+
+    /// Fold one observer event, returning the activity events to publish.
+    ///
+    /// Pure with respect to the relay: it decides, the caller sends. Returning
+    /// the events rather than sending them is what makes the refresh, dedup and
+    /// terminal rules testable without a socket.
+    fn ingest(
+        &mut self,
+        event: &observer::ObserverEvent,
+        now: tokio::time::Instant,
+    ) -> Vec<nostr::EventBuilder> {
+        let Some(route) = event.project.as_ref() else {
+            return Vec::new();
+        };
+        let Some(turn_id) = event.turn_id.as_deref() else {
+            return Vec::new();
+        };
+
+        let repo = buzz_sdk::GitRepoCoord::from_a_tag_value(&route.coordinate);
+        let Some(repo) = repo else {
+            tracing::warn!(
+                coordinate = %route.coordinate,
+                "project activity: unreadable repository coordinate — not announcing"
+            );
+            return Vec::new();
+        };
+
+        if TURN_TERMINAL_KINDS.contains(&event.kind.as_str()) {
+            // Only the turn that is actually being shown may clear it. A late
+            // terminal frame from a turn that ended before this one started
+            // would otherwise blank an indicator for work still in progress.
+            match self.live.get(&route.root) {
+                Some(live) if live.turn_id == turn_id => {}
+                _ => return Vec::new(),
+            }
+            self.live.remove(&route.root);
+            return build_project_activity_or_warn(
+                &repo,
+                &route.root,
+                &self.agent_hex,
+                buzz_sdk::builders::ProjectActivityState::Idle,
+                turn_id,
+                None,
+            )
+            .into_iter()
+            .collect();
+        }
+
+        let stage = Self::stage_for(&event.kind).map(str::to_string);
+        let announce = match self.live.get(&route.root) {
+            // A different turn on the same root: announce immediately, so the
+            // stale turn's id stops being the one an `idle` must match.
+            Some(live) if live.turn_id != turn_id => true,
+            Some(live) => {
+                let moved_on = stage.is_some() && stage != live.stage;
+                moved_on || now.duration_since(live.announced_at) >= PROJECT_ACTIVITY_REFRESH
+            }
+            None => true,
+        };
+        if !announce {
+            return Vec::new();
+        }
+
+        // Carry the previous stage when this frame has none of its own: a
+        // refresh tick during a long tool call should re-announce what the
+        // agent is doing, not blank the caption it already showed.
+        let stage = stage.or_else(|| {
+            self.live
+                .get(&route.root)
+                .filter(|live| live.turn_id == turn_id)
+                .and_then(|live| live.stage.clone())
+        });
+        self.live.insert(
+            route.root.clone(),
+            LiveProjectTurn {
+                turn_id: turn_id.to_string(),
+                coordinate: route.coordinate.clone(),
+                stage: stage.clone(),
+                announced_at: now,
+            },
+        );
+        build_project_activity_or_warn(
+            &repo,
+            &route.root,
+            &self.agent_hex,
+            buzz_sdk::builders::ProjectActivityState::Working,
+            turn_id,
+            stage.as_deref(),
+        )
+        .into_iter()
+        .collect()
+    }
+
+    /// Re-announce every live turn whose last announcement has aged out.
+    fn refresh(&mut self, now: tokio::time::Instant) -> Vec<nostr::EventBuilder> {
+        let mut out = Vec::new();
+        for (root, live) in self.live.iter_mut() {
+            if now.duration_since(live.announced_at) < PROJECT_ACTIVITY_REFRESH {
+                continue;
+            }
+            let Some(repo) = buzz_sdk::GitRepoCoord::from_a_tag_value(&live.coordinate) else {
+                continue;
+            };
+            live.announced_at = now;
+            out.extend(build_project_activity_or_warn(
+                &repo,
+                root,
+                &self.agent_hex,
+                buzz_sdk::builders::ProjectActivityState::Working,
+                &live.turn_id,
+                live.stage.as_deref(),
+            ));
+        }
+        out
+    }
+
+    fn sign(&self, builder: nostr::EventBuilder) -> Option<nostr::Event> {
+        builder
+            .sign_with_keys(&self.keys)
+            .map_err(|error| {
+                tracing::warn!(%error, "project activity: signing failed");
+            })
+            .ok()
+    }
+}
+
+/// Build one activity event, or warn and produce nothing.
+///
+/// A refusal here is a bug in the caller's inputs, not something to retry: the
+/// coordinate and root came off a validated project origin. It is logged rather
+/// than propagated because an unannounceable turn must still run.
+fn build_project_activity_or_warn(
+    repo: &buzz_sdk::GitRepoCoord,
+    root: &str,
+    agent_hex: &str,
+    state: buzz_sdk::builders::ProjectActivityState,
+    turn_id: &str,
+    stage: Option<&str>,
+) -> Option<nostr::EventBuilder> {
+    match buzz_sdk::builders::build_project_activity(repo, root, agent_hex, state, turn_id, stage) {
+        Ok(builder) => Some(builder),
+        Err(error) => {
+            tracing::warn!(%error, root = %root, "project activity: refused by the builder");
+            None
+        }
+    }
+}
+
+/// Drive [`ProjectActivityPublisher`] from the observer bus.
+///
+/// The snapshot is deliberately **not** replayed. It is a buffer of everything
+/// that has already happened, and announcing from it would resurrect turns that
+/// finished before this task started.
+async fn run_project_activity_publisher(
+    mut rx: tokio::sync::broadcast::Receiver<observer::ObserverEvent>,
+    publisher: RelayEventPublisher,
+    keys: nostr::Keys,
+    agent_hex: String,
+) {
+    let mut state = ProjectActivityPublisher::new(keys, agent_hex);
+    let mut refresh = tokio::time::interval(PROJECT_ACTIVITY_REFRESH);
+    refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        let builders = tokio::select! {
+            result = rx.recv() => match result {
+                Ok(event) => state.ingest(&event, tokio::time::Instant::now()),
+                // A lagged receiver has missed frames, not turns: the next frame
+                // of a live turn re-announces it and the refresh tick covers a
+                // quiet one. Nothing here needs the frames that were dropped.
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(count)) => {
+                    tracing::warn!(dropped = count, "project activity publisher lagged");
+                    Vec::new()
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            },
+            _ = refresh.tick() => state.refresh(tokio::time::Instant::now()),
+        };
+        for builder in builders {
+            if let Some(event) = state.sign(builder) {
+                if let Err(error) = publisher.publish_event(event).await {
+                    tracing::warn!(%error, "project activity: publish failed");
+                }
+            }
+        }
+    }
+}
+
 fn spawn_relay_observer_publisher(
     observer: observer::ObserverHandle,
     publisher: RelayEventPublisher,
@@ -956,6 +1211,7 @@ fn handle_cancel_turn_control(
             "control_result",
             None,
             &observer::ObserverContext {
+                project: None,
                 channel_id: Some(channel_id.to_string()),
                 session_id: None,
                 turn_id: None,
@@ -1033,6 +1289,7 @@ fn handle_switch_model_control(
             "control_result",
             None,
             &observer::ObserverContext {
+                project: None,
                 channel_id: Some(channel_id.to_string()),
                 session_id: None,
                 turn_id: None,
@@ -1454,6 +1711,32 @@ async fn tokio_main() -> Result<()> {
         }
     }
     let owner_cache = OwnerCache::new(startup_owner.clone());
+
+    // NIP-PA project activity. Behind the project-routing flag and nothing
+    // else: it is what makes an issue show that an agent is working on it, so
+    // tying it to `--relay-observer` would mean the indicator silently vanishes
+    // wherever owner telemetry happens to be off.
+    //
+    // Subscribes here rather than inside the task so no frame emitted between
+    // this line and the task's first poll is lost.
+    let mut project_activity_task = None;
+    if config.project_routing_enabled {
+        if let Some(observer) = observer.clone() {
+            let rx = observer.subscribe();
+            let publisher = relay.event_publisher();
+            let keys = config.keys.clone();
+            let agent_hex = pubkey_hex.clone();
+            project_activity_task = Some(tokio::spawn(run_project_activity_publisher(
+                rx, publisher, keys, agent_hex,
+            )));
+            tracing::info!("project activity publisher enabled");
+        } else {
+            tracing::warn!(
+                "project routing is enabled but no observer bus exists; \
+                 project activity will not be published"
+            );
+        }
+    }
 
     let mut relay_observer_control_rx = None;
     let mut relay_observer_publisher_task = None;
@@ -2955,6 +3238,14 @@ async fn tokio_main() -> Result<()> {
     }
 
     if let Some(handle) = relay_observer_publisher_task.take() {
+        handle.abort();
+    }
+    // Aborted rather than drained, like the observer publisher above. Anything
+    // still queued here is a `working` announcement for a turn this process is
+    // about to stop running, and NIP-PA's staleness window is what clears it —
+    // the desktop stops showing the agent as working 45 seconds later without
+    // needing a farewell nobody is guaranteed to send.
+    if let Some(handle) = project_activity_task.take() {
         handle.abort();
     }
 
@@ -7453,6 +7744,7 @@ mod observer_chunk_coalescer_tests {
         text: &str,
     ) -> observer::ObserverEvent {
         observer::ObserverEvent {
+            project: None,
             seq,
             timestamp: format!("2026-04-29T04:00:0{seq}Z"),
             kind: "acp_read".to_string(),
@@ -7481,6 +7773,7 @@ mod observer_chunk_coalescer_tests {
 
     fn non_chunk_event(seq: u64) -> observer::ObserverEvent {
         observer::ObserverEvent {
+            project: None,
             seq,
             timestamp: format!("2026-04-29T04:00:0{seq}Z"),
             kind: "turn_started".to_string(),
@@ -8999,6 +9292,7 @@ mod observer_payload_trim_tests {
 
     fn event_with_payload(kind: &str, payload: serde_json::Value) -> observer::ObserverEvent {
         observer::ObserverEvent {
+            project: None,
             seq: 1,
             timestamp: "2026-06-16T00:00:00Z".to_string(),
             kind: kind.to_string(),
@@ -9883,6 +10177,353 @@ mod peer_call_channel_tests {
             )
             .await,
             peer_call::PeerTrust::Untrusted,
+        );
+    }
+}
+
+/// NIP-PA: what a project turn announces on its root, and when it stops.
+///
+/// [`ProjectActivityPublisher::ingest`] is the whole decision — refresh, dedup,
+/// stage carry-over and the terminal rule — so these drive it directly with the
+/// observer events the pool really emits, and read the *signed events* it
+/// produces rather than its internal map.
+#[cfg(test)]
+mod project_activity_tests {
+    use super::*;
+    use nostr::Keys;
+
+    const ROOT: &str = "48be1cc2000000000000000000000000000000000000000000000000000000ab";
+    const OTHER_ROOT: &str = "48be1cc2000000000000000000000000000000000000000000000000000000cd";
+
+    fn coordinate() -> String {
+        format!("30617:{}:buzz", "a".repeat(64))
+    }
+
+    /// An observer frame exactly as the pool emits one for a project turn.
+    fn project_frame(kind: &str, root: &str, turn: &str) -> observer::ObserverEvent {
+        observer::ObserverEvent {
+            seq: 1,
+            timestamp: "2026-08-02T00:00:00Z".to_string(),
+            kind: kind.to_string(),
+            agent_index: Some(0),
+            channel_id: None,
+            project: Some(observer::ProjectRouteRef {
+                coordinate: coordinate(),
+                root: root.to_string(),
+            }),
+            session_id: Some("sess".to_string()),
+            turn_id: Some(turn.to_string()),
+            started_at: Some("2026-08-02T00:00:00Z".to_string()),
+            payload: serde_json::json!({}),
+        }
+    }
+
+    /// A channel turn's frame: the control for every project assertion below.
+    fn channel_frame(kind: &str) -> observer::ObserverEvent {
+        observer::ObserverEvent {
+            channel_id: Some("11111111-1111-1111-1111-111111111111".to_string()),
+            project: None,
+            ..project_frame(kind, ROOT, "turn-1")
+        }
+    }
+
+    fn publisher() -> (ProjectActivityPublisher, Keys) {
+        let keys = Keys::generate();
+        let hex = keys.public_key().to_hex().to_ascii_lowercase();
+        (ProjectActivityPublisher::new(keys.clone(), hex), keys)
+    }
+
+    fn signed(keys: &Keys, builders: Vec<nostr::EventBuilder>) -> Vec<nostr::Event> {
+        builders
+            .into_iter()
+            .map(|b| b.sign_with_keys(keys).expect("sign"))
+            .collect()
+    }
+
+    fn tag_of(event: &nostr::Event, key: &str) -> Option<String> {
+        event.tags.iter().find_map(|t| {
+            let s = t.as_slice();
+            (s.first().map(String::as_str) == Some(key))
+                .then(|| s.get(1).cloned())
+                .flatten()
+        })
+    }
+
+    /// A project turn announces `working` on its own root, with no `h`.
+    #[test]
+    fn a_project_turn_announces_working_on_its_root() {
+        let (mut state, keys) = publisher();
+        let now = tokio::time::Instant::now();
+
+        let events = signed(
+            &keys,
+            state.ingest(&project_frame("turn_started", ROOT, "t1"), now),
+        );
+        assert_eq!(events.len(), 1, "a started project turn must announce once");
+        let event = &events[0];
+
+        assert_eq!(
+            event.kind.as_u16(),
+            buzz_core::kind::KIND_PROJECT_ACTIVITY as u16
+        );
+        assert_eq!(tag_of(event, "a").as_deref(), Some(coordinate().as_str()));
+        assert_eq!(tag_of(event, "e").as_deref(), Some(ROOT));
+        assert_eq!(tag_of(event, "state").as_deref(), Some("working"));
+        assert_eq!(tag_of(event, "turn").as_deref(), Some("t1"));
+        assert_eq!(
+            tag_of(event, "agent").as_deref(),
+            Some(keys.public_key().to_hex().to_ascii_lowercase().as_str())
+        );
+        assert_eq!(
+            tag_of(event, "h"),
+            None,
+            "an issue is not a channel: an `h` here routes the signal where nobody is looking"
+        );
+        // The root `e` is marked, so a client that groups by root sees it.
+        assert!(event.tags.iter().any(|t| {
+            let s = t.as_slice();
+            s.first().map(String::as_str) == Some("e")
+                && s.get(3).map(String::as_str) == Some("root")
+        }));
+    }
+
+    /// A channel turn announces nothing. This is the regression control: the
+    /// existing channel activity route is untouched by this phase, and a
+    /// publisher that fired on channel frames would put every ordinary turn on
+    /// a project wire.
+    #[test]
+    fn a_channel_turn_announces_no_project_activity() {
+        let (mut state, _keys) = publisher();
+        let now = tokio::time::Instant::now();
+        for kind in ["turn_started", "acp_read", "turn_completed"] {
+            assert!(
+                state.ingest(&channel_frame(kind), now).is_empty(),
+                "{kind} on a channel turn must not reach the project wire"
+            );
+        }
+    }
+
+    /// The indicator clears when the turn ends.
+    #[test]
+    fn a_finished_turn_clears_its_own_root() {
+        let (mut state, keys) = publisher();
+        let now = tokio::time::Instant::now();
+        state.ingest(&project_frame("turn_started", ROOT, "t1"), now);
+
+        let events = signed(
+            &keys,
+            state.ingest(&project_frame("turn_completed", ROOT, "t1"), now),
+        );
+        assert_eq!(events.len(), 1);
+        assert_eq!(tag_of(&events[0], "state").as_deref(), Some("idle"));
+        assert_eq!(tag_of(&events[0], "e").as_deref(), Some(ROOT));
+
+        // Nothing is left to refresh: a cleared root must not come back to life
+        // on the next tick.
+        assert!(state.refresh(now + PROJECT_ACTIVITY_REFRESH * 2).is_empty());
+    }
+
+    /// A late terminal frame from a turn that already ended must not clear the
+    /// turn running now. Without the `turn` check the agent goes dark on an
+    /// issue it is actively working.
+    #[test]
+    fn a_stale_terminal_frame_does_not_clear_the_current_turn() {
+        let (mut state, keys) = publisher();
+        let now = tokio::time::Instant::now();
+        state.ingest(&project_frame("turn_started", ROOT, "t1"), now);
+        state.ingest(&project_frame("turn_completed", ROOT, "t1"), now);
+        state.ingest(&project_frame("turn_started", ROOT, "t2"), now);
+
+        assert!(
+            state
+                .ingest(&project_frame("turn_completed", ROOT, "t1"), now)
+                .is_empty(),
+            "the previous turn's completion cleared the turn running now"
+        );
+        let refreshed = signed(&keys, state.refresh(now + PROJECT_ACTIVITY_REFRESH));
+        assert_eq!(refreshed.len(), 1, "t2 is still live and still refreshing");
+        assert_eq!(tag_of(&refreshed[0], "turn").as_deref(), Some("t2"));
+    }
+
+    /// One root's activity does not appear on another.
+    #[test]
+    fn two_roots_keep_their_own_activity() {
+        let (mut state, keys) = publisher();
+        let now = tokio::time::Instant::now();
+        state.ingest(&project_frame("turn_started", ROOT, "t1"), now);
+        state.ingest(&project_frame("turn_started", OTHER_ROOT, "t2"), now);
+
+        let cleared = signed(
+            &keys,
+            state.ingest(&project_frame("turn_completed", ROOT, "t1"), now),
+        );
+        assert_eq!(cleared.len(), 1);
+        assert_eq!(tag_of(&cleared[0], "e").as_deref(), Some(ROOT));
+
+        let refreshed = signed(&keys, state.refresh(now + PROJECT_ACTIVITY_REFRESH));
+        assert_eq!(
+            refreshed.len(),
+            1,
+            "finishing one root must leave the other announcing"
+        );
+        assert_eq!(tag_of(&refreshed[0], "e").as_deref(), Some(OTHER_ROOT));
+    }
+
+    /// Chatter does not become a stream of announcements, but a live turn does
+    /// keep re-announcing — the event is ephemeral, so silence is invisibility.
+    #[test]
+    fn a_live_turn_is_re_announced_periodically_and_not_on_every_frame() {
+        let (mut state, _keys) = publisher();
+        let now = tokio::time::Instant::now();
+        assert_eq!(
+            state
+                .ingest(&project_frame("turn_started", ROOT, "t1"), now)
+                .len(),
+            1
+        );
+        // An unrecognised frame at the same instant says nothing new.
+        assert!(state
+            .ingest(&project_frame("acp_notification", ROOT, "t1"), now)
+            .is_empty());
+
+        let later = now + PROJECT_ACTIVITY_REFRESH;
+        assert_eq!(
+            state
+                .ingest(&project_frame("acp_notification", ROOT, "t1"), later)
+                .len(),
+            1,
+            "a turn that goes quiet must still be re-announced before it looks stale"
+        );
+    }
+
+    /// A recognised stage is published, and a frame with no stage of its own
+    /// does not blank the caption the agent is still under.
+    #[test]
+    fn a_stage_change_is_announced_and_then_carried() {
+        let (mut state, keys) = publisher();
+        let now = tokio::time::Instant::now();
+        state.ingest(&project_frame("turn_started", ROOT, "t1"), now);
+
+        let reading = signed(
+            &keys,
+            state.ingest(&project_frame("acp_read", ROOT, "t1"), now),
+        );
+        assert_eq!(reading.len(), 1, "a new stage is worth an announcement");
+        assert_eq!(
+            tag_of(&reading[0], "stage").as_deref(),
+            Some("reading files")
+        );
+
+        let refreshed = signed(&keys, state.refresh(now + PROJECT_ACTIVITY_REFRESH));
+        assert_eq!(
+            tag_of(&refreshed[0], "stage").as_deref(),
+            Some("reading files"),
+            "the refresh blanked a caption the agent is still working under"
+        );
+    }
+
+    /// A frame with no turn id, or an unreadable coordinate, announces nothing
+    /// rather than publishing an event no consumer can place.
+    #[test]
+    fn an_unplaceable_frame_announces_nothing() {
+        let (mut state, _keys) = publisher();
+        let now = tokio::time::Instant::now();
+
+        let mut no_turn = project_frame("turn_started", ROOT, "t1");
+        no_turn.turn_id = None;
+        assert!(state.ingest(&no_turn, now).is_empty());
+
+        let mut bad_coordinate = project_frame("turn_started", ROOT, "t1");
+        bad_coordinate.project = Some(observer::ProjectRouteRef {
+            coordinate: "not-a-coordinate".to_string(),
+            root: ROOT.to_string(),
+        });
+        assert!(state.ingest(&bad_coordinate, now).is_empty());
+    }
+    /// The route a real flushed batch produces, through the production mapping.
+    ///
+    /// This is the join between Phase 1's routing and this phase's activity: if
+    /// a project batch stopped resolving to a project route, every assertion
+    /// above would still pass while the issue went dark again.
+    #[test]
+    fn a_project_batch_routes_its_turn_to_the_root_and_a_channel_batch_does_not() {
+        let root = ROOT.to_string();
+        let origin = crate::project::ProjectOrigin::for_test(&coordinate(), &root, false);
+        let key = crate::project::project_route_key(&root).expect("the root keys");
+        let event = nostr::EventBuilder::new(nostr::Kind::TextNote, "look at this")
+            .sign_with_keys(&Keys::generate())
+            .expect("sign");
+
+        let project_batch = queue::FlushBatch {
+            channel_id: key,
+            events: vec![queue::BatchEvent {
+                event: event.clone(),
+                prompt_tag: "@mention".into(),
+                received_at: std::time::Instant::now(),
+                project: Some(origin),
+            }],
+            cancelled_events: vec![],
+            cancel_reason: None,
+        };
+        assert_eq!(
+            pool::observer_route_for(&pool::PromptSource::Channel(key), Some(&project_batch)),
+            observer::TurnRoute::Project(observer::ProjectRouteRef {
+                coordinate: coordinate(),
+                root,
+            }),
+            "a project turn must not report a route key as a channel id"
+        );
+
+        let channel_id = uuid::Uuid::new_v4();
+        let channel_batch = queue::FlushBatch {
+            channel_id,
+            events: vec![queue::BatchEvent {
+                event,
+                prompt_tag: "@mention".into(),
+                received_at: std::time::Instant::now(),
+                project: None,
+            }],
+            cancelled_events: vec![],
+            cancel_reason: None,
+        };
+        assert_eq!(
+            pool::observer_route_for(
+                &pool::PromptSource::Channel(channel_id),
+                Some(&channel_batch)
+            ),
+            observer::TurnRoute::Channel(channel_id),
+            "an ordinary channel turn must keep reporting its channel"
+        );
+    }
+
+    /// A channel turn's observer payload is byte-for-byte what it was.
+    ///
+    /// The desktop's existing stores read `channelId` and know nothing about
+    /// `project`. Serialising a null `project` key onto every channel frame
+    /// would be a silent format change on a wire that is already deployed.
+    #[test]
+    fn a_channel_frame_carries_no_project_key_at_all() {
+        let json = serde_json::to_value(channel_frame("turn_started")).expect("serialise");
+        assert!(
+            json.get("project").is_none(),
+            "a channel frame gained a project key: {json}"
+        );
+        assert_eq!(
+            json.get("channelId").and_then(serde_json::Value::as_str),
+            Some("11111111-1111-1111-1111-111111111111")
+        );
+
+        let json =
+            serde_json::to_value(project_frame("turn_started", ROOT, "t1")).expect("serialise");
+        assert_eq!(
+            json.pointer("/project/root")
+                .and_then(serde_json::Value::as_str),
+            Some(ROOT)
+        );
+        assert!(
+            json.get("channelId")
+                .is_some_and(serde_json::Value::is_null),
+            "a project turn must not claim a channel: {json}"
         );
     }
 }

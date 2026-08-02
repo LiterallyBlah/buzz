@@ -24,6 +24,7 @@ import {
 } from "./ProjectFeedRow";
 import { OverviewRailSection } from "./ProjectOverviewPanel";
 import { ProfileIdentityButton } from "./ProjectProfileIdentity";
+import { ProjectActivityIndicator } from "./ProjectActivityIndicator";
 import { ProjectRichContent } from "./ProjectRichContent";
 
 export function issueStatusClassName(status: ProjectIssue["status"]) {
@@ -226,6 +227,8 @@ export function ProjectIssueDetail({
             <ProjectRichContent content={issue.content} tags={issue.tags} />
           ) : null}
         </header>
+
+        <ProjectActivityIndicator profiles={profiles} rootEventId={issue.id} />
 
         <section className="space-y-3 p-4">
           <h4 className="flex items-center gap-1.5 text-sm font-semibold text-foreground">

@@ -11,8 +11,9 @@ use buzz_core::{
         KIND_GIT_STATUS_CLOSED, KIND_GIT_STATUS_DRAFT, KIND_GIT_STATUS_MERGED,
         KIND_GIT_STATUS_OPEN, KIND_IA_ARCHIVE_REQUEST, KIND_IA_UNARCHIVE_REQUEST,
         KIND_MODERATION_BAN, KIND_MODERATION_RESOLVE_REPORT, KIND_MODERATION_TIMEOUT,
-        KIND_MODERATION_UNBAN, KIND_MODERATION_UNTIMEOUT, KIND_PRESENCE_UPDATE, KIND_TEXT_NOTE,
-        KIND_USER_STATUS, KIND_WORKFLOW_DEF, KIND_WORKFLOW_TRIGGER,
+        KIND_MODERATION_UNBAN, KIND_MODERATION_UNTIMEOUT, KIND_PRESENCE_UPDATE,
+        KIND_PROJECT_ACTIVITY, KIND_TEXT_NOTE, KIND_USER_STATUS, KIND_WORKFLOW_DEF,
+        KIND_WORKFLOW_TRIGGER,
     },
     observer::{
         content_looks_like_nip44, OBSERVER_AGENT_TAG, OBSERVER_FRAME_CONTROL, OBSERVER_FRAME_TAG,
@@ -982,6 +983,32 @@ impl GitRepoCoord {
         check_repo_id(&self.id)?;
         Ok(format!("30617:{owner}:{}", self.id))
     }
+
+    /// Read a coordinate back out of an `a`-tag value.
+    ///
+    /// The inverse of [`Self::to_a_tag_value`], for callers that hold a
+    /// validated coordinate string and need its parts to build another event.
+    /// `None` rather than an error for anything that is not a `30617:` triple:
+    /// a caller in that position has already lost, and there is nothing here it
+    /// could usefully distinguish between failures.
+    ///
+    /// A coordinate is exactly three colon-separated parts: `check_repo_id`
+    /// restricts identifiers to `[a-zA-Z0-9._-]`, so a fourth part is not a
+    /// repository with a colon in its name — it is something this should not
+    /// claim to have understood.
+    pub fn from_a_tag_value(value: &str) -> Option<Self> {
+        let parts: Vec<&str> = value.split(':').collect();
+        let [kind, owner, id] = parts[..] else {
+            return None;
+        };
+        if kind != "30617" || owner.is_empty() || id.is_empty() {
+            return None;
+        }
+        Some(Self {
+            owner: owner.to_string(),
+            id: id.to_string(),
+        })
+    }
 }
 
 /// Metadata for a git patch event (kind:1617, NIP-34).
@@ -1171,6 +1198,80 @@ pub fn build_git_comment(
     }
 
     Ok(EventBuilder::new(Kind::Custom(KIND_TEXT_NOTE as u16), content).tags(tags))
+}
+
+// ── NIP-PA: project activity ──────────────────────────────────────────────────
+
+/// Whether an agent is working on a root, or has stopped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProjectActivityState {
+    /// A turn is running on this root as of `created_at`.
+    Working,
+    /// The named turn ended — completed, failed or cancelled.
+    ///
+    /// One terminal state, not three. This event answers "is anything happening
+    /// on this issue right now"; *what* happened is said durably by the comment
+    /// the agent posts and by the owner-scoped telemetry, and a second, weaker
+    /// account of the outcome on an unstored wire would only be something to
+    /// disagree with them.
+    Idle,
+}
+
+impl ProjectActivityState {
+    fn as_tag(self) -> &'static str {
+        match self {
+            ProjectActivityState::Working => "working",
+            ProjectActivityState::Idle => "idle",
+        }
+    }
+}
+
+/// Build an agent activity signal for a project root (kind:20003, NIP-PA).
+///
+/// Ephemeral and unencrypted: it says only that an agent is working on this
+/// root, which is already visible to anyone who can read the issue. The
+/// transcript stays in the owner-scoped NIP-AO frames.
+///
+/// `agent` is the pubkey that will sign this event. It is emitted as a tag as
+/// well so a consumer can filter by `#agent` without reading authorship; a
+/// receiver refuses a mismatch rather than preferring one of the two.
+///
+/// **No `h` is emitted and none may be added.** An issue is not a channel, and
+/// the synthetic channel id this replaces is what made every channel-keyed
+/// consumer subtly wrong instead of visibly silent.
+pub fn build_project_activity(
+    repo: &GitRepoCoord,
+    root: &str,
+    agent: &str,
+    state: ProjectActivityState,
+    turn_id: &str,
+    stage: Option<&str>,
+) -> Result<EventBuilder, SdkError> {
+    let a_value = repo.to_a_tag_value()?;
+    let root = check_hex_exact(root, 64, "root")?;
+    let agent = check_pubkey_hex(agent, "agent")?;
+    if turn_id.trim().is_empty() {
+        return Err(SdkError::InvalidInput(
+            "turn_id must not be empty: an idle without one clears the wrong turn".into(),
+        ));
+    }
+
+    let mut tags = vec![
+        tag(&["a", &a_value])?,
+        tag(&["e", &root, "", "root"])?,
+        tag(&["agent", &agent])?,
+        tag(&["state", state.as_tag()])?,
+        tag(&["turn", turn_id])?,
+    ];
+    // A stage label is presentation. It is trimmed and bounded here rather than
+    // at the consumer because an unbounded one is published to every reader of
+    // the issue, and a blank one would render as a caption with nothing in it.
+    if let Some(stage) = stage.map(str::trim).filter(|s| !s.is_empty()) {
+        let stage: String = stage.chars().take(80).collect();
+        tags.push(tag(&["stage", &stage])?);
+    }
+
+    Ok(EventBuilder::new(Kind::Custom(KIND_PROJECT_ACTIVITY as u16), "").tags(tags))
 }
 
 /// Status to apply to a patch or issue root (kind:1630/1631/1632/1633, NIP-34).
@@ -3345,6 +3446,133 @@ mod tests {
             "a project comment must name no channel: an `h` scopes it to a \
              channel and takes it out of the project's own filter"
         );
+    }
+
+    /// NIP-PA: the shape a project activity event must have, including the
+    /// tag it must never have.
+    #[test]
+    fn a_project_activity_event_binds_a_root_and_names_no_channel() {
+        let owner = "a".repeat(64);
+        let repo = GitRepoCoord {
+            owner: owner.clone(),
+            id: "repo".to_string(),
+        };
+        let root = event_id().to_hex();
+        let agent = keys().public_key().to_hex();
+
+        let ev = sign(
+            build_project_activity(
+                &repo,
+                &root,
+                &agent,
+                ProjectActivityState::Working,
+                "turn-1",
+                Some("reading files"),
+            )
+            .unwrap(),
+        );
+
+        assert_eq!(ev.kind.as_u16(), 20003);
+        assert_eq!(ev.content, "", "content is unused and must stay empty");
+        assert!(has_tag(&ev, "a", &format!("30617:{owner}:repo")));
+        assert!(has_tag(&ev, "agent", &agent));
+        assert!(has_tag(&ev, "state", "working"));
+        assert!(has_tag(&ev, "turn", "turn-1"));
+        assert!(has_tag(&ev, "stage", "reading files"));
+        assert!(
+            tag_values(&ev, "h").is_empty(),
+            "an issue is not a channel: an `h` routes this where nobody is looking"
+        );
+        assert!(ev.tags.iter().any(|t| {
+            let s = t.as_slice();
+            s.first().map(|v| v.as_str()) == Some("e")
+                && s.get(1).map(|v| v.as_str()) == Some(root.as_str())
+                && s.get(3).map(|v| v.as_str()) == Some("root")
+        }));
+    }
+
+    /// An idle without a turn cannot be published at all.
+    ///
+    /// `turn` is what stops a late terminal frame from clearing the turn that
+    /// is running now, so an event missing it is not merely incomplete — it is
+    /// the shape that makes an agent go dark while it is working.
+    #[test]
+    fn project_activity_refuses_an_announcement_with_nothing_to_correlate() {
+        let repo = GitRepoCoord {
+            owner: "a".repeat(64),
+            id: "repo".to_string(),
+        };
+        let root = event_id().to_hex();
+        let agent = keys().public_key().to_hex();
+
+        assert!(matches!(
+            build_project_activity(&repo, &root, &agent, ProjectActivityState::Idle, "  ", None)
+                .unwrap_err(),
+            SdkError::InvalidInput(_)
+        ));
+        assert!(matches!(
+            build_project_activity(
+                &repo,
+                "nothex",
+                &agent,
+                ProjectActivityState::Working,
+                "t",
+                None
+            )
+            .unwrap_err(),
+            SdkError::InvalidInput(_)
+        ));
+    }
+
+    /// A blank stage is dropped rather than published as an empty caption.
+    #[test]
+    fn a_blank_stage_is_not_a_caption() {
+        let repo = GitRepoCoord {
+            owner: "a".repeat(64),
+            id: "repo".to_string(),
+        };
+        let ev = sign(
+            build_project_activity(
+                &repo,
+                &event_id().to_hex(),
+                &keys().public_key().to_hex(),
+                ProjectActivityState::Working,
+                "t",
+                Some("   "),
+            )
+            .unwrap(),
+        );
+        assert!(tag_values(&ev, "stage").is_empty());
+    }
+
+    /// A coordinate survives the round trip, and anything that is not one is
+    /// refused rather than half-read.
+    #[test]
+    fn a_repository_coordinate_reads_back_as_it_was_written() {
+        let owner = "a".repeat(64);
+        let coordinate = format!("30617:{owner}:my-repo");
+        let parsed = GitRepoCoord::from_a_tag_value(&coordinate).expect("parses");
+        assert_eq!(parsed.owner, owner);
+        assert_eq!(parsed.id, "my-repo");
+        assert_eq!(parsed.to_a_tag_value().unwrap(), coordinate);
+
+        let trailing = format!("30617:{owner}:");
+        let four_parts = format!("30617:{owner}:group:repo");
+        for refused in [
+            "30618:x:y",
+            "30617::y",
+            trailing.as_str(),
+            // A fourth part is not a repository whose name contains a colon —
+            // identifiers cannot — so reading one would be inventing a
+            // coordinate nobody published.
+            four_parts.as_str(),
+            "nope",
+        ] {
+            assert!(
+                GitRepoCoord::from_a_tag_value(refused).is_none(),
+                "{refused} should not parse"
+            );
+        }
     }
 
     /// One event shape serves both root kinds.
