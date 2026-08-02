@@ -6664,23 +6664,24 @@ mod tests {
             .collect()
     }
 
-    /// Every root id a project REQ frame asks about, deduplicated and sorted.
+    /// Every value a project REQ frame's filters carry under `tags`,
+    /// deduplicated and sorted.
     ///
-    /// Reads the `#e` and `#E` branches out of the frame's own filters rather
-    /// than substring-matching the serialised frame. `contains(root)` is
-    /// satisfied by a frame that carries the root *and* by one that carries it
-    /// alongside anything else, or that dropped a sibling root — so it cannot
-    /// express "the complete intended set", which is what the watched successor
-    /// has to carry to keep covering the roots already enrolled.
-    fn req_root_set(frame: &serde_json::Value) -> Vec<String> {
-        let mut roots: Vec<String> = frame
+    /// Reads the named branches out of the frame's own filters rather than
+    /// substring-matching the serialised frame. `contains(x)` is satisfied by a
+    /// frame that carries `x` *and* by one that carries it alongside anything
+    /// else, or that dropped a sibling — so it cannot express "the complete
+    /// intended set", which is the property both the watched successor and the
+    /// widened enrolment filter have to hold.
+    fn req_tag_set(frame: &serde_json::Value, tags: &[&str]) -> Vec<String> {
+        let mut values: Vec<String> = frame
             .as_array()
             .map(|f| &f[2..])
             .unwrap_or_default()
             .iter()
             .flat_map(|filter| {
-                ["#e", "#E"].into_iter().flat_map(move |tag| {
-                    filter[tag]
+                tags.iter().flat_map(move |tag| {
+                    filter[*tag]
                         .as_array()
                         .map(|v| {
                             v.iter()
@@ -6691,9 +6692,23 @@ mod tests {
                 })
             })
             .collect();
-        roots.sort();
-        roots.dedup();
-        roots
+        values.sort();
+        values.dedup();
+        values
+    }
+
+    /// Every root id a project REQ frame asks about.
+    ///
+    /// Both reference styles, because they are not interchangeable: comments
+    /// and status events point at the root with lowercase `e`, a PR update with
+    /// uppercase `E`.
+    fn req_root_set(frame: &serde_json::Value) -> Vec<String> {
+        req_tag_set(frame, &["#e", "#E"])
+    }
+
+    /// Every repository coordinate a project REQ frame asks about.
+    fn req_coordinate_set(frame: &serde_json::Value) -> Vec<String> {
+        req_tag_set(frame, &["#a"])
     }
 
     /// Subscription ids named by `CLOSE` frames, in wire order.
@@ -9490,9 +9505,18 @@ mod tests {
             assert_eq!(seen.len(), 1, "one enrolment REQ: {seen:?}");
             assert_eq!(seen[0][0], "REQ");
             assert_eq!(seen[0][1], crate::project::PROJECT_ENROL_SUB_ID);
-            assert!(
-                seen[0].to_string().contains(&agent_hex),
-                "the enrolment REQ must be scoped to this agent"
+            assert_eq!(
+                req_tag_set(&seen[0], &["#p"]),
+                vec![agent_hex.clone()],
+                "the enrolment REQ must be scoped to this agent and no other: \
+                 {seen:?}"
+            );
+            let first_coordinate = format!("30617:{owner_hex}:e2e-repo");
+            assert_eq!(
+                req_coordinate_set(&seen[0]),
+                vec![first_coordinate.clone()],
+                "the enrolment REQ must name exactly the discovered \
+                 repository: {seen:?}"
             );
             let first_enrolment = seen[0].to_string();
 
@@ -9528,9 +9552,28 @@ mod tests {
                  shipped defect: the enrolment can never widen past the first \
                  repository"
             );
-            assert!(
-                widened.contains(&other_owner.public_key().to_hex()),
-                "the second repository is absent from the widened filter"
+            //
+            // **Widened, not replaced.** `contains(second_owner)` passes for a
+            // filter that gained the second repository *and* for one that
+            // swapped the first out for it — and a swap is the same shipped
+            // defect wearing the opposite sign: the agent stops hearing about
+            // the repository it was already enrolled on. Only the complete
+            // coordinate set tells the two apart.
+            let mut expected_coordinates = vec![
+                first_coordinate.clone(),
+                format!("30617:{}:second-repo", other_owner.public_key().to_hex()),
+            ];
+            expected_coordinates.sort();
+            assert_eq!(
+                req_coordinate_set(&seen[0]),
+                expected_coordinates,
+                "the widened enrolment must carry both discovered \
+                 repositories, not just the newest: {seen:?}"
+            );
+            assert_eq!(
+                req_tag_set(&seen[0], &["#p"]),
+                vec![agent_hex.clone()],
+                "widening must not widen the agent scope: {seen:?}"
             );
 
             // ── 3. the owner opens an issue naming the agent ─────────────────
@@ -9561,9 +9604,11 @@ mod tests {
             assert_eq!(seen.len(), 1, "the first watched REQ, no CLOSE: {seen:?}");
             assert_eq!(seen[0][0], "REQ");
             assert_eq!(seen[0][1], crate::project::watched_sub_id(0));
-            assert!(
-                seen[0].to_string().contains(&root.id.to_hex()),
-                "the watched REQ must name the enrolled root"
+            assert_eq!(
+                req_root_set(&seen[0]),
+                vec![root.id.to_hex()],
+                "generation 0 must watch exactly the one enrolled root: \
+                 {seen:?}"
             );
 
             // ── 4. a second root replaces the watch and retires generation 0 ─
@@ -9711,9 +9756,21 @@ mod tests {
                 other => panic!("the watched generation did not admit the comment: {other:?}"),
             }
             assert_eq!(batch.channel_id, route_key, "flushed under the root key");
-            assert!(
-                batch.project_origin().is_some(),
-                "the flushed batch carries its project origin"
+            //
+            // `is_some()` would pass for an origin bound to the wrong
+            // repository or the wrong root — a typed context that is present
+            // and wrong is worse than one that is absent, because everything
+            // downstream trusts it. The author is deliberately not checked
+            // here: `ProjectOrigin` does not carry one, and the triggering
+            // author's own path to the wire is asserted where it is
+            // load-bearing, in the `--to` argument of the argv below.
+            let origin = batch
+                .project_origin()
+                .expect("the flushed batch carries its project origin");
+            assert_eq!(
+                (origin.coordinate(), origin.root(), origin.is_pull_request()),
+                (coordinate.as_str(), root.id.to_hex().as_str(), false),
+                "the origin must name the repository and root that produced it"
             );
 
             // ── the endpoint the agent's reply is submitted to ───────────────
