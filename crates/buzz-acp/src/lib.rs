@@ -2915,42 +2915,6 @@ fn should_report_refusal(degradation: project::Degradation, refused_total: u64) 
     }
 }
 
-/// Project dispatch entry point.
-///
-/// **Discovery is ingested; routed events are still dropped.**
-///
-/// Ingesting an announcement grants no **authority**: it adds a coordinate to a
-/// set and nothing else — no session woken, no model turn, no invocation right.
-/// The coordinate is derived from the announcement's *signer*, so a flood of
-/// valid announcements cannot make anyone an owner they are not, and enrolment
-/// still has to match a root's own signed `a` against the set.
-///
-/// It is **not** free, though. An earlier version of this comment said the
-/// worst case was "a set containing repositories nobody cares about", which
-/// treated valid hostile input as harmless because it lacked authority. The
-/// allocator is less philosophical: the discovery REQ is global, so every
-/// distinct announcement anyone publishes is a real coordinate held in memory.
-/// That is bounded by [`project::DISCOVERY_CEILING`], which refuses rather than
-/// evicts and marks the set permanently incomplete when it trips.
-///
-/// The set is **not durable**. It lives in this run loop and is gone on
-/// restart. That is deliberate — the plan rejects a second authoritative local
-/// database — but it means restart recovery is relay-derived reconstruction,
-/// which does not exist yet: there is no paginated discovery reconstruction and
-/// no recovery for announcements dropped under backpressure.
-///
-/// **Neither catch-up frames nor end-of-backlog boundaries arrive here.** Both
-/// are handled in the relay task, beside the registry that admitted them and
-/// the reconstructions that hold pages. This arm used to receive catch-up frames
-/// as ordinary routed events and drop them, leaving the page short with nothing
-/// to say so; it also used to receive the boundary itself, as a capability this
-/// side could not use and did not consume.
-///
-/// Routed events remain dropped, and that asymmetry is the point. Delivering
-/// one means deciding who may invoke this agent, and the async authority gate
-/// is not built. Dropping is the only correct behaviour in the interim.
-///
-/// Still a work-in-progress state that must not be committed.
 /// Everything the project branch is permitted to touch.
 ///
 /// **What it does not carry is the point.** There is no
@@ -2995,6 +2959,50 @@ enum ProjectDispatched {
     },
 }
 
+/// Project dispatch entry point.
+///
+/// **Discovery is ingested; routed events are still dropped.**
+///
+/// Ingesting an announcement grants no **authority**: it adds a coordinate to a
+/// set and nothing else — no session woken, no model turn, no invocation right.
+/// The coordinate is derived from the announcement's *signer*, so a flood of
+/// valid announcements cannot make anyone an owner they are not, and enrolment
+/// still has to match a root's own signed `a` against the set.
+///
+/// It is **not** free, though. An earlier version of this comment said the
+/// worst case was "a set containing repositories nobody cares about", which
+/// treated valid hostile input as harmless because it lacked authority. The
+/// allocator is less philosophical: the discovery REQ is global, so every
+/// distinct announcement anyone publishes is a real coordinate held in memory.
+/// That is bounded by [`project::DISCOVERY_CEILING`], which refuses rather than
+/// evicts and marks the set permanently incomplete when it trips.
+///
+/// The set is **not durable**. It lives in this run loop and is gone on
+/// restart. That is deliberate — the plan rejects a second authoritative local
+/// database — but it means restart recovery is relay-derived reconstruction,
+/// which does not exist yet: there is no paginated discovery reconstruction and
+/// no recovery for announcements dropped under backpressure.
+///
+/// **Neither catch-up frames nor end-of-backlog boundaries arrive here.** Both
+/// are handled in the relay task, beside the registry that admitted them and
+/// the reconstructions that hold pages. This arm used to receive catch-up frames
+/// as ordinary routed events and drop them, leaving the page short with nothing
+/// to say so; it also used to receive the boundary itself, as a capability this
+/// side could not use and did not consume.
+///
+/// **Routed events are dispatched, not dropped.** The authority gate composes
+/// [`project::classify_kind`], [`project::classify_project_author`],
+/// [`project::resolve_addressing`] and [`project::classify_project_event`]
+/// against live runtime state in [`project::decide_project_event`]; an
+/// authorised effect enrols the root and queues a turn under
+/// [`project::ProjectRoute::key`].
+///
+/// An earlier revision of this comment described the opposite — an unbuilt
+/// gate, discarded events, and a tree unfit to commit. Each clause stopped
+/// being true when the gate landed, and the comment outlived all three. That
+/// is worse than no comment: a reader who trusts it concludes the feature does
+/// not exist. The false text is deliberately not quoted here, so a search for
+/// it finds nothing.
 fn handle_project_event(
     dispatch: &mut ProjectDispatch<'_>,
     project_event: &project::ProjectEvent,
