@@ -1294,6 +1294,77 @@ mod tests {
     use super::*;
     use nostr::{Alphabet, Filter, SingleLetterTag};
 
+    /// The NIP-PC peer-call REQ is authorized as submitted.
+    ///
+    /// Phase 6 attributed a total peer-call delivery failure to this gate
+    /// closing the REQ. It does not: kinds `43001` and `43004` are not in
+    /// `P_GATED_KINDS`, so `can_match_p_gated` is false for both filters and
+    /// the gate returns early. Adding an author exemption here would have
+    /// widened a real read boundary for a symptom it cannot cause.
+    ///
+    /// Pinned so the claim is checkable rather than argued, and so that if
+    /// either kind is ever added to `P_GATED_KINDS` this fails loudly instead
+    /// of silently closing every agent's peer subscription.
+    #[test]
+    fn the_acp_peer_call_req_passes_every_global_read_gate() {
+        let authed = "1".repeat(64);
+        let addressed: Filter = serde_json::from_value(serde_json::json!({
+            "kinds": [43001, 43004],
+            "#p": [authed],
+            "since": 1,
+        }))
+        .expect("addressed filter");
+        let own: Filter = serde_json::from_value(serde_json::json!({
+            "kinds": [43001],
+            "authors": [authed],
+            "since": 1,
+        }))
+        .expect("own-call filter");
+        let submitted = [addressed, own.clone()];
+
+        assert!(
+            p_gated_filters_authorized(&submitted, &authed),
+            "the peer-call REQ is closed by the p-gate"
+        );
+        assert!(engram_filters_authorized(&submitted, &authed));
+        assert!(author_only_filters_authorized(&submitted, &authed));
+
+        // The own-call filter carries no `#p` at all, and must still pass: it
+        // is author-constrained, which is the narrower claim of the two.
+        assert!(p_gated_filters_authorized(&[own], &authed));
+    }
+
+    /// A foreign-author filter for the same kind is not thereby authorized.
+    ///
+    /// Nothing above grants it — the point is that the gate's silence about
+    /// kind `43001` is not a permission, so no test should be read as one.
+    /// Authorization for these kinds comes from the envelope itself, verified
+    /// after delivery.
+    #[test]
+    fn a_foreign_author_peer_call_filter_gains_nothing_from_this_gate() {
+        let authed = "1".repeat(64);
+        let foreign = "2".repeat(64);
+        let stranger: Filter = serde_json::from_value(serde_json::json!({
+            "kinds": [43001],
+            "authors": [foreign],
+        }))
+        .expect("foreign filter");
+        // True, and deliberately unremarkable: this gate is not the boundary
+        // for peer calls in either direction.
+        assert!(p_gated_filters_authorized(&[stranger], &authed));
+
+        // The boundary it *is* responsible for still holds.
+        let gift_wrap_fishing: Filter = serde_json::from_value(serde_json::json!({
+            "kinds": [1059],
+            "#p": [foreign],
+        }))
+        .expect("gift wrap filter");
+        assert!(
+            !p_gated_filters_authorized(&[gift_wrap_fishing], &authed),
+            "a p-gated kind addressed to someone else must still be refused"
+        );
+    }
+
     #[test]
     fn global_queries_push_access_scope_before_limit() {
         let accessible = vec![uuid::Uuid::new_v4(), uuid::Uuid::new_v4()];

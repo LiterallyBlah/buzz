@@ -1769,3 +1769,148 @@ mod tests {
         );
     }
 }
+
+/// The NIP-PC peer-call subscription a `buzz-acp` runtime actually opens.
+///
+/// Phase 6 reported that four zero-channel runtimes saw no peer call at all —
+/// neither the caller's own authored `43001` nor the callee's addressed copy —
+/// and attributed it to `p_gated_filters_authorized` closing the REQ. These
+/// tests exist because that attribution is wrong, and a security gate is a bad
+/// place to act on a guess: kinds `43001`/`43004` are not in `P_GATED_KINDS`,
+/// so the gate never applies to this subscription, and widening it would have
+/// loosened a real boundary while changing nothing about the symptom.
+///
+/// What they pin is the whole delivery path for the exact filter pair
+/// `relay.rs::peer_call_filters` emits: the REQ is authorized, the two-filter
+/// subscription declines the `(kind, #p)` fast index and lands on the generic
+/// global kind index, and both the caller and the callee match one signed call.
+/// If any of that stops being true, the cause is here; while it holds, it is
+/// somewhere else.
+#[cfg(test)]
+mod peer_call_subscription_tests {
+    use super::*;
+    use nostr::{EventBuilder, Keys, Kind, Tag};
+
+    /// Byte-for-byte the shape of `buzz-acp`'s `peer_call_filters`.
+    fn acp_peer_call_filters(self_hex: &str) -> Vec<Filter> {
+        vec![
+            serde_json::from_value(serde_json::json!({
+                "kinds": [43001, 43004],
+                "#p": [self_hex],
+                "since": 1,
+            }))
+            .expect("addressed filter"),
+            serde_json::from_value(serde_json::json!({
+                "kinds": [43001],
+                "authors": [self_hex],
+                "since": 1,
+            }))
+            .expect("own-call filter"),
+        ]
+    }
+
+    fn signed_call(caller: &Keys, callee_hex: &str) -> StoredEvent {
+        let event = EventBuilder::new(Kind::Custom(43001), "PAIR:a->b")
+            .tags(vec![Tag::parse(["p", callee_hex]).expect("p tag")])
+            .sign_with_keys(caller)
+            .expect("sign");
+        // No `h` tag: a peer call names no channel, so it is stored globally.
+        StoredEvent::new(event, None)
+    }
+
+    /// One published call reaches both ends of it.
+    ///
+    /// The caller learns of its own call only this way — `buzz agents call`
+    /// runs in a separate process, so the runtime's outstanding-call ledger is
+    /// populated by seeing its own signed event come back off the relay.
+    #[test]
+    fn a_signed_call_reaches_its_caller_and_its_callee() {
+        let caller = Keys::generate();
+        let callee = Keys::generate();
+        let caller_hex = caller.public_key().to_hex();
+        let callee_hex = callee.public_key().to_hex();
+
+        let registry = SubscriptionRegistry::new();
+        let caller_conn = uuid::Uuid::new_v4();
+        let callee_conn = uuid::Uuid::new_v4();
+        registry.register_scoped(
+            test_community(),
+            caller_conn,
+            "hermes-peer".into(),
+            acp_peer_call_filters(&caller_hex),
+            None,
+        );
+        registry.register_scoped(
+            test_community(),
+            callee_conn,
+            "hermes-peer".into(),
+            acp_peer_call_filters(&callee_hex),
+            None,
+        );
+
+        let matches = registry.fan_out_scoped(test_community(), &signed_call(&caller, &callee_hex));
+
+        assert!(
+            matches.iter().any(|(conn, _)| *conn == caller_conn),
+            "the caller never sees its own call, so its ledger stays empty"
+        );
+        assert!(
+            matches.iter().any(|(conn, _)| *conn == callee_conn),
+            "the callee never sees the call addressed to it"
+        );
+    }
+
+    /// A third agent subscribed the same way receives nothing.
+    ///
+    /// The delivery above must come from the two filters, not from the global
+    /// kind index handing kind `43001` to everyone who asked for it.
+    #[test]
+    fn an_uninvolved_agent_receives_neither_copy() {
+        let caller = Keys::generate();
+        let callee = Keys::generate();
+        let bystander = Keys::generate();
+
+        let registry = SubscriptionRegistry::new();
+        let bystander_conn = uuid::Uuid::new_v4();
+        registry.register_scoped(
+            test_community(),
+            bystander_conn,
+            "hermes-peer".into(),
+            acp_peer_call_filters(&bystander.public_key().to_hex()),
+            None,
+        );
+
+        let matches = registry.fan_out_scoped(
+            test_community(),
+            &signed_call(&caller, &callee.public_key().to_hex()),
+        );
+
+        assert!(
+            matches.is_empty(),
+            "a call between two other agents was delivered to a bystander"
+        );
+    }
+
+    /// The two-filter subscription must decline the `(kind, #p)` fast index.
+    ///
+    /// That index is keyed on the event's `p` values, and a caller's own call
+    /// carries the *callee's* `p` tag. Indexing this subscription there would
+    /// silently drop exactly the own-call delivery the ledger depends on —
+    /// which is the symptom that was reported, arrived at by a different route.
+    #[test]
+    fn a_partly_p_constrained_subscription_falls_back_to_the_kind_index() {
+        let self_hex = Keys::generate().public_key().to_hex();
+        assert!(
+            extract_global_p_kind_index_keys(test_community(), &acp_peer_call_filters(&self_hex))
+                .is_none(),
+            "the own-call filter has no #p, so the p-kind index cannot represent this REQ"
+        );
+
+        // The addressed filter alone is fully constrained and may use it.
+        let addressed = vec![acp_peer_call_filters(&self_hex)[0].clone()];
+        assert!(
+            extract_global_p_kind_index_keys(test_community(), &addressed).is_some(),
+            "a fully #p-constrained REQ should still take the narrow index"
+        );
+    }
+}
