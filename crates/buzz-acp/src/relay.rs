@@ -7196,9 +7196,273 @@ mod tests {
         );
         let frames = drain_test_frames(&mut server).await;
         assert_eq!(
+            req_ids(&frames),
+            vec![crate::project::watched_sub_id(1)],
+            "the refusal must have burned no generation, so the successor is 1: {frames:?}"
+        );
+        assert_eq!(
             close_ids(&frames),
             vec![crate::project::watched_sub_id(0)],
             "and the real predecessor is what gets retired: {frames:?}"
+        );
+    }
+
+    /// **A watched generation this owner never allocated is still retired.**
+    ///
+    /// The other half of the capability-leak counterexample, and the half that
+    /// makes the derivation load-bearing rather than merely defensive. With a
+    /// stored `watched_current` field, `proj-roots-99` arriving from outside
+    /// left the field at `None`, so the next replacement named no predecessor
+    /// and 99 stayed durable beside the successor forever.
+    ///
+    /// Reading the predecessor out of durable intent means the owner retires
+    /// whatever is actually there, including something it did not put there.
+    #[tokio::test]
+    async fn a_singly_seeded_watched_intent_becomes_the_predecessor_and_is_retired() {
+        let (mut ws, mut server) = test_ws_pair().await;
+        let mut state = BgState::new();
+
+        // Nothing this owner allocated — generation 99, from outside.
+        state
+            .project_requests
+            .force_watched_intent(99, watched_filter(9));
+        assert_eq!(
+            state
+                .project_requests
+                .current_watched()
+                .expect("one watched intent resolves"),
+            Some(99),
+            "the derivation must see the intent that is actually there"
+        );
+
+        assert!(
+            submit_replacement(
+                &mut ws,
+                &mut state,
+                crate::project::ProjectReplacement::Watched,
+                vec![watched_filter(1)],
+            )
+            .await
+        );
+
+        let frames = drain_test_frames(&mut server).await;
+        assert_eq!(
+            req_ids(&frames),
+            vec![crate::project::watched_sub_id(0)],
+            "the successor takes this owner's next generation: {frames:?}"
+        );
+        assert_eq!(
+            close_ids(&frames),
+            vec![crate::project::watched_sub_id(99)],
+            "and the seeded generation is what gets retired: {frames:?}"
+        );
+        assert!(
+            state
+                .project_requests
+                .intent(&crate::project::watched_sub_id(99))
+                .is_none(),
+            "no durable trace of 99 may survive the replacement"
+        );
+        assert_eq!(
+            state
+                .project_requests
+                .current_watched()
+                .expect("one watched intent resolves"),
+            Some(0),
+        );
+    }
+
+    /// **A watched id and the generation its identity carries must agree.**
+    ///
+    /// The key is what goes on the wire; the class is what admits inbound
+    /// frames. A pair that disagrees asks the relay one question and admits the
+    /// answers to another — and it would resolve as a predecessor under the
+    /// wrong id, so the CLOSE would retire a subscription the relay never
+    /// opened while the real one stayed live.
+    #[tokio::test]
+    async fn a_watched_intent_whose_id_disagrees_with_its_generation_is_refused() {
+        let (mut ws, mut server) = test_ws_pair().await;
+        let mut state = BgState::new();
+
+        state.project_requests.force_intent(
+            &crate::project::watched_sub_id(3),
+            crate::project::ProjectSubscription::Watched { generation: 7 },
+            watched_filter(9),
+        );
+
+        assert!(
+            submit_replacement(
+                &mut ws,
+                &mut state,
+                crate::project::ProjectReplacement::Watched,
+                vec![watched_filter(1)],
+            )
+            .await,
+            "an invariant violation is not a transport failure"
+        );
+        let frames = drain_test_frames(&mut server).await;
+        assert!(frames.is_empty(), "nothing may be written: {frames:?}");
+
+        let violation = state
+            .project_requests
+            .current_watched()
+            .expect_err("a disagreeing id and generation must not resolve");
+        assert!(
+            violation.contains(&crate::project::watched_sub_id(3))
+                && violation.contains(&crate::project::watched_sub_id(7)),
+            "the report must name both the id it found and the id the class implies: {violation}"
+        );
+    }
+
+    /// **Enrolment intent lives under the enrolment id, and nothing else does.**
+    ///
+    /// Both directions are refused. An enrolment class under a foreign id would
+    /// never be retired, because the enrolment replacement only ever names its
+    /// own fixed id; a foreign class under the enrolment id would be retired by
+    /// an enrolment replacement that never installed it.
+    #[tokio::test]
+    async fn enrolment_intent_that_is_not_under_the_enrolment_id_is_refused() {
+        for (id, class) in [
+            (
+                "proj-enrol-elsewhere".to_string(),
+                crate::project::ProjectSubscription::Enrolment,
+            ),
+            (
+                crate::project::PROJECT_ENROL_SUB_ID.to_string(),
+                crate::project::ProjectSubscription::Discovery,
+            ),
+        ] {
+            let (mut ws, mut server) = test_ws_pair().await;
+            let mut state = BgState::new();
+            state
+                .project_requests
+                .force_intent(&id, class.clone(), watched_filter(9));
+
+            // Both replacements refuse: durable intent is one record, and a
+            // registry that writes into a record it has just found inconsistent
+            // is reconciling corruption by ignoring it.
+            for replacement in [
+                crate::project::ProjectReplacement::Watched,
+                crate::project::ProjectReplacement::Enrolment,
+            ] {
+                assert!(
+                    submit_replacement(&mut ws, &mut state, replacement, vec![watched_filter(1)],)
+                        .await,
+                    "{id}/{class:?}: an invariant violation is not a transport failure"
+                );
+                let frames = drain_test_frames(&mut server).await;
+                assert!(
+                    frames.is_empty(),
+                    "{id}/{class:?}: nothing may be written: {frames:?}"
+                );
+            }
+
+            assert!(
+                state.project_requests.current_watched().is_err(),
+                "{id}/{class:?}: the derivation must refuse"
+            );
+        }
+    }
+
+    /// **The outcomes that decide before allocation spend nothing — proved at
+    /// the ceiling.**
+    ///
+    /// Asserting "the successor is 1, not 2" proves a single refusal burned
+    /// nothing. This proves it for every non-allocating outcome at once, and
+    /// proves it where the evidence is unambiguous: with exactly one generation
+    /// left, anything that burns one leaves the next valid replacement with
+    /// none, and `WatchedGenerationExhausted` is a very different result from
+    /// `Replaced`.
+    ///
+    /// A counter that merely *looked* right would still pass a
+    /// successor-number assertion in the middle of the range. At the ceiling
+    /// there is no room for it to be nearly right.
+    #[tokio::test]
+    async fn no_outcome_that_decides_before_allocation_spends_a_generation() {
+        let (mut ws, mut server) = test_ws_pair().await;
+        let mut state = BgState::new();
+
+        // Install one generation, then leave exactly one unallocated.
+        assert!(
+            submit_replacement(
+                &mut ws,
+                &mut state,
+                crate::project::ProjectReplacement::Watched,
+                vec![watched_filter(1)],
+            )
+            .await
+        );
+        drain_test_frames(&mut server).await;
+        state
+            .project_requests
+            .seed_allocators_for_exhaustion(u64::MAX, 1);
+
+        // 1. InvalidFilters — a limit constrains nothing about which events.
+        assert!(
+            submit_replacement(
+                &mut ws,
+                &mut state,
+                crate::project::ProjectReplacement::Watched,
+                vec![serde_json::json!({ "limit": 500 })],
+            )
+            .await
+        );
+
+        // 2. A true no-op — the same question already live.
+        assert!(
+            submit_replacement(
+                &mut ws,
+                &mut state,
+                crate::project::ProjectReplacement::Watched,
+                vec![watched_filter(1)],
+            )
+            .await
+        );
+
+        // 3. InvariantViolation — a second watched intent, then removed, so the
+        //    final valid attempt has a single predecessor to retire.
+        state
+            .project_requests
+            .force_watched_intent(99, watched_filter(9));
+        assert!(
+            submit_replacement(
+                &mut ws,
+                &mut state,
+                crate::project::ProjectReplacement::Watched,
+                vec![watched_filter(2)],
+            )
+            .await
+        );
+        state.project_requests.clear_watched_intent(99);
+
+        let frames = drain_test_frames(&mut server).await;
+        assert!(
+            frames.is_empty(),
+            "none of the three may write anything: {frames:?}"
+        );
+
+        // The ceiling is intact: the last generation is still there to take.
+        assert!(
+            submit_replacement(
+                &mut ws,
+                &mut state,
+                crate::project::ProjectReplacement::Watched,
+                vec![watched_filter(2)],
+            )
+            .await
+        );
+        let frames = drain_test_frames(&mut server).await;
+        assert_eq!(
+            req_ids(&frames),
+            vec![crate::project::watched_sub_id(u64::MAX)],
+            "the maximum generation must still be unspent: {frames:?}"
+        );
+        assert_eq!(
+            state
+                .project_requests
+                .current_watched()
+                .expect("one watched intent resolves"),
+            Some(u64::MAX),
         );
     }
 

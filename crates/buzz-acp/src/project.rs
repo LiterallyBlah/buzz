@@ -805,6 +805,18 @@ mod requests {
         WriteFailed(String),
     }
 
+    /// Current project state, as read out of durable intent.
+    ///
+    /// Not stored anywhere. It is the return of one validating walk, so the two
+    /// facts a replacement needs cannot be answered from a tree that was found
+    /// consistent for one of them and never checked for the other.
+    struct CurrentIntent {
+        /// The generation whose durable intent is current, if any.
+        watched: Option<u64>,
+        /// Whether enrolment intent is current under its fixed id.
+        enrolment: bool,
+    }
+
     /// What [`ProjectRequests::record_intent`] decided.
     #[derive(Debug, PartialEq)]
     pub(crate) enum IntentAdmission {
@@ -1404,26 +1416,100 @@ mod requests {
         /// the successor, which is the defect this whole design removes — so
         /// the caller is told the registry cannot answer, and installs nothing.
         pub(crate) fn current_watched(&self) -> Result<Option<u64>, String> {
-            let mut found: Vec<(&str, u64)> = self
-                .intent
-                .iter()
-                .filter_map(|(id, identity)| match identity.subscription() {
+            self.derive_current().map(|current| current.watched)
+        }
+
+        /// Whether an enrolment request's durable intent is current.
+        ///
+        /// Derived for the same reason as [`Self::current_watched`], and by the
+        /// same rule: the id is fixed, so the question is whether *that* id
+        /// holds enrolment intent — not whether a boolean somewhere was set.
+        fn enrolment_current(&self) -> Result<bool, String> {
+            self.derive_current().map(|current| current.enrolment)
+        }
+
+        /// Read the whole of current project state out of durable intent, or
+        /// refuse.
+        ///
+        /// **One walk, all the invariants, shared by both replacements.** An
+        /// enrolment replacement is blocked by a corrupt *watched* intent and
+        /// vice versa, which is deliberate: durable intent is one record, and a
+        /// registry willing to write into a record it has just found to be
+        /// inconsistent is a registry that reconciles corruption by ignoring
+        /// it.
+        ///
+        /// The invariants, each of which is a way the id and the identity under
+        /// it can disagree:
+        ///
+        /// - at most one watched intent — more than one has no single
+        ///   predecessor, and choosing between them retires one and leaves the
+        ///   other durable beside the successor;
+        /// - a watched intent's key is `watched_sub_id(generation)` for the
+        ///   generation its own class carries — the key is what goes on the
+        ///   wire and the class is what admits inbound frames, so a pair that
+        ///   disagrees asks one question and answers another;
+        /// - enrolment intent lives under [`super::PROJECT_ENROL_SUB_ID`] and
+        ///   nothing else does — an enrolment class under some other id would
+        ///   be replaced without ever being retired, and a foreign class under
+        ///   the enrolment id would be retired by an enrolment replacement that
+        ///   never installed it.
+        ///
+        /// Discovery and root catch-up are not checked here. Their ids are not
+        /// derived from a generation this owner allocates, so they are not the
+        /// disagreement this function exists to catch — saying so rather than
+        /// letting the omission read as coverage.
+        fn derive_current(&self) -> Result<CurrentIntent, String> {
+            let mut watched: Vec<(&str, u64)> = Vec::new();
+            let mut enrolment = false;
+
+            for (id, identity) in &self.intent {
+                match identity.subscription() {
                     super::ProjectSubscription::Watched { generation } => {
-                        Some((id.as_str(), *generation))
+                        let expected = super::watched_sub_id(*generation);
+                        if id != &expected {
+                            return Err(format!(
+                                "watched intent under id {id} carries generation {generation}, \
+                                 whose id is {expected}"
+                            ));
+                        }
+                        watched.push((id.as_str(), *generation));
                     }
-                    _ => None,
-                })
-                .collect();
-            match found.len() {
-                0 => Ok(None),
-                1 => Ok(Some(found[0].1)),
+                    super::ProjectSubscription::Enrolment => {
+                        if id != super::PROJECT_ENROL_SUB_ID {
+                            return Err(format!(
+                                "enrolment intent is held under id {id} rather than {}",
+                                super::PROJECT_ENROL_SUB_ID
+                            ));
+                        }
+                        enrolment = true;
+                    }
+                    _ => {
+                        if id == super::PROJECT_ENROL_SUB_ID {
+                            return Err(format!(
+                                "the enrolment id {id} holds a {:?} intent",
+                                identity.subscription()
+                            ));
+                        }
+                    }
+                }
+            }
+
+            match watched.len() {
+                0 => Ok(CurrentIntent {
+                    watched: None,
+                    enrolment,
+                }),
+                1 => Ok(CurrentIntent {
+                    watched: Some(watched[0].1),
+                    enrolment,
+                }),
                 _ => {
                     // Sorted so the report is the same on every run — a
                     // `HashMap` would otherwise name the intruder in a
                     // different order each time and the failure would read as
                     // flaky rather than deterministic.
-                    found.sort_unstable();
-                    let ids: Vec<&str> = found.iter().map(|(id, _)| *id).collect();
+                    watched.sort_unstable();
+                    let ids: Vec<&str> = watched.iter().map(|(id, _)| *id).collect();
                     Err(format!(
                         "durable intent holds {} watched generations ({}); \
                          exactly one may be current",
@@ -1434,22 +1520,6 @@ mod requests {
             }
         }
 
-        /// Whether an enrolment request's durable intent is current.
-        ///
-        /// Derived for the same reason as [`Self::current_watched`], and by the
-        /// same rule: the id is fixed, so the question is whether *that* id
-        /// holds enrolment intent — not whether a boolean somewhere was set.
-        fn enrolment_current(&self) -> bool {
-            self.intent
-                .get(super::PROJECT_ENROL_SUB_ID)
-                .is_some_and(|identity| {
-                    matches!(
-                        identity.subscription(),
-                        super::ProjectSubscription::Enrolment
-                    )
-                })
-        }
-
         /// Test hook: install a watched intent outside the semantic owner.
         ///
         /// The only way to reach the state a generic subscribe command used to
@@ -1458,13 +1528,30 @@ mod requests {
         /// it, which is the point of the regression that uses it.
         #[cfg(test)]
         pub(crate) fn force_watched_intent(&mut self, generation: u64, filter: Value) {
-            let identity = ProjectRequestIdentity::new(
+            self.force_intent(
+                &super::watched_sub_id(generation),
                 super::ProjectSubscription::Watched { generation },
                 filter,
-            )
-            .expect("test intent filter must be bounded");
-            self.intent
-                .insert(super::watched_sub_id(generation), identity);
+            );
+        }
+
+        /// Test hook: install intent under an arbitrary id and class.
+        ///
+        /// The id and the class are taken separately on purpose. Every
+        /// invariant [`Self::derive_current`] enforces is a way for those two to
+        /// disagree, and a hook that derived one from the other could not
+        /// express the disagreement — so the refusals would be unprovable and
+        /// the checks would be decoration.
+        #[cfg(test)]
+        pub(crate) fn force_intent(
+            &mut self,
+            sub_id: &str,
+            subscription: super::ProjectSubscription,
+            filter: Value,
+        ) {
+            let identity = ProjectRequestIdentity::new(subscription, filter)
+                .expect("test intent filter must be bounded");
+            self.intent.insert(sub_id.to_string(), identity);
         }
 
         /// Test hook: remove a watched intent, undoing
@@ -1524,12 +1611,16 @@ mod requests {
                 Err(violation) => return ReplaceOutcome::InvariantViolation(violation),
             };
             // A no-op is a predecessor whose durable intent already asks these
-            // filters *and* which is live on this connection. Intent alone is
-            // not enough: intent recorded while disconnected has never reached
-            // a socket, and reporting `Unchanged` for it would leave the relay
-            // asked nothing while the registry claimed to be current.
+            // filters *and* which is live on this connection asking the same
+            // ones. Intent alone is not enough: intent recorded while
+            // disconnected has never reached a socket, and reporting
+            // `Unchanged` for it would leave the relay asked nothing while the
+            // registry claimed to be current. Live alone is not enough either —
+            // the two are separate maps, and a no-op has to be a no-op in both.
             if let Some(prior_id) = predecessor.as_deref() {
-                if self.asks_exactly(prior_id, &filters) {
+                if self.intent_asks_exactly(prior_id, &filters)
+                    && self.live_asks_exactly(prior_id, &filters)
+                {
                     return ReplaceOutcome::Unchanged;
                 }
             }
@@ -1553,13 +1644,24 @@ mod requests {
                 .await
         }
 
-        /// Does `sub_id` already ask exactly `filters`, on this connection?
+        /// Does `sub_id`'s durable intent already ask exactly `filters`?
         ///
-        /// Live rather than intended, and by identity rather than by id: a
-        /// registration under the right id asking a different question is not
-        /// unchanged, and the only thing that makes a REQ redundant is that the
-        /// relay is already answering this exact one.
-        fn asks_exactly(&self, sub_id: &str, filters: &[Value]) -> bool {
+        /// The whole authority available while disconnected: reconnect replays
+        /// intent verbatim, so intent that already asks this is intent the next
+        /// connection will install unchanged.
+        fn intent_asks_exactly(&self, sub_id: &str, filters: &[Value]) -> bool {
+            self.intent
+                .get(sub_id)
+                .is_some_and(|held| held.filters().eq(filters.iter()))
+        }
+
+        /// Is `sub_id` live on this connection asking exactly `filters`?
+        ///
+        /// By identity rather than by id: a registration under the right id
+        /// asking a different question is not unchanged, and the only thing
+        /// that makes a REQ redundant is that the relay is already answering
+        /// this exact one.
+        fn live_asks_exactly(&self, sub_id: &str, filters: &[Value]) -> bool {
             self.live
                 .get(sub_id)
                 .is_some_and(|live| live.identity.filters().eq(filters.iter()))
@@ -1585,11 +1687,7 @@ mod requests {
             // same intent under a fresh generation would burn one to arrive
             // where the next reconnect was already going.
             if let Some(prior_id) = predecessor.as_deref() {
-                if self
-                    .intent
-                    .get(prior_id)
-                    .is_some_and(|held| held.filters().eq(filters.iter()))
-                {
+                if self.intent_asks_exactly(prior_id, &filters) {
                     return ReplaceOutcome::Unchanged;
                 }
             }
@@ -1627,7 +1725,10 @@ mod requests {
                 return ReplaceOutcome::InvalidFilters;
             };
             let id = super::PROJECT_ENROL_SUB_ID;
-            let predecessor = self.enrolment_current().then_some(id);
+            let predecessor = match self.enrolment_current() {
+                Ok(current) => current.then_some(id),
+                Err(violation) => return ReplaceOutcome::InvariantViolation(violation),
+            };
             self.replace_request(sink, predecessor, id, identity).await
         }
 
@@ -1640,7 +1741,10 @@ mod requests {
                 return ReplaceOutcome::InvalidFilters;
             };
             let id = super::PROJECT_ENROL_SUB_ID;
-            let predecessor = self.enrolment_current().then_some(id);
+            let predecessor = match self.enrolment_current() {
+                Ok(current) => current.then_some(id),
+                Err(violation) => return ReplaceOutcome::InvariantViolation(violation),
+            };
             self.replace_intent(predecessor, id, identity);
             ReplaceOutcome::Replaced { retired: None }
         }
