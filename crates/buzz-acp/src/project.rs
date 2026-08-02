@@ -105,6 +105,13 @@ pub(crate) use requests::{
     IntentAdmission, OpenOutcome, OpenedHistoryPage, ProjectRequestIdentity, ProjectRequests,
 };
 
+/// Named by the replacement wire tests today; the run loop consumes it when
+/// dispatch moves behind the narrow replacement capability. Scoped to this one
+/// export rather than allowed module-wide, so a genuinely dead export still
+/// surfaces.
+#[allow(unused_imports)]
+pub(crate) use requests::ReplaceOutcome;
+
 /// Named by the tests that open pages, and by the reconstruction driver when it
 /// lands — nothing in production opens one yet. Scoped to this one export
 /// rather than allowed module-wide, so a genuinely dead export still surfaces.
@@ -135,6 +142,17 @@ pub(crate) trait ProjectReqSink: sealed::Sealed {
         &mut self,
         text: String,
     ) -> impl std::future::Future<Output = Result<(), String>>;
+
+    /// Write one already-serialised CLOSE frame.
+    ///
+    /// Separate from [`Self::write_project_req`] so the two cannot be confused
+    /// at a call site: a CLOSE that went out as a REQ would open an unbounded
+    /// subscription, and a REQ that went out as a CLOSE would silently retire
+    /// the request it was meant to install.
+    fn write_project_close(
+        &mut self,
+        text: String,
+    ) -> impl std::future::Future<Output = Result<(), String>>;
 }
 
 mod sealed {
@@ -160,6 +178,17 @@ impl ProjectReqSink
         .await
         .map_err(|_| "timed out writing project REQ".to_string())?
         .map_err(|e| format!("failed to write project REQ: {e}"))
+    }
+
+    async fn write_project_close(&mut self, text: String) -> Result<(), String> {
+        use futures_util::SinkExt;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(PROJECT_REQ_SEND_TIMEOUT_SECS),
+            self.send(tokio_tungstenite::tungstenite::Message::Text(text.into())),
+        )
+        .await
+        .map_err(|_| "timed out writing project CLOSE".to_string())?
+        .map_err(|e| format!("failed to write project CLOSE: {e}"))
     }
 }
 
@@ -687,6 +716,30 @@ mod requests {
         /// transport attempt, and only [`ProjectRequests::open_history_page`]
         /// mints those. Nothing written, nothing recorded.
         NotOpenableHere,
+    }
+
+    /// What [`ProjectRequests::replace_request`] decided.
+    ///
+    /// Distinct from [`OpenOutcome`] because replacement and opening differ on
+    /// exactly one point: a replacement is *authorised* to change the identity
+    /// held under an id, and an open is not. Sharing an outcome type would
+    /// invite sharing the check that refuses it.
+    #[derive(Debug, PartialEq)]
+    pub(crate) enum ReplaceOutcome {
+        /// The successor is live and written. `retired` names the predecessor
+        /// whose live state and durable intent were removed, when replacement
+        /// moved to a new id.
+        Replaced { retired: Option<String> },
+        /// The successor is byte-identical to what is already live. Nothing was
+        /// written, because re-sending an identical REQ churns the relay's
+        /// admission budget to arrive where it already is.
+        Unchanged,
+        /// The incarnation space is spent. Nothing written, predecessor intact.
+        Exhausted,
+        /// The successor write failed. **The predecessor is intact** — its live
+        /// registration and its durable intent are exactly as they were, so the
+        /// agent keeps answering on the subscription it already had.
+        WriteFailed(String),
     }
 
     /// What [`ProjectRequests::record_intent`] decided.
@@ -1234,6 +1287,120 @@ mod requests {
                 None => self.incarnations_exhausted = true,
             }
             Some(taken)
+        }
+        /// Replace a live project subscription, transactionally.
+        ///
+        /// **Why this is not `open_request`.** `open_request` refuses to change
+        /// the identity held under an id, and must: reopening a live id does
+        /// not cancel the relay's existing request, so reclassifying traffic it
+        /// is still producing would be a lie. Widening the enrolment filter is
+        /// exactly that change, deliberately made — so it needs an operation
+        /// that is *allowed* to make it, rather than a relaxation of the one
+        /// that must not.
+        ///
+        /// **Ordering: install the successor, then retire the predecessor.**
+        /// The reverse leaves a window with no live subscription, and a
+        /// successor that then failed would leave nothing at all — the agent
+        /// would stop hearing about roots it is enrolled on, silently. Held
+        /// this way round, a failed successor is a no-op.
+        ///
+        /// `predecessor` is `None` for a first install, `Some(id)` when the
+        /// successor takes a new id (a fresh watched generation). When it names
+        /// the same id as `sub_id`, the relay's own REQ-replacement semantics
+        /// do the retiring and no CLOSE is sent — a CLOSE there would retire
+        /// the successor that just replaced it.
+        pub(crate) async fn replace_request<S: ProjectReqSink>(
+            &mut self,
+            sink: &mut S,
+            predecessor: Option<&str>,
+            sub_id: &str,
+            identity: ProjectRequestIdentity,
+        ) -> ReplaceOutcome {
+            if self
+                .live
+                .get(sub_id)
+                .is_some_and(|l| l.identity == identity)
+            {
+                return ReplaceOutcome::Unchanged;
+            }
+            if self.incarnations_exhausted {
+                return ReplaceOutcome::Exhausted;
+            }
+
+            let text = match serde_json::to_string(&identity.req_frame(sub_id)) {
+                Ok(text) => text,
+                Err(e) => return ReplaceOutcome::WriteFailed(format!("serialize: {e}")),
+            };
+
+            // Durable intent for the successor is recorded before the write, as
+            // in `open_request`: a failed write leaves the intent standing
+            // because the intent is still what we want. The difference is that
+            // here it may *overwrite* a predecessor's intent under the same id,
+            // so the prior value is kept to be put back if the write fails.
+            let displaced = self.intent.insert(sub_id.to_string(), identity.clone());
+
+            if let Err(e) = sink.write_project_req(text).await {
+                match displaced {
+                    Some(prior) => {
+                        self.intent.insert(sub_id.to_string(), prior);
+                    }
+                    None => {
+                        self.intent.remove(sub_id);
+                    }
+                }
+                return ReplaceOutcome::WriteFailed(e);
+            }
+
+            // Taken after the write returned, exactly as `open_request` does:
+            // a write that never landed must not consume an incarnation, so a
+            // retry is a genuinely new authority.
+            let Some(incarnation) = self.burn_incarnation() else {
+                match displaced {
+                    Some(prior) => {
+                        self.intent.insert(sub_id.to_string(), prior);
+                    }
+                    None => {
+                        self.intent.remove(sub_id);
+                    }
+                }
+                return ReplaceOutcome::Exhausted;
+            };
+            self.live.insert(
+                sub_id.to_string(),
+                LiveRegistration {
+                    identity,
+                    authority: Arc::new(RegistrationAuthority {
+                        registry: Arc::clone(&self.epoch),
+                        incarnation,
+                    }),
+                },
+            );
+
+            // ---- Successor is installed. Only now retire the predecessor. ---
+            let retired = match predecessor {
+                Some(prior_id) if prior_id != sub_id => {
+                    self.live.remove(prior_id);
+                    self.intent.remove(prior_id);
+                    self.suspended.remove(prior_id);
+
+                    // Best-effort. The predecessor is already retired locally,
+                    // so a failed CLOSE costs a stale relay-side subscription
+                    // whose frames are no longer admitted — noise, not
+                    // authority. Failing the replacement over it would undo a
+                    // successor that is already live and correct.
+                    let close = serde_json::json!(["CLOSE", prior_id]).to_string();
+                    if let Err(e) = sink.write_project_close(close).await {
+                        tracing::debug!(
+                            sub_id = prior_id,
+                            "predecessor CLOSE failed after successful replacement: {e}"
+                        );
+                    }
+                    Some(prior_id.to_string())
+                }
+                _ => None,
+            };
+
+            ReplaceOutcome::Replaced { retired }
         }
 
         /// Decide, write the REQ, then install the registration.
@@ -5617,6 +5784,350 @@ mod tests {
         }
     }
 
+    /// A paired socket whose **server side is kept and readable**.
+    ///
+    /// `TestSocket` drops its server, which is fine for "did the write
+    /// succeed" but proves nothing about what the relay received. Replacement
+    /// is about ordering and content on the wire, so these tests read frames.
+    struct WireSocket {
+        client: tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+        server: tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
+    }
+
+    async fn wire_socket() -> WireSocket {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind wire socket");
+        let address = listener.local_addr().expect("read address");
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            tokio_tungstenite::accept_async(stream)
+                .await
+                .expect("server handshake")
+        });
+        let (client, _) = tokio_tungstenite::connect_async(format!("ws://{address}"))
+            .await
+            .expect("client handshake");
+        WireSocket {
+            client,
+            server: server.await.expect("join server"),
+        }
+    }
+
+    impl WireSocket {
+        /// Next frame the relay actually received, as JSON.
+        async fn next_frame(&mut self) -> serde_json::Value {
+            use futures_util::StreamExt;
+            let msg = tokio::time::timeout(std::time::Duration::from_secs(2), self.server.next())
+                .await
+                .expect("timed out waiting for a frame")
+                .expect("socket closed")
+                .expect("read frame");
+            serde_json::from_str(msg.to_text().expect("text frame")).expect("parse frame")
+        }
+
+        /// Every frame currently readable without blocking.
+        async fn drain_frames(&mut self) -> Vec<serde_json::Value> {
+            use futures_util::StreamExt;
+            let mut out = Vec::new();
+            while let Ok(Some(Ok(msg))) =
+                tokio::time::timeout(std::time::Duration::from_millis(200), self.server.next())
+                    .await
+            {
+                if let Ok(text) = msg.to_text() {
+                    if let Ok(v) = serde_json::from_str(text) {
+                        out.push(v);
+                    }
+                }
+            }
+            out
+        }
+    }
+
+    /// A watched-root identity over the given roots, built the production way.
+    fn watched_enrolments_for(roots: &[&str]) -> ProjectRequestIdentity {
+        let mut enrolments = ProjectEnrolments::new();
+        for root in roots {
+            enrolments
+                .enrol(&EnrolmentCandidate::for_test(root, &coord(), OWNER, false))
+                .expect("enrol");
+        }
+        let filters = watched_roots_filters(&enrolments, 0);
+        assert!(!filters.is_empty(), "watched filters must not be empty");
+        ProjectRequestIdentity::from_filters(
+            ProjectSubscription::Watched {
+                generation: roots.len() as u64,
+            },
+            filters,
+        )
+        .expect("bounded")
+    }
+
+    /// An enrolment identity over the given discovered coordinates.
+    fn enrolment_identity_for(coords: &[&str]) -> ProjectRequestIdentity {
+        let discovered = known(coords);
+        let filter = enrolment_filter(&discovered, AGENT, 0).expect("filter");
+        ProjectRequestIdentity::from_filters(ProjectSubscription::Enrolment, vec![filter])
+            .expect("bounded")
+    }
+
+    /// **A second discovered repository widens the enrolment filter.**
+    ///
+    /// This is the defect that shipped: the enrolment id is fixed, so the
+    /// second identity differed under the same id and `open_request` refused
+    /// it as `Conflict` — which the caller read as handled. The filter could
+    /// never grow past the first repository.
+    #[tokio::test]
+    async fn a_second_discovery_widens_the_enrolment_filter_on_the_wire() {
+        let mut requests = ProjectRequests::new();
+        let mut socket = wire_socket().await;
+        let id = PROJECT_ENROL_SUB_ID;
+
+        let first = enrolment_identity_for(&[&coord()]);
+        assert_eq!(
+            requests
+                .replace_request(&mut socket.client, None, id, first)
+                .await,
+            ReplaceOutcome::Replaced { retired: None }
+        );
+        let frame = socket.next_frame().await;
+        assert_eq!(frame[0], "REQ");
+        assert_eq!(frame[1], id);
+        let first_text = frame.to_string();
+
+        let second_coord = format!("30617:{OWNER}:second-repo");
+        let widened = enrolment_identity_for(&[&coord(), &second_coord]);
+        assert_eq!(
+            requests
+                .replace_request(&mut socket.client, Some(id), id, widened)
+                .await,
+            ReplaceOutcome::Replaced { retired: None },
+            "same-id replacement retires nothing: the relay's REQ replacement does it"
+        );
+
+        let frame = socket.next_frame().await;
+        assert_eq!(frame[0], "REQ", "the widened filter is a REQ, not a CLOSE");
+        assert_eq!(frame[1], id, "replacement reuses the enrolment id");
+        let widened_text = frame.to_string();
+        assert_ne!(first_text, widened_text, "the filter did not change");
+        assert!(
+            widened_text.contains("second-repo"),
+            "the second repository is absent from the widened filter: {widened_text}"
+        );
+    }
+
+    /// **The successor REQ is written before the predecessor CLOSE.**
+    ///
+    /// Reversed, there is a window with no live subscription, and a successor
+    /// that then failed would leave nothing at all.
+    #[tokio::test]
+    async fn the_successor_req_precedes_the_predecessor_close() {
+        let mut requests = ProjectRequests::new();
+        let mut socket = wire_socket().await;
+
+        let gen0 = watched_sub_id(0);
+        let gen1 = watched_sub_id(1);
+        let roots_a = watched_enrolments_for(&[ROOT]);
+        let roots_b = watched_enrolments_for(&[ROOT, OTHER_ROOT]);
+
+        requests
+            .replace_request(&mut socket.client, None, &gen0, roots_a)
+            .await;
+        let _ = socket.next_frame().await;
+
+        assert_eq!(
+            requests
+                .replace_request(&mut socket.client, Some(&gen0), &gen1, roots_b)
+                .await,
+            ReplaceOutcome::Replaced {
+                retired: Some(gen0.clone())
+            }
+        );
+
+        let frames = socket.drain_frames().await;
+        assert_eq!(
+            frames.len(),
+            2,
+            "expected successor REQ then predecessor CLOSE"
+        );
+        assert_eq!(frames[0][0], "REQ");
+        assert_eq!(frames[0][1], gen1, "successor first");
+        assert_eq!(frames[1][0], "CLOSE");
+        assert_eq!(frames[1][1], gen0, "predecessor closed second");
+    }
+
+    /// The successor carries the complete new root set, not a delta.
+    #[tokio::test]
+    async fn the_watched_successor_carries_the_whole_root_set() {
+        let mut requests = ProjectRequests::new();
+        let mut socket = wire_socket().await;
+
+        let gen0 = watched_sub_id(0);
+        let gen1 = watched_sub_id(1);
+        requests
+            .replace_request(
+                &mut socket.client,
+                None,
+                &gen0,
+                watched_enrolments_for(&[ROOT]),
+            )
+            .await;
+        let _ = socket.next_frame().await;
+
+        requests
+            .replace_request(
+                &mut socket.client,
+                Some(&gen0),
+                &gen1,
+                watched_enrolments_for(&[ROOT, OTHER_ROOT]),
+            )
+            .await;
+
+        let req = socket.next_frame().await;
+        let text = req.to_string();
+        assert!(text.contains(ROOT), "successor lost the original root");
+        assert!(text.contains(OTHER_ROOT), "successor lacks the new root");
+    }
+
+    /// **A failed successor leaves the predecessor intact.**
+    ///
+    /// Live registration and durable intent both. Otherwise a transient write
+    /// error silently unsubscribes the agent from roots it is enrolled on.
+    #[tokio::test]
+    async fn a_failed_successor_preserves_the_predecessor() {
+        let mut requests = ProjectRequests::new();
+        let mut socket = wire_socket().await;
+
+        let gen0 = watched_sub_id(0);
+        let gen1 = watched_sub_id(1);
+        let original = watched_enrolments_for(&[ROOT]);
+        requests
+            .replace_request(&mut socket.client, None, &gen0, original.clone())
+            .await;
+        let _ = socket.next_frame().await;
+
+        // A genuinely closed transport, not a simulated one. Dropping the peer
+        // is not enough: tungstenite buffers into the OS socket and the write
+        // still returns `Ok`. Closing the client's own WebSocket makes the
+        // next send fail for real, which is the condition under test.
+        <_ as futures_util::SinkExt<tokio_tungstenite::tungstenite::Message>>::close(
+            &mut socket.client,
+        )
+        .await
+        .expect("close the client transport");
+        drop(socket.server);
+        let outcome = requests
+            .replace_request(
+                &mut socket.client,
+                Some(&gen0),
+                &gen1,
+                watched_enrolments_for(&[ROOT, OTHER_ROOT]),
+            )
+            .await;
+
+        assert!(
+            matches!(outcome, ReplaceOutcome::WriteFailed(_)),
+            "expected a write failure, got {outcome:?}"
+        );
+        assert_eq!(
+            requests.intent(&gen0),
+            Some(&original),
+            "the predecessor's durable intent was discarded on a failed successor"
+        );
+        assert!(
+            requests.intent(&gen1).is_none(),
+            "a successor that never reached the socket left durable intent behind"
+        );
+    }
+
+    /// Reconnect replays the successor only — retired generations do not
+    /// accumulate in durable intent.
+    #[tokio::test]
+    async fn reconnect_replays_only_the_latest_generation() {
+        let mut requests = ProjectRequests::new();
+        let mut socket = wire_socket().await;
+
+        let mut previous: Option<String> = None;
+        for generation in 0..3u64 {
+            let id = watched_sub_id(generation);
+            let roots: Vec<&str> = if generation == 0 {
+                vec![ROOT]
+            } else {
+                vec![ROOT, OTHER_ROOT]
+            };
+            requests
+                .replace_request(
+                    &mut socket.client,
+                    previous.as_deref(),
+                    &id,
+                    watched_enrolments_for(&roots),
+                )
+                .await;
+            let _ = socket.drain_frames().await;
+            previous = Some(id);
+        }
+
+        requests.clear_connection();
+        let replay = requests.replayable();
+        assert_eq!(
+            replay.len(),
+            1,
+            "every generation is still intended: {:?}",
+            replay.iter().map(|(id, _)| id).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            replay[0].0,
+            watched_sub_id(2),
+            "replayed the wrong generation"
+        );
+    }
+
+    /// The authority distinction is preserved: `open_request` still refuses a
+    /// changed identity, and replacement is the only operation permitted to
+    /// make that change.
+    ///
+    /// A metadata conflict therefore cannot masquerade as a successful
+    /// replacement — the two outcomes come from different operations, and the
+    /// one that refuses has not been loosened.
+    #[tokio::test]
+    async fn a_metadata_conflict_cannot_masquerade_as_replacement() {
+        let mut requests = ProjectRequests::new();
+        let mut socket = wire_socket().await;
+        let id = PROJECT_ENROL_SUB_ID;
+
+        requests
+            .replace_request(
+                &mut socket.client,
+                None,
+                id,
+                enrolment_identity_for(&[&coord()]),
+            )
+            .await;
+        let _ = socket.next_frame().await;
+
+        let second = format!("30617:{OWNER}:second-repo");
+        let widened = enrolment_identity_for(&[&coord(), &second]);
+
+        let refused = requests
+            .open_request(&mut socket.client, id, widened.clone())
+            .await;
+        assert!(
+            matches!(refused, OpenOutcome::Conflict { .. }),
+            "open_request must still refuse to change an id's identity, got {refused:?}"
+        );
+
+        let replaced = requests
+            .replace_request(&mut socket.client, Some(id), id, widened)
+            .await;
+        assert_eq!(
+            replaced,
+            ReplaceOutcome::Replaced { retired: None },
+            "replacement is the operation permitted to make that change"
+        );
+    }
+
     /// Open a request the only way one can be opened.
     ///
     /// Goes through `ProjectRequests::open_request` against a **real paired
@@ -8664,13 +9175,17 @@ mod tests {
     /// trade-off is why this is asserted against the source rather than observed
     /// at runtime.
     ///
-    /// There are two openers now — one for pages, one for everything else — and
-    /// the earlier version of this test asserted a single installation site. That
-    /// assertion had to be updated rather than deleted: a count of one was never
-    /// the property, it was the shape the property happened to have while there
-    /// was one opener. What is pinned is that installation sites and awaited
-    /// writes strictly alternate, so each install follows a write that returned
-    /// and none can drift above the one before it.
+    /// There are three openers now — pages, ordinary opens, and replacement —
+    /// and this count has been revised twice for the same reason. A count of
+    /// one, then two, was never the property; it was the shape the property
+    /// happened to have while there were that many openers. What is pinned is
+    /// that installation sites and awaited writes strictly alternate, so each
+    /// install follows a write that returned and none can drift above the one
+    /// before it.
+    ///
+    /// Revising the number is correct **only** while the alternation assertion
+    /// below still passes unchanged. If a new opener ever forces that one to be
+    /// weakened, the opener is wrong, not the test.
     #[test]
     fn no_registration_is_installed_before_its_write_returns() {
         let source = include_str!("project.rs");
@@ -8686,8 +9201,8 @@ mod tests {
 
         assert_eq!(
             installs.len(),
-            2,
-            "exactly two places install a live registration: {installs:?}"
+            3,
+            "exactly three places install a live registration: {installs:?}"
         );
         assert_eq!(
             writes.len(),
