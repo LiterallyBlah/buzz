@@ -8089,6 +8089,59 @@ mod tests {
         );
     }
 
+    /// Frames the relay can read right now, as JSON.
+    ///
+    /// Bounded, so a frame that never arrives fails as an assertion on an empty
+    /// vector rather than hanging the scenario.
+    async fn readable_frames(
+        server: &mut WebSocketStream<tokio::net::TcpStream>,
+    ) -> Vec<serde_json::Value> {
+        let mut out = Vec::new();
+        while let Ok(Some(Ok(msg))) = timeout(Duration::from_millis(300), server.next()).await {
+            if let Ok(text) = msg.to_text() {
+                if let Ok(value) = serde_json::from_str(text) {
+                    out.push(value);
+                }
+            }
+        }
+        out
+    }
+
+    /// Drives production replacement onto the scenario's own socket.
+    ///
+    /// Owns the `BgState` and the client half together, because the registry's
+    /// write and the state it installs into are one operation. Interior
+    /// mutability is required by the trait taking `&self`, which is right:
+    /// dispatch holds a capability, not a mutable resource.
+    struct SocketSubscriber {
+        inner: tokio::sync::Mutex<(BgState, WsStream)>,
+    }
+
+    impl crate::ProjectSubscriber for SocketSubscriber {
+        async fn replace_project_subscription(
+            &self,
+            predecessor: Option<&str>,
+            sub_id: &str,
+            subscription: crate::project::ProjectSubscription,
+            filters: Vec<serde_json::Value>,
+        ) -> Result<(), RelayError> {
+            let mut guard = self.inner.lock().await;
+            let (state, ws) = &mut *guard;
+            let identity =
+                crate::project::ProjectRequestIdentity::from_filters(subscription, filters)
+                    .expect("the scenario's filters are bounded");
+            match state
+                .project_requests
+                .replace_request(ws, predecessor, sub_id, identity)
+                .await
+            {
+                crate::project::ReplaceOutcome::Replaced { .. }
+                | crate::project::ReplaceOutcome::Unchanged => Ok(()),
+                other => panic!("replacement failed in the scenario: {other:?}"),
+            }
+        }
+    }
+
     /// **Phase A end to end: relay bytes to the agent's stdin.**
     ///
     /// One scenario, not two green halves. The batch the pool claims is the
@@ -8115,46 +8168,79 @@ mod tests {
             let agent_identity =
                 crate::project::AgentIdentity::new(&agent.public_key()).expect("identity");
 
-            let mut state = BgState::new();
             let (tx, mut rx) = mpsc::channel(16);
             let mut discovered = crate::project::DiscoveredRepositories::new();
             let mut enrolments = crate::project::ProjectEnrolments::new();
             let mut queue = crate::queue::EventQueue::new(crate::config::DedupMode::Queue);
             let humans = std::collections::BTreeSet::new();
             let externals = std::collections::BTreeSet::new();
+            let mut subscriptions = crate::ProjectSubscriptions::default();
 
-            macro_rules! dispatch_all {
+            // One socket and one registry for the whole scenario. Every REQ and
+            // CLOSE below is read off the server half, so what is asserted is
+            // what the relay received rather than what a helper returned.
+            let (client, mut server) = test_ws_pair().await;
+            let subscriber = SocketSubscriber {
+                inner: tokio::sync::Mutex::new((BgState::new(), client)),
+            };
+
+            macro_rules! drive_all {
                 () => {{
                     let mut last = crate::ProjectDispatched::Ignored;
                     for ev in drain(&mut rx) {
                         if let BuzzEvent::Project(p) = ev {
-                            let mut d = crate::ProjectDispatch {
-                                identity: crate::project::ProjectIdentity {
-                                    agent: &agent_identity,
-                                    agent_owner: Some(&owner_hex),
-                                    approved_humans: &humans,
-                                    approved_external_agents: &externals,
+                            last = crate::dispatch_project_event(
+                                &mut crate::ProjectDispatch {
+                                    identity: crate::project::ProjectIdentity {
+                                        agent: &agent_identity,
+                                        agent_owner: Some(&owner_hex),
+                                        approved_humans: &humans,
+                                        approved_external_agents: &externals,
+                                    },
+                                    discovered: &mut discovered,
+                                    enrolments: &mut enrolments,
+                                    queue: &mut queue,
                                 },
-                                discovered: &mut discovered,
-                                enrolments: &mut enrolments,
-                                queue: &mut queue,
-                            };
-                            last = crate::handle_project_event(&mut d, &p);
+                                &subscriber,
+                                &mut subscriptions,
+                                &agent_hex,
+                                0,
+                                &p,
+                            )
+                            .await;
                         }
                     }
                     last
                 }};
             }
 
-            // ── relay bytes in ──────────────────────────────────────────────
-            let (mut ws, _server) = test_ws_pair().await;
-            let discovery_id = crate::project::discovery_sub_id();
-            assert_eq!(
-                send_project_subscribe(&mut ws, &mut state, &discovery_id, discovery_identity())
-                    .await,
-                ProjectSendOutcome::Sent
-            );
+            macro_rules! deliver {
+                ($sub_id:expr, $event:expr) => {{
+                    let mut guard = subscriber.inner.lock().await;
+                    deliver_frame(&mut guard.0, $sub_id, $event, &tx).await;
+                }};
+            }
 
+            // ── 1. discovery REQ, written the production way ─────────────────
+            let discovery_id = crate::project::discovery_sub_id();
+            {
+                let mut guard = subscriber.inner.lock().await;
+                let (state, ws) = &mut *guard;
+                assert_eq!(
+                    send_project_subscribe(ws, state, &discovery_id, discovery_identity()).await,
+                    ProjectSendOutcome::Sent
+                );
+            }
+            let seen = readable_frames(&mut server).await;
+            assert_eq!(
+                seen.len(),
+                1,
+                "discovery writes exactly one frame: {seen:?}"
+            );
+            assert_eq!(seen[0][0], "REQ");
+            assert_eq!(seen[0][1], discovery_id);
+
+            // ── 2. the announcement drives an enrolment replacement ──────────
             let announcement = EventBuilder::new(
                 nostr::Kind::Custom(buzz_core::kind::KIND_GIT_REPO_ANNOUNCEMENT as u16),
                 "",
@@ -8162,24 +8248,60 @@ mod tests {
             .tags([nostr::Tag::parse(["d", "e2e-repo"]).expect("d tag")])
             .sign_with_keys(&owner)
             .expect("sign");
-            deliver_frame(&mut state, &discovery_id, &announcement, &tx).await;
-            assert_eq!(dispatch_all!(), crate::ProjectDispatched::DiscoveryChanged);
+            deliver!(&discovery_id, &announcement);
+            assert_eq!(drive_all!(), crate::ProjectDispatched::DiscoveryChanged);
 
-            let filter = crate::project::enrolment_filter(&discovered, &agent_hex, 0)
-                .expect("enrolment filter");
-            let identity = crate::project::ProjectRequestIdentity::from_filters(
-                crate::project::ProjectSubscription::Enrolment,
-                vec![filter],
+            let seen = readable_frames(&mut server).await;
+            assert_eq!(seen.len(), 1, "one enrolment REQ: {seen:?}");
+            assert_eq!(seen[0][0], "REQ");
+            assert_eq!(seen[0][1], crate::project::PROJECT_ENROL_SUB_ID);
+            assert!(
+                seen[0].to_string().contains(&agent_hex),
+                "the enrolment REQ must be scoped to this agent"
+            );
+            let first_enrolment = seen[0].to_string();
+
+            // ── 2b. a second repository must WIDEN that enrolment ────────────
+            //
+            // Without this the scenario proves only that an enrolment REQ is
+            // issued, which the shipped defect also did. Widening is the thing
+            // that was broken: the id is fixed, so the second identity has to
+            // replace the first rather than be refused as a conflict.
+            let other_owner = nostr::Keys::generate();
+            let other_announcement = EventBuilder::new(
+                nostr::Kind::Custom(buzz_core::kind::KIND_GIT_REPO_ANNOUNCEMENT as u16),
+                "",
             )
-            .expect("bounded");
-            let enrol_id = crate::project::PROJECT_ENROL_SUB_ID.to_string();
+            .tags([nostr::Tag::parse(["d", "second-repo"]).expect("d tag")])
+            .sign_with_keys(&other_owner)
+            .expect("sign");
+            deliver!(&discovery_id, &other_announcement);
+            assert_eq!(drive_all!(), crate::ProjectDispatched::DiscoveryChanged);
+
+            let seen = readable_frames(&mut server).await;
+            assert_eq!(seen.len(), 1, "the widened enrolment REQ: {seen:?}");
+            assert_eq!(seen[0][0], "REQ");
             assert_eq!(
-                send_project_subscribe(&mut ws, &mut state, &enrol_id, identity).await,
-                ProjectSendOutcome::Sent
+                seen[0][1],
+                crate::project::PROJECT_ENROL_SUB_ID,
+                "widening reuses the enrolment id"
+            );
+            let widened = seen[0].to_string();
+            assert_ne!(
+                widened, first_enrolment,
+                "the second discovery did not change the filter — this is the \
+                 shipped defect: the enrolment can never widen past the first \
+                 repository"
+            );
+            assert!(
+                widened.contains(&other_owner.public_key().to_hex()),
+                "the second repository is absent from the widened filter"
             );
 
+            // ── 3. the owner opens an issue naming the agent ─────────────────
             let coordinate = format!("30617:{owner_hex}:e2e-repo");
             let body = "the pipeline drops frames after reconnect";
+            let enrol_id = crate::project::PROJECT_ENROL_SUB_ID.to_string();
             let root = EventBuilder::new(
                 nostr::Kind::Custom(buzz_core::kind::KIND_GIT_ISSUE as u16),
                 body,
@@ -8190,15 +8312,57 @@ mod tests {
             ])
             .sign_with_keys(&owner)
             .expect("sign");
-            deliver_frame(&mut state, &enrol_id, &root, &tx).await;
+            deliver!(&enrol_id, &root);
 
-            let route_key = match dispatch_all!() {
+            let route_key = match drive_all!() {
                 crate::ProjectDispatched::Queued { key, queued, .. } => {
                     assert!(queued, "the root must enter the queue");
                     key
                 }
                 other => panic!("expected a queued turn, got {other:?}"),
             };
+
+            let seen = readable_frames(&mut server).await;
+            assert_eq!(seen.len(), 1, "the first watched REQ, no CLOSE: {seen:?}");
+            assert_eq!(seen[0][0], "REQ");
+            assert_eq!(seen[0][1], crate::project::watched_sub_id(0));
+            assert!(
+                seen[0].to_string().contains(&root.id.to_hex()),
+                "the watched REQ must name the enrolled root"
+            );
+
+            // ── 4. a second root replaces the watch and retires generation 0 ─
+            let second = EventBuilder::new(
+                nostr::Kind::Custom(buzz_core::kind::KIND_GIT_ISSUE as u16),
+                "a second issue on the same repository",
+            )
+            .tags([
+                nostr::Tag::parse(["a", &coordinate]).expect("a tag"),
+                nostr::Tag::parse(["p", &agent_hex]).expect("p tag"),
+            ])
+            .sign_with_keys(&owner)
+            .expect("sign");
+            deliver!(&enrol_id, &second);
+            drive_all!();
+
+            let seen = readable_frames(&mut server).await;
+            assert_eq!(
+                seen.len(),
+                2,
+                "successor REQ then predecessor CLOSE: {seen:?}"
+            );
+            assert_eq!(seen[0][0], "REQ");
+            assert_eq!(
+                seen[0][1],
+                crate::project::watched_sub_id(1),
+                "successor first"
+            );
+            assert!(
+                seen[0].to_string().contains(&second.id.to_hex()),
+                "the successor must carry the newly enrolled root"
+            );
+            assert_eq!(seen[1][0], "CLOSE", "the predecessor is closed second");
+            assert_eq!(seen[1][1], crate::project::watched_sub_id(0));
 
             // ── the batch the pool claims is the batch the queue produced ────
             let batch = queue.flush_next().expect("the queued turn flushes");
