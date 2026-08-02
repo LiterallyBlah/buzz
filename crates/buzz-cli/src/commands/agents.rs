@@ -1,5 +1,8 @@
 use buzz_core::kind::KIND_IA_ARCHIVED_LIST;
-use buzz_core::peer_call::{derive_call_id, onward_context, PeerCallRoute};
+use buzz_core::peer_call::{
+    derive_call_id, onward_context, PeerCallRoute, CALL_WINDOW_SECS, KIND_PEER_CALL,
+    KIND_PEER_CALL_RESULT, MAX_FANOUT,
+};
 use buzz_sdk::builders::{
     build_archive_identity_request, build_peer_call, build_peer_call_result,
     build_unarchive_identity_request, PeerCallMeta,
@@ -52,6 +55,149 @@ fn resolve_route(
     }
 }
 
+// ── NIP-PC issuing gate ───────────────────────────────────────────────────────
+//
+// The fan-out ceiling has to be enforced *here*, before the call is signed and
+// submitted. A caller that publishes first and counts afterwards has already
+// invoked the callee: the task runs, the work is done, and the only thing left
+// to decide is whether to listen to the answer. That is not a bound on fan-out,
+// it is a bound on how many answers the caller is willing to hear.
+//
+// The harness cannot supply the count either. `buzz agents call` is a separate
+// one-shot process from the ACP harness and shares no memory with it, so the
+// authority on "what have I already published on this route" is the relay's own
+// record. Reconstructing it from there also survives an agent restart, which
+// an in-process counter does not.
+
+/// The lone value of a tag on a stored event, or `None` if absent or repeated.
+fn sole_tag(event: &serde_json::Value, name: &str) -> Option<String> {
+    let mut found = event
+        .get("tags")?
+        .as_array()?
+        .iter()
+        .filter_map(|t| {
+            let arr = t.as_array()?;
+            (arr.first()?.as_str()? == name).then(|| arr.get(1)?.as_str().map(str::to_owned))?
+        })
+        .collect::<Vec<_>>();
+    (found.len() == 1).then(|| found.remove(0))
+}
+
+/// The callee and id of a stored call **if it was made on `route`**.
+///
+/// Route membership is decided by recomputing the call id rather than by
+/// re-reading the route tags, because the id is already derived from the route:
+/// a call whose id recomputes under this route was made on this route, and one
+/// that does not, was not. Reusing the derivation means there is no second route
+/// parser here to disagree with the harness's.
+fn call_on_route(
+    event: &serde_json::Value,
+    caller: &str,
+    route: &PeerCallRoute,
+) -> Option<(String, String)> {
+    if event.get("kind")?.as_u64()? != u64::from(KIND_PEER_CALL) {
+        return None;
+    }
+    let callee = sole_tag(event, "p")?.to_ascii_lowercase();
+    let nonce = sole_tag(event, "nonce")?.to_ascii_lowercase();
+    let call_id = sole_tag(event, "call")?.to_ascii_lowercase();
+    (derive_call_id(caller, &callee, route, &nonce) == call_id).then_some((call_id, callee))
+}
+
+/// The ids of this caller's calls on `route` that nobody has answered.
+///
+/// A result frees the slot only when it is *the callee's* result: the caller
+/// asked one specific agent, and a third party publishing a `43004` carrying the
+/// same call id must not be able to buy back fan-out capacity on its behalf.
+/// That check is the same one `admit_result` makes before it resumes anything,
+/// so a result that would free a slot here is a result that would actually have
+/// closed the call.
+fn outstanding_call_ids(
+    calls: &[serde_json::Value],
+    results: &[serde_json::Value],
+    caller: &str,
+    route: &PeerCallRoute,
+) -> Vec<String> {
+    let caller = caller.to_ascii_lowercase();
+    let answered: Vec<(String, String)> = results
+        .iter()
+        .filter(|e| {
+            e.get("kind").and_then(serde_json::Value::as_u64)
+                == Some(u64::from(KIND_PEER_CALL_RESULT))
+        })
+        .filter_map(|e| {
+            let call_id = sole_tag(e, "call")?.to_ascii_lowercase();
+            let author = e.get("pubkey")?.as_str()?.to_ascii_lowercase();
+            Some((call_id, author))
+        })
+        .collect();
+
+    let mut outstanding = Vec::new();
+    for event in calls {
+        let author = event
+            .get("pubkey")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if author != caller {
+            continue;
+        }
+        let Some((call_id, callee)) = call_on_route(event, &caller, route) else {
+            continue;
+        };
+        let closed = answered
+            .iter()
+            .any(|(id, by)| *id == call_id && *by == callee);
+        if !closed && !outstanding.contains(&call_id) {
+            outstanding.push(call_id);
+        }
+    }
+    outstanding
+}
+
+/// Refuse to publish an eleventh concurrent call on one route.
+///
+/// Runs before the envelope is built or signed, so a refusal means no event
+/// exists: the callee is never invoked, rather than being invoked and ignored.
+///
+/// Fails **closed**. If the outstanding set cannot be established the call is
+/// not published — a ceiling that yields to a failed query is not a ceiling, and
+/// the relay that could not answer this query is the same one the call was about
+/// to be submitted to.
+async fn issuing_gate(
+    client: &BuzzClient,
+    caller: &str,
+    route: &PeerCallRoute,
+) -> Result<(), CliError> {
+    let since = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs().saturating_sub(CALL_WINDOW_SECS))
+        .unwrap_or(0);
+
+    // One round trip, two filters ORed by the relay: the calls this caller
+    // published, and the results addressed back to it.
+    let raw = client
+        .query_multi(&[
+            json!({"kinds": [KIND_PEER_CALL], "authors": [caller], "since": since}),
+            json!({"kinds": [KIND_PEER_CALL_RESULT], "#p": [caller], "since": since}),
+        ])
+        .await?;
+    let events: Vec<serde_json::Value> = serde_json::from_str(&raw)
+        .map_err(|e| CliError::Other(format!("could not read outstanding calls: {e}")))?;
+
+    let outstanding = outstanding_call_ids(&events, &events, caller, route);
+    if outstanding.len() >= MAX_FANOUT {
+        return Err(CliError::Usage(format!(
+            "fan-out limit reached: {} calls are already outstanding on this route \
+             (maximum {MAX_FANOUT}). Wait for a result, or call from a different \
+             conversation. A call is released after {CALL_WINDOW_SECS}s if it is \
+             never answered.",
+            outstanding.len()
+        )));
+    }
+    Ok(())
+}
+
 pub async fn dispatch(command: AgentsCmd, client: &BuzzClient) -> Result<(), CliError> {
     match command {
         AgentsCmd::Call {
@@ -68,6 +214,11 @@ pub async fn dispatch(command: AgentsCmd, client: &BuzzClient) -> Result<(), Cli
             let caller = client.keys().public_key().to_hex().to_ascii_lowercase();
             let callee = to.to_ascii_lowercase();
             let route = resolve_route(channel, thread, project, root)?;
+
+            // Before anything is built, signed or submitted. A call that trips
+            // the ceiling must never reach the relay — once it does, the callee
+            // has been invoked and the limit is retrospective.
+            issuing_gate(client, &caller, &route).await?;
 
             // A v4 UUID is 16 random bytes, which is exactly the nonce width.
             // Reusing it avoids adding a second source of randomness to a crate
@@ -924,5 +1075,257 @@ mod tests {
             Some("short".into())
         )
         .is_err());
+    }
+}
+
+/// The NIP-PC fan-out ceiling, proved where it has to hold: before publication.
+///
+/// Every test here drives the real `dispatch(AgentsCmd::Call { .. })` against a
+/// local HTTP relay and counts what reached `/events`. The assertion that
+/// matters is not that an error was returned — it is that the refused call
+/// produced **no event**, so the callee was never invoked and never did the
+/// work. A ceiling that discards the answer to a task that already ran is not a
+/// ceiling, and a test that only checks the error message cannot tell the two
+/// apart.
+#[cfg(test)]
+mod issuing_gate_tests {
+    use std::net::SocketAddr;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::Arc;
+
+    use axum::extract::State;
+    use axum::routing::post;
+    use axum::{Json, Router};
+    use buzz_sdk::builders::{build_peer_call, build_peer_call_result, PeerCallMeta};
+    use nostr::Keys;
+    use serde_json::Value;
+    use tokio::net::TcpListener;
+
+    use super::*;
+    use crate::AgentsCmd;
+
+    const CHANNEL: &str = "8f377516-7391-47bf-bcc4-249a1028b212";
+    const OTHER_CHANNEL: &str = "1b2c3d4e-5f60-4718-8293-a4b5c6d7e8f9";
+
+    #[derive(Clone)]
+    struct Relay {
+        stored: Arc<Vec<Value>>,
+        published: Arc<AtomicU32>,
+    }
+
+    /// A relay that answers `/query` from a fixed history and counts `/events`.
+    async fn relay_with(stored: Vec<Value>) -> (String, Arc<AtomicU32>) {
+        let published = Arc::new(AtomicU32::new(0));
+        let state = Relay {
+            stored: Arc::new(stored),
+            published: published.clone(),
+        };
+        let app = Router::new()
+            .route(
+                "/query",
+                post(|State(s): State<Relay>, _body: String| async move {
+                    Json(Value::Array(s.stored.as_ref().clone()))
+                }),
+            )
+            .route(
+                "/events",
+                post(|State(s): State<Relay>, _body: String| async move {
+                    s.published.fetch_add(1, Ordering::SeqCst);
+                    Json(serde_json::json!({"accepted": true, "message": ""}))
+                }),
+            )
+            .with_state(state);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr: SocketAddr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (format!("http://{addr}"), published)
+    }
+
+    fn channel_route(uuid: &str) -> PeerCallRoute {
+        PeerCallRoute::Channel {
+            channel: uuid.to_string(),
+            thread_root: None,
+        }
+    }
+
+    /// A published call, exactly as this CLI would have written it.
+    fn stored_call(caller: &Keys, callee: &Keys, route: &PeerCallRoute, i: usize) -> Value {
+        let caller_hex = caller.public_key().to_hex().to_ascii_lowercase();
+        let (hop, visited) = onward_context(&[], &caller_hex);
+        let event = build_peer_call(
+            &caller_hex,
+            "an earlier task",
+            &PeerCallMeta {
+                callee: callee.public_key().to_hex().to_ascii_lowercase(),
+                route: route.clone(),
+                nonce: format!("{i:032x}"),
+                hop,
+                visited,
+            },
+        )
+        .expect("well-formed call")
+        .sign_with_keys(caller)
+        .expect("sign");
+        serde_json::to_value(event).expect("serialise")
+    }
+
+    fn call_id_of(event: &Value) -> String {
+        sole_tag(event, "call").expect("a call carries its id")
+    }
+
+    fn stored_result(
+        answerer: &Keys,
+        caller: &Keys,
+        call_id: &str,
+        route: &PeerCallRoute,
+    ) -> Value {
+        let event = build_peer_call_result(
+            &caller.public_key().to_hex().to_ascii_lowercase(),
+            call_id,
+            "done",
+            route,
+        )
+        .expect("well-formed result")
+        .sign_with_keys(answerer)
+        .expect("sign");
+        serde_json::to_value(event).expect("serialise")
+    }
+
+    fn call_command(to: &Keys, channel: &str) -> AgentsCmd {
+        AgentsCmd::Call {
+            to: to.public_key().to_hex(),
+            task: "one more thing".into(),
+            channel: Some(channel.to_string()),
+            thread: None,
+            project: None,
+            root: None,
+            visited: vec![],
+            nonce: None,
+        }
+    }
+
+    /// Ten outstanding calls on one route publish; the eleventh does not exist.
+    #[tokio::test]
+    async fn the_eleventh_concurrent_call_never_reaches_the_relay() {
+        let caller = Keys::generate();
+        let callee = Keys::generate();
+        let route = channel_route(CHANNEL);
+        let history: Vec<Value> = (0..MAX_FANOUT)
+            .map(|i| stored_call(&caller, &callee, &route, i))
+            .collect();
+
+        let (url, published) = relay_with(history).await;
+        let client = BuzzClient::new(url, caller.clone(), None, None).unwrap();
+
+        let err = dispatch(call_command(&callee, CHANNEL), &client)
+            .await
+            .expect_err("the eleventh call must be refused");
+        assert!(
+            matches!(err, CliError::Usage(ref m) if m.contains("fan-out limit")),
+            "unexpected error: {err:?}"
+        );
+        assert_eq!(
+            published.load(Ordering::SeqCst),
+            0,
+            "a refused call still reached the relay — the callee would have run it"
+        );
+    }
+
+    /// The control. One slot short of the ceiling, the same command publishes —
+    /// so the refusal above is the ceiling and not a broken call path.
+    #[tokio::test]
+    async fn the_tenth_concurrent_call_publishes_normally() {
+        let caller = Keys::generate();
+        let callee = Keys::generate();
+        let route = channel_route(CHANNEL);
+        let history: Vec<Value> = (0..MAX_FANOUT - 1)
+            .map(|i| stored_call(&caller, &callee, &route, i))
+            .collect();
+
+        let (url, published) = relay_with(history).await;
+        let client = BuzzClient::new(url, caller.clone(), None, None).unwrap();
+
+        dispatch(call_command(&callee, CHANNEL), &client)
+            .await
+            .expect("under the ceiling");
+        assert_eq!(published.load(Ordering::SeqCst), 1);
+    }
+
+    /// A correlated result frees the slot it occupied.
+    #[tokio::test]
+    async fn a_completed_call_returns_its_slot_to_the_route() {
+        let caller = Keys::generate();
+        let callee = Keys::generate();
+        let route = channel_route(CHANNEL);
+        let mut history: Vec<Value> = (0..MAX_FANOUT)
+            .map(|i| stored_call(&caller, &callee, &route, i))
+            .collect();
+        let answered = call_id_of(&history[0]);
+        history.push(stored_result(&callee, &caller, &answered, &route));
+
+        let (url, published) = relay_with(history).await;
+        let client = BuzzClient::new(url, caller.clone(), None, None).unwrap();
+
+        dispatch(call_command(&callee, CHANNEL), &client)
+            .await
+            .expect("one call was answered, so one slot is free");
+        assert_eq!(published.load(Ordering::SeqCst), 1);
+    }
+
+    /// Only the callee's own result frees the slot. A stranger who saw the call
+    /// id on the relay cannot hand the caller back capacity it never spent.
+    #[tokio::test]
+    async fn a_result_from_anyone_but_the_callee_frees_nothing() {
+        let caller = Keys::generate();
+        let callee = Keys::generate();
+        let stranger = Keys::generate();
+        let route = channel_route(CHANNEL);
+        let mut history: Vec<Value> = (0..MAX_FANOUT)
+            .map(|i| stored_call(&caller, &callee, &route, i))
+            .collect();
+        let target = call_id_of(&history[0]);
+        history.push(stored_result(&stranger, &caller, &target, &route));
+
+        let (url, published) = relay_with(history).await;
+        let client = BuzzClient::new(url, caller.clone(), None, None).unwrap();
+
+        dispatch(call_command(&callee, CHANNEL), &client)
+            .await
+            .expect_err("a third party's result must not free a slot");
+        assert_eq!(published.load(Ordering::SeqCst), 0);
+    }
+
+    /// The budget is per originating route, not a global throttle on the agent.
+    #[tokio::test]
+    async fn a_different_route_keeps_its_own_budget() {
+        let caller = Keys::generate();
+        let callee = Keys::generate();
+        let route = channel_route(CHANNEL);
+        let history: Vec<Value> = (0..MAX_FANOUT)
+            .map(|i| stored_call(&caller, &callee, &route, i))
+            .collect();
+
+        let (url, published) = relay_with(history).await;
+        let client = BuzzClient::new(url, caller.clone(), None, None).unwrap();
+
+        dispatch(call_command(&callee, OTHER_CHANNEL), &client)
+            .await
+            .expect("a full route does not exhaust every other conversation");
+        assert_eq!(published.load(Ordering::SeqCst), 1);
+    }
+
+    /// The gate fails closed. A relay that cannot say what is outstanding is not
+    /// a relay this caller may publish an eleventh call to on faith.
+    #[tokio::test]
+    async fn an_unreadable_history_refuses_rather_than_publishing() {
+        let (url, published) = relay_with(vec![]).await;
+        // Point the client at a path that answers nothing at all.
+        let client =
+            BuzzClient::new(format!("{url}/nowhere"), Keys::generate(), None, None).unwrap();
+        dispatch(call_command(&Keys::generate(), CHANNEL), &client)
+            .await
+            .expect_err("an unanswerable query must not publish");
+        assert_eq!(published.load(Ordering::SeqCst), 0);
     }
 }

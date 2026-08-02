@@ -204,8 +204,39 @@ sibling or an owner-listed external agent, so the threat model is a buggy peer
 rather than a hostile one; a receiver-side bound that survives a hostile caller
 would have to be a per-route budget rather than a value carried on the wire.
 
-Maximum depth is **3**. Maximum fan-out is **10** concurrent outstanding calls
-per originating route.
+Maximum depth is **3**.
+
+### Fan-out
+
+Maximum fan-out is **10** concurrent outstanding calls per originating route.
+
+Unlike every other control in this document, fan-out binds the **caller**, and
+it MUST be enforced *before the call is published*. A caller that publishes and
+then counts has already invoked the callee: the task runs, the work is done, and
+the only thing left to decide is whether to listen to the answer. That bounds
+how many answers a caller hears, not how many callees it starts.
+
+The outstanding set is reconstructed from the relay rather than from process
+memory. A caller queries its own recent calls on the route and the results
+addressed back to it, and counts the calls no result has closed:
+
+```
+{"kinds":[43001], "authors":[<self>], "since": now - 3600}
+{"kinds":[43004], "#p":[<self>],      "since": now - 3600}
+```
+
+A call is closed by a result carrying its call id **and authored by that call's
+callee** — the same condition [What the caller checks on a result](#what-the-caller-checks-on-a-result)
+imposes, so a slot is freed only by a result that would actually have resumed
+the call. A third party republishing the id frees nothing.
+
+A call also stops occupying a slot **3600 seconds** after it was published.
+Without that window the outstanding set is every call the caller ever made that
+nobody answered, and an agent whose peer crashed ten times could never call on
+that route again.
+
+If the outstanding set cannot be established, the caller MUST NOT publish. A
+ceiling that yields to a failed query is not a ceiling.
 
 ## The result event (kind 43004)
 
@@ -238,6 +269,28 @@ become one.
 
 Exactly one result is expected per call. A second result for the same call id
 is refused as a replay.
+
+### The callee's runtime must ask for one
+
+A result does not happen by itself. The callee is an agent that was woken by a
+call and is otherwise in an ordinary turn, and every default a harness has about
+answering a turn produces a *message*: a threaded reply on a channel, a comment
+on a project root. Neither correlates. A runtime that wakes an agent with a call
+and then hands it the ordinary reply instruction has told it to do the wrong
+thing, competently, and the caller waits forever.
+
+So a conforming runtime MUST, for a call turn:
+
+1. give the callee the caller, the call id and the route — the three values a
+   result needs, none of which the agent can be expected to reassemble from the
+   raw tag list; and
+2. **replace** its ordinary reply instruction for that turn rather than adding
+   to it. An agent handed both a correlated result command and an ordinary reply
+   command has been given a choice it cannot make correctly.
+
+The reference implementation emits a `[Peer Call]` prompt section carrying a
+ready-to-run `buzz agents call-result` invocation, and suppresses the channel
+reply anchor and the project comment command while it does so.
 
 ## Validation
 
@@ -282,11 +335,15 @@ caller as a new prompt.
 | Revisit | A callee already present in `visited` is refused. |
 | Depth | `hop > 3` is refused. |
 | Consistency | `visited.len() != hop` is refused. |
-| Fan-out | More than 10 concurrent outstanding calls per originating route is refused. |
 
-These are checked by the receiving side and are not negotiable by the caller.
-A caller that violates them gets no turn out of the callee, which is what makes
-them loop controls rather than etiquette.
+All of these are checked by the **receiving** side and are not negotiable by the
+caller. A caller that violates them gets no turn out of the callee, which is what
+makes them loop controls rather than etiquette.
+
+[Fan-out](#fan-out) is the one control that is not in this table, because it is
+not one of these. It binds the issuer, before publication, and a receiver cannot
+enforce it: the callee sees one call and has no view of the other nine the caller
+made to other agents.
 
 ## Authority
 
@@ -342,6 +399,9 @@ event. Neither kind is `p`-gated, so no read-authorization change is involved.
   `crates/buzz-acp/src/relay.rs` — the peer-call subscription.
 - Builders: `crates/buzz-sdk/src/builders.rs` — `build_peer_call`,
   `build_peer_call_result`.
-- CLI: `buzz agents call`, `buzz agents call-result`.
+- Call turn framing: `crates/buzz-acp/src/queue.rs` — the `[Peer Call]` section
+  and the reply instructions it suppresses.
+- CLI: `buzz agents call`, `buzz agents call-result`. The pre-publication
+  fan-out gate lives in `crates/buzz-cli/src/commands/agents.rs`.
 - Trust configuration: same-owner NIP-OA siblings are trusted by default;
   external agents are listed with `--peer-agents` / `BUZZ_ACP_PEER_AGENTS`.

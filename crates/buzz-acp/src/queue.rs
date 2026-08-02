@@ -1188,6 +1188,44 @@ pub(crate) fn format_event_block(
     block
 }
 
+/// The prompt tag a NIP-PC call is queued under.
+///
+/// Written only by the harness's peer-call admission path, after the envelope
+/// parsed and named this agent as callee. The prompt path reads it to decide
+/// that this turn owes a correlated result rather than a reply, so it is a
+/// marker with an effect and not a label.
+pub const PEER_CALL_PROMPT_TAG: &str = "@call";
+
+/// The `[Peer Call]` section: what this turn owes, and the command that pays it.
+///
+/// Emitted **instead of** the ordinary reply instruction, not beside it. A call
+/// and a message are different acts with different consequences — a message
+/// leaves the caller's outstanding call open forever — and an agent handed both
+/// a correct instruction and an incorrect one will choose, sometimes wrongly.
+/// Everything the ordinary sections would have said about replying is therefore
+/// suppressed for the duration of a call turn.
+fn format_peer_call_section(directive: &crate::peer_call::ResultDirective) -> String {
+    format!(
+        "[Peer Call]\n\
+         Another agent has called you to perform one bounded task. This is not a \
+         message thread: when the task is done you owe exactly one correlated \
+         result, and nothing else closes the call.\n\n\
+         Call id: {}\n\n\
+         Return your result with this command, verbatim — the caller, the call \
+         id and the route are already filled in:\n\n\
+         ```bash\n\
+         {}\n\
+         ```\n\n\
+         Pass the result body on stdin; it may be empty, but the command must be \
+         run. An ordinary channel message or issue comment does not correlate: \
+         the caller would keep waiting for an answer that never arrives, so this \
+         command is the reply for this turn rather than an addition to one. Send \
+         exactly one result — a second is refused as a replay.",
+        directive.call_id(),
+        directive.command(),
+    )
+}
+
 /// Append a reply instruction when the agent is responding to a thread event.
 ///
 /// Tells the agent to default to `--reply-to <event_id>` for ordinary replies
@@ -1291,10 +1329,17 @@ fn resolve_reply_anchor(
 /// otherwise, and a suggestion in prose is a thing the agent may or may not
 /// act on. A self-authored wake is refused upstream, so this participant is
 /// never the replying agent itself.
+/// `owes_result` is true when this turn is a NIP-PC call. The identifying half
+/// of the section still applies — the agent is genuinely looking at a repository
+/// root — but the reply command does not: answering a call with
+/// `buzz issues comment` posts a comment and leaves the call outstanding
+/// forever. The command is therefore withheld here and the `[Peer Call]` section
+/// supplies the only one that closes the turn.
 fn format_project_context(
     project: &crate::project::ProjectOrigin,
     triggering: &str,
     triggering_author: &str,
+    owes_result: bool,
 ) -> String {
     let coordinate = project.coordinate();
     let root = project.root();
@@ -1308,7 +1353,7 @@ fn format_project_context(
     let repo_owner = parts.next().unwrap_or_default();
     let repo_id = parts.next().unwrap_or_default();
 
-    format!(
+    let header = format!(
         "[Project]\n\
          You are working on a git {class}, not a channel. This conversation \
          belongs to a repository root, and replies must be attached to that \
@@ -1316,7 +1361,20 @@ fn format_project_context(
          Repository: {coordinate}\n\
          Root event: {root}\n\
          Triggering event: {triggering}\n\
-         Asked by: {triggering_author}\n\n\
+         Asked by: {triggering_author}"
+    );
+
+    if owes_result {
+        return format!(
+            "{header}\n\n\
+             This turn is a peer call, so it is answered with a correlated \
+             result rather than a comment on this {class}. See [Peer Call] \
+             below for the command."
+        );
+    }
+
+    format!(
+        "{header}\n\n\
          To reply on this {class}:\n\n\
          ```bash\n\
          buzz issues comment \\\n  \
@@ -1601,11 +1659,31 @@ pub fn format_prompt(batch: &FlushBatch, args: &FormatPromptArgs<'_>) -> Vec<Str
     // route key is a UUIDv5 of a root and names no channel, so emitting both
     // would hand the agent a correct instruction and an incorrect one and let
     // it choose.
+    // A NIP-PC call turn owes a correlated result, not a reply. The directive is
+    // derived from the triggering event only when the admission path labelled it
+    // `@call` — so a turn that was never admitted as a call to this agent cannot
+    // acquire a result command by being formatted, and a turn that was cannot
+    // lose one.
+    //
+    // Every ordinary reply instruction is suppressed while it is present: the
+    // reply anchor is withheld from the context hints and the project section
+    // withholds its comment command, because handing an agent both a correlated
+    // result command and an ordinary reply command is handing it a choice it has
+    // no way to make correctly.
+    let call_directive = (last_event.prompt_tag == PEER_CALL_PROMPT_TAG)
+        .then(|| crate::peer_call::result_directive(&last_event.event))
+        .flatten();
+    let reply_anchor = match call_directive {
+        Some(_) => None,
+        None => reply_anchor,
+    };
+
     if let Some(project) = args.project {
         sections.push(format_project_context(
             project,
             &last_event.event.id.to_hex(),
             &sender_pubkey,
+            call_directive.is_some(),
         ));
     } else {
         sections.push(format_context_hints(
@@ -1616,6 +1694,10 @@ pub fn format_prompt(batch: &FlushBatch, args: &FormatPromptArgs<'_>) -> Vec<Str
             args.conversation_context.is_some(),
             reply_anchor.as_deref(),
         ));
+    }
+
+    if let Some(ref directive) = call_directive {
+        sections.push(format_peer_call_section(directive));
     }
 
     // 3. Conversation context (thread or DM).
@@ -1754,6 +1836,251 @@ impl MergeFraming {
 pub(crate) fn native_steer_framing() -> (&'static str, &'static str) {
     let framing = MergeFraming::for_reason(Some(CancelReason::Steer));
     (framing.new_header_single, framing.closing_note)
+}
+
+/// What a NIP-PC call turn's prompt tells the agent to run.
+///
+/// Every assertion here is about the string the agent actually receives, and
+/// each positive case is paired with the identical event under the ordinary
+/// `@mention` tag. Without that control a test could pass because the reply
+/// instruction was never emitted for this event shape in the first place, and
+/// the suppression it claims to prove would be doing nothing.
+#[cfg(test)]
+mod peer_call_prompt_tests {
+    use super::*;
+    use buzz_core::peer_call::{onward_context, PeerCallRoute};
+    use buzz_sdk::builders::{build_peer_call, PeerCallMeta};
+    use nostr::{EventBuilder, Keys, Kind};
+
+    const NONCE: &str = "0123456789abcdef0123456789abcdef";
+
+    fn make_event(content: &str) -> Event {
+        EventBuilder::new(Kind::Custom(9), content)
+            .tags([])
+            .sign_with_keys(&Keys::generate())
+            .unwrap()
+    }
+
+    fn signed_call(caller: &Keys, callee_hex: &str, route: &PeerCallRoute) -> Event {
+        let caller_hex = caller.public_key().to_hex().to_ascii_lowercase();
+        let (hop, visited) = onward_context(&[], &caller_hex);
+        build_peer_call(
+            &caller_hex,
+            "summarise the open questions",
+            &PeerCallMeta {
+                callee: callee_hex.to_string(),
+                route: route.clone(),
+                nonce: NONCE.into(),
+                hop,
+                visited,
+            },
+        )
+        .expect("well-formed call")
+        .sign_with_keys(caller)
+        .expect("sign")
+    }
+
+    fn call_id_of(event: &Event) -> String {
+        event
+            .tags
+            .iter()
+            .find_map(|t| {
+                let s = t.as_slice();
+                (s.first().map(String::as_str) == Some("call")).then(|| s[1].clone())
+            })
+            .expect("a call carries its id")
+    }
+
+    /// Render one event under a given prompt tag, the way a flush does.
+    fn prompt_for(
+        event: Event,
+        tag: &str,
+        project: Option<crate::project::ProjectOrigin>,
+    ) -> String {
+        let batch = FlushBatch {
+            channel_id: Uuid::new_v4(),
+            events: vec![BatchEvent {
+                event,
+                prompt_tag: tag.into(),
+                received_at: Instant::now(),
+                project: project.clone(),
+            }],
+            cancelled_events: vec![],
+            cancel_reason: None,
+        };
+        format_prompt(
+            &batch,
+            &FormatPromptArgs {
+                project: batch.project_origin(),
+                ..Default::default()
+            },
+        )
+        .join("\n\n")
+    }
+
+    #[test]
+    fn a_channel_call_turn_is_given_the_result_command_and_not_a_reply_command() {
+        let caller = Keys::generate();
+        let callee = Keys::generate();
+        let channel = Uuid::new_v4();
+        let route = PeerCallRoute::Channel {
+            channel: channel.to_string(),
+            thread_root: None,
+        };
+        let event = signed_call(&caller, &callee.public_key().to_hex(), &route);
+        let call_id = call_id_of(&event);
+        let caller_hex = caller.public_key().to_hex().to_ascii_lowercase();
+
+        // Control: the same event under the ordinary tag gets the ordinary
+        // reply instruction. This is what the call turn has to displace.
+        let ordinary = prompt_for(event.clone(), "@mention", None);
+        assert!(
+            ordinary.contains("--reply-to"),
+            "control did not produce a reply instruction, so suppressing it proves nothing"
+        );
+        assert!(!ordinary.contains("[Peer Call]"));
+
+        let prompt = prompt_for(event, PEER_CALL_PROMPT_TAG, None);
+
+        assert!(prompt.contains("[Peer Call]"), "no peer-call section");
+        assert!(
+            prompt.contains("buzz agents call-result"),
+            "no result command"
+        );
+        assert!(
+            prompt.contains(&format!("--to {caller_hex}")),
+            "the result command does not name the caller"
+        );
+        assert!(
+            prompt.contains(&format!("--call {call_id}")),
+            "the result command does not carry the call id"
+        );
+        assert!(
+            prompt.contains(&format!("--channel {channel}")),
+            "the result command does not carry the route"
+        );
+
+        // Replaces, not competes.
+        assert!(
+            !prompt.contains("--reply-to"),
+            "an ordinary reply instruction survived alongside the result command"
+        );
+        assert!(
+            !prompt.contains("buzz messages send"),
+            "the agent was still offered the command that leaves the call open"
+        );
+    }
+
+    #[test]
+    fn a_threaded_channel_call_carries_its_thread_into_the_result_command() {
+        let caller = Keys::generate();
+        let callee = Keys::generate();
+        let channel = Uuid::new_v4();
+        let thread = "c".repeat(64);
+        let route = PeerCallRoute::Channel {
+            channel: channel.to_string(),
+            thread_root: Some(thread.clone()),
+        };
+        let event = signed_call(&caller, &callee.public_key().to_hex(), &route);
+
+        let prompt = prompt_for(event, PEER_CALL_PROMPT_TAG, None);
+        assert!(prompt.contains(&format!("--channel {channel}")));
+        assert!(
+            prompt.contains(&format!("--thread {thread}")),
+            "a call made inside a thread must be answered inside it"
+        );
+        assert!(!prompt.contains("--reply-to"));
+    }
+
+    #[test]
+    fn a_project_call_turn_replaces_the_issue_comment_command() {
+        let caller = Keys::generate();
+        let callee = Keys::generate();
+        let owner = "a".repeat(64);
+        let root = "b".repeat(64);
+        let coordinate = format!("30617:{owner}:my-repo");
+        let origin = crate::project::ProjectOrigin::for_test(&coordinate, &root, false);
+        let route = PeerCallRoute::Project {
+            coordinate: coordinate.clone(),
+            root: root.clone(),
+        };
+        let event = signed_call(&caller, &callee.public_key().to_hex(), &route);
+        let call_id = call_id_of(&event);
+
+        let ordinary = prompt_for(event.clone(), "@mention", Some(origin.clone()));
+        assert!(
+            ordinary.contains("buzz issues comment"),
+            "control did not produce the comment command"
+        );
+
+        let prompt = prompt_for(event, PEER_CALL_PROMPT_TAG, Some(origin));
+
+        // The identifying half of the project framing survives — the agent is
+        // still looking at a repository root and needs to know which.
+        assert!(prompt.contains("[Project]"));
+        assert!(prompt.contains(&coordinate));
+        assert!(prompt.contains(&root));
+
+        assert!(prompt.contains("[Peer Call]"));
+        assert!(prompt.contains(&format!("--call {call_id}")));
+        assert!(
+            prompt.contains(&format!("--project {coordinate}")),
+            "the result command does not carry the project route"
+        );
+        assert!(
+            !prompt.contains("buzz issues comment"),
+            "a call turn was still offered the comment command, which leaves the call open"
+        );
+
+        // The emitted command is one the production builder accepts. A prompt
+        // that renders a plausible-looking command the CLI would reject is the
+        // same failure as no command at all, one step later.
+        let tokens: Vec<&str> = prompt.split_whitespace().filter(|t| *t != "\\").collect();
+        let flag = |name: &str| {
+            tokens
+                .iter()
+                .position(|t| *t == name)
+                .and_then(|i| tokens.get(i + 1))
+                .map(|v| (*v).to_string())
+                .unwrap_or_else(|| panic!("prompt has no {name}"))
+        };
+        buzz_sdk::builders::build_peer_call_result(
+            &flag("--to"),
+            &flag("--call"),
+            "done",
+            &PeerCallRoute::Project {
+                coordinate: flag("--project"),
+                root: flag("--root"),
+            },
+        )
+        .expect("the project result command the prompt emitted must build");
+    }
+
+    /// The tag alone does not mint a directive. An ordinary message mislabelled
+    /// `@call` has no envelope to build a command from, and the prompt path
+    /// falls back to the ordinary instructions rather than emitting a section
+    /// with empty fields.
+    #[test]
+    fn a_turn_that_is_not_a_call_gets_no_result_command_however_it_is_labelled() {
+        let prompt = prompt_for(make_event("just a message"), PEER_CALL_PROMPT_TAG, None);
+        assert!(!prompt.contains("[Peer Call]"));
+        assert!(!prompt.contains("buzz agents call-result"));
+    }
+
+    /// A result turn is an answer to work this agent asked for. It owes nothing
+    /// back, so it keeps the ordinary instructions.
+    #[test]
+    fn a_result_turn_is_not_told_to_answer_itself() {
+        let caller = Keys::generate();
+        let callee = Keys::generate();
+        let route = PeerCallRoute::Channel {
+            channel: Uuid::new_v4().to_string(),
+            thread_root: None,
+        };
+        let event = signed_call(&caller, &callee.public_key().to_hex(), &route);
+        let prompt = prompt_for(event, "@call-result", None);
+        assert!(!prompt.contains("[Peer Call]"));
+    }
 }
 
 #[cfg(test)]

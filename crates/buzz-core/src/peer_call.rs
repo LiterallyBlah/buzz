@@ -37,7 +37,25 @@ pub const CALL_ID_DOMAIN: &str = "buzz/peer-call/v1";
 pub const MAX_HOP: u32 = 3;
 
 /// Maximum concurrent outstanding calls per originating route.
+///
+/// Enforced *before publication*, by the issuing side, against the relay's own
+/// record of what this caller has already published. A ceiling checked after the
+/// event is on the wire is not a ceiling: the callee has already been invoked
+/// and has already done the work, and all the caller can still decide is to
+/// discard the answer.
 pub const MAX_FANOUT: usize = 10;
+
+/// How long an unanswered call occupies a fan-out slot, in seconds.
+///
+/// The outstanding set is reconstructed from relay history rather than from
+/// process memory, so without a window it is the set of every call this caller
+/// ever made that nobody answered — and an agent whose peer crashed ten times
+/// could never call on that route again. A slot is freed by a correlated result
+/// or by this window elapsing, whichever comes first.
+///
+/// It bounds the query too: the issuing gate asks for calls `since` this far
+/// back rather than for all of history.
+pub const CALL_WINDOW_SECS: u64 = 3600;
 
 /// Maximum `content` length for a call or a result, in bytes.
 pub const MAX_CALL_CONTENT_BYTES: usize = 16 * 1024;

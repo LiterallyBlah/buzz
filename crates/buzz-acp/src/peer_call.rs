@@ -36,7 +36,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use buzz_core::peer_call::{
     derive_call_id, is_lowercase_hex, parse_hop, PeerCallRoute, KIND_PEER_CALL,
-    KIND_PEER_CALL_RESULT, MAX_CALL_CONTENT_BYTES, MAX_FANOUT,
+    KIND_PEER_CALL_RESULT, MAX_CALL_CONTENT_BYTES,
 };
 use uuid::Uuid;
 
@@ -353,6 +353,84 @@ impl ResultEnvelope {
     }
 }
 
+/// The exact command a callee runs to answer the call it was woken by.
+///
+/// # Why this is not advice
+///
+/// A call arrives as an ordinary turn. Everything the harness normally tells an
+/// agent about replying — `--reply-to` on a channel, `buzz issues comment` on a
+/// project root — produces a *message*, and a message is not a result: it leaves
+/// the caller's outstanding call open forever and the correlated answer never
+/// happens. An agent that is handed a call and the ordinary reply instruction
+/// has been told to do the wrong thing, competently.
+///
+/// So the call turn carries this instead, and it is spelled out rather than
+/// described. The three values a result needs — the original caller, the call
+/// id, and the route — are not things an agent can be expected to assemble
+/// correctly from the raw tag list under time pressure; the call id in
+/// particular is a derived 64-hex string that means nothing on inspection. A
+/// command the agent can run verbatim is the difference between a lifecycle that
+/// closes and one that only closes in tests.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ResultDirective {
+    caller: String,
+    call_id: String,
+    route: PeerCallRoute,
+}
+
+impl ResultDirective {
+    /// The `buzz agents call-result` invocation that answers this call.
+    ///
+    /// The route flags are the same ones `resolve_route` in the CLI accepts, so
+    /// the emitted command is one the binary actually parses rather than a
+    /// plausible-looking rendering of it.
+    pub(crate) fn command(&self) -> String {
+        let route = match &self.route {
+            PeerCallRoute::Channel {
+                channel,
+                thread_root,
+            } => match thread_root {
+                Some(root) => format!("--channel {channel} \\\n  --thread {root}"),
+                None => format!("--channel {channel}"),
+            },
+            PeerCallRoute::Project { coordinate, root } => {
+                format!("--project {coordinate} \\\n  --root {root}")
+            }
+        };
+        format!(
+            "buzz agents call-result \\\n  \
+             --to {} \\\n  \
+             --call {} \\\n  \
+             {route} \\\n  \
+             --body -",
+            self.caller, self.call_id
+        )
+    }
+
+    pub(crate) fn call_id(&self) -> &str {
+        &self.call_id
+    }
+}
+
+/// The result directive for an inbound call, or `None` if the event is not one.
+///
+/// Verification is repeated here rather than threaded from admission. The
+/// alternative was a new field on `QueuedEvent` and `BatchEvent` — and on the
+/// seventy-five places that build them — to carry a value that is already
+/// written on the event in front of us. What matters is that this cannot
+/// *invent* a directive: it goes through the same [`CallEnvelope::parse`] the
+/// admission path used, so an event that would not have been admitted produces
+/// no command, and the caller supplies the fact that admission happened.
+pub(crate) fn result_directive(event: &nostr::Event) -> Option<ResultDirective> {
+    let peer = VerifiedPeerEvent::verify(event.clone())?;
+    let envelope = CallEnvelope::parse(&peer).ok()?;
+    Some(ResultDirective {
+        caller: envelope.caller,
+        call_id: envelope.call_id,
+        route: envelope.route,
+    })
+}
+
 /// Read the one route form an envelope carries.
 ///
 /// Presence of both forms is a refusal rather than a precedence rule. An event
@@ -466,8 +544,6 @@ pub(crate) enum CallRefusal {
     Replay,
     /// This agent is already in the call path.
     Revisit,
-    /// Too many concurrent calls on this route.
-    FanOut,
 }
 
 /// An admitted call, and what handling it requires.
@@ -524,13 +600,11 @@ pub(crate) fn admit_call(
     }
 
     // Fan-out is deliberately *not* checked here. It is a bound on how many
-    // calls this agent may have in flight, which is a fact about the issuing
-    // side and is enforced in `register_outgoing`. An inbound counterpart would
-    // need a second per-route counter maintained against events this process
-    // does not author, and the version of it that existed here first was worse
-    // than absent: it consulted a function that returned a constant, so the
-    // comparison could never be true and the line read as a control while
-    // enforcing nothing.
+    // calls an agent may have in flight, which is a fact about the *issuing*
+    // side, and it is enforced there — before publication, by the `buzz agents
+    // call` gate. A callee-side copy would bound the wrong party: it would
+    // refuse a caller's eleventh call after that caller had already spent ten
+    // legitimate ones on somebody else.
     let session_key = envelope.session_key;
 
     Ok(AcceptedCall {
@@ -652,27 +726,17 @@ impl CallLedger {
         self.seen.insert(call.envelope.call_id.clone());
     }
 
-    /// Register a call this agent is about to publish.
+    /// Record a call this agent published, so its result can correlate.
     ///
-    /// Refuses once [`MAX_FANOUT`] calls are already outstanding on the same
-    /// route. Returning an error rather than publishing-and-forgetting is what
-    /// makes the ceiling real: a caller that ignored the result would fan out
-    /// without bound and the cap would be documentation.
-    pub(crate) fn register_outgoing(
-        &mut self,
-        call_id: &str,
-        callee: &str,
-        route: &PeerCallRoute,
-    ) -> Result<(), CallRefusal> {
-        let token = route.route_token();
-        let live = self
-            .outstanding
-            .values()
-            .filter(|c| c.route.route_token() == token)
-            .count();
-        if live >= MAX_FANOUT {
-            return Err(CallRefusal::FanOut);
-        }
+    /// Deliberately **not** where the fan-out ceiling lives. This runs when the
+    /// agent's own call comes back off the wire, which is after the callee could
+    /// already have been invoked; a refusal here would not stop an eleventh call
+    /// from doing its work, only from having its answer heard. The ceiling is
+    /// enforced by the issuing side before publication — see
+    /// [`buzz_core::peer_call::MAX_FANOUT`] and the `buzz agents call` gate — and
+    /// putting a second, weaker copy of it here would mean two authorities
+    /// disagreeing about the same number.
+    pub(crate) fn register_outgoing(&mut self, call_id: &str, callee: &str, route: &PeerCallRoute) {
         self.outstanding.insert(
             call_id.to_ascii_lowercase(),
             OutstandingCall {
@@ -680,7 +744,18 @@ impl CallLedger {
                 route: route.clone(),
             },
         );
-        Ok(())
+    }
+
+    /// How many of this agent's calls on `route` are still awaiting a result.
+    ///
+    /// Reported rather than enforced here: the issuing gate is the authority,
+    /// and this is what the harness can say about its own in-process view.
+    pub(crate) fn outstanding_on_route(&self, route: &PeerCallRoute) -> usize {
+        let token = route.route_token();
+        self.outstanding
+            .values()
+            .filter(|c| c.route.route_token() == token)
+            .count()
     }
 
     /// Close an outstanding call once its result has been accepted.
@@ -736,7 +811,7 @@ pub(crate) fn call_marker(event: &VerifiedPeerEvent, agent_hex: &str) -> CallMar
 mod tests {
     use super::*;
     use buzz_core::peer_call::onward_context;
-    use buzz_core::peer_call::MAX_HOP;
+    use buzz_core::peer_call::{MAX_FANOUT, MAX_HOP};
     use nostr::{EventBuilder, Keys, Kind, Tag};
 
     const CHANNEL: &str = "8f377516-7391-47bf-bcc4-249a1028b212";
@@ -935,9 +1010,7 @@ mod tests {
         let call_id = derive_call_id(&hex_of(&caller), &hex_of(&callee), &route, NONCE);
 
         let mut ledger = CallLedger::new();
-        ledger
-            .register_outgoing(&call_id, &hex_of(&callee), &route)
-            .expect("registered");
+        ledger.register_outgoing(&call_id, &hex_of(&callee), &route);
         assert_eq!(ledger.outstanding_count(), 1);
 
         let event = verified(signed_result(
@@ -1124,33 +1197,55 @@ mod tests {
     }
 
     #[test]
-    fn bounded_fan_out_holds_on_one_route() {
+    fn the_ledger_counts_outstanding_calls_per_route_not_in_total() {
+        let caller = keys(1);
+        let callee = keys(2);
+        let route = channel_route();
+        let elsewhere = project_route();
+        let mut ledger = CallLedger::new();
+
+        for i in 0..MAX_FANOUT {
+            let nonce = format!("{i:032x}");
+            let call_id = derive_call_id(&hex_of(&caller), &hex_of(&callee), &route, &nonce);
+            ledger.register_outgoing(&call_id, &hex_of(&callee), &route);
+        }
+        let other_id = derive_call_id(&hex_of(&caller), &hex_of(&callee), &elsewhere, NONCE);
+        ledger.register_outgoing(&other_id, &hex_of(&callee), &elsewhere);
+
+        assert_eq!(ledger.outstanding_on_route(&route), MAX_FANOUT);
+        assert_eq!(
+            ledger.outstanding_on_route(&elsewhere),
+            1,
+            "a route's budget is its own, not a share of one global throttle"
+        );
+        assert_eq!(ledger.outstanding_count(), MAX_FANOUT + 1);
+    }
+
+    /// The ledger does **not** refuse an eleventh call, and that is deliberate.
+    ///
+    /// It learns of a call only when the agent's own event returns from the
+    /// relay, by which point the callee may already be running the task. A
+    /// refusal here would discard the answer to work that was done anyway, so
+    /// the ceiling lives in the issuing gate before publication instead (see
+    /// `buzz-cli`'s `issuing_gate` tests). This asserts the ledger's silence so
+    /// that reintroducing a check here has to break a test that says why not.
+    #[test]
+    fn the_ledger_does_not_pretend_to_bound_what_has_already_been_published() {
+        let caller = keys(1);
         let callee = keys(2);
         let route = channel_route();
         let mut ledger = CallLedger::new();
 
-        for i in 0..MAX_FANOUT {
-            let nonce = format!("{:032x}", i);
-            let call_id = derive_call_id(&hex_of(&keys(1)), &hex_of(&callee), &route, &nonce);
-            ledger
-                .register_outgoing(&call_id, &hex_of(&callee), &route)
-                .expect("under the ceiling");
+        for i in 0..=MAX_FANOUT {
+            let nonce = format!("{i:032x}");
+            let call_id = derive_call_id(&hex_of(&caller), &hex_of(&callee), &route, &nonce);
+            ledger.register_outgoing(&call_id, &hex_of(&callee), &route);
         }
-        assert_eq!(ledger.outstanding_count(), MAX_FANOUT);
-
-        let one_too_many = derive_call_id(&hex_of(&keys(1)), &hex_of(&callee), &route, NONCE);
         assert_eq!(
-            ledger.register_outgoing(&one_too_many, &hex_of(&callee), &route),
-            Err(CallRefusal::FanOut)
+            ledger.outstanding_on_route(&route),
+            MAX_FANOUT + 1,
+            "a call that reached the wire is recorded, so its result can still correlate"
         );
-
-        // A different route has its own budget — the ceiling is per route, not
-        // a global throttle on the agent.
-        let elsewhere = project_route();
-        let other_id = derive_call_id(&hex_of(&keys(1)), &hex_of(&callee), &elsewhere, NONCE);
-        assert!(ledger
-            .register_outgoing(&other_id, &hex_of(&callee), &elsewhere)
-            .is_ok());
     }
 
     // ── Trust ─────────────────────────────────────────────────────────────────
@@ -1233,9 +1328,7 @@ mod tests {
         let call_id = derive_call_id(&hex_of(&caller), &hex_of(&callee), &route, NONCE);
 
         let mut ledger = CallLedger::new();
-        ledger
-            .register_outgoing(&call_id, &hex_of(&callee), &route)
-            .expect("registered");
+        ledger.register_outgoing(&call_id, &hex_of(&callee), &route);
 
         let event = verified(signed_result(
             &impostor,
@@ -1280,9 +1373,7 @@ mod tests {
         let call_id = derive_call_id(&hex_of(&caller), &hex_of(&callee), &route, NONCE);
 
         let mut ledger = CallLedger::new();
-        ledger
-            .register_outgoing(&call_id, &hex_of(&callee), &route)
-            .expect("registered");
+        ledger.register_outgoing(&call_id, &hex_of(&callee), &route);
 
         // Same id, answered onto the project surface instead.
         let event = verified(signed_result(
@@ -1601,9 +1692,7 @@ mod tests {
 
         // Caller side: register what it just published.
         let mut caller_ledger = CallLedger::new();
-        caller_ledger
-            .register_outgoing(&call_id, &hex_of(&callee), &route)
-            .expect("under the fan-out ceiling");
+        caller_ledger.register_outgoing(&call_id, &hex_of(&callee), &route);
 
         // Callee side: admit the call exactly once.
         let mut callee_ledger = CallLedger::new();

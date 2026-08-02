@@ -3253,11 +3253,15 @@ async fn attest_project_sibling(
 ///
 /// A call and a result read very differently to the agent receiving them — one
 /// is work to do, the other is an answer to work it asked for — so they are not
-/// both flattened into `@mention`. The label is presentation only; nothing
-/// downstream branches on it.
+/// both flattened into `@mention`.
+///
+/// [`queue::PEER_CALL_PROMPT_TAG`] is load-bearing rather than decorative: the
+/// prompt path reads it to decide that a turn owes a *result* instead of a
+/// reply, and it is set only here, on the admission path, after the envelope was
+/// parsed and addressed to this agent. Nothing else in the harness writes it.
 fn peer_prompt_tag(kind: u32) -> &'static str {
     match kind {
-        buzz_core::peer_call::KIND_PEER_CALL => "@call",
+        buzz_core::peer_call::KIND_PEER_CALL => queue::PEER_CALL_PROMPT_TAG,
         buzz_core::peer_call::KIND_PEER_CALL_RESULT => "@call-result",
         _ => "@mention",
     }
@@ -3268,13 +3272,13 @@ fn peer_prompt_tag(kind: u32) -> &'static str {
 /// The harness does not publish calls itself: the agent subprocess runs
 /// `buzz agents call`, and the only place this process can learn that a call
 /// exists is its own event coming back off the wire. Without this the ledger
-/// would be empty, every returned result would correlate to nothing, and the
-/// fan-out ceiling would bound a set that was always empty — a control in name
-/// only.
+/// would be empty and every returned result would correlate to nothing.
 ///
-/// A refusal here is a real effect, not a log line: an unregistered call is one
-/// whose result will not resume anything, which is precisely what "bounded
-/// fan-out" has to mean for a caller that publishes through a separate process.
+/// Registration is unconditional for a well-formed own call. The fan-out
+/// ceiling is not enforced here and must not be: by the time an event returns
+/// from the relay the callee may already be running the task, so refusing to
+/// record it would discard the answer to work that happened anyway. The ceiling
+/// runs in `buzz agents call` before publication.
 fn register_outgoing_call(
     ledger: &mut peer_call::CallLedger,
     peer: &peer_call::VerifiedPeerEvent,
@@ -3293,20 +3297,14 @@ fn register_outgoing_call(
     if !envelope.caller().eq_ignore_ascii_case(agent_hex) {
         return;
     }
-    match ledger.register_outgoing(envelope.call_id(), envelope.callee(), envelope.route()) {
-        Ok(()) => tracing::debug!(
-            call_id = %envelope.call_id(),
-            callee = %envelope.callee(),
-            outstanding = ledger.outstanding_count(),
-            "outgoing peer call registered"
-        ),
-        Err(refusal) => tracing::warn!(
-            call_id = %envelope.call_id(),
-            callee = %envelope.callee(),
-            ?refusal,
-            "outgoing peer call not registered — its result will not correlate"
-        ),
-    }
+    ledger.register_outgoing(envelope.call_id(), envelope.callee(), envelope.route());
+    tracing::debug!(
+        call_id = %envelope.call_id(),
+        callee = %envelope.callee(),
+        outstanding_on_route = ledger.outstanding_on_route(envelope.route()),
+        outstanding_total = ledger.outstanding_count(),
+        "outgoing peer call registered"
+    );
 }
 
 /// Map the project authority gate's verdict onto the peer-call trust classes.
@@ -9255,7 +9253,7 @@ mod observer_payload_trim_tests {
 #[cfg(test)]
 mod peer_call_channel_tests {
     use super::*;
-    use buzz_core::peer_call::{onward_context, PeerCallRoute, MAX_FANOUT};
+    use buzz_core::peer_call::{onward_context, PeerCallRoute};
     use buzz_sdk::builders::{build_peer_call, build_peer_call_result, PeerCallMeta};
     use nostr::{EventBuilder, JsonUtil, Keys};
 
@@ -9573,54 +9571,157 @@ mod peer_call_channel_tests {
         );
     }
 
-    /// Fan-out is bounded where it is issued, through the same path production
-    /// registers calls on. The eleventh concurrent call on one route is not
-    /// registered, and its result therefore correlates to nothing — which is
-    /// what makes the ceiling an effect rather than a log line.
+    /// The whole lifecycle, with nothing about the result hand-written.
+    ///
+    /// The callee's turn is rendered by the production prompt path; a stub
+    /// callee reads the command out of that prompt exactly as an agent would,
+    /// and the result is published through the production builder using only
+    /// values the prompt supplied. Then the caller's own harness correlates it.
+    ///
+    /// The earlier round-trip tests constructed the result themselves from
+    /// variables they already had in scope, which proved that a well-formed
+    /// result correlates — not that a woken callee is ever in a position to
+    /// produce one. This starts from the prompt and therefore fails if the
+    /// prompt stops carrying the caller, the call id or the route.
     #[test]
-    fn fan_out_is_bounded_at_ten_outstanding_calls_on_one_route() {
-        let agent = Keys::generate();
+    fn a_woken_callee_can_answer_from_its_prompt_alone_and_the_caller_resumes_once() {
+        let caller = Keys::generate();
+        let callee = Keys::generate();
         let channel = uuid::Uuid::new_v4();
         let route = channel_route(channel);
-        let mut ledger = peer_call::CallLedger::new();
 
-        let mut over_the_line = None;
-        for i in 0..=MAX_FANOUT {
-            let callee = Keys::generate();
-            let nonce = format!("{i:032x}");
-            let ours = call(&agent, &hex_of(&callee), &route, &nonce);
-            decide_channel_peer_event(
-                &ours,
-                channel,
-                &hex_of(&agent),
-                peer_call::PeerTrust::SelfAuthored,
-                &mut ledger,
-            );
-            if i == MAX_FANOUT {
-                over_the_line = Some((callee, ours));
-            }
-        }
-        assert_eq!(ledger.outstanding_count(), MAX_FANOUT);
-
-        let (callee, refused_call) = over_the_line.expect("the eleventh call");
-        let answer = result(
-            &callee,
-            &hex_of(&agent),
-            &call_id_of(&refused_call),
+        // 1. The caller publishes. Its own harness sees the event come back and
+        //    records the outstanding call.
+        let mut caller_ledger = peer_call::CallLedger::new();
+        let call_event = call(
+            &caller,
+            &hex_of(&callee),
             &route,
-            "done anyway",
+            "0123456789abcdef0123456789abcdef",
+        );
+        assert_eq!(
+            decide_channel_peer_event(
+                &call_event,
+                channel,
+                &hex_of(&caller),
+                peer_call::PeerTrust::SelfAuthored,
+                &mut caller_ledger,
+            ),
+            ChannelPeerOutcome::Consumed,
+        );
+        assert_eq!(caller_ledger.outstanding_count(), 1);
+
+        // 2. The callee's harness admits it and queues a turn.
+        let mut callee_ledger = peer_call::CallLedger::new();
+        let outcome = decide_channel_peer_event(
+            &call_event,
+            channel,
+            &hex_of(&callee),
+            peer_call::PeerTrust::TrustedAgent,
+            &mut callee_ledger,
+        );
+        let ChannelPeerOutcome::Turn { prompt_tag, .. } = outcome else {
+            panic!("the call did not become a turn: {outcome:?}");
+        };
+
+        // 3. The turn is rendered by the production prompt path.
+        let batch = queue::FlushBatch {
+            channel_id: channel,
+            events: vec![queue::BatchEvent {
+                event: call_event.clone(),
+                prompt_tag: prompt_tag.into(),
+                received_at: std::time::Instant::now(),
+                project: None,
+            }],
+            cancelled_events: vec![],
+            cancel_reason: None,
+        };
+        let prompt = queue::format_prompt(&batch, &queue::FormatPromptArgs::default()).join("\n\n");
+
+        // 4. A stub callee runs what it was told to run. It knows nothing this
+        //    prompt did not tell it — the parsed flags are the only inputs.
+        let flags = parse_result_command(&prompt).expect("the prompt carries a result command");
+        let answer = build_peer_call_result(
+            &flags.to,
+            &flags.call,
+            "three questions remain open",
+            &flags.route,
+        )
+        .expect("the prompt's own values build a valid result")
+        .sign_with_keys(&callee)
+        .expect("sign");
+
+        // 5. The caller's harness correlates it, once.
+        assert_eq!(
+            decide_channel_peer_event(
+                &answer,
+                channel,
+                &hex_of(&caller),
+                peer_call::PeerTrust::TrustedAgent,
+                &mut caller_ledger,
+            ),
+            ChannelPeerOutcome::Turn {
+                channel_id: channel,
+                prompt_tag: "@call-result",
+            },
+        );
+        assert_eq!(
+            caller_ledger.outstanding_count(),
+            0,
+            "the call the prompt described is the call that closed"
         );
         assert_eq!(
             decide_channel_peer_event(
                 &answer,
                 channel,
-                &hex_of(&agent),
+                &hex_of(&caller),
                 peer_call::PeerTrust::TrustedAgent,
-                &mut ledger,
+                &mut caller_ledger,
             ),
             ChannelPeerOutcome::Consumed,
-            "a call past the fan-out ceiling was never registered, so nothing resumes"
+            "a second result must not resume the call again"
         );
+    }
+
+    /// The flags of the `buzz agents call-result` command a prompt emitted.
+    struct ResultCommandFlags {
+        to: String,
+        call: String,
+        route: PeerCallRoute,
+    }
+
+    /// Read the emitted command the way a shell would: tokens, minus the line
+    /// continuations. Anything the prompt failed to spell out is missing here
+    /// too, which is the point — this cannot fill in a value from the test.
+    fn parse_result_command(prompt: &str) -> Option<ResultCommandFlags> {
+        let start = prompt.find("buzz agents call-result")?;
+        let rest = &prompt[start..];
+        let end = rest.find("\n```").unwrap_or(rest.len());
+        let tokens: Vec<&str> = rest[..end]
+            .split_whitespace()
+            .filter(|t| *t != "\\")
+            .collect();
+        let flag = |name: &str| -> Option<String> {
+            tokens
+                .iter()
+                .position(|t| *t == name)
+                .and_then(|i| tokens.get(i + 1))
+                .map(|v| (*v).to_string())
+        };
+
+        let route = match (flag("--channel"), flag("--project"), flag("--root")) {
+            (Some(channel), None, None) => PeerCallRoute::Channel {
+                channel,
+                thread_root: flag("--thread"),
+            },
+            (None, Some(coordinate), Some(root)) => PeerCallRoute::Project { coordinate, root },
+            _ => return None,
+        };
+        Some(ResultCommandFlags {
+            to: flag("--to")?,
+            call: flag("--call")?,
+            route,
+        })
     }
 
     /// The envelope's declared route must be the channel it arrived on. A
