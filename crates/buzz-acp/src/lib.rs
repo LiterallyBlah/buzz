@@ -1724,10 +1724,11 @@ async fn tokio_main() -> Result<()> {
     // phase's job and is deliberately absent here rather than half-present.
     let mut project_enrolments = project::ProjectEnrolments::new();
 
-    // What the loop has installed. Held across events because a replacement
-    // must name the generation it supersedes, and that is only knowable from
-    // the last one issued.
-    let mut project_subscriptions = ProjectSubscriptions::default();
+    // No project-subscription state is held here. What is installed, which
+    // generation it carries and which predecessor it retires all live in the
+    // background registry, because that is the only component that knows.
+    // A copy on this side could only ever be a guess about the far side of a
+    // channel, and the guess is what went wrong.
 
     // The agent's own identity, in both spellings, from one source — so the
     // `p`-tag check and visible-mention detection cannot end up pointed at
@@ -2004,7 +2005,6 @@ async fn tokio_main() -> Result<()> {
                                     queue: &mut queue,
                                 },
                                 &relay,
-                                &mut project_subscriptions,
                                 &pubkey_hex,
                                 startup_watermark,
                                 &project_event,
@@ -2863,46 +2863,26 @@ fn should_report_refusal(degradation: project::Degradation, refused_total: u64) 
 /// should not be able to reach the rest. It is also a *replacement* capability
 /// rather than a subscribe one, because retirement is where the two
 /// subscription defects lived and a method that can only add cannot express it.
+/// **Submission, not installation.** The future resolves when the background
+/// task has accepted the command, which says nothing about whether a REQ was
+/// written or a subscription installed. Implementors must not report anything
+/// stronger, and callers must not read anything stronger into it.
 pub(crate) trait ProjectSubscriber {
-    fn replace_project_subscription(
+    fn submit_project_replacement(
         &self,
-        predecessor: Option<&str>,
-        sub_id: &str,
-        subscription: project::ProjectSubscription,
+        replacement: project::ProjectReplacement,
         filters: Vec<serde_json::Value>,
     ) -> impl std::future::Future<Output = Result<(), relay::RelayError>>;
 }
 
 impl ProjectSubscriber for relay::HarnessRelay {
-    async fn replace_project_subscription(
+    async fn submit_project_replacement(
         &self,
-        predecessor: Option<&str>,
-        sub_id: &str,
-        subscription: project::ProjectSubscription,
+        replacement: project::ProjectReplacement,
         filters: Vec<serde_json::Value>,
     ) -> Result<(), relay::RelayError> {
-        relay::HarnessRelay::replace_project_subscription(
-            self,
-            predecessor,
-            sub_id,
-            subscription,
-            filters,
-        )
-        .await
+        relay::HarnessRelay::submit_project_replacement(self, replacement, filters).await
     }
-}
-
-/// Where the run loop's project subscriptions live.
-///
-/// Held across events because a replacement has to name the generation it
-/// supersedes, and that predecessor is only knowable from the last one issued.
-#[derive(Debug, Default)]
-pub(crate) struct ProjectSubscriptions {
-    /// The watched-root generation currently installed, if any.
-    watched: Option<u64>,
-    /// Whether an enrolment REQ has been issued at all. The id is fixed, so a
-    /// replacement names itself as its own predecessor once one exists.
-    enrolment_issued: bool,
 }
 
 /// Dispatch one project event **and bring subscriptions into line with it.**
@@ -2918,7 +2898,6 @@ pub(crate) struct ProjectSubscriptions {
 pub(crate) async fn dispatch_project_event(
     dispatch: &mut ProjectDispatch<'_>,
     subscriber: &impl ProjectSubscriber,
-    subscriptions: &mut ProjectSubscriptions,
     agent_pubkey_hex: &str,
     since: u64,
     project_event: &project::ProjectEvent,
@@ -2934,20 +2913,14 @@ pub(crate) async fn dispatch_project_event(
             if let Some(filter) =
                 project::enrolment_filter(dispatch.discovered, agent_pubkey_hex, since)
             {
-                let id = project::PROJECT_ENROL_SUB_ID;
-                let predecessor = subscriptions.enrolment_issued.then_some(id);
                 if let Err(e) = subscriber
-                    .replace_project_subscription(
-                        predecessor,
-                        id,
-                        project::ProjectSubscription::Enrolment,
+                    .submit_project_replacement(
+                        project::ProjectReplacement::Enrolment,
                         vec![filter],
                     )
                     .await
                 {
-                    tracing::warn!("enrolment replacement error: {e}");
-                } else {
-                    subscriptions.enrolment_issued = true;
+                    tracing::warn!("enrolment replacement submission error: {e}");
                 }
             }
         }
@@ -2961,46 +2934,23 @@ pub(crate) async fn dispatch_project_event(
         } => {
             let filters = project::watched_roots_filters(dispatch.enrolments, since);
             if !filters.is_empty() {
-                // **Checked, and fail-closed on exhaustion.**
+                // **Nothing about the generation is decided here.**
                 //
-                // `g + 1` panics in debug and wraps to zero in release. Wrapping
-                // is the worse half: generation zero is a wire identity this
-                // process may already have used, so a wrapped successor would
-                // reuse it — and the behaviour would differ by build mode,
-                // which is the last property an authority decision should have.
+                // This used to allocate the generation, name the predecessor,
+                // and advance its own counter when the submission returned
+                // `Ok` — which meant only that the command had been enqueued.
+                // A generation the registry never installed could therefore be
+                // named as the next predecessor, and retiring that nonexistent
+                // id left the genuine predecessor durable beside the successor.
                 //
-                // Exhaustion therefore emits no command at all. The predecessor
-                // stays live and its durable intent stays intact, so the agent
-                // keeps answering on the subscription it has; it simply stops
-                // widening. Losing the ability to watch new roots is a bounded
-                // loss. Reusing a generation is not.
-                let generation = match subscriptions.watched {
-                    None => Some(0),
-                    Some(current) => current.checked_add(1),
-                };
-                let Some(generation) = generation else {
-                    tracing::error!(
-                        current = subscriptions.watched,
-                        "watched-root generations exhausted — refusing to reuse one; \
-                         the existing watched subscription is retained and no further \
-                         root can be added to it"
-                    );
-                    return dispatched;
-                };
-                let sub_id = project::watched_sub_id(generation);
-                let predecessor = subscriptions.watched.map(project::watched_sub_id);
+                // Checked allocation and fail-closed exhaustion still hold;
+                // they hold in `ProjectRequests`, which is the only component
+                // that knows what is installed.
                 if let Err(e) = subscriber
-                    .replace_project_subscription(
-                        predecessor.as_deref(),
-                        &sub_id,
-                        project::ProjectSubscription::Watched { generation },
-                        filters,
-                    )
+                    .submit_project_replacement(project::ProjectReplacement::Watched, filters)
                     .await
                 {
-                    tracing::warn!("watched-roots replacement error: {e}");
-                } else {
-                    subscriptions.watched = Some(generation);
+                    tracing::warn!("watched-roots replacement submission error: {e}");
                 }
             }
         }
@@ -3056,7 +3006,9 @@ enum ProjectDispatched {
 
 /// Project dispatch entry point.
 ///
-/// **Discovery is ingested; routed events are still dropped.**
+/// **Both arms do work.** Discovery updates the known-repository set; routed
+/// events go through the authority gate and, when authorised, enrol a root and
+/// queue a turn. See the two sections below for what each of those costs.
 ///
 /// Ingesting an announcement grants no **authority**: it adds a coordinate to a
 /// set and nothing else — no session woken, no model turn, no invocation right.
@@ -4455,27 +4407,26 @@ mod project_discovery_ingestion_tests {
     /// The narrow capability is what makes this possible: dispatch needs one
     /// method, so a test can supply one method. Handing it the relay handle
     /// would have required a relay.
+    /// Records the *submissions*, which is all this side now produces.
+    ///
+    /// There is deliberately no id, generation or predecessor to record: those
+    /// are the registry's, and a test that could observe them here would be
+    /// observing a decision this side no longer makes.
     #[derive(Default)]
     struct RecordingSubscriber {
-        calls: std::sync::Mutex<Vec<(Option<String>, String, String)>>,
+        calls: std::sync::Mutex<Vec<(project::ProjectReplacement, String)>>,
     }
 
     impl ProjectSubscriber for RecordingSubscriber {
-        async fn replace_project_subscription(
+        async fn submit_project_replacement(
             &self,
-            predecessor: Option<&str>,
-            sub_id: &str,
-            subscription: project::ProjectSubscription,
+            replacement: project::ProjectReplacement,
             filters: Vec<serde_json::Value>,
         ) -> Result<(), relay::RelayError> {
-            self.calls.lock().unwrap().push((
-                predecessor.map(str::to_string),
-                sub_id.to_string(),
-                format!(
-                    "{subscription:?}|{}",
-                    serde_json::to_string(&filters).unwrap()
-                ),
-            ));
+            self.calls
+                .lock()
+                .unwrap()
+                .push((replacement, serde_json::to_string(&filters).unwrap()));
             Ok(())
         }
     }
@@ -4499,7 +4450,6 @@ mod project_discovery_ingestion_tests {
         let mut enrolments = project::ProjectEnrolments::new();
         let mut queue = EventQueue::new(config::DedupMode::Queue);
         let subscriber = RecordingSubscriber::default();
-        let mut subscriptions = ProjectSubscriptions::default();
 
         for keys in [&owner_a, &owner_b] {
             let announcement = proven_announcement(keys, "repo").await;
@@ -4514,7 +4464,6 @@ mod project_discovery_ingestion_tests {
                     &mut queue,
                 ),
                 &subscriber,
-                &mut subscriptions,
                 &agent_hex,
                 0,
                 &project::ProjectEvent::Discovery { announcement },
@@ -4523,24 +4472,28 @@ mod project_discovery_ingestion_tests {
         }
 
         let calls = subscriber.calls.lock().unwrap().clone();
-        assert_eq!(calls.len(), 2, "each discovery must issue a REQ: {calls:?}");
-
-        assert_eq!(calls[0].0, None, "the first enrolment REQ replaces nothing");
-        assert_eq!(calls[0].1, project::PROJECT_ENROL_SUB_ID);
-
         assert_eq!(
-            calls[1].0.as_deref(),
-            Some(project::PROJECT_ENROL_SUB_ID),
-            "the second names the first as its predecessor — without this the \
-             registry refuses the identity change and the filter never widens"
-        );
-        assert_eq!(calls[1].1, project::PROJECT_ENROL_SUB_ID);
-        assert_ne!(
-            calls[0].2, calls[1].2,
-            "the second REQ carries the same filter as the first: it did not widen"
+            calls.len(),
+            2,
+            "each discovery must submit a replacement: {calls:?}"
         );
         assert!(
-            calls[1].2.contains(&owner_b.public_key().to_hex()),
+            calls
+                .iter()
+                .all(|(class, _)| *class == project::ProjectReplacement::Enrolment),
+            "discovery must submit enrolment replacements: {calls:?}"
+        );
+
+        // What this side is responsible for is *the question* — that the second
+        // submission asks a wider one than the first. The id and predecessor it
+        // is installed under are the registry's, and are proved on the wire by
+        // the canonical scenario rather than guessed at here.
+        assert_ne!(
+            calls[0].1, calls[1].1,
+            "the second submission carries the same filter as the first: it did not widen"
+        );
+        assert!(
+            calls[1].1.contains(&owner_b.public_key().to_hex()),
             "the second repository is absent from the widened filter"
         );
     }
@@ -4560,7 +4513,6 @@ mod project_discovery_ingestion_tests {
         let mut enrolments = project::ProjectEnrolments::new();
         let mut queue = EventQueue::new(config::DedupMode::Queue);
         let subscriber = RecordingSubscriber::default();
-        let mut subscriptions = ProjectSubscriptions::default();
 
         macro_rules! drive {
             ($ev:expr) => {
@@ -4575,7 +4527,6 @@ mod project_discovery_ingestion_tests {
                         &mut queue,
                     ),
                     &subscriber,
-                    &mut subscriptions,
                     &agent_hex,
                     0,
                     $ev,
@@ -4608,114 +4559,33 @@ mod project_discovery_ingestion_tests {
         }
 
         let calls = subscriber.calls.lock().unwrap().clone();
+
+        // Exactly one enrolment submission per discovery that widened, and one
+        // watched submission per newly enrolled root. This side decides *that*
+        // a replacement is wanted and *what* should be asked; it decides
+        // nothing about identity, so there is nothing else here to assert.
+        let enrolment: Vec<_> = calls
+            .iter()
+            .filter(|(class, _)| *class == project::ProjectReplacement::Enrolment)
+            .collect();
         let watched: Vec<_> = calls
             .iter()
-            .filter(|(_, id, _)| id.starts_with("proj-roots-"))
+            .filter(|(class, _)| *class == project::ProjectReplacement::Watched)
             .collect();
-        assert_eq!(watched.len(), 2, "each new root replaces the watched REQ");
-        assert_eq!(watched[0].0, None, "the first watched REQ replaces nothing");
+
         assert_eq!(
-            watched[1].0.as_deref(),
-            Some(watched[0].1.as_str()),
-            "the successor must name the generation it retires"
+            enrolment.len(),
+            1,
+            "one discovery, one enrolment submission: {calls:?}"
+        );
+        assert_eq!(
+            watched.len(),
+            2,
+            "each newly enrolled root submits a watched replacement: {calls:?}"
         );
         assert_ne!(
             watched[0].1, watched[1].1,
-            "the successor must take a fresh generation id"
-        );
-    }
-
-    /// **Exhausted watched generations fail closed, identically in both build
-    /// modes.**
-    ///
-    /// The bug this pins was `g + 1`: a panic in debug, and in release a wrap
-    /// to generation zero — a wire identity this process may already have used.
-    /// Reusing one would let a retired request's frames be admitted under a
-    /// successor's authority, and the behaviour would depend on build mode.
-    ///
-    /// This test asserts the *refusal*, so it proves the same outcome under
-    /// `cargo test` and `cargo test --release`. A test that asserted the panic
-    /// would pass in debug and prove nothing about the mode where it matters.
-    #[tokio::test]
-    async fn exhausted_watched_generations_refuse_rather_than_reuse() {
-        let owner = Keys::generate();
-        let agent = Keys::generate();
-        let agent_identity = project::AgentIdentity::new(&agent.public_key()).unwrap();
-        let owner_hex = owner.public_key().to_hex();
-        let agent_hex = agent.public_key().to_hex();
-        let humans = std::collections::BTreeSet::new();
-        let externals = std::collections::BTreeSet::new();
-        let mut discovered = project::DiscoveredRepositories::new();
-        let mut enrolments = project::ProjectEnrolments::new();
-        let mut queue = EventQueue::new(config::DedupMode::Queue);
-        let subscriber = RecordingSubscriber::default();
-
-        // The last generation this process can name.
-        let mut subscriptions = ProjectSubscriptions {
-            watched: Some(u64::MAX),
-            enrolment_issued: true,
-        };
-
-        macro_rules! drive {
-            ($ev:expr) => {
-                dispatch_project_event(
-                    &mut dispatch_over(
-                        &agent_identity,
-                        Some(&owner_hex),
-                        &humans,
-                        &externals,
-                        &mut discovered,
-                        &mut enrolments,
-                        &mut queue,
-                    ),
-                    &subscriber,
-                    &mut subscriptions,
-                    &agent_hex,
-                    0,
-                    $ev,
-                )
-                .await
-            };
-        }
-
-        drive!(&project::ProjectEvent::Discovery {
-            announcement: proven_announcement(&owner, "proj").await,
-        });
-        let after_discovery = subscriber.calls.lock().unwrap().len();
-
-        let root = root_event(
-            &owner,
-            &agent,
-            "proj",
-            buzz_core::kind::KIND_GIT_ISSUE,
-            "a root that would need a new generation",
-        );
-        let verified = project::VerifiedProjectEvent::verify(root)
-            .await
-            .expect("valid");
-        let route = project::ProjectRoute::derive(&verified).expect("routes");
-        drive!(&project::ProjectEvent::Routed {
-            source: project::ProjectSubscription::Enrolment,
-            route,
-            event: verified,
-        });
-
-        let calls = subscriber.calls.lock().unwrap().clone();
-        assert_eq!(
-            calls.len(),
-            after_discovery,
-            "an exhausted generation space must emit no replacement command: {calls:?}"
-        );
-        assert!(
-            !calls
-                .iter()
-                .any(|(_, id, _)| id == &project::watched_sub_id(0)),
-            "generation zero was reused"
-        );
-        assert_eq!(
-            subscriptions.watched,
-            Some(u64::MAX),
-            "the predecessor generation must be retained on refusal"
+            "the second submission must carry the wider root set, not repeat the first"
         );
     }
 

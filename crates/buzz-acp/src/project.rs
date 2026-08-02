@@ -100,6 +100,21 @@ pub(crate) enum ProjectSubscription {
     },
 }
 
+/// Which project subscription a replacement command targets.
+///
+/// Deliberately **not** [`ProjectSubscription`]. That type carries the watched
+/// generation, and a caller able to supply a generation is a caller able to
+/// supply a stale one — which is exactly how a generation the registry had
+/// never installed came to be named as a predecessor. Callers name the class;
+/// the registry stamps the generation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProjectReplacement {
+    /// `#a` + `#p` over the discovered set. Fixed id.
+    Enrolment,
+    /// `#e` / `#E` over the enrolled roots. One generation per replacement.
+    Watched,
+}
+
 pub(crate) use requests::{
     AuthorityVerdict, CatchUpFrame, CatchUpOutcome, EndOfStoredEvents, FrameAdmission,
     IntentAdmission, OpenOutcome, OpenedHistoryPage, ProjectRequestIdentity, ProjectRequests,
@@ -736,6 +751,15 @@ mod requests {
         Unchanged,
         /// The incarnation space is spent. Nothing written, predecessor intact.
         Exhausted,
+        /// The filters would not build a bounded request, so no identity was
+        /// minted. Nothing written, nothing installed, predecessor intact.
+        ///
+        /// This decision used to live in the relay command handler, *before*
+        /// the registry was called — it warned and returned, so nothing
+        /// downstream could observe it and the caller's own bookkeeping had
+        /// already advanced. Refusing here makes "installs nothing, leaves the
+        /// predecessor current" a fact a test can read.
+        Refused,
         /// The successor write failed. **The predecessor is intact** — its live
         /// registration and its durable intent are exactly as they were, so the
         /// agent keeps answering on the subscription it already had.
@@ -959,6 +983,35 @@ mod requests {
         /// not restore the ability to mint authority the process has already
         /// spent.
         incarnations_exhausted: bool,
+        /// The watched generation whose durable intent is **current** — the one
+        /// a successor must name as its predecessor to retire.
+        ///
+        /// Advanced only by a replacement that actually installed. The run loop
+        /// used to hold this and advance it when the command was *enqueued*, so
+        /// a generation that never reached the registry could be named as the
+        /// next predecessor; `replace_request` then retired that nonexistent id
+        /// and left the genuine predecessor durable beside the successor.
+        watched_current: Option<u64>,
+        /// Next watched generation to hand out. Only ever increases.
+        ///
+        /// Separate from [`Self::watched_current`] on purpose: an *attempt* may
+        /// burn a generation without installing one. Reusing the number after a
+        /// failed write would put a wire identity this process has already used
+        /// back on the wire, which is the reuse hazard the whole checked
+        /// allocator exists to prevent.
+        next_watched_generation: u64,
+        /// Set once the watched generation space is spent. Never cleared, and
+        /// survives [`Self::clear_connection`] for the same reason
+        /// [`Self::incarnations_exhausted`] does.
+        watched_generations_exhausted: bool,
+        /// Whether an enrolment request has ever been installed.
+        ///
+        /// The enrolment id is fixed, so a replacement names itself as its own
+        /// predecessor once one exists. Held here rather than in the run loop
+        /// because "has this been installed" is the same class of fact as
+        /// [`Self::watched_current`], and splitting it across two owners is how
+        /// the watched half went wrong.
+        enrolment_installed: bool,
     }
 
     impl ProjectRequests {
@@ -1288,6 +1341,155 @@ mod requests {
             }
             Some(taken)
         }
+
+        /// Take the next watched generation, or `None` once the space is spent.
+        ///
+        /// Deliberately the same shape as [`Self::burn_incarnation`] — one
+        /// allocator idiom in this file, not two. A generation is burned on
+        /// *attempt*: a failed write consumes it and it is never handed out
+        /// again, because the number may already have been seen on the wire.
+        fn burn_watched_generation(&mut self) -> Option<u64> {
+            if self.watched_generations_exhausted {
+                return None;
+            }
+            let taken = self.next_watched_generation;
+            match self.next_watched_generation.checked_add(1) {
+                Some(next) => self.next_watched_generation = next,
+                None => self.watched_generations_exhausted = true,
+            }
+            Some(taken)
+        }
+
+        /// The watched generation currently installed, for tests and logging.
+        pub(crate) fn watched_current(&self) -> Option<u64> {
+            self.watched_current
+        }
+
+        /// Test hook: start the allocators near their ceilings.
+        ///
+        /// Sets only where allocation *begins*. It cannot install a generation,
+        /// mint an authority or register anything live — exhaustion still has
+        /// to be reached by burning, through the same `checked_add` production
+        /// uses. That distinction is why this is not the "ceremony is not
+        /// provenance" lever: there is no state here a caller could not reach
+        /// by allocating enough times, only a way to reach it in one step.
+        #[cfg(test)]
+        pub(crate) fn seed_allocators_for_exhaustion(
+            &mut self,
+            next_watched: u64,
+            next_incarnation: u64,
+        ) {
+            self.next_watched_generation = next_watched;
+            self.next_incarnation = next_incarnation;
+        }
+
+        /// Replace the watched-roots subscription with one carrying `filters`.
+        ///
+        /// **The semantic entry point.** Callers submit what they want watched;
+        /// they do not choose the generation, the id, or the predecessor. Those
+        /// are derived here, by the only component that knows what is installed.
+        ///
+        /// A caller that could supply the generation could supply a stale one,
+        /// which is precisely the defect this replaces: the run loop advanced
+        /// its own copy when the command was enqueued and then named a
+        /// generation the registry had never seen.
+        pub(crate) async fn replace_watched<S: ProjectReqSink>(
+            &mut self,
+            sink: &mut S,
+            filters: Vec<Value>,
+        ) -> ReplaceOutcome {
+            let Some(generation) = self.burn_watched_generation() else {
+                return ReplaceOutcome::Exhausted;
+            };
+            let Some(identity) = ProjectRequestIdentity::from_filters(
+                super::ProjectSubscription::Watched { generation },
+                filters,
+            ) else {
+                return ReplaceOutcome::Refused;
+            };
+            let sub_id = super::watched_sub_id(generation);
+            let predecessor = self.watched_current.map(super::watched_sub_id);
+            let outcome = self
+                .replace_request(sink, predecessor.as_deref(), &sub_id, identity)
+                .await;
+            // Only an install moves the predecessor. The burned generation is
+            // spent either way.
+            if matches!(outcome, ReplaceOutcome::Replaced { .. }) {
+                self.watched_current = Some(generation);
+            }
+            outcome
+        }
+
+        /// The offline half of [`Self::replace_watched`].
+        ///
+        /// No REQ can be written with no socket, but the intent must still move
+        /// or the next connection replays the predecessor. The generation is
+        /// allocated and the current one advanced here too, because durable
+        /// intent *is* what reconnect installs — there is no later moment at
+        /// which this becomes true.
+        pub(crate) fn replace_watched_intent(&mut self, filters: Vec<Value>) -> ReplaceOutcome {
+            let Some(generation) = self.burn_watched_generation() else {
+                return ReplaceOutcome::Exhausted;
+            };
+            let Some(identity) = ProjectRequestIdentity::from_filters(
+                super::ProjectSubscription::Watched { generation },
+                filters,
+            ) else {
+                return ReplaceOutcome::Refused;
+            };
+            let sub_id = super::watched_sub_id(generation);
+            let predecessor = self.watched_current.map(super::watched_sub_id);
+            self.replace_intent(predecessor.as_deref(), &sub_id, identity);
+            self.watched_current = Some(generation);
+            ReplaceOutcome::Replaced {
+                retired: predecessor,
+            }
+        }
+
+        /// Replace the enrolment subscription with one carrying `filters`.
+        ///
+        /// The id is fixed, so the predecessor is this same id once anything
+        /// has been installed under it — and `None` before that, because naming
+        /// a predecessor that never existed is what made the original defect
+        /// survivable.
+        pub(crate) async fn replace_enrolment<S: ProjectReqSink>(
+            &mut self,
+            sink: &mut S,
+            filters: Vec<Value>,
+        ) -> ReplaceOutcome {
+            let Some(identity) = ProjectRequestIdentity::from_filters(
+                super::ProjectSubscription::Enrolment,
+                filters,
+            ) else {
+                return ReplaceOutcome::Refused;
+            };
+            let id = super::PROJECT_ENROL_SUB_ID;
+            let predecessor = self.enrolment_installed.then_some(id);
+            let outcome = self.replace_request(sink, predecessor, id, identity).await;
+            if matches!(
+                outcome,
+                ReplaceOutcome::Replaced { .. } | ReplaceOutcome::Unchanged
+            ) {
+                self.enrolment_installed = true;
+            }
+            outcome
+        }
+
+        /// The offline half of [`Self::replace_enrolment`].
+        pub(crate) fn replace_enrolment_intent(&mut self, filters: Vec<Value>) -> ReplaceOutcome {
+            let Some(identity) = ProjectRequestIdentity::from_filters(
+                super::ProjectSubscription::Enrolment,
+                filters,
+            ) else {
+                return ReplaceOutcome::Refused;
+            };
+            let id = super::PROJECT_ENROL_SUB_ID;
+            let predecessor = self.enrolment_installed.then_some(id);
+            self.replace_intent(predecessor, id, identity);
+            self.enrolment_installed = true;
+            ReplaceOutcome::Replaced { retired: None }
+        }
+
         /// Record a replacement's durable intent while disconnected.
         ///
         /// The offline half of [`Self::replace_request`]: no REQ can be written

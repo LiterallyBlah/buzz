@@ -561,13 +561,14 @@ enum RelayCommand {
     /// id, and replacement is the operation permitted to. Folding them into one
     /// command would put that decision at the call site rather than in the
     /// registry that owns it.
+    /// **Semantic, not addressed.** The command names the class it wants
+    /// replaced and the filters it wants asked. It carries no id, no
+    /// generation and no predecessor, because the component that knows what is
+    /// installed is the registry on the far side of this channel — and a
+    /// sender that could name a predecessor could name one that was never
+    /// installed.
     ReplaceProject {
-        /// The subscription being retired, when the successor takes a new id.
-        /// `None` for a first install; equal to `sub_id` when the relay's own
-        /// REQ replacement does the retiring.
-        predecessor: Option<String>,
-        sub_id: String,
-        subscription: crate::project::ProjectSubscription,
+        replacement: crate::project::ProjectReplacement,
         filters: Vec<Value>,
     },
 }
@@ -960,22 +961,29 @@ impl HarnessRelay {
             .map_err(|_| RelayError::ConnectionClosed)
     }
 
-    /// Replace a live project subscription, transactionally.
+    /// **Submit** a project-subscription replacement to the background task.
+    ///
+    /// `Ok(())` means the command was accepted by the channel — *enqueued*, not
+    /// written and not installed. The only reachable error is a closed channel.
+    /// Whether a REQ reaches the relay, whether the registry installs it, and
+    /// which generation it becomes are decided later and elsewhere.
+    ///
+    /// The name says `submit` for that reason. It was
+    /// `replace_project_subscription`, and a caller read its `Ok` as proof the
+    /// replacement had happened — then advanced its own generation counter on
+    /// the strength of it. There is no counter on this side any more, and the
+    /// name no longer invites one.
     ///
     /// See [`RelayCommand::ReplaceProject`] for why this is not
     /// [`Self::subscribe_project`] with different arguments.
-    pub async fn replace_project_subscription(
+    pub async fn submit_project_replacement(
         &self,
-        predecessor: Option<&str>,
-        sub_id: &str,
-        subscription: crate::project::ProjectSubscription,
+        replacement: crate::project::ProjectReplacement,
         filters: Vec<Value>,
     ) -> Result<(), RelayError> {
         self.cmd_tx
             .send(RelayCommand::ReplaceProject {
-                predecessor: predecessor.map(str::to_string),
-                sub_id: sub_id.to_string(),
-                subscription,
+                replacement,
                 filters,
             })
             .await
@@ -1507,23 +1515,37 @@ fn apply_command_to_state(state: &mut BgState, cmd: RelayCommand) {
             }
         }
         RelayCommand::ReplaceProject {
-            predecessor,
-            sub_id,
-            subscription,
+            replacement,
             filters,
         } => {
             // Offline: move the durable intent only. No REQ can be written with
             // no socket, but the intent must still move or the next connection
             // replays the predecessor and the replacement is silently lost.
-            let Some(identity) =
-                crate::project::ProjectRequestIdentity::from_filters(subscription, filters)
-            else {
-                warn!(sub_id, "refusing a project replacement with no filters");
-                return;
+            //
+            // The generation is allocated here as it is when connected, by the
+            // same owner. Durable intent is what reconnect installs, so there
+            // is no later moment at which this becomes true.
+            let outcome = match replacement {
+                crate::project::ProjectReplacement::Enrolment => {
+                    state.project_requests.replace_enrolment_intent(filters)
+                }
+                crate::project::ProjectReplacement::Watched => {
+                    state.project_requests.replace_watched_intent(filters)
+                }
             };
-            state
-                .project_requests
-                .replace_intent(predecessor.as_deref(), &sub_id, identity);
+            match outcome {
+                crate::project::ReplaceOutcome::Refused => {
+                    warn!(?replacement, "refusing an unbounded project replacement");
+                }
+                crate::project::ReplaceOutcome::Exhausted => {
+                    error!(
+                        ?replacement,
+                        "project generations exhausted while disconnected — no further \
+                         replacement can be recorded"
+                    );
+                }
+                _ => {}
+            }
         }
         RelayCommand::SubscribeMembership => {
             state.membership_sub_active = true;
@@ -1715,38 +1737,44 @@ async fn execute_connected_command(
             }
         }
         RelayCommand::ReplaceProject {
-            predecessor,
-            sub_id,
-            subscription,
+            replacement,
             filters,
         } => {
-            let Some(identity) =
-                crate::project::ProjectRequestIdentity::from_filters(subscription, filters)
-            else {
-                warn!(sub_id, "refusing a project replacement with no filters");
-                return true;
+            // The registry derives the id, the generation and the predecessor.
+            // Nothing here chooses any of them, so nothing here can choose a
+            // stale one.
+            let outcome = match replacement {
+                crate::project::ProjectReplacement::Enrolment => {
+                    state.project_requests.replace_enrolment(ws, filters).await
+                }
+                crate::project::ProjectReplacement::Watched => {
+                    state.project_requests.replace_watched(ws, filters).await
+                }
             };
-            match state
-                .project_requests
-                .replace_request(ws, predecessor.as_deref(), &sub_id, identity)
-                .await
-            {
+            match outcome {
                 crate::project::ReplaceOutcome::Replaced { retired } => {
-                    debug!(sub_id, ?retired, "project subscription replaced");
+                    debug!(?replacement, ?retired, "project subscription replaced");
                     true
                 }
                 crate::project::ReplaceOutcome::Unchanged => {
                     debug!(
-                        sub_id,
+                        ?replacement,
                         "project subscription already current — no REQ written"
                     );
                     true
                 }
+                // Nothing was written and nothing installed, so the predecessor
+                // is still current and a later valid replacement will retire
+                // it. The connection is fine; our own filters were not.
+                crate::project::ReplaceOutcome::Refused => {
+                    warn!(?replacement, "refusing an unbounded project replacement");
+                    true
+                }
                 crate::project::ReplaceOutcome::Exhausted => {
                     error!(
-                        sub_id,
-                        "project request incarnations exhausted — no further project \
-                         subscription can be opened or replaced"
+                        ?replacement,
+                        "project generations exhausted — no further project subscription \
+                         can be opened or replaced"
                     );
                     true
                 }
@@ -1754,7 +1782,7 @@ async fn execute_connected_command(
                 // subscription it already had. Only a write failure may take the
                 // connection down, and this is one.
                 crate::project::ReplaceOutcome::WriteFailed(e) => {
-                    warn!(sub_id, "project replacement write failed: {e}");
+                    warn!(?replacement, "project replacement write failed: {e}");
                     false
                 }
             }
@@ -3257,9 +3285,12 @@ async fn resubscribe_after_reconnect(
     // something the relay just said no to. A fresh connection has had its
     // suspensions cleared, so everything intended is offered once.
     //
-    // Only discovery exists today. When watched and catch-up requests arrive
-    // this loop needs the pacing and shutdown-awareness the channel burst above
-    // has, and it does not have it yet.
+    // Discovery, enrolment and watched intent all replay through here, and
+    // catch-up pages will too. This loop still lacks the pacing and
+    // shutdown-awareness the channel burst above has — that gap is real and
+    // unaddressed, and it grew when the second and third request classes
+    // arrived. An earlier revision of this comment said only discovery existed,
+    // which stopped being true when enrolment landed.
     for (sub_id, identity) in state.project_requests.replayable() {
         match send_project_subscribe(ws, state, &sub_id, identity).await {
             ProjectSendOutcome::Sent | ProjectSendOutcome::AlreadyOpen => {}
@@ -6456,6 +6487,374 @@ mod tests {
         );
     }
 
+    // ── the composed replacement path ───────────────────────────────────────
+    //
+    // These four drive `execute_connected_command` — the production background
+    // owner — rather than `ProjectRequests::replace_request`. The defect they
+    // exist for lived *between* those two: the run loop advanced its own
+    // generation when the command was enqueued, so a generation the registry
+    // never installed became the next named predecessor. A test that called
+    // `replace_request` directly could not see that seam at all, because it
+    // supplied the predecessor itself.
+
+    /// Every frame the relay has received and not yet been read for.
+    async fn drain_test_frames(
+        server: &mut WebSocketStream<tokio::net::TcpStream>,
+    ) -> Vec<serde_json::Value> {
+        let mut frames = Vec::new();
+        while let Ok(Some(Ok(message))) = timeout(Duration::from_millis(80), server.next()).await {
+            if let Ok(text) = message.to_text() {
+                if let Ok(value) = serde_json::from_str(text) {
+                    frames.push(value);
+                }
+            }
+        }
+        frames
+    }
+
+    /// Subscription ids named by `REQ` frames, in wire order.
+    fn req_ids(frames: &[serde_json::Value]) -> Vec<String> {
+        frames
+            .iter()
+            .filter(|f| f[0] == "REQ")
+            .filter_map(|f| f[1].as_str().map(str::to_string))
+            .collect()
+    }
+
+    /// Subscription ids named by `CLOSE` frames, in wire order.
+    fn close_ids(frames: &[serde_json::Value]) -> Vec<String> {
+        frames
+            .iter()
+            .filter(|f| f[0] == "CLOSE")
+            .filter_map(|f| f[1].as_str().map(str::to_string))
+            .collect()
+    }
+
+    /// Submit a replacement the way the run loop does: as a command, through
+    /// the production background owner. Returns "keep the connection".
+    async fn submit_replacement(
+        ws: &mut WsStream,
+        state: &mut BgState,
+        replacement: crate::project::ProjectReplacement,
+        filters: Vec<Value>,
+    ) -> bool {
+        execute_connected_command(
+            ws,
+            state,
+            &"0".repeat(64),
+            RelayCommand::ReplaceProject {
+                replacement,
+                filters,
+            },
+        )
+        .await
+    }
+
+    /// A bounded watched filter that differs per call, so successive
+    /// replacements are genuinely different questions.
+    fn watched_filter(root_byte: u8) -> Value {
+        serde_json::json!({ "#e": [format!("{:064x}", root_byte)] })
+    }
+
+    /// **A failed generation must never become the retired predecessor.**
+    ///
+    /// The shipped chain: submit acknowledged the mpsc, the run loop advanced
+    /// its copy, the socket write then failed, and the *next* replacement named
+    /// the failed generation as its predecessor. `replace_request` dutifully
+    /// retired that nonexistent id, so the genuinely installed predecessor
+    /// stayed durable beside the successor — two live watched subscriptions,
+    /// one of them retired as far as anything local was concerned.
+    #[tokio::test]
+    async fn a_failed_watched_generation_is_burned_but_never_retires_anything() {
+        let (mut ws, mut server) = test_ws_pair().await;
+        let mut state = BgState::new();
+
+        // ── generation 0 installs ────────────────────────────────────────────
+        assert!(
+            submit_replacement(
+                &mut ws,
+                &mut state,
+                crate::project::ProjectReplacement::Watched,
+                vec![watched_filter(1)],
+            )
+            .await,
+            "a successful replacement keeps the connection"
+        );
+        assert_eq!(state.project_requests.watched_current(), Some(0));
+        let frames = drain_test_frames(&mut server).await;
+        assert_eq!(
+            req_ids(&frames),
+            vec![crate::project::watched_sub_id(0)],
+            "the first watched REQ, with nothing behind it: {frames:?}"
+        );
+        assert!(close_ids(&frames).is_empty(), "nothing to retire yet");
+
+        // ── the socket dies; generation 1 burns and writes nothing ───────────
+        drop(server);
+        let _ = ws.close(None).await;
+        assert!(
+            !submit_replacement(
+                &mut ws,
+                &mut state,
+                crate::project::ProjectReplacement::Watched,
+                vec![watched_filter(2)],
+            )
+            .await,
+            "a write failure must take the connection down"
+        );
+        assert_eq!(
+            state.project_requests.watched_current(),
+            Some(0),
+            "a failed attempt must not move the installed predecessor"
+        );
+
+        // ── reconnect, then succeed ──────────────────────────────────────────
+        let (mut ws2, mut server2) = test_ws_pair().await;
+        state.project_requests.clear_connection();
+        assert!(
+            submit_replacement(
+                &mut ws2,
+                &mut state,
+                crate::project::ProjectReplacement::Watched,
+                vec![watched_filter(3)],
+            )
+            .await
+        );
+
+        // Generation 1 was burned and is gone. The successor is 2, and what it
+        // retires is 0 — the generation that was genuinely installed.
+        assert_eq!(state.project_requests.watched_current(), Some(2));
+        let frames = drain_test_frames(&mut server2).await;
+        assert_eq!(
+            req_ids(&frames),
+            vec![crate::project::watched_sub_id(2)],
+            "the successor must take a fresh generation, not reuse the failed one: {frames:?}"
+        );
+        assert_eq!(
+            close_ids(&frames),
+            vec![crate::project::watched_sub_id(0)],
+            "the successor must retire the generation that was actually installed: {frames:?}"
+        );
+
+        // ── reconnect replays only the successful successor ──────────────────
+        let (mut ws3, mut server3) = test_ws_pair().await;
+        let (_tx, mut cmd_rx) = mpsc::channel(1);
+        state.project_requests.clear_connection();
+        assert!(matches!(
+            resubscribe_after_reconnect(&mut ws3, &mut cmd_rx, &mut state, "agent", true).await,
+            ResubscribeResult::Ok
+        ));
+        let replayed = req_ids(&drain_test_frames(&mut server3).await);
+        assert_eq!(
+            replayed,
+            vec![crate::project::watched_sub_id(2)],
+            "reconnect must replay only the current durable intent — a retired or \
+             failed generation returning here is the defect coming back: {replayed:?}"
+        );
+    }
+
+    /// **A refused filter installs nothing and retires nothing.**
+    ///
+    /// This decision used to be made in the command handler *before* the
+    /// registry was reached — it warned and returned, while the run loop had
+    /// already advanced its generation. So the next replacement named a
+    /// generation that had never existed.
+    #[tokio::test]
+    async fn a_refused_replacement_leaves_the_real_predecessor_current() {
+        let (mut ws, mut server) = test_ws_pair().await;
+        let mut state = BgState::new();
+
+        assert!(
+            submit_replacement(
+                &mut ws,
+                &mut state,
+                crate::project::ProjectReplacement::Watched,
+                vec![watched_filter(1)],
+            )
+            .await
+        );
+        assert_eq!(state.project_requests.watched_current(), Some(0));
+        drain_test_frames(&mut server).await;
+
+        // `{"limit": ..}` constrains nothing about *which* events are wanted,
+        // so it would ask the relay for everything. The registry refuses to
+        // mint an identity from it.
+        assert!(
+            submit_replacement(
+                &mut ws,
+                &mut state,
+                crate::project::ProjectReplacement::Watched,
+                vec![serde_json::json!({ "limit": 500 })],
+            )
+            .await,
+            "a refusal is not a transport failure — the connection is fine"
+        );
+        let frames = drain_test_frames(&mut server).await;
+        assert!(
+            frames.is_empty(),
+            "a refused replacement must write nothing at all: {frames:?}"
+        );
+        assert_eq!(
+            state.project_requests.watched_current(),
+            Some(0),
+            "a refusal must leave the actual predecessor current"
+        );
+
+        // And the next valid replacement retires that predecessor, not the
+        // generation the refusal burned.
+        assert!(
+            submit_replacement(
+                &mut ws,
+                &mut state,
+                crate::project::ProjectReplacement::Watched,
+                vec![watched_filter(2)],
+            )
+            .await
+        );
+        let frames = drain_test_frames(&mut server).await;
+        assert_eq!(
+            close_ids(&frames),
+            vec![crate::project::watched_sub_id(0)],
+            "the valid replacement must retire the real predecessor: {frames:?}"
+        );
+    }
+
+    /// **Spent watched generations fail closed, in both build modes.**
+    ///
+    /// Asserts the refusal rather than a panic: the original `g + 1` panicked
+    /// in debug and wrapped to generation zero in release, and release is the
+    /// only mode where the reuse happened. A test that asserted the panic would
+    /// have passed in debug and said nothing about the mode that mattered.
+    #[tokio::test]
+    async fn spent_watched_generations_refuse_rather_than_reuse() {
+        let (mut ws, mut server) = test_ws_pair().await;
+        let mut state = BgState::new();
+
+        state
+            .project_requests
+            .seed_allocators_for_exhaustion(u64::MAX, 0);
+
+        // The last generation this process can name installs normally.
+        assert!(
+            submit_replacement(
+                &mut ws,
+                &mut state,
+                crate::project::ProjectReplacement::Watched,
+                vec![watched_filter(1)],
+            )
+            .await
+        );
+        assert_eq!(state.project_requests.watched_current(), Some(u64::MAX));
+        drain_test_frames(&mut server).await;
+
+        // The space is now spent.
+        assert!(
+            submit_replacement(
+                &mut ws,
+                &mut state,
+                crate::project::ProjectReplacement::Watched,
+                vec![watched_filter(2)],
+            )
+            .await,
+            "exhaustion is terminal, not a transport failure"
+        );
+        let frames = drain_test_frames(&mut server).await;
+        assert!(
+            frames.is_empty(),
+            "an exhausted generation space must write nothing: {frames:?}"
+        );
+        assert!(
+            !frames
+                .iter()
+                .any(|f| f[1] == serde_json::json!(crate::project::watched_sub_id(0))),
+            "generation zero was reused: {frames:?}"
+        );
+        assert_eq!(
+            state.project_requests.watched_current(),
+            Some(u64::MAX),
+            "the predecessor must be retained on refusal"
+        );
+        assert!(
+            state
+                .project_requests
+                .match_frame(&crate::project::watched_sub_id(u64::MAX))
+                .is_some(),
+            "the agent keeps answering on the subscription it already had"
+        );
+    }
+
+    /// **A spent incarnation space fails closed the same way.**
+    ///
+    /// A second, independent ceiling: the registry may have generations left
+    /// and no authority to stamp them with. The run loop's own checked counter
+    /// could not see this one at all, so an exhausted registry still read as a
+    /// successful replacement upstream.
+    #[tokio::test]
+    async fn a_spent_incarnation_space_refuses_the_replacement() {
+        let (mut ws, mut server) = test_ws_pair().await;
+        let mut state = BgState::new();
+
+        assert!(
+            submit_replacement(
+                &mut ws,
+                &mut state,
+                crate::project::ProjectReplacement::Watched,
+                vec![watched_filter(1)],
+            )
+            .await
+        );
+        assert_eq!(state.project_requests.watched_current(), Some(0));
+        drain_test_frames(&mut server).await;
+
+        // Burn the incarnation space, leaving generations available.
+        state
+            .project_requests
+            .seed_allocators_for_exhaustion(1, u64::MAX);
+        assert!(
+            submit_replacement(
+                &mut ws,
+                &mut state,
+                crate::project::ProjectReplacement::Watched,
+                vec![watched_filter(2)],
+            )
+            .await
+        );
+        drain_test_frames(&mut server).await;
+
+        let frames_before = drain_test_frames(&mut server).await;
+        assert!(
+            frames_before.is_empty(),
+            "nothing outstanding before the exhausted attempt: {frames_before:?}"
+        );
+        assert!(
+            submit_replacement(
+                &mut ws,
+                &mut state,
+                crate::project::ProjectReplacement::Watched,
+                vec![watched_filter(3)],
+            )
+            .await,
+            "exhaustion is terminal, not a transport failure"
+        );
+        let frames = drain_test_frames(&mut server).await;
+        assert!(
+            frames.is_empty(),
+            "a spent incarnation space must write nothing: {frames:?}"
+        );
+        assert_eq!(
+            state.project_requests.watched_current(),
+            Some(1),
+            "the last genuinely installed generation stays current"
+        );
+        assert!(
+            state
+                .project_requests
+                .intent(&crate::project::watched_sub_id(1))
+                .is_some(),
+            "and its durable intent is preserved"
+        );
+    }
+
     #[tokio::test]
     async fn an_already_open_request_does_not_emit_a_second_req() {
         // `AlreadyLive` is not permission to re-send. A second REQ under a live
@@ -8115,30 +8514,52 @@ mod tests {
     /// dispatch holds a capability, not a mutable resource.
     struct SocketSubscriber {
         inner: tokio::sync::Mutex<(BgState, WsStream)>,
+        /// What the last executed command returned for "keep the connection".
+        kept: tokio::sync::Mutex<bool>,
+    }
+
+    impl SocketSubscriber {
+        /// Whether the last command this subscriber ran left the connection up.
+        ///
+        /// `execute_connected_command` answers exactly that, and it is the
+        /// production answer — a write failure returns `false` and is what
+        /// takes the socket down.
+        async fn last_connection_kept(&self) -> bool {
+            *self.kept.lock().await
+        }
     }
 
     impl crate::ProjectSubscriber for SocketSubscriber {
-        async fn replace_project_subscription(
+        /// **Drives the production command path**, not the registry directly.
+        ///
+        /// The submission is turned into the same [`RelayCommand`] the run loop
+        /// sends and handed to [`execute_connected_command`], so the seam under
+        /// test is the one production composes: submit → command → background
+        /// owner → registry → socket. Calling `replace_request` here instead
+        /// would skip the two boundaries where the defect actually lived.
+        async fn submit_project_replacement(
             &self,
-            predecessor: Option<&str>,
-            sub_id: &str,
-            subscription: crate::project::ProjectSubscription,
+            replacement: crate::project::ProjectReplacement,
             filters: Vec<serde_json::Value>,
         ) -> Result<(), RelayError> {
             let mut guard = self.inner.lock().await;
             let (state, ws) = &mut *guard;
-            let identity =
-                crate::project::ProjectRequestIdentity::from_filters(subscription, filters)
-                    .expect("the scenario's filters are bounded");
-            match state
-                .project_requests
-                .replace_request(ws, predecessor, sub_id, identity)
-                .await
-            {
-                crate::project::ReplaceOutcome::Replaced { .. }
-                | crate::project::ReplaceOutcome::Unchanged => Ok(()),
-                other => panic!("replacement failed in the scenario: {other:?}"),
-            }
+            let kept = execute_connected_command(
+                ws,
+                state,
+                "0".repeat(64).as_str(),
+                RelayCommand::ReplaceProject {
+                    replacement,
+                    filters,
+                },
+            )
+            .await;
+            *self.kept.lock().await = kept;
+            // Submission succeeded: the command was accepted and run. Whether
+            // it installed anything is a separate question, answered by the
+            // registry and readable through `last_connection_kept` and the
+            // frames on the wire.
+            Ok(())
         }
     }
 
@@ -8208,7 +8629,6 @@ mod tests {
             let mut queue = crate::queue::EventQueue::new(crate::config::DedupMode::Queue);
             let humans = std::collections::BTreeSet::new();
             let externals = std::collections::BTreeSet::new();
-            let mut subscriptions = crate::ProjectSubscriptions::default();
 
             // One socket and one registry for the whole scenario. Every REQ and
             // CLOSE below is read off the server half, so what is asserted is
@@ -8216,6 +8636,7 @@ mod tests {
             let (client, mut server) = test_ws_pair().await;
             let subscriber = SocketSubscriber {
                 inner: tokio::sync::Mutex::new((BgState::new(), client)),
+                kept: tokio::sync::Mutex::new(true),
             };
 
             macro_rules! drive_all {
@@ -8236,12 +8657,20 @@ mod tests {
                                     queue: &mut queue,
                                 },
                                 &subscriber,
-                                &mut subscriptions,
                                 &agent_hex,
                                 0,
                                 &p,
                             )
                             .await;
+                            // Every replacement this scenario causes must have
+                            // been executed *and* kept the connection. Without
+                            // this the scenario would read identically whether
+                            // the command installed anything or failed its
+                            // write, because submission returns `Ok` either way.
+                            assert!(
+                                subscriber.last_connection_kept().await,
+                                "a project replacement failed its write mid-scenario"
+                            );
                         }
                     }
                     last
