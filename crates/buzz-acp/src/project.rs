@@ -76,6 +76,20 @@ pub(crate) enum ProjectSubscription {
     Enrolment,
     /// `#e` / `#E` over enrolled roots, one generation per REQ replacement.
     Watched { generation: u64 },
+    /// The enrolment REQ, carrying a frame from its **stored backlog** —
+    /// history, not news.
+    ///
+    /// A per-frame stamp rather than a request class: the enrolment REQ is one
+    /// subscription that delivers its backlog and then keeps delivering, so
+    /// "replay or live" is a property of the frame and must be decided before
+    /// it enters the bounded event queue. A boolean read later cannot answer
+    /// it — a backlog frame can still be sitting in that queue when the EOSE
+    /// arrives, and would then be processed as live and re-answered.
+    ///
+    /// Carries the same authority as `Enrolment` and less permission: every
+    /// effect is folded through `ProcessingMode::Replay`, so a historical root
+    /// enrols without waking anyone.
+    EnrolmentReplay,
     /// The NIP-PC peer-call REQ, carrying a project-routed envelope.
     ///
     /// A transport source, not a grant. It exists so a call that arrives before
@@ -1426,6 +1440,16 @@ mod requests {
                         "durable intent holds a root catch-up under id {id} \
                          (root {root}, {stream:?}); catch-up pages are re-derived from \
                          their own cursor and are never durable"
+                    ));
+                }
+                super::ProjectSubscription::EnrolmentReplay => {
+                    // A per-frame stamp, not a request. The enrolment request
+                    // is persisted as `Enrolment`; a record naming the replay
+                    // stamp was written by something that mistook provenance
+                    // for identity.
+                    return Err(format!(
+                        "durable intent holds an enrolment-replay stamp under id {id}; \
+                         replay is a property of a frame, not a request"
                     ));
                 }
                 super::ProjectSubscription::PeerCall => {
@@ -4051,9 +4075,31 @@ pub(crate) fn enrolment_filter(
         "kinds": [KIND_GIT_ISSUE, KIND_GIT_PULL_REQUEST, KIND_TEXT_NOTE],
         "#a": coords,
         "#p": [agent_pubkey_hex],
-        "since": since,
+        "since": since.saturating_sub(ENROLMENT_RECONSTRUCTION_WINDOW_SECS),
+        "limit": ENROLMENT_RECONSTRUCTION_LIMIT,
     }))
 }
+
+/// How far back the enrolment REQ reaches for roots that predate this process.
+///
+/// The filter used to floor at the startup watermark, which made enrolment a
+/// live tail: an issue addressed to this agent yesterday was outside the window,
+/// so after a restart the agent held no authority for its own conversations and
+/// correctly refused everything that referred to them.
+///
+/// Thirty days rather than "everything". An unbounded reach is a full-history
+/// scan on every reconnect for a set that is bounded anyway by
+/// `ENROLMENT_RECONSTRUCTION_LIMIT`, and a root nobody has touched in a month is
+/// not the restart case this exists for. It is a retention choice, and it is
+/// stated here so it can be argued with rather than discovered.
+pub(crate) const ENROLMENT_RECONSTRUCTION_WINDOW_SECS: u64 = 30 * 24 * 60 * 60;
+
+/// The row ceiling on one enrolment backlog.
+///
+/// Bounded because the backlog is replayed through the ordinary gate: every row
+/// costs a signature check. The reach above decides *how far*, this decides
+/// *how much*, and neither is left to the relay's discretion.
+pub(crate) const ENROLMENT_RECONSTRUCTION_LIMIT: u64 = 500;
 
 /// NIP-01 filters for the watched-root REQ.
 ///
@@ -6273,7 +6319,10 @@ pub(crate) fn resolve_addressing(
     }
 
     if !evidence.p_tag_present {
-        if matches!(source, ProjectSubscription::Enrolment) {
+        if matches!(
+            source,
+            ProjectSubscription::Enrolment | ProjectSubscription::EnrolmentReplay
+        ) {
             return None;
         }
         return Some(Addressing::WatchedRoot);
@@ -6327,6 +6376,19 @@ pub(crate) fn resolve_addressing(
     }
 
     Some(Addressing::ExplicitMention)
+}
+
+/// Which processing mode a frame carries, from the source it was stamped with.
+///
+/// The stamp is applied in the relay task before the event enters the bounded
+/// queue, so this is a lookup rather than a decision: by the time an effect is
+/// being folded, "was this history?" has already been answered by whoever
+/// received the frame.
+pub(crate) fn processing_mode_for(source: &ProjectSubscription) -> ProcessingMode {
+    match source {
+        ProjectSubscription::EnrolmentReplay => ProcessingMode::Replay,
+        _ => ProcessingMode::Live,
+    }
 }
 
 /// Constrain an effect by processing mode.
@@ -12029,11 +12091,37 @@ mod tests {
 
     #[test]
     fn enrolment_filter_scopes_by_project_and_agent() {
-        let f = enrolment_filter(&known(&[&coord()]), AGENT, 100).expect("filter");
+        let now = 2 * ENROLMENT_RECONSTRUCTION_WINDOW_SECS;
+        let f = enrolment_filter(&known(&[&coord()]), AGENT, now).expect("filter");
         assert_eq!(f["kinds"], json!([1621, 1618, 1]));
         assert_eq!(f["#a"], json!([coord()]));
         assert_eq!(f["#p"], json!([AGENT]));
-        assert_eq!(f["since"], json!(100));
+        assert_eq!(f["limit"], json!(ENROLMENT_RECONSTRUCTION_LIMIT));
+    }
+
+    /// Enrolment reaches **behind** the caller's floor, and is bounded.
+    ///
+    /// The floor used to be taken literally, which made this a live tail: a
+    /// root addressed to the agent before it started was outside the window, so
+    /// after a restart it held no authority for its own conversations and
+    /// correctly refused everything referring to them. Reaching back is what
+    /// makes reconstruction possible; the `limit` is what stops it becoming a
+    /// full-history scan on every reconnect.
+    #[test]
+    fn enrolment_filter_reaches_back_past_the_callers_floor() {
+        let now = 10 * ENROLMENT_RECONSTRUCTION_WINDOW_SECS;
+        let f = enrolment_filter(&known(&[&coord()]), AGENT, now).expect("filter");
+        assert_eq!(
+            f["since"],
+            json!(now - ENROLMENT_RECONSTRUCTION_WINDOW_SECS),
+            "a root published before startup must be inside the window"
+        );
+        assert!(f["limit"].as_u64().is_some_and(|l| l > 0));
+
+        // A floor inside the window saturates at zero rather than wrapping to
+        // the end of time and matching nothing.
+        let early = enrolment_filter(&known(&[&coord()]), AGENT, 5).expect("filter");
+        assert_eq!(early["since"], json!(0));
     }
 
     #[test]

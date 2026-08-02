@@ -4192,6 +4192,20 @@ fn handle_project_event(
                 },
             );
 
+            // History restores state; it does not answer anyone.
+            //
+            // Folded here, on the decision this gate just made, rather than at
+            // any of the effect sites below: one place to read, and no effect
+            // can be added later that quietly escapes it. The stamp itself was
+            // applied in the relay task before this event entered the queue —
+            // a frame's provenance cannot be recovered afterwards, because a
+            // backlog frame may still be queued when the boundary arrives.
+            let mode = project::processing_mode_for(source);
+            let decision = project::ProjectDecision {
+                effect: project::apply_processing_mode(decision.effect, mode),
+                ..decision
+            };
+
             // ── NIP-PC loop controls ─────────────────────────────────────────
             //
             // The authority gate above decided *whether this author may direct
@@ -5422,6 +5436,116 @@ mod project_discovery_ingestion_tests {
                 event: verified,
             },
         )
+    }
+
+    /// A root replayed from the enrolment backlog restores authority and wakes
+    /// nobody.
+    ///
+    /// The restart case: an issue addressed to this agent before it started.
+    /// Without reconstruction the agent holds no authority for its own
+    /// conversations and correctly refuses everything referring to them; with
+    /// reconstruction but no replay mode it re-answers every one of them. The
+    /// stamp is what separates those two outcomes.
+    #[tokio::test]
+    async fn a_replayed_root_enrols_without_running_a_turn() {
+        let owner = Keys::generate();
+        let agent = Keys::generate();
+        let root = root_event(
+            &owner,
+            &agent,
+            "demo",
+            buzz_core::kind::KIND_GIT_ISSUE,
+            "look",
+        );
+
+        let live = dispatch_routed(
+            &owner,
+            &agent,
+            "demo",
+            project::ProjectSubscription::Enrolment,
+            None,
+            root.clone(),
+        )
+        .await;
+        assert!(
+            matches!(live, ProjectDispatched::Queued { queued: true, .. }),
+            "precondition: the same root live is a turn — got {live:?}"
+        );
+
+        let replayed = dispatch_routed(
+            &owner,
+            &agent,
+            "demo",
+            project::ProjectSubscription::EnrolmentReplay,
+            None,
+            root,
+        )
+        .await;
+        assert!(
+            matches!(replayed, ProjectDispatched::Enrolled),
+            "history must restore authority and queue nothing — got {replayed:?}"
+        );
+    }
+
+    /// A replayed comment refreshes context; it does not answer.
+    #[tokio::test]
+    async fn a_replayed_comment_is_context_not_a_prompt() {
+        let owner = Keys::generate();
+        let agent = Keys::generate();
+        let root = root_event(
+            &owner,
+            &agent,
+            "demo",
+            buzz_core::kind::KIND_GIT_ISSUE,
+            "look",
+        );
+        let comment = EventBuilder::new(nostr::Kind::TextNote, "and again?")
+            .tags([
+                nostr::Tag::parse(["a", &format!("30617:{}:demo", owner.public_key().to_hex())])
+                    .unwrap(),
+                nostr::Tag::parse(["e", &root.id.to_hex(), "", "root"]).unwrap(),
+                nostr::Tag::parse(["p", &agent.public_key().to_hex()]).unwrap(),
+            ])
+            .sign_with_keys(&owner)
+            .expect("sign");
+
+        let replayed = dispatch_routed(
+            &owner,
+            &agent,
+            "demo",
+            project::ProjectSubscription::EnrolmentReplay,
+            Some(root),
+            comment,
+        )
+        .await;
+        assert!(
+            !matches!(replayed, ProjectDispatched::Queued { queued: true, .. }),
+            "a replayed comment must not run a turn — got {replayed:?}"
+        );
+    }
+
+    /// The mode is a property of the frame's stamp and of nothing else.
+    ///
+    /// Pinned so that adding a subscription class cannot silently make its
+    /// frames replay — or, worse, make replay frames live.
+    #[test]
+    fn only_the_replay_stamp_carries_replay_mode() {
+        use project::{processing_mode_for, ProcessingMode, ProjectSubscription};
+        assert!(matches!(
+            processing_mode_for(&ProjectSubscription::EnrolmentReplay),
+            ProcessingMode::Replay
+        ));
+        for live in [
+            ProjectSubscription::Enrolment,
+            ProjectSubscription::Discovery,
+            ProjectSubscription::PeerCall,
+            ProjectSubscription::Watched { generation: 3 },
+        ] {
+            assert!(
+                matches!(processing_mode_for(&live), ProcessingMode::Live),
+                "{live:?} must stay live"
+            );
+        }
     }
 
     fn root_event(

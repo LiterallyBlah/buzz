@@ -1198,6 +1198,14 @@ struct BgState {
     /// Used as the floor `since` for membership notification replay so events
     /// predating this session are never re-delivered.
     startup_watermark: Option<u64>,
+    /// Has the **current** enrolment request delivered its stored backlog?
+    ///
+    /// False until that request's own EOSE is witnessed, and reset to false
+    /// whenever a replacement enrolment request is opened — a boundary minted
+    /// for the request this one replaced says nothing about this one's backlog.
+    /// Nothing else sets it: a timeout, `NOTICE`, `CLOSED`, reconnect or an
+    /// EOSE for an id we never opened never reaches the arm that does.
+    enrolment_backlog_drained: bool,
     /// Replay floor captured when each channel was first subscribed.
     /// Used as the `since` fallback on reconnect for channels that have no
     /// `last_seen` or `channel_dropped_since`. This prevents channels joined
@@ -1329,6 +1337,7 @@ impl BgState {
             channel_dropped_since: HashMap::new(),
             proactive_resubscribe_needed: false,
             startup_watermark: None,
+            enrolment_backlog_drained: false,
             subscribe_since: HashMap::new(),
             rate_limit_gate: None,
             rate_limited_pending: HashMap::new(),
@@ -1828,6 +1837,12 @@ async fn execute_connected_command(
             // stale one.
             let outcome = match replacement {
                 crate::project::ProjectReplacement::Enrolment => {
+                    // A new request has a new backlog. The boundary minted for
+                    // the request this replaces certifies nothing about it, so
+                    // it is withdrawn here rather than left standing — a stale
+                    // boundary would let a newly reachable coordinate's history
+                    // arrive stamped live and be answered.
+                    state.enrolment_backlog_drained = false;
                     state.project_requests.replace_enrolment(ws, filters).await
                 }
                 crate::project::ProjectReplacement::Watched => {
@@ -3131,7 +3146,33 @@ async fn handle_ws_message(
                             route_catch_up_frame(state, admission, expected, *event).await;
                             return true;
                         }
-                        let source = admission.subscription().clone();
+                        // Replay or live, decided **here** — before the event
+                        // enters the bounded queue, because a backlog frame can
+                        // still be sitting in that queue when the boundary
+                        // arrives, and a flag read later would call it live.
+                        //
+                        // Two conditions, and the second is the one that keeps
+                        // replay safety from becoming "quietly miss concurrent
+                        // work": a frame is history only if the enrolment
+                        // backlog has not yet drained *and* the event predates
+                        // this process. A root published while the enrolment
+                        // REQ is being replaced is newer than startup, so it is
+                        // live and gets answered, exactly once — the shared
+                        // dedup slot stops the watched REQ answering it again.
+                        let source = {
+                            let class = admission.subscription().clone();
+                            let is_backlog =
+                                matches!(class, crate::project::ProjectSubscription::Enrolment)
+                                    && !state.enrolment_backlog_drained
+                                    && state
+                                        .startup_watermark
+                                        .is_some_and(|w| event.created_at.as_secs() < w);
+                            if is_backlog {
+                                crate::project::ProjectSubscription::EnrolmentReplay
+                            } else {
+                                class
+                            }
+                        };
 
                         // Project dispatch. The step order below is the whole
                         // security property, so it is written out rather than
@@ -3412,6 +3453,19 @@ async fn handle_ws_message(
                         .witness_end_of_stored_events(&subscription_id)
                     {
                         debug!(sub_id = %subscription_id, "project EOSE");
+
+                        // The replay boundary, and the only thing that mints
+                        // one. `witness_end_of_stored_events` returned `Some`
+                        // only because we hold a live registration under this
+                        // exact id, so a stale or unknown id cannot certify
+                        // that our backlog has drained.
+                        if matches!(
+                            witness.subscription(),
+                            crate::project::ProjectSubscription::Enrolment
+                        ) {
+                            state.enrolment_backlog_drained = true;
+                            debug!("enrolment backlog drained — later frames are live");
+                        }
 
                         // `None` is the ordinary case for discovery, enrolment
                         // and watched requests: they keep delivering after their
