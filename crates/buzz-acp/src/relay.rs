@@ -6030,69 +6030,227 @@ mod tests {
         assert!(keep_going, "dispatch must not signal connection loss");
     }
 
-    /// Deliver a signed EVENT the way a relay does: the retained peer writes
-    /// the raw frame, and the **same registered connection** reads it back off
-    /// the wire and hands it to production frame handling.
+    /// The write half of a scenario's relay peer.
+    type PeerSink = futures_util::stream::SplitSink<
+        WebSocketStream<tokio::net::TcpStream>,
+        tokio_tungstenite::tungstenite::Message,
+    >;
+
+    /// Which of the peer's identities signs an inbound event.
+    #[derive(Clone, Copy, Debug)]
+    enum PeerSigner {
+        /// The repository owner: discoverer, issue author, commenter.
+        Owner,
+        /// A second, unrelated owner, used to prove enrolment widening.
+        SecondOwner,
+    }
+
+    /// What a scenario asks the relay peer to publish.
     ///
-    /// Deliberately not [`deliver_frame`]. That builds a fresh socket per
-    /// event and passes a constructed `Message::Text` straight into
-    /// `handle_ws_message`, so the bytes never cross a connection and the
-    /// socket a request was registered on is not the socket its answer arrives
-    /// on. Every boundary between "a relay sent this" and "the gate saw it" was
-    /// therefore assumed rather than crossed — which is what let a prepared
-    /// midpoint survive three rounds of review.
+    /// It carries a kind, content and tags — no signature, no key, and no
+    /// `Event`. Producing the signed object is the peer's job, and the peer's
+    /// alone.
+    struct InboundSpec {
+        signer: PeerSigner,
+        kind: u16,
+        content: String,
+        tags: Vec<Vec<String>>,
+    }
+
+    enum PeerCommand {
+        Publish {
+            sub_id: String,
+            spec: InboundSpec,
+            reply: tokio::sync::oneshot::Sender<nostr::EventId>,
+        },
+        /// After a reconnect, the peer writes to the replacement socket.
+        Rebind {
+            sink: PeerSink,
+            reply: tokio::sync::oneshot::Sender<()>,
+        },
+    }
+
+    /// The relay peer: the only holder of the keys inbound events are signed
+    /// with, and the only writer of inbound frames.
+    ///
+    /// **Why a task rather than a helper the scenario calls with an `Event`.**
+    /// The phase contract names "direct midpoint injection replaces the
+    /// connected path" as a mutant this suite must catch, and the previous
+    /// shape could not catch it. That helper took the signed `Event` as an
+    /// argument, so an edit which read the frame off the socket, discarded it
+    /// and passed a locally rebuilt `Message::Text` to `handle_ws_message`
+    /// produced byte-identical input. No assertion separates a transported
+    /// value from a reconstruction of itself, and the helper's own comment said
+    /// so — which is an admission that the falsifier was open, not a proof that
+    /// it was closed.
+    ///
+    /// What changes here is not the assertions but what the scenario *has*. The
+    /// signing keys and the serialised frames are moved into this task; what
+    /// crosses back is an [`nostr::EventId`] and nothing else. A midpoint
+    /// injection now has nothing faithful to inject. Its best available forgery
+    /// is an event signed by a key the scenario still holds — the agent's — and
+    /// production refuses that twice over: `VerifiedProjectEvent::verify`
+    /// rejects a signature that does not match the id, and an event genuinely
+    /// signed by the agent classifies as self-authored and never queues. The
+    /// mutant is caught by the production gate rather than by a test asserting
+    /// about its own fixture.
+    struct RelayPeer {
+        tx: mpsc::Sender<PeerCommand>,
+    }
+
+    impl RelayPeer {
+        /// Sign `spec` and write it, followed by a sentinel, to the socket the
+        /// peer currently holds. Returns the id of the event it wrote.
+        async fn publish(&self, sub_id: &str, spec: InboundSpec) -> nostr::EventId {
+            let (reply, wait) = tokio::sync::oneshot::channel();
+            self.tx
+                .send(PeerCommand::Publish {
+                    sub_id: sub_id.to_string(),
+                    spec,
+                    reply,
+                })
+                .await
+                .expect("the relay peer accepts the publish");
+            timeout(Duration::from_secs(5), wait)
+                .await
+                .expect("timed out waiting for the relay peer to publish")
+                .expect("the relay peer answered")
+        }
+
+        /// Point the peer at the replacement connection after a reconnect.
+        async fn rebind(&self, sink: PeerSink) {
+            let (reply, wait) = tokio::sync::oneshot::channel();
+            self.tx
+                .send(PeerCommand::Rebind { sink, reply })
+                .await
+                .expect("the relay peer accepts the rebind");
+            timeout(Duration::from_secs(5), wait)
+                .await
+                .expect("timed out waiting for the relay peer to rebind")
+                .expect("the relay peer answered");
+        }
+    }
+
+    /// Move the peer's sockets and signing keys out of the scenario.
+    ///
+    /// `owner` and `second_owner` are consumed here on purpose: after this call
+    /// no caller can sign as either identity, which is what makes a prepared
+    /// midpoint unbuildable rather than merely discouraged.
+    fn spawn_relay_peer(
+        mut sink: PeerSink,
+        owner: nostr::Keys,
+        second_owner: nostr::Keys,
+    ) -> RelayPeer {
+        let (tx, mut rx) = mpsc::channel::<PeerCommand>(8);
+        tokio::spawn(async move {
+            use futures_util::SinkExt;
+            while let Some(command) = rx.recv().await {
+                match command {
+                    PeerCommand::Publish {
+                        sub_id,
+                        spec,
+                        reply,
+                    } => {
+                        let keys = match spec.signer {
+                            PeerSigner::Owner => &owner,
+                            PeerSigner::SecondOwner => &second_owner,
+                        };
+                        let tags: Vec<nostr::Tag> = spec
+                            .tags
+                            .iter()
+                            .map(|tag| nostr::Tag::parse(tag.clone()).expect("peer tag parses"))
+                            .collect();
+                        let event = EventBuilder::new(nostr::Kind::Custom(spec.kind), spec.content)
+                            .tags(tags)
+                            .sign_with_keys(keys)
+                            .expect("the relay peer signs");
+                        let text = serde_json::to_string(&json!(["EVENT", sub_id, event]))
+                            .expect("encode frame");
+                        // The EVENT, and immediately behind it a sentinel. Both
+                        // are read back in order by `deliver_over_connection`;
+                        // see the assertion there for what the sentinel proves.
+                        let sentinel =
+                            serde_json::to_string(&json!(["NOTICE", sentinel_text(event.id)]))
+                                .expect("encode sentinel");
+                        sink.send(Message::Text(text.into()))
+                            .await
+                            .expect("the relay peer writes the EVENT");
+                        sink.send(Message::Text(sentinel.into()))
+                            .await
+                            .expect("the relay peer writes the sentinel");
+                        let _ = reply.send(event.id);
+                    }
+                    PeerCommand::Rebind {
+                        sink: replacement,
+                        reply,
+                    } => {
+                        sink = replacement;
+                        let _ = reply.send(());
+                    }
+                }
+            }
+        });
+        RelayPeer { tx }
+    }
+
+    /// The sentinel the peer writes behind every EVENT.
+    ///
+    /// An id is all this needs to be: it is an ordering marker, not evidence
+    /// about the event's contents.
+    fn sentinel_text(id: nostr::EventId) -> String {
+        format!("delivered:{id}")
+    }
+
+    /// Read the next EVENT off the retained connection and hand it to
+    /// production frame handling.
+    ///
+    /// Nothing here builds a frame. The bytes are whatever [`RelayPeer`] wrote,
+    /// and the **same registered connection** reads them back — so the socket a
+    /// request was registered on is the socket its answer arrives on.
+    ///
+    /// Deliberately not [`deliver_frame`]. That builds a fresh socket per event
+    /// and passes a constructed `Message::Text` straight into
+    /// `handle_ws_message`, so the bytes never cross a connection at all.
     async fn deliver_over_connection(
-        server: &mut WebSocketStream<tokio::net::TcpStream>,
         state: &mut BgState,
         ws: &mut WsStream,
         sub_id: &str,
-        event: &Event,
+        event_id: nostr::EventId,
         event_tx: &mpsc::Sender<Option<BuzzEvent>>,
         keys: &nostr::Keys,
     ) {
-        use futures_util::SinkExt;
-        let text = serde_json::to_string(&json!(["EVENT", sub_id, event])).expect("encode frame");
-
-        // The peer writes the EVENT and, immediately behind it, a sentinel.
-        // Both are read back below, in order. See the assertions after dispatch
-        // for why the sentinel is here.
-        let sentinel = serde_json::to_string(&json!(["NOTICE", format!("delivered:{}", event.id)]))
-            .expect("encode sentinel");
-        server
-            .send(Message::Text(text.clone().into()))
-            .await
-            .expect("the relay peer writes the EVENT");
-        server
-            .send(Message::Text(sentinel.clone().into()))
-            .await
-            .expect("the relay peer writes the sentinel");
-
         let message = timeout(Duration::from_secs(2), ws.next())
             .await
             .expect("timed out reading the EVENT off the connection")
             .expect("the connection closed before the EVENT arrived")
             .expect("read the EVENT frame");
 
-        // **The first thing on this connection is the EVENT.**
+        // **The first thing on this connection is the EVENT the peer wrote.**
         //
-        // What this proves, exactly: the connection is live, the peer's write
-        // arrived, and the stream is consumed in order — so a frame left queued
-        // or delivered out of order fails here.
-        //
-        // What it does not prove, stated because the phase contract names
-        // "direct midpoint injection replaces the connected path" as a mutant
-        // this suite should catch: **no assertion here can catch it.** The
-        // injection would be an edit to this helper, and any value a helper can
-        // assert is a value the same helper can fabricate — the transported
-        // bytes and a locally constructed `Message::Text` have identical
-        // contents by definition, so no comparison distinguishes them. The
-        // property is held by construction and by review of this function, not
-        // by a test. Writing an assertion that appeared to cover it would be
-        // the self-matching proof this file has been burned by before.
+        // The envelope is checked against the two public values the peer handed
+        // back — the id it published and the subscription it published on — so
+        // a frame delivered on the wrong registration, or out of order, fails
+        // here. It is checked by projection rather than by string equality
+        // because this function has no serialised frame to compare against, and
+        // that absence is the point: see [`RelayPeer`].
+        let envelope: serde_json::Value =
+            serde_json::from_str(message.to_text().expect("the EVENT frame is text"))
+                .expect("the transported frame is JSON");
         assert_eq!(
-            message.to_text().expect("the EVENT frame is text"),
-            text,
-            "the frame handled below did not come off this connection"
+            envelope[0],
+            json!("EVENT"),
+            "not an EVENT frame: {envelope}"
+        );
+        assert_eq!(
+            envelope[1],
+            json!(sub_id),
+            "the EVENT arrived on a registration this delivery did not name: {envelope}"
+        );
+        assert_eq!(
+            envelope[2]["id"],
+            json!(event_id.to_hex()),
+            "the frame read off this connection is not the event the peer \
+             published: {envelope}"
         );
 
         let (observer_tx, _observer_rx) = mpsc::channel(8);
@@ -6117,9 +6275,12 @@ mod tests {
             .expect("timed out reading the sentinel")
             .expect("the connection closed before the sentinel arrived")
             .expect("read the sentinel frame");
+        let echoed: serde_json::Value =
+            serde_json::from_str(echoed.to_text().expect("sentinel is text"))
+                .expect("the sentinel is JSON");
         assert_eq!(
-            echoed.to_text().expect("sentinel is text"),
-            sentinel,
+            echoed,
+            json!(["NOTICE", sentinel_text(event_id)]),
             "the EVENT was not consumed from the connection — it was still \
              queued when the sentinel was read, so the frame handled above did \
              not come off this socket"
@@ -8983,10 +9144,17 @@ mod tests {
         let frame = next_test_frame(&mut server).await;
         assert_eq!(frame[0], "REQ");
         assert_eq!(frame[1], enrol_id);
-        let filter_text = frame[2].to_string();
-        assert!(
-            filter_text.contains(&agent_hex),
-            "the enrolment REQ must be scoped to this agent"
+        assert_eq!(
+            req_tag_set(&frame, &["#p"]),
+            vec![agent_hex.clone()],
+            "the enrolment REQ must be scoped to this agent and no other: \
+             {frame:?}"
+        );
+        assert_eq!(
+            req_coordinate_set(&frame),
+            vec![format!("30617:{owner_hex}:connected-repo")],
+            "the enrolment REQ must name exactly the one discovered \
+             repository: {frame:?}"
         );
 
         // ── 4. The owner opens an issue naming the agent ────────────────────
@@ -9070,9 +9238,11 @@ mod tests {
             frame[1], watched_id,
             "the replacement uses a fresh generation"
         );
-        assert!(
-            frame.to_string().contains(&root.id.to_hex()),
-            "the watched REQ must name the root just enrolled"
+        assert_eq!(
+            req_root_set(&frame),
+            vec![root.id.to_hex()],
+            "the watched REQ must name exactly the root just enrolled: \
+             {frame:?}"
         );
     }
 
@@ -9273,9 +9443,11 @@ mod tests {
     ///
     /// Bounded, so a frame that never arrives fails as an assertion on an empty
     /// vector rather than hanging the scenario.
-    async fn readable_frames(
-        server: &mut WebSocketStream<tokio::net::TcpStream>,
-    ) -> Vec<serde_json::Value> {
+    async fn readable_frames<S>(server: &mut S) -> Vec<serde_json::Value>
+    where
+        S: futures_util::Stream<Item = Result<Message, tokio_tungstenite::tungstenite::Error>>
+            + Unpin,
+    {
         let mut out = Vec::new();
         while let Ok(Some(Ok(msg))) = timeout(Duration::from_millis(300), server.next()).await {
             if let Ok(text) = msg.to_text() {
@@ -9398,8 +9570,10 @@ mod tests {
         // night, so the whole scenario is bounded.
         timeout(Duration::from_secs(60), async {
             let owner = nostr::Keys::generate();
+            let other_owner = nostr::Keys::generate();
             let agent = nostr::Keys::generate();
             let owner_hex = owner.public_key().to_hex();
+            let other_owner_hex = other_owner.public_key().to_hex();
             let agent_hex = agent.public_key().to_hex();
             let agent_identity =
                 crate::project::AgentIdentity::new(&agent.public_key()).expect("identity");
@@ -9414,7 +9588,15 @@ mod tests {
             // One socket and one registry for the whole scenario. Every REQ and
             // CLOSE below is read off the server half, so what is asserted is
             // what the relay received rather than what a helper returned.
-            let (client, mut server) = test_ws_pair().await;
+            //
+            // The server half is split: the scenario keeps the reader, and the
+            // writer goes to the relay peer together with both owner
+            // identities. After this line the scenario cannot sign as an owner
+            // and cannot write to the wire — which is what makes a prepared
+            // midpoint unbuildable here. See [`RelayPeer`].
+            let (client, server) = test_ws_pair().await;
+            let (server_sink, mut server_rx) = server.split();
+            let peer = spawn_relay_peer(server_sink, owner, other_owner);
             let subscriber = SocketSubscriber {
                 inner: tokio::sync::Mutex::new((BgState::new(), client)),
                 kept: tokio::sync::Mutex::new(true),
@@ -9459,15 +9641,15 @@ mod tests {
             }
 
             // Every EVENT below crosses the retained connection: the relay peer
-            // writes it, and the socket the requests were registered on reads
-            // it. No fresh socket, and no `Message::Text` handed directly to
-            // `handle_ws_message`.
+            // signs and writes it, and the socket the requests were registered
+            // on reads it. No fresh socket, and no `Message::Text` handed
+            // directly to `handle_ws_message` — the id is all this scenario
+            // ever holds of an inbound event.
             macro_rules! deliver {
-                ($sub_id:expr, $event:expr) => {{
+                ($sub_id:expr, $event_id:expr) => {{
                     let mut guard = subscriber.inner.lock().await;
                     let (state, ws) = &mut *guard;
-                    deliver_over_connection(&mut server, state, ws, $sub_id, $event, &tx, &agent)
-                        .await;
+                    deliver_over_connection(state, ws, $sub_id, $event_id, &tx, &agent).await;
                 }};
             }
 
@@ -9481,7 +9663,7 @@ mod tests {
                     ProjectSendOutcome::Sent
                 );
             }
-            let seen = readable_frames(&mut server).await;
+            let seen = readable_frames(&mut server_rx).await;
             assert_eq!(
                 seen.len(),
                 1,
@@ -9491,17 +9673,21 @@ mod tests {
             assert_eq!(seen[0][1], discovery_id);
 
             // ── 2. the announcement drives an enrolment replacement ──────────
-            let announcement = EventBuilder::new(
-                nostr::Kind::Custom(buzz_core::kind::KIND_GIT_REPO_ANNOUNCEMENT as u16),
-                "",
-            )
-            .tags([nostr::Tag::parse(["d", "e2e-repo"]).expect("d tag")])
-            .sign_with_keys(&owner)
-            .expect("sign");
-            deliver!(&discovery_id, &announcement);
+            let announcement = peer
+                .publish(
+                    &discovery_id,
+                    InboundSpec {
+                        signer: PeerSigner::Owner,
+                        kind: buzz_core::kind::KIND_GIT_REPO_ANNOUNCEMENT as u16,
+                        content: String::new(),
+                        tags: vec![vec!["d".to_string(), "e2e-repo".to_string()]],
+                    },
+                )
+                .await;
+            deliver!(&discovery_id, announcement);
             assert_eq!(drive_all!(), crate::ProjectDispatched::DiscoveryChanged);
 
-            let seen = readable_frames(&mut server).await;
+            let seen = readable_frames(&mut server_rx).await;
             assert_eq!(seen.len(), 1, "one enrolment REQ: {seen:?}");
             assert_eq!(seen[0][0], "REQ");
             assert_eq!(seen[0][1], crate::project::PROJECT_ENROL_SUB_ID);
@@ -9526,18 +9712,21 @@ mod tests {
             // issued, which the shipped defect also did. Widening is the thing
             // that was broken: the id is fixed, so the second identity has to
             // replace the first rather than be refused as a conflict.
-            let other_owner = nostr::Keys::generate();
-            let other_announcement = EventBuilder::new(
-                nostr::Kind::Custom(buzz_core::kind::KIND_GIT_REPO_ANNOUNCEMENT as u16),
-                "",
-            )
-            .tags([nostr::Tag::parse(["d", "second-repo"]).expect("d tag")])
-            .sign_with_keys(&other_owner)
-            .expect("sign");
-            deliver!(&discovery_id, &other_announcement);
+            let other_announcement = peer
+                .publish(
+                    &discovery_id,
+                    InboundSpec {
+                        signer: PeerSigner::SecondOwner,
+                        kind: buzz_core::kind::KIND_GIT_REPO_ANNOUNCEMENT as u16,
+                        content: String::new(),
+                        tags: vec![vec!["d".to_string(), "second-repo".to_string()]],
+                    },
+                )
+                .await;
+            deliver!(&discovery_id, other_announcement);
             assert_eq!(drive_all!(), crate::ProjectDispatched::DiscoveryChanged);
 
-            let seen = readable_frames(&mut server).await;
+            let seen = readable_frames(&mut server_rx).await;
             assert_eq!(seen.len(), 1, "the widened enrolment REQ: {seen:?}");
             assert_eq!(seen[0][0], "REQ");
             assert_eq!(
@@ -9561,7 +9750,7 @@ mod tests {
             // coordinate set tells the two apart.
             let mut expected_coordinates = vec![
                 first_coordinate.clone(),
-                format!("30617:{}:second-repo", other_owner.public_key().to_hex()),
+                format!("30617:{other_owner_hex}:second-repo"),
             ];
             expected_coordinates.sort();
             assert_eq!(
@@ -9580,17 +9769,21 @@ mod tests {
             let coordinate = format!("30617:{owner_hex}:e2e-repo");
             let body = "the pipeline drops frames after reconnect";
             let enrol_id = crate::project::PROJECT_ENROL_SUB_ID.to_string();
-            let root = EventBuilder::new(
-                nostr::Kind::Custom(buzz_core::kind::KIND_GIT_ISSUE as u16),
-                body,
-            )
-            .tags([
-                nostr::Tag::parse(["a", &coordinate]).expect("a tag"),
-                nostr::Tag::parse(["p", &agent_hex]).expect("p tag"),
-            ])
-            .sign_with_keys(&owner)
-            .expect("sign");
-            deliver!(&enrol_id, &root);
+            let root = peer
+                .publish(
+                    &enrol_id,
+                    InboundSpec {
+                        signer: PeerSigner::Owner,
+                        kind: buzz_core::kind::KIND_GIT_ISSUE as u16,
+                        content: body.to_string(),
+                        tags: vec![
+                            vec!["a".to_string(), coordinate.clone()],
+                            vec!["p".to_string(), agent_hex.clone()],
+                        ],
+                    },
+                )
+                .await;
+            deliver!(&enrol_id, root);
 
             let route_key = match drive_all!() {
                 crate::ProjectDispatched::Queued { key, queued, .. } => {
@@ -9600,32 +9793,36 @@ mod tests {
                 other => panic!("expected a queued turn, got {other:?}"),
             };
 
-            let seen = readable_frames(&mut server).await;
+            let seen = readable_frames(&mut server_rx).await;
             assert_eq!(seen.len(), 1, "the first watched REQ, no CLOSE: {seen:?}");
             assert_eq!(seen[0][0], "REQ");
             assert_eq!(seen[0][1], crate::project::watched_sub_id(0));
             assert_eq!(
                 req_root_set(&seen[0]),
-                vec![root.id.to_hex()],
+                vec![root.to_hex()],
                 "generation 0 must watch exactly the one enrolled root: \
                  {seen:?}"
             );
 
             // ── 4. a second root replaces the watch and retires generation 0 ─
-            let second = EventBuilder::new(
-                nostr::Kind::Custom(buzz_core::kind::KIND_GIT_ISSUE as u16),
-                "a second issue on the same repository",
-            )
-            .tags([
-                nostr::Tag::parse(["a", &coordinate]).expect("a tag"),
-                nostr::Tag::parse(["p", &agent_hex]).expect("p tag"),
-            ])
-            .sign_with_keys(&owner)
-            .expect("sign");
-            deliver!(&enrol_id, &second);
+            let second = peer
+                .publish(
+                    &enrol_id,
+                    InboundSpec {
+                        signer: PeerSigner::Owner,
+                        kind: buzz_core::kind::KIND_GIT_ISSUE as u16,
+                        content: "a second issue on the same repository".to_string(),
+                        tags: vec![
+                            vec!["a".to_string(), coordinate.clone()],
+                            vec!["p".to_string(), agent_hex.clone()],
+                        ],
+                    },
+                )
+                .await;
+            deliver!(&enrol_id, second);
             drive_all!();
 
-            let seen = readable_frames(&mut server).await;
+            let seen = readable_frames(&mut server_rx).await;
             assert_eq!(
                 seen.len(),
                 2,
@@ -9643,7 +9840,7 @@ mod tests {
             // check while silently dropping the watch on everything enrolled
             // before it — the agent would stop hearing about the first root
             // and nothing on the wire would say so.
-            let mut expected_roots = vec![root.id.to_hex(), second.id.to_hex()];
+            let mut expected_roots = vec![root.to_hex(), second.to_hex()];
             expected_roots.sort();
             assert_eq!(
                 req_root_set(&seen[0]),
@@ -9676,10 +9873,12 @@ mod tests {
                     ResubscribeResult::Ok
                 ));
             }
-            // The dead socket's peer goes with it; everything after this reads
-            // the replacement.
-            server = replacement_server;
-            let replayed = readable_frames(&mut server).await;
+            // The dead socket's write half goes with it; everything after this
+            // reads the replacement, and the peer writes to it.
+            let (replacement_sink, replacement_rx) = replacement_server.split();
+            peer.rebind(replacement_sink).await;
+            server_rx = replacement_rx;
+            let replayed = readable_frames(&mut server_rx).await;
             let replayed_ids: Vec<String> = replayed
                 .iter()
                 .filter(|f| f[0] == "REQ")
@@ -9734,17 +9933,21 @@ mod tests {
             // the one the prompt assertions read.
             let batch = queue.flush_next().expect("the queued turn flushes");
 
-            let comment = EventBuilder::new(
-                nostr::Kind::Custom(buzz_core::kind::KIND_TEXT_NOTE as u16),
-                "any progress on this?",
-            )
-            .tags([
-                nostr::Tag::parse(["a", &coordinate]).expect("a tag"),
-                nostr::Tag::parse(["e", &root.id.to_hex()]).expect("e tag"),
-            ])
-            .sign_with_keys(&owner)
-            .expect("sign");
-            deliver!(&crate::project::watched_sub_id(1), &comment);
+            let comment = peer
+                .publish(
+                    &crate::project::watched_sub_id(1),
+                    InboundSpec {
+                        signer: PeerSigner::Owner,
+                        kind: buzz_core::kind::KIND_TEXT_NOTE as u16,
+                        content: "any progress on this?".to_string(),
+                        tags: vec![
+                            vec!["a".to_string(), coordinate.clone()],
+                            vec!["e".to_string(), root.to_hex()],
+                        ],
+                    },
+                )
+                .await;
+            deliver!(&crate::project::watched_sub_id(1), comment);
             match drive_all!() {
                 crate::ProjectDispatched::Queued { key, queued, .. } => {
                     assert!(queued, "the comment must enter the queue");
@@ -9769,7 +9972,7 @@ mod tests {
                 .expect("the flushed batch carries its project origin");
             assert_eq!(
                 (origin.coordinate(), origin.root(), origin.is_pull_request()),
-                (coordinate.as_str(), root.id.to_hex().as_str(), false),
+                (coordinate.as_str(), root.to_hex().as_str(), false),
                 "the origin must name the repository and root that produced it"
             );
 
@@ -10084,7 +10287,7 @@ for line in sys.stdin:
                 .collect();
 
             assert!(text.contains(&coordinate), "no repository coordinate");
-            assert!(text.contains(&root.id.to_hex()), "no root event id");
+            assert!(text.contains(&root.to_hex()), "no root event id");
             assert!(text.contains("issue"), "no issue/PR classification");
             assert!(text.contains("buzz issues comment"), "no reply command");
             assert!(
@@ -10143,7 +10346,7 @@ for line in sys.stdin:
                     "--repo-id".to_string(),
                     "e2e-repo".to_string(),
                     "--root".to_string(),
-                    root.id.to_hex(),
+                    root.to_hex(),
                     "--to".to_string(),
                     owner_hex.clone(),
                     "--content".to_string(),
@@ -10296,7 +10499,7 @@ for line in sys.stdin:
             );
             assert_eq!(
                 values_of("e"),
-                vec![root.id.to_hex()],
+                vec![root.to_hex()],
                 "the comment is not attached to the root that woke the agent"
             );
             assert_eq!(

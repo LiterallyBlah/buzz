@@ -1584,10 +1584,19 @@ mod requests {
         /// So the fail-closed regression can show the owner recovers once the
         /// ambiguity is gone. A registry that refused forever afterwards would
         /// also pass an assertion that it refused once.
+        ///
+        /// **`intent` only, deliberately.** This used to remove from `live` as
+        /// well. Nothing needed it — the generations it undoes are seeded by
+        /// [`Self::force_watched_intent`], which never installs anything live,
+        /// so the removal was a no-op in every caller. What it cost was the one
+        /// property that makes these hooks safe to keep: with it, a test-only
+        /// entry point could retire installed truth, which is exactly the
+        /// authority the contract says the registry alone may hold. Together
+        /// the two seeders can now write corrupt *intent* and nothing else,
+        /// which is all the fail-closed proofs need and all they may have.
         #[cfg(test)]
         pub(crate) fn clear_watched_intent(&mut self, generation: u64) {
             self.intent.remove(&super::watched_sub_id(generation));
-            self.live.remove(&super::watched_sub_id(generation));
         }
 
         /// Test hook: start the allocators near their ceilings.
