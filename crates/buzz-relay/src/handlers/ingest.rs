@@ -28,8 +28,8 @@ use buzz_core::kind::{
     KIND_NIP29_EDIT_METADATA, KIND_NIP29_JOIN_REQUEST, KIND_NIP29_LEAVE_REQUEST,
     KIND_NIP29_PUT_USER, KIND_NIP29_REMOVE_USER, KIND_NIP43_LEAVE_REQUEST,
     KIND_NIP65_RELAY_LIST_METADATA, KIND_PERSONA, KIND_PIN_LIST, KIND_PRESENCE_UPDATE,
-    KIND_PRODUCT_FEEDBACK, KIND_PROFILE, KIND_REACTION, KIND_READ_STATE, KIND_REPORT,
-    KIND_STREAM_MESSAGE, KIND_STREAM_MESSAGE_BOOKMARKED, KIND_STREAM_MESSAGE_DIFF,
+    KIND_PRODUCT_FEEDBACK, KIND_PROFILE, KIND_PROJECT_ACTIVITY, KIND_REACTION, KIND_READ_STATE,
+    KIND_REPORT, KIND_STREAM_MESSAGE, KIND_STREAM_MESSAGE_BOOKMARKED, KIND_STREAM_MESSAGE_DIFF,
     KIND_STREAM_MESSAGE_EDIT, KIND_STREAM_MESSAGE_PINNED, KIND_STREAM_MESSAGE_SCHEDULED,
     KIND_STREAM_MESSAGE_V2, KIND_STREAM_REMINDER, KIND_TEAM, KIND_TEAM_CATALOG, KIND_TEXT_NOTE,
     KIND_USER_STATUS, KIND_WORKFLOW_DEF, KIND_WORKFLOW_TRIGGER, RELAY_ADMIN_ADD_MEMBER,
@@ -309,12 +309,86 @@ fn required_scope_for_kind(kind: u32, event: &Event) -> Result<Scope, &'static s
         | KIND_GIT_STATUS_MERGED
         | KIND_GIT_STATUS_CLOSED
         | KIND_GIT_STATUS_DRAFT => Ok(Scope::MessagesWrite),
+        // NIP-PA: ephemeral agent activity on a project root. Ordinary
+        // message-write scope, the same as the typing indicator it is the
+        // project-routed counterpart of — it says only what anyone who can read
+        // the issue can already see. It is *routed* as an ephemeral event, not
+        // stored; see the fan-out branch in `ingest_event_inner`.
+        KIND_PROJECT_ACTIVITY => Ok(Scope::MessagesWrite),
+        // NIP-PC: a peer call and its correlated result. Ordinary agent message
+        // writes — the envelope carries its own authority (derived call id,
+        // verified caller/callee, hop and visited controls), and this gate only
+        // proves the transport may submit message writes at all.
+        //
+        // Both are stored rather than ephemeral, and must be: `buzz agents
+        // call` runs in a separate process from the runtime that has to learn
+        // its call is outstanding, so the relay's copy is the only place that
+        // knowledge exists.
+        k if k == buzz_core::peer_call::KIND_PEER_CALL
+            || k == buzz_core::peer_call::KIND_PEER_CALL_RESULT =>
+        {
+            Ok(Scope::MessagesWrite)
+        }
         // Command kinds — DM management, workflows, approvals
         KIND_DM_OPEN | KIND_DM_ADD_MEMBER | KIND_DM_HIDE => Ok(Scope::MessagesWrite),
         KIND_WORKFLOW_DEF | KIND_WORKFLOW_TRIGGER => Ok(Scope::MessagesWrite),
         KIND_APPROVAL_GRANT | KIND_APPROVAL_DENY => Ok(Scope::MessagesWrite),
         _ => Err("restricted: unknown event kind"),
     }
+}
+
+/// Publish an ephemeral event to subscribers without storing it.
+///
+/// The HTTP counterpart of the channel-less branch in
+/// `handlers::event::handle_ephemeral_event`, and deliberately the same shape:
+/// mark the id local so the Redis subscriber loop does not deliver it twice,
+/// publish for other relay nodes, then fan out to local subscribers.
+///
+/// A channel tag is honoured if one is present, membership check and all. No
+/// current ephemeral kind routed here carries one — an issue is not a channel —
+/// but the two transports must not disagree about what an `h` means, and
+/// "unreachable today" is a poor reason for a private channel's ephemeral
+/// traffic to escape its membership gate tomorrow.
+async fn publish_ephemeral_event(
+    state: &Arc<AppState>,
+    tenant: &TenantContext,
+    event: Event,
+    event_id_hex: String,
+) -> Result<IngestResult, IngestError> {
+    let channel_id = extract_channel_id(&event);
+    if let Some(ch_id) = channel_id {
+        if let Err(msg) =
+            check_channel_membership(tenant, state, ch_id, event.pubkey.as_bytes(), None).await
+        {
+            return Err(IngestError::AuthFailed(msg));
+        }
+    }
+
+    state.mark_local_event(tenant.community(), &event.id);
+    let topic = match channel_id {
+        Some(ch_id) => buzz_pubsub::EventTopic::Channel(ch_id),
+        None => buzz_pubsub::EventTopic::Global,
+    };
+    if let Err(e) = state.pubsub.publish_event(tenant, topic, &event).await {
+        // Best effort, and it says so: the local fan-out below still runs, so
+        // subscribers on this node see the frame even when the cross-node
+        // publish fails. Releasing the local mark keeps a later redelivery from
+        // being suppressed as a duplicate of a delivery that never happened.
+        state
+            .local_event_ids
+            .invalidate(&(tenant.community(), event.id.to_bytes()));
+        warn!(event_id = %event_id_hex, "ephemeral publish failed: {e}");
+    }
+
+    let stored_event = buzz_core::event::StoredEvent::new(event, channel_id);
+    super::event::fan_out_event_to_local_subscribers(state, tenant.community(), &stored_event)
+        .await;
+
+    Ok(IngestResult {
+        event_id: event_id_hex,
+        accepted: true,
+        message: String::new(),
+    })
 }
 
 /// Extract a channel UUID from the `"h"` NIP-29 group tag.
@@ -1738,6 +1812,22 @@ async fn ingest_event_inner(
         }
     }
 
+    // NIP-PA activity is ephemeral (20000–29999): fanned out, never stored.
+    //
+    // The WebSocket path diverts *every* ephemeral kind before it reaches
+    // ingest (`handlers/event.rs`), so nothing downstream of here has ever had
+    // to consider one. Admitting kind 20003 to the scope map alone would have
+    // let it fall through to `insert_event_with_thread_metadata` and persist a
+    // frame whose whole contract is that it expires — a "working" indicator
+    // that outlives its turn by the lifetime of the database.
+    //
+    // Placed after the ban and timeout gate rather than beside the report and
+    // feedback branches above: those are deliberately exempt so a timed-out
+    // member can still report abuse, and an activity signal has no such claim.
+    if kind_u32 == KIND_PROJECT_ACTIVITY {
+        return publish_ephemeral_event(state, tenant, event, event_id_hex).await;
+    }
+
     let mut channel_id = if kind_u32 == KIND_REACTION {
         match derive_reaction_channel(tenant.community(), &state.db, &event).await {
             ReactionChannelResult::Channel(ch_id) => Some(ch_id),
@@ -2621,8 +2711,8 @@ mod tests {
     use buzz_conformance::{TraceStep, Tracer};
     use buzz_core::kind::{
         KIND_CANVAS, KIND_FORUM_COMMENT, KIND_FORUM_POST, KIND_FORUM_VOTE, KIND_LONG_FORM,
-        KIND_MANAGED_AGENT, KIND_PERSONA, KIND_PRESENCE_UPDATE, KIND_STREAM_MESSAGE,
-        KIND_STREAM_MESSAGE_DIFF, KIND_TEAM, KIND_USER_STATUS,
+        KIND_MANAGED_AGENT, KIND_PERSONA, KIND_PRESENCE_UPDATE, KIND_PROJECT_ACTIVITY,
+        KIND_STREAM_MESSAGE, KIND_STREAM_MESSAGE_DIFF, KIND_TEAM, KIND_USER_STATUS,
     };
     use nostr::{EventBuilder, Kind};
 
@@ -2926,9 +3016,86 @@ mod tests {
         }
     }
 
+    /// Being ephemeral is not by itself a reason to be outside the allowlist —
+    /// it decides how a kind is *routed*, not whether it may be submitted.
+    ///
+    /// Presence stays out because it is WebSocket-only (the HTTP path refuses
+    /// it explicitly, above). NIP-PA activity is in, because the `buzz` CLI
+    /// publishes it over HTTP like every other agent write, and is diverted to
+    /// fan-out before storage rather than being kept out of ingest entirely.
     #[test]
-    fn ephemeral_kinds_not_in_scope_allowlist() {
+    fn ephemeral_presence_stays_out_of_the_scope_allowlist() {
         assert!(required_scope_for_kind(KIND_PRESENCE_UPDATE, &make_dummy_event()).is_err());
+    }
+
+    /// The three kinds the accepted clients publish and the relay refused.
+    ///
+    /// Each failed as `restricted: unknown event kind` — a 400 that reads like
+    /// a malformed request, so the CLI could not tell "I sent something wrong"
+    /// from "this relay does not implement the protocol you are speaking".
+    /// Pinned by kind number as well as by constant: the numbers are the
+    /// protocol, and a constant that silently moved would take the ingress
+    /// admission with it while this test kept passing.
+    #[test]
+    fn project_and_peer_call_kinds_are_admitted_as_message_writes() {
+        let dummy = make_dummy_event();
+        for (kind, label) in [
+            (KIND_PROJECT_ACTIVITY, "NIP-PA project activity"),
+            (buzz_core::peer_call::KIND_PEER_CALL, "NIP-PC call"),
+            (
+                buzz_core::peer_call::KIND_PEER_CALL_RESULT,
+                "NIP-PC call result",
+            ),
+        ] {
+            assert_eq!(
+                required_scope_for_kind(kind, &dummy)
+                    .unwrap_or_else(|e| panic!("{label} (kind {kind}) is refused at ingress: {e}")),
+                Scope::MessagesWrite,
+                "{label} is an ordinary agent message write"
+            );
+        }
+        assert_eq!(KIND_PROJECT_ACTIVITY, 20003);
+        assert_eq!(buzz_core::peer_call::KIND_PEER_CALL, 43001);
+        assert_eq!(buzz_core::peer_call::KIND_PEER_CALL_RESULT, 43004);
+    }
+
+    /// Admitting three kinds is not opening the door.
+    ///
+    /// The neighbours are chosen deliberately: 20004 and 43002/43003/43005/43006
+    /// sit immediately beside the admitted kinds, so a range check written where
+    /// an equality check belongs would let them through.
+    #[test]
+    fn neighbouring_and_unknown_kinds_are_still_refused() {
+        let dummy = make_dummy_event();
+        for kind in [20004u32, 20999, 43002, 43003, 43005, 43006, 44999, 61234] {
+            assert_eq!(
+                required_scope_for_kind(kind, &dummy),
+                Err("restricted: unknown event kind"),
+                "kind {kind} must stay refused"
+            );
+        }
+    }
+
+    /// Why one of the three is diverted and the other two are not.
+    ///
+    /// An activity frame is ephemeral, so storing it would outlive the turn it
+    /// describes. A call and its result are not: `buzz agents call` runs in a
+    /// different process from the runtime that must learn its call is
+    /// outstanding, so the relay's stored copy is the only place that fact
+    /// exists. If either answer flipped, the divert in `ingest_event_inner`
+    /// would be routing the wrong kinds.
+    #[test]
+    fn only_the_activity_kind_is_ephemeral() {
+        assert!(
+            buzz_core::kind::is_ephemeral(KIND_PROJECT_ACTIVITY),
+            "activity is diverted to fan-out because it is ephemeral"
+        );
+        assert!(!buzz_core::kind::is_ephemeral(
+            buzz_core::peer_call::KIND_PEER_CALL
+        ));
+        assert!(!buzz_core::kind::is_ephemeral(
+            buzz_core::peer_call::KIND_PEER_CALL_RESULT
+        ));
     }
 
     #[test]
