@@ -1076,6 +1076,15 @@ enum ProjectSendOutcome {
     /// after a successful write, leaving nothing to undo. Durable intent
     /// survives.
     WriteFailed,
+    /// The registry refused because the durable record as a whole does not
+    /// resolve. Nothing written, nothing recorded, no incarnation burned, and
+    /// the socket is fine.
+    ///
+    /// Separate from [`Self::MetadataConflict`], which is about *this* id
+    /// belonging to another request: this one is about the record the id would
+    /// have joined, and no other project request can be opened either until it
+    /// is resolved.
+    InvariantViolation,
 }
 
 /// Two-generation dedup set with bounded memory.
@@ -1528,6 +1537,17 @@ fn apply_command_to_state(state: &mut BgState, cmd: RelayCommand) {
                     // everything.
                     warn!("refusing a project discovery subscription with no filters");
                 }
+                crate::project::IntentAdmission::InvariantViolation(violation) => {
+                    // Durable intent as a whole does not resolve, so there is
+                    // no record to add a canonical entry to. Reported at the
+                    // same level as the replacements' violation: it is a local
+                    // inconsistency, not a transport failure, and the next
+                    // connection will replay nothing until it is gone.
+                    warn!(
+                        %violation,
+                        "refusing project discovery intent — the durable record does not resolve"
+                    );
+                }
                 crate::project::IntentAdmission::Recorded
                 | crate::project::IntentAdmission::AlreadyIntended => {}
             }
@@ -1759,6 +1779,10 @@ async fn execute_connected_command(
                 ProjectSendOutcome::UnboundedFilters => true,
                 // Terminal, but not a transport failure — the socket stays.
                 ProjectSendOutcome::Exhausted => true,
+                // A local inconsistency in durable intent. The socket is fine
+                // and nothing was written; reconnecting would replay the same
+                // record and refuse again.
+                ProjectSendOutcome::InvariantViolation => true,
                 ProjectSendOutcome::WriteFailed => false,
             }
         }
@@ -3698,6 +3722,17 @@ async fn resubscribe_after_reconnect(
                      failure, original authority retained"
                 );
             }
+            ProjectSendOutcome::InvariantViolation => {
+                // Unreachable from here: `replayable` validated the whole
+                // record to mint these tokens, and nothing between that call
+                // and this one writes to it. Reported rather than ignored,
+                // because a silent arm would hide the two walks disagreeing.
+                error!(
+                    sub_id,
+                    "project resubscribe refused a token it had just validated — internal \
+                     invariant failure"
+                );
+            }
             ProjectSendOutcome::Exhausted => {
                 // Not a conflict and not a dead socket. Reporting it as either
                 // would send someone looking for a disagreement or a network
@@ -4554,6 +4589,18 @@ fn report_project_open(sub_id: &str, outcome: crate::project::OpenOutcome) -> Pr
                 "refusing a project subscription whose filters constrain nothing"
             );
             ProjectSendOutcome::UnboundedFilters
+        }
+        crate::project::OpenOutcome::InvariantViolation(violation) => {
+            // The record this request would have joined does not resolve, so
+            // the registry acted on none of it. Logged at error for the same
+            // reason `replayable`'s refusal is: no project request can be
+            // opened at all until durable intent is consistent again.
+            error!(
+                sub_id,
+                %violation,
+                "refusing a project subscription — the durable record does not resolve"
+            );
+            ProjectSendOutcome::InvariantViolation
         }
     }
 }
@@ -7285,15 +7332,34 @@ mod tests {
         state
     }
 
-    /// `record` plus durable watched intent for `generation`.
-    fn with_watched(
-        record: crate::project::DurableRecord,
-        generation: u64,
+    /// One entry of a persisted document, in the shape the loader takes them:
+    /// an id, a class and filters, and no capability of any kind.
+    type PersistedIntent = (String, crate::project::ProjectSubscription, Vec<Value>);
+
+    /// A record restored from a persisted document.
+    ///
+    /// **The only route these proofs have to a record**, and the same one
+    /// production restores its empty document through. Nothing here is a
+    /// `cfg(test)` entry point into the owner: the entries are plain data, a
+    /// restored record carries no live registration, no epoch and no
+    /// incarnation, and the registry validates the whole of it before acting on
+    /// any of it. So a document can say what production would never write, and
+    /// what it buys is a refusal.
+    fn restored(
+        entries: Vec<PersistedIntent>,
+        next_watched_generation: u64,
+        next_incarnation: u64,
     ) -> crate::project::DurableRecord {
-        record.with_intent(
-            &crate::project::watched_sub_id(generation),
+        crate::project::DurableRecord::restore(entries, next_watched_generation, next_incarnation)
+            .expect("these documents' filters are bounded")
+    }
+
+    /// A persisted watched entry for `generation`, under the id it belongs to.
+    fn watched_entry(generation: u64) -> PersistedIntent {
+        (
+            crate::project::watched_sub_id(generation),
             crate::project::ProjectSubscription::Watched { generation },
-            watched_filter(9),
+            vec![watched_filter(9)],
         )
     }
 
@@ -7578,8 +7644,7 @@ mod tests {
     async fn spent_watched_generations_refuse_rather_than_reuse() {
         let (mut ws, mut server) = test_ws_pair().await;
         // Born with the generation allocator at its last usable value.
-        let mut state =
-            state_over(crate::project::DurableRecord::empty().with_allocators(u64::MAX, 0));
+        let mut state = state_over(restored(Vec::new(), u64::MAX, 0));
 
         // The last generation this process can name installs normally.
         assert!(
@@ -7651,8 +7716,7 @@ mod tests {
         // Generations to spare, and one incarnation left. The record supplies
         // where each allocator begins and nothing else; the space is spent by
         // burning it, through the same `checked_add` production uses.
-        let mut state =
-            state_over(crate::project::DurableRecord::empty().with_allocators(0, u64::MAX));
+        let mut state = state_over(restored(Vec::new(), 0, u64::MAX));
 
         // The last authority this process can mint installs normally.
         assert!(
@@ -7752,13 +7816,7 @@ mod tests {
         // so this proves the *ambiguity* refusal rather than the provenance
         // refusal — they are different invariants and a test that could pass on
         // either proves neither.
-        let mut state = state_over(with_watched(
-            with_watched(
-                crate::project::DurableRecord::empty().with_allocators(100, 1),
-                0,
-            ),
-            99,
-        ));
+        let mut state = state_over(restored(vec![watched_entry(0), watched_entry(99)], 100, 1));
 
         // The owner refuses rather than choosing a predecessor. Choosing would
         // retire one and leave the other durable beside the successor, which is
@@ -7812,10 +7870,7 @@ mod tests {
         // burned nothing and poisoned nothing. A hook that removed 99 from the
         // registry under test would have proved the same thing about a
         // registry the hook had just written to.
-        let mut state = state_over(with_watched(
-            crate::project::DurableRecord::empty().with_allocators(100, 1),
-            0,
-        ));
+        let mut state = state_over(restored(vec![watched_entry(0)], 100, 1));
         assert!(
             submit_replacement(
                 &mut ws,
@@ -7861,10 +7916,7 @@ mod tests {
         // A generation the allocator had never issued is a different failure,
         // proved separately below; mixing the two would let this test pass on
         // the wrong refusal.
-        let mut state = state_over(with_watched(
-            crate::project::DurableRecord::empty().with_allocators(100, 0),
-            99,
-        ));
+        let mut state = state_over(restored(vec![watched_entry(99)], 100, 0));
         assert_eq!(
             state
                 .project_requests
@@ -7928,7 +7980,7 @@ mod tests {
 
         // The allocator has issued nothing at all, so 99 cannot have come
         // from it.
-        let mut state = state_over(with_watched(crate::project::DurableRecord::empty(), 99));
+        let mut state = state_over(restored(vec![watched_entry(99)], 0, 0));
 
         assert!(
             submit_replacement(
@@ -7989,10 +8041,14 @@ mod tests {
     async fn a_watched_intent_whose_id_disagrees_with_its_generation_is_refused() {
         let (mut ws, mut server) = test_ws_pair().await;
 
-        let mut state = state_over(crate::project::DurableRecord::empty().with_intent(
-            &crate::project::watched_sub_id(3),
-            crate::project::ProjectSubscription::Watched { generation: 7 },
-            watched_filter(9),
+        let mut state = state_over(restored(
+            vec![(
+                crate::project::watched_sub_id(3),
+                crate::project::ProjectSubscription::Watched { generation: 7 },
+                vec![watched_filter(9)],
+            )],
+            0,
+            0,
         ));
 
         assert!(
@@ -8038,10 +8094,10 @@ mod tests {
             ),
         ] {
             let (mut ws, mut server) = test_ws_pair().await;
-            let mut state = state_over(crate::project::DurableRecord::empty().with_intent(
-                &id,
-                class.clone(),
-                watched_filter(9),
+            let mut state = state_over(restored(
+                vec![(id.clone(), class.clone(), vec![watched_filter(9)])],
+                0,
+                0,
             ));
 
             // Both replacements refuse: durable intent is one record, and a
@@ -8085,10 +8141,14 @@ mod tests {
             crate::project::PROJECT_ENROL_SUB_ID.to_string(),
         ] {
             let (mut ws, mut server) = test_ws_pair().await;
-            let mut state = state_over(crate::project::DurableRecord::empty().with_intent(
-                &id,
-                crate::project::ProjectSubscription::Discovery,
-                watched_filter(9),
+            let mut state = state_over(restored(
+                vec![(
+                    id.clone(),
+                    crate::project::ProjectSubscription::Discovery,
+                    vec![watched_filter(9)],
+                )],
+                0,
+                0,
             ));
 
             for replacement in [
@@ -8135,13 +8195,17 @@ mod tests {
             "proj-anything".to_string(),
         ] {
             let (mut ws, mut server) = test_ws_pair().await;
-            let mut state = state_over(crate::project::DurableRecord::empty().with_intent(
-                &id,
-                crate::project::ProjectSubscription::RootCatchUp {
-                    root: root.clone(),
-                    stream: crate::project::HistoryStream::Comments,
-                },
-                watched_filter(9),
+            let mut state = state_over(restored(
+                vec![(
+                    id.clone(),
+                    crate::project::ProjectSubscription::RootCatchUp {
+                        root: root.clone(),
+                        stream: crate::project::HistoryStream::Comments,
+                    },
+                    vec![watched_filter(9)],
+                )],
+                0,
+                0,
             ));
 
             assert!(
@@ -8207,14 +8271,19 @@ mod tests {
         ];
 
         for (why, id, class) in intruders {
-            let canonical = crate::project::DurableRecord::empty().with_intent(
-                &crate::project::discovery_sub_id(),
-                crate::project::ProjectSubscription::Discovery,
-                watched_filter(9),
-            );
+            let canonical = || {
+                (
+                    crate::project::discovery_sub_id(),
+                    crate::project::ProjectSubscription::Discovery,
+                    vec![watched_filter(9)],
+                )
+            };
 
-            let mut poisoned =
-                state_over(canonical.clone().with_intent(&id, class, watched_filter(8)));
+            let mut poisoned = state_over(restored(
+                vec![canonical(), (id.clone(), class, vec![watched_filter(8)])],
+                0,
+                0,
+            ));
             assert!(
                 poisoned.project_requests.replayable().is_err(),
                 "{why}: the record must not resolve"
@@ -8241,7 +8310,7 @@ mod tests {
 
             // The positive control, over the same canonical entry: with the
             // intruder gone, this connection does replay.
-            let mut clean = state_over(canonical);
+            let mut clean = state_over(restored(vec![canonical()], 0, 0));
             let (ws, mut server) = test_ws_pair().await;
             assert!(matches!(
                 reconnect_onto(&mut clean, ws).await,
@@ -8253,6 +8322,173 @@ mod tests {
                 "{why}: the canonical entry on its own is replayed"
             );
         }
+    }
+
+    /// **Stamping the canonical id does not make the record it joins
+    /// canonical.**
+    ///
+    /// The shipped defect, and the narrowest one in this family. Recording
+    /// discovery intent derives its own id and class, so the *entry* it writes
+    /// is always canonical — and that read as safety. It is not: the check that
+    /// followed asked only whether the canonical id was vacant. Over a record
+    /// already holding a discovery class under a foreign id it was, so a second
+    /// discovery entry was written beside the first and the command reported
+    /// `Recorded`. The record went from one violation to two, on the way to a
+    /// reconnect that would replay neither.
+    ///
+    /// Driven through `apply_command_to_state`, which is the disconnected
+    /// command path in production, rather than through the registry method it
+    /// calls.
+    #[tokio::test]
+    async fn discovery_intent_is_refused_into_a_record_that_does_not_resolve() {
+        let intruder = || {
+            (
+                "proj-discovery-elsewhere".to_string(),
+                crate::project::ProjectSubscription::Discovery,
+                vec![watched_filter(9)],
+            )
+        };
+
+        let mut poisoned = state_over(restored(vec![intruder()], 0, 0));
+        apply_command_to_state(
+            &mut poisoned,
+            RelayCommand::SubscribeProjectDiscovery {
+                filters: discovery_filters(),
+            },
+        );
+        assert!(
+            poisoned
+                .project_requests
+                .intent(&crate::project::discovery_sub_id())
+                .is_none(),
+            "nothing may be recorded under the canonical id"
+        );
+        assert_eq!(
+            poisoned.project_requests.intent_len(),
+            1,
+            "and the record is exactly as it was — refusal is not repair"
+        );
+
+        // The positive control, over the same command: with the intruder gone
+        // the entry is recorded, so the refusal above is about the record and
+        // not about the command.
+        let mut clean = BgState::new();
+        apply_command_to_state(
+            &mut clean,
+            RelayCommand::SubscribeProjectDiscovery {
+                filters: discovery_filters(),
+            },
+        );
+        assert!(
+            intent_asks(
+                &clean,
+                &crate::project::discovery_sub_id(),
+                &discovery_filters()
+            ),
+            "the canonical record takes the same entry"
+        );
+    }
+
+    /// **A record that does not resolve opens nothing on a live socket.**
+    ///
+    /// The connected half of the refusal above. `open_discovery` stamps its own
+    /// id and class too, and went on to write a REQ and install a registration
+    /// over a record no replacement or replay could resolve — bytes on the wire
+    /// carrying authority derived from a record the owner had already decided
+    /// it could not read.
+    #[tokio::test]
+    async fn a_record_that_does_not_resolve_opens_no_project_request() {
+        let (mut ws, mut server) = test_ws_pair().await;
+        let mut state = state_over(restored(
+            vec![(
+                crate::project::watched_sub_id(3),
+                crate::project::ProjectSubscription::Watched { generation: 7 },
+                vec![watched_filter(9)],
+            )],
+            8,
+            0,
+        ));
+
+        assert!(
+            matches!(
+                send_project_discovery(&mut ws, &mut state, discovery_filters()).await,
+                ProjectSendOutcome::InvariantViolation
+            ),
+            "the record does not resolve, so no request may be opened"
+        );
+        let frames = drain_test_frames(&mut server).await;
+        assert!(frames.is_empty(), "nothing may be written: {frames:?}");
+        assert_eq!(
+            state.project_requests.live_len(),
+            0,
+            "and nothing may be registered"
+        );
+        assert!(
+            state
+                .project_requests
+                .intent(&crate::project::discovery_sub_id())
+                .is_none(),
+            "and nothing recorded"
+        );
+    }
+
+    /// **A refused page burns no incarnation.**
+    ///
+    /// A catch-up's wire id carries the incarnation it was minted under, so the
+    /// allocator's position is readable off the socket — which makes "the
+    /// refusal consumed nothing" an assertion about bytes rather than about an
+    /// accessor. The refused attempt below happens first; the page that follows
+    /// it, over the same document minus the intruder, still takes incarnation
+    /// zero.
+    #[tokio::test]
+    async fn a_page_over_a_record_that_does_not_resolve_burns_no_incarnation() {
+        use crate::project::HistoryStream;
+
+        let root = test_root_id();
+        let cursor =
+            || crate::project::HistoryCursor::new(&root, HistoryStream::Comments, 1_000, 4, 1_000);
+        let intruder = || {
+            (
+                crate::project::PROJECT_ENROL_SUB_ID.to_string(),
+                crate::project::ProjectSubscription::Discovery,
+                vec![watched_filter(9)],
+            )
+        };
+
+        let (mut ws, mut server) = test_ws_pair().await;
+        let mut poisoned = state_over(restored(vec![intruder()], 0, 0));
+        assert!(
+            matches!(
+                poisoned
+                    .project_requests
+                    .open_history_page(&mut ws, cursor().begin_request())
+                    .await,
+                crate::project::PageOpen::InvariantViolation(_)
+            ),
+            "a page may not be opened over a record that does not resolve"
+        );
+        let frames = drain_test_frames(&mut server).await;
+        assert!(frames.is_empty(), "nothing may be written: {frames:?}");
+
+        // The same document without the intruder, at the same allocator
+        // position: the first page this process opens still names incarnation
+        // zero, so the refusal above took nothing with it.
+        let (mut ws, mut server) = test_ws_pair().await;
+        let mut clean = state_over(restored(Vec::new(), 0, 0));
+        let page = match clean
+            .project_requests
+            .open_history_page(&mut ws, cursor().begin_request())
+            .await
+        {
+            crate::project::PageOpen::Opened(page) => page,
+            other => panic!("a resolvable record must open a page: {other:?}"),
+        };
+        assert!(
+            page.sub_id().ends_with("-0"),
+            "the first page must still be minted under incarnation zero: {}",
+            page.sub_id()
+        );
+        let _ = drain_test_frames(&mut server).await;
     }
 
     /// **The outcomes that decide before allocation spend nothing — proved at
@@ -8274,8 +8510,7 @@ mod tests {
         // Born one below the ceiling, so the install below takes the
         // second-to-last generation and exactly one remains for the final
         // attempt to prove is still there.
-        let mut state =
-            state_over(crate::project::DurableRecord::empty().with_allocators(u64::MAX - 1, 0));
+        let mut state = state_over(restored(Vec::new(), u64::MAX - 1, 0));
 
         // One generation installed, and exactly one left unallocated.
         assert!(
@@ -8351,17 +8586,16 @@ mod tests {
     /// burned the last generation, the second half would have nothing to take.
     #[tokio::test]
     async fn an_invariant_violation_spends_no_generation() {
-        let ceiling = || {
-            with_watched(
-                crate::project::DurableRecord::empty().with_allocators(u64::MAX, 1),
-                0,
-            )
+        let ceiling = |extra: Vec<PersistedIntent>| {
+            let mut entries = vec![watched_entry(0)];
+            entries.extend(extra);
+            restored(entries, u64::MAX, 1)
         };
 
         // Two watched intents, both issued by this allocator, so the refusal is
         // the ambiguity one and not provenance.
         let (mut ws, mut server) = test_ws_pair().await;
-        let mut state = state_over(with_watched(ceiling(), 99));
+        let mut state = state_over(ceiling(vec![watched_entry(99)]));
         assert!(
             submit_replacement(
                 &mut ws,
@@ -8380,7 +8614,7 @@ mod tests {
 
         // The same record without the intruder still has the last generation.
         let (mut ws, mut server) = test_ws_pair().await;
-        let mut state = state_over(ceiling());
+        let mut state = state_over(ceiling(Vec::new()));
         assert!(
             submit_replacement(
                 &mut ws,
@@ -8928,8 +9162,7 @@ mod tests {
         let (mut ws, mut server) = test_ws_pair().await;
         // Born with one incarnation left; the burner below spends it, through
         // the same `checked_add` production uses.
-        let mut state =
-            state_over(crate::project::DurableRecord::empty().with_allocators(0, u64::MAX));
+        let mut state = state_over(restored(Vec::new(), 0, u64::MAX));
         let agent = nostr::Keys::generate().public_key().to_hex();
         let sub_id = crate::project::discovery_sub_id();
 

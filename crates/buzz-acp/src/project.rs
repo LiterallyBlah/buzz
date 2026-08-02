@@ -651,6 +651,10 @@ mod requests {
         Exhausted,
         /// The write failed. Nothing installed; the burned token stays burned.
         WriteFailed(String),
+        /// The durable record does not resolve, so this registry acted on
+        /// nothing: no intent, no incarnation, no registration, no byte. Carries
+        /// the violation [`super::DurableRecord::derive_current`] reported.
+        InvariantViolation(String),
     }
 
     /// A capability naming exactly one registration.
@@ -768,6 +772,10 @@ mod requests {
         /// and a decision made outside the owner is a decision a second caller
         /// can make differently.
         UnboundedFilters,
+        /// The durable record does not resolve. Nothing recorded, nothing
+        /// written, no incarnation burned — the refusal is decided before the
+        /// preflight, so this id's own state is not even consulted.
+        InvariantViolation(String),
     }
 
     /// One request a registry intends and would re-ask for on a connection.
@@ -874,6 +882,10 @@ mod requests {
         /// intent replays verbatim, so an unbounded filter admitted here is a
         /// REQ for everything on the relay written by the next connection.
         UnboundedFilters,
+        /// The durable record does not resolve, so nothing was recorded into
+        /// it. Stamping a canonical id makes one entry canonical; it cannot make
+        /// the record it would join resolvable.
+        InvariantViolation(String),
     }
 
     /// Proof that the relay reported end-of-stored-events for a request this
@@ -1091,15 +1103,20 @@ mod requests {
     ///
     /// That is why the fail-closed proofs live against it. They need a record
     /// production cannot produce — two watched intents, a class under the wrong
-    /// id, a generation this allocator never issued — and until now they
-    /// reached into the registry through test-only mutators to plant one. Five
-    /// entry points able to install, remove or renumber durable truth on a
-    /// registry that had already installed things is authority outside the
-    /// owner, whatever it is called, and it made "the registry is the sole
-    /// producer of installed-current truth" true only modulo `cfg(test)`. A
-    /// record is now composed before a registry exists and handed to
-    /// [`ProjectRequests::over`] at birth, so nothing can alter a registry in
-    /// flight and the owner carries no test-only entry point at all.
+    /// id, a generation this allocator never issued — and they reach one
+    /// through [`Self::restore`], the same loader production restores its empty
+    /// document through. There is no `cfg(test)` route in: the two builders
+    /// that used to be here composed durable intent for the real owner out of
+    /// an id and a class a test chose, which is the shape that made "the
+    /// registry is the sole producer of installed-current truth" true only
+    /// modulo `cfg(test)`, and before them five mutators could install, remove
+    /// or renumber durable truth on a registry that had already installed
+    /// things.
+    ///
+    /// A restored record is **not** trusted for having been restored. It is a
+    /// document from outside this process, so the owner validates the whole of
+    /// it before every operation that could act on it, and a record that fails
+    /// buys the caller nothing at all — see [`Self::derive_current`].
     #[derive(Debug, Default, Clone)]
     pub(crate) struct DurableRecord {
         /// Local policy. It outlives connections, and only local action removes
@@ -1137,8 +1154,65 @@ mod requests {
     impl DurableRecord {
         /// What a registry starts life over in production: nothing recorded,
         /// both allocators at zero.
+        ///
+        /// Restored like any other document, through the one entry below,
+        /// rather than assembled beside it — the empty document is a document.
+        /// `unwrap_or_default` rather than an `expect`: a restore with no entry
+        /// to refuse cannot fail, and if it ever did, the value it would have
+        /// returned is this one.
         pub(crate) fn empty() -> Self {
-            Self::default()
+            Self::restore(Vec::new(), 0, 0).unwrap_or_default()
+        }
+
+        /// Restore a record this process did not write.
+        ///
+        /// **The canonical loader, and the only way a non-empty record
+        /// exists.** Durable intent outlives a connection, so something has to
+        /// be able to present a record that was composed elsewhere — a
+        /// persisted document, or a proof about one. What that something must
+        /// never be is a door into a registry that has already installed
+        /// things: the five mutators this replaced could install, remove or
+        /// renumber durable truth behind a live registry, and the two builders
+        /// after them could still hand the real owner an entry no production
+        /// operation would have written.
+        ///
+        /// So the entries arrive as plain data — an id, a class, filters —
+        /// carrying no live registration, no epoch, no incarnation and no
+        /// authority, and a restored record is *not* trusted for being
+        /// restored. It is exactly as suspect as a file on disk, and every
+        /// operation that could mutate intent, allocate an identity, install or
+        /// retire authority, replay, or write bytes validates the whole of it
+        /// first and refuses it whole — see [`Self::derive_current`] and the
+        /// callers listed there.
+        ///
+        /// The one thing refused *here* is a filter that constrains nothing:
+        /// [`ProjectRequestIdentity`] has a single fallible constructor by
+        /// design, an entry it cannot express is an entry this record cannot
+        /// hold, and a document containing one is refused entire rather than
+        /// silently shortened.
+        pub(crate) fn restore(
+            entries: Vec<(String, super::ProjectSubscription, Vec<Value>)>,
+            next_watched_generation: u64,
+            next_incarnation: u64,
+        ) -> Result<Self, String> {
+            let mut intent = HashMap::with_capacity(entries.len());
+            for (sub_id, subscription, filters) in entries {
+                let Some(identity) = ProjectRequestIdentity::from_filters(subscription, filters)
+                else {
+                    return Err(format!(
+                        "persisted intent under id {sub_id} carries filters that constrain \
+                         nothing; a record holding one is not restored"
+                    ));
+                };
+                intent.insert(sub_id, identity);
+            }
+            Ok(Self {
+                intent,
+                next_incarnation,
+                incarnations_exhausted: false,
+                next_watched_generation,
+                watched_generations_exhausted: false,
+            })
         }
 
         /// Read the whole of current project state out of durable intent, or
@@ -1188,10 +1262,39 @@ mod requests {
         /// only class that can appear twice is watched, under two different
         /// generations, and that is the count below.
         ///
-        /// Nothing here mutates and nothing here writes. A record that fails is
-        /// a record whose registry refuses to emit bytes, retire a predecessor,
-        /// burn a generation or replay — see [`ProjectRequests::replayable`],
-        /// which asks this same question before it hands anything back.
+        /// Nothing here mutates and nothing here writes.
+        ///
+        /// **Asked before every operation that could act on the record, not
+        /// merely before the two replacements.** A record that fails is a
+        /// record whose registry records no intent, allocates no identity,
+        /// installs and retires no authority, replays nothing and writes no
+        /// byte — and does all of that having changed nothing, because the
+        /// question is asked before the first mutation rather than beside it.
+        /// The gate is [`ProjectRequests::checked_current`]; its callers are
+        /// [`ProjectRequests::record_discovery_intent`],
+        /// [`ProjectRequests::open_request`] (so `open_discovery` and
+        /// `open_replayed`), [`ProjectRequests::open_history_page`],
+        /// [`ProjectRequests::current_watched`] and
+        /// [`ProjectRequests::enrolment_current`] (so both replacements and
+        /// both offline halves), and [`ProjectRequests::replayable`].
+        /// [`ProjectRequests::replace_request`] is the one writer that does not
+        /// ask again: it is private, and the predecessor id it takes can only
+        /// have been derived from one of these walks.
+        ///
+        /// An earlier revision gated only the replacements and replay, which
+        /// read as coverage: `record_discovery_intent` walked a record holding
+        /// a discovery class under a foreign id, found the canonical id vacant,
+        /// and wrote a second discovery entry into it — reconciling corruption
+        /// by adding to it.
+        ///
+        /// What is deliberately **not** gated is the pair that only gives
+        /// authority up: [`ProjectRequests::refuse_live`] and
+        /// [`ProjectRequests::witness_end_of_stored_events`] remove a live
+        /// registration this connection installed while the record was still
+        /// valid. Refusing to honour a relay's `CLOSED` because durable intent
+        /// is inconsistent would leave that registration admitting frames the
+        /// relay has already refused, which is the fail-*open* direction. They
+        /// touch no durable state, allocate nothing and write nothing.
         fn derive_current(&self) -> Result<CurrentIntent, String> {
             let mut watched: Vec<(&str, u64)> = Vec::new();
             let mut enrolment = false;
@@ -1291,40 +1394,6 @@ mod requests {
                 }
             }
         }
-
-        /// Record an intent under an id and a class the caller chooses.
-        ///
-        /// The id and the class are taken separately on purpose. Every
-        /// invariant [`Self::derive_current`] enforces is a way for those two
-        /// to disagree, and a builder that derived one from the other could not
-        /// express the disagreement — so the refusals would be unprovable and
-        /// the checks would be decoration.
-        #[cfg(test)]
-        pub(crate) fn with_intent(
-            mut self,
-            sub_id: &str,
-            subscription: super::ProjectSubscription,
-            filter: Value,
-        ) -> Self {
-            let identity = ProjectRequestIdentity::new(subscription, filter)
-                .expect("a composed record's filter must be bounded");
-            self.intent.insert(sub_id.to_string(), identity);
-            self
-        }
-
-        /// Start the allocators at `next_watched` and `next_incarnation`.
-        ///
-        /// Says only where allocation *begins*. It installs no generation,
-        /// mints no authority and registers nothing live — exhaustion still has
-        /// to be reached by burning, through the same `checked_add` production
-        /// uses. There is no state here a caller could not reach by allocating
-        /// enough times, only a way to reach it in one step.
-        #[cfg(test)]
-        pub(crate) fn with_allocators(mut self, next_watched: u64, next_incarnation: u64) -> Self {
-            self.next_watched_generation = next_watched;
-            self.next_incarnation = next_incarnation;
-            self
-        }
     }
 
     impl ProjectRequests {
@@ -1348,6 +1417,22 @@ mod requests {
             }
         }
 
+        /// The whole durable record, validated, before this registry acts on
+        /// it.
+        ///
+        /// **One gate, one rule, one walk.** Every operation that could mutate
+        /// intent, allocate an identity, install or retire authority, replay or
+        /// write bytes begins here and returns the violation unchanged if the
+        /// record does not resolve — so a refusal is decided before any of
+        /// those have happened rather than partway through them. The
+        /// `CurrentIntent` it hands back is the same walk's answer, so an
+        /// operation that also needs to know the current watched generation or
+        /// whether enrolment is installed reads it from here instead of walking
+        /// the record a second time.
+        fn checked_current(&self) -> Result<CurrentIntent, String> {
+            self.record.derive_current()
+        }
+
         /// Record the discovery subscription's durable intent, with no socket.
         ///
         /// **The semantic entry point.** The caller submits what it wants
@@ -1355,7 +1440,15 @@ mod requests {
         /// A caller that supplied them could record a discovery class under any
         /// key it liked — an entry no replacement would ever retire, replayed
         /// verbatim by the next connection.
+        ///
+        /// The record is validated first. Stamping the canonical id is what
+        /// makes *this* entry canonical; it says nothing about the record the
+        /// entry would join, and a second discovery entry recorded beside a
+        /// foreign one is a record no replacement can resolve afterwards.
         pub(crate) fn record_discovery_intent(&mut self, filters: Vec<Value>) -> IntentAdmission {
+            if let Err(violation) = self.checked_current() {
+                return IntentAdmission::InvariantViolation(violation);
+            }
             let Some(identity) =
                 ProjectRequestIdentity::from_filters(ProjectSubscription::Discovery, filters)
             else {
@@ -1580,6 +1673,12 @@ mod requests {
             sink: &mut S,
             collector: HistoryPageCollector,
         ) -> PageOpen {
+            // The whole record first: a page burns an incarnation, writes a REQ
+            // and installs a registration, and none of the three may happen
+            // over a record this registry cannot resolve.
+            if let Err(violation) = self.checked_current() {
+                return PageOpen::InvariantViolation(violation);
+            }
             // Rows that arrived before this registration existed cannot belong
             // to it. Without this a collector could be filled first and
             // laundered into the registration opened afterwards.
@@ -1724,7 +1823,7 @@ mod requests {
         /// the successor, which is the defect this whole design removes — so
         /// the caller is told the registry cannot answer, and installs nothing.
         pub(crate) fn current_watched(&self) -> Result<Option<u64>, String> {
-            self.record.derive_current().map(|current| current.watched)
+            self.checked_current().map(|current| current.watched)
         }
 
         /// Whether an enrolment request's durable intent is current.
@@ -1733,9 +1832,7 @@ mod requests {
         /// same rule: the id is fixed, so the question is whether *that* id
         /// holds enrolment intent — not whether a boolean somewhere was set.
         fn enrolment_current(&self) -> Result<bool, String> {
-            self.record
-                .derive_current()
-                .map(|current| current.enrolment)
+            self.checked_current().map(|current| current.enrolment)
         }
 
         /// Replace the watched-roots subscription with one carrying `filters`.
@@ -1913,7 +2010,12 @@ mod requests {
         /// Unlike [`Self::record_intent`] this is permitted to overwrite, for
         /// the same reason replacement may and opening may not. It writes no
         /// live registration, so nothing becomes answerable here.
-        pub(crate) fn replace_intent(
+        ///
+        /// Private, for the reason [`Self::record_intent`] is: it takes the id
+        /// and the identity already paired, and the only things allowed to pair
+        /// them are the two offline halves above — which validate the whole
+        /// record before they do.
+        fn replace_intent(
             &mut self,
             predecessor: Option<&str>,
             sub_id: &str,
@@ -1950,7 +2052,17 @@ mod requests {
         /// the same id as `sub_id`, the relay's own REQ-replacement semantics
         /// do the retiring and no CLOSE is sent — a CLOSE there would retire
         /// the successor that just replaced it.
-        pub(crate) async fn replace_request<S: ProjectReqSink>(
+        ///
+        /// **Private, and validated by its argument rather than by a check of
+        /// its own.** `predecessor` is the id this replacement retires, and the
+        /// only thing that can derive it is a walk of the whole record —
+        /// [`Self::current_watched`] for a watched generation,
+        /// [`Self::enrolment_current`] for the fixed enrolment id. So a caller
+        /// that has an argument to pass has already validated the record, and a
+        /// caller that has not cannot call this at all. A second walk here
+        /// would re-ask a question its own parameter is the answer to, and an
+        /// arm no caller can reach is an arm no proof can hold to account.
+        async fn replace_request<S: ProjectReqSink>(
             &mut self,
             sink: &mut S,
             predecessor: Option<&str>,
@@ -2110,6 +2222,16 @@ mod requests {
             sub_id: &str,
             identity: ProjectRequestIdentity,
         ) -> OpenOutcome {
+            // ---- The whole record, before the preflight. --------------------
+            //
+            // Opening records intent, writes a REQ and burns an incarnation.
+            // `open_replayed` arrives from a record `replayable` has just
+            // validated, but `open_discovery` does not, and neither may act on
+            // a record that no longer resolves.
+            if let Err(violation) = self.checked_current() {
+                return OpenOutcome::InvariantViolation(violation);
+            }
+
             // ---- Preflight. Nothing enters `live`. -------------------------
             //
             // An async operation has three exits, not two: `Ok`, `Err`, and
@@ -2212,7 +2334,7 @@ mod requests {
         /// connection has had its suspensions cleared, so everything intended
         /// is offered once.
         pub(crate) fn replayable(&self) -> Result<Vec<ReplayableRequest>, String> {
-            self.record.derive_current()?;
+            self.checked_current()?;
             let mut out: Vec<ReplayableRequest> = self
                 .record
                 .intent
@@ -6966,8 +7088,9 @@ mod tests {
         // reach honestly, which is not a test anyone can run. The allocator
         // position is all the record supplies — nothing here is installed,
         // registered or minted.
-        let mut requests =
-            ProjectRequests::over(DurableRecord::empty().with_allocators(0, u64::MAX));
+        let mut requests = ProjectRequests::over(
+            DurableRecord::restore(Vec::new(), 0, u64::MAX).expect("an empty document restores"),
+        );
         let sub_id = discovery_sub_id();
         assert!(matches!(
             open_discovery_on_test_socket(&mut requests, discovery_filters()).await,
@@ -7013,8 +7136,9 @@ mod tests {
     async fn exhaustion_does_not_disturb_requests_already_live() {
         // Refusing new registrations must not retroactively invalidate one that
         // was legitimately opened before the space ran out.
-        let mut requests =
-            ProjectRequests::over(DurableRecord::empty().with_allocators(0, u64::MAX));
+        let mut requests = ProjectRequests::over(
+            DurableRecord::restore(Vec::new(), 0, u64::MAX).expect("an empty document restores"),
+        );
         let discovery = discovery_sub_id();
         let watched = watched_sub_id(0);
 
@@ -7557,6 +7681,32 @@ mod tests {
             assert!(
                 requests.match_frame(&watched_sub_id(0)).is_some(),
                 "four refusals must not have burned a generation: {unbounded:?}"
+            );
+
+            // And the loader, which is the fifth route in: a persisted
+            // document holding one of these is refused *entire*, so there is
+            // no record for a registry to be born over and nothing is
+            // silently shortened to the entries that were readable.
+            let violation = DurableRecord::restore(
+                vec![
+                    (
+                        discovery_sub_id(),
+                        ProjectSubscription::Discovery,
+                        unbounded.clone(),
+                    ),
+                    (
+                        PROJECT_ENROL_SUB_ID.to_string(),
+                        ProjectSubscription::Enrolment,
+                        watched_filters_for(&[ROOT]),
+                    ),
+                ],
+                0,
+                0,
+            )
+            .expect_err("a document holding an unbounded filter must not restore");
+            assert!(
+                violation.contains(&discovery_sub_id()),
+                "the refusal must name the entry it refused: {violation}"
             );
         }
     }
