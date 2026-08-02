@@ -1599,6 +1599,32 @@ pub(crate) fn discovery_sub_id() -> String {
     format!("{PROJECT_SUB_ID_PREFIX}discovery")
 }
 
+/// The startup discovery subscription, or `None` when project routing is off.
+///
+/// This is the entirety of what `project_routing_enabled` gates. Discovery is
+/// the one project subscription that depends on no prior state, and every other
+/// project REQ derives its filter from what discovery finds: with discovery
+/// closed the discovered set stays empty, so enrolment has nothing to widen to
+/// and no root is ever watched. The flag therefore needs exactly one check, and
+/// a second one would only be somewhere for the two to disagree.
+///
+/// It exists as a function so the decision is reachable from a test. Reading
+/// the flag inline at the call site left it provable only by running the whole
+/// startup path, and the control test that stood in for it exercised
+/// [`project_req_frames`] — which no production code calls.
+pub(crate) fn discovery_subscription(
+    enabled: bool,
+) -> Option<(String, ProjectSubscription, Vec<serde_json::Value>)> {
+    if !enabled {
+        return None;
+    }
+    Some((
+        discovery_sub_id(),
+        ProjectSubscription::Discovery,
+        vec![serde_json::json!({ "kinds": [buzz_core::kind::KIND_GIT_REPO_ANNOUNCEMENT] })],
+    ))
+}
+
 pub(crate) fn watched_sub_id(generation: u64) -> String {
     format!("{PROJECT_SUB_ID_PREFIX}roots-{generation}")
 }

@@ -1369,20 +1369,17 @@ async fn tokio_main() -> Result<()> {
     // The class passed here is what every inbound frame on this id will be
     // classified as; the id's spelling carries no authority. Registration
     // happens in lockstep with the write inside the relay task.
-    if config.project_routing_enabled {
-        let sub_id = project::discovery_sub_id();
-        let filters =
-            vec![serde_json::json!({ "kinds": [buzz_core::kind::KIND_GIT_REPO_ANNOUNCEMENT] })];
-        if let Err(e) = relay
-            .subscribe_project(&sub_id, project::ProjectSubscription::Discovery, filters)
-            .await
-        {
-            tracing::warn!("repository discovery subscribe error: {e}");
-        } else {
-            tracing::info!(sub_id, "subscribed to repository announcements");
+    match project::discovery_subscription(config.project_routing_enabled) {
+        Some((sub_id, class, filters)) => {
+            if let Err(e) = relay.subscribe_project(&sub_id, class, filters).await {
+                tracing::warn!("repository discovery subscribe error: {e}");
+            } else {
+                tracing::info!(sub_id, "subscribed to repository announcements");
+            }
         }
-    } else {
-        tracing::debug!("project routing disabled — no project subscriptions opened");
+        None => {
+            tracing::debug!("project routing disabled — no project subscriptions opened");
+        }
     }
 
     let presence_publisher = relay.event_publisher();

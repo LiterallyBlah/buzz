@@ -8805,7 +8805,59 @@ for line in sys.stdin:
         .expect("the end-to-end scenario must not hang");
     }
 
-    /// The flag-off control: no project REQ bytes at all.
+    /// The flag-off control, through the harness the scenario uses.
+    ///
+    /// The same socket and the same production write path as
+    /// [`phase_a_end_to_end_relay_bytes_reach_the_agents_stdin`], driven from
+    /// the decision production actually makes. With the flag off nothing is
+    /// written, and because every other project REQ derives its filter from
+    /// discovery state, nothing downstream has anything to fire on — no
+    /// announcement arrives, so no repository is discovered, so no root is
+    /// enrolled or watched.
+    ///
+    /// The asymmetry is the point: a control that writes no bytes because the
+    /// harness never asked it to would pass against a flag that gates nothing.
+    #[tokio::test]
+    async fn the_flag_off_control_writes_no_bytes_where_the_flag_on_control_writes_a_req() {
+        let (mut client, mut server) = test_ws_pair().await;
+        let mut state = BgState::new();
+
+        assert!(
+            crate::project::discovery_subscription(false).is_none(),
+            "the flag-off decision must be to open nothing"
+        );
+        assert!(
+            readable_frames(&mut server).await.is_empty(),
+            "a disabled harness put bytes on the socket before anything asked it to"
+        );
+
+        let (sub_id, class, filters) = crate::project::discovery_subscription(true)
+            .expect("the flag-on decision must be to open discovery");
+        // `from_filters` refuses a filter that constrains nothing, so this also
+        // says the production discovery filter is a bounded request rather than
+        // a subscription to the whole relay.
+        let identity = crate::project::ProjectRequestIdentity::from_filters(class, filters)
+            .expect("the production discovery filter must constrain events");
+        assert_eq!(
+            send_project_subscribe(&mut client, &mut state, &sub_id, identity).await,
+            ProjectSendOutcome::Sent
+        );
+
+        let seen = readable_frames(&mut server).await;
+        assert_eq!(
+            seen.len(),
+            1,
+            "the flag on writes exactly one REQ: {seen:?}"
+        );
+        assert_eq!(seen[0][0], "REQ");
+        assert_eq!(
+            seen[0][1],
+            crate::project::discovery_sub_id(),
+            "the flag-on control opens something other than discovery"
+        );
+    }
+
+    /// The frame-level flag check.
     #[test]
     fn the_flag_off_control_writes_no_project_req_bytes() {
         let discovered = crate::project::DiscoveredRepositories::for_test(std::iter::once(
