@@ -2,7 +2,11 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  allowedActorsForProjectIssue,
+  allowedActorsForRoot,
   buildGitIssueTags,
+  buildGitStatusTags,
+  nextProjectIssueStatusCreatedAt,
   eventToProjectIssue,
   getAllTags,
   getTag,
@@ -138,4 +142,163 @@ test("builds repository-scoped issue creation tags", () => {
       ["subject", "Fix the broken workflow"],
     ],
   );
+});
+
+// ── Phase 4: mention picker and issue status controls ────────────────────────
+
+test("selected mentions become p tags on the issue", () => {
+  const first = "1".repeat(64);
+  const second = "2".repeat(64);
+  const tags = buildGitIssueTags({
+    repoAddress: REPO_ADDRESS,
+    repoOwner: OWNER,
+    title: "Needs eyes",
+    recipients: [first.toUpperCase(), second],
+  });
+
+  assert.deepEqual(tags, [
+    ["a", REPO_ADDRESS],
+    ["p", OWNER],
+    ["subject", "Needs eyes"],
+    ["p", first],
+    ["p", second],
+  ]);
+});
+
+test("creating an issue with no mentions is byte-for-byte what it was", () => {
+  // The regression that matters most: the picker is optional, and an issue
+  // created without touching it must produce the previous event exactly.
+  const base = {
+    repoAddress: REPO_ADDRESS,
+    repoOwner: OWNER,
+    title: "Fix the broken workflow",
+  };
+  assert.deepEqual(buildGitIssueTags(base), [
+    ["a", REPO_ADDRESS],
+    ["p", OWNER],
+    ["subject", "Fix the broken workflow"],
+  ]);
+  assert.deepEqual(buildGitIssueTags({ ...base, recipients: [] }), [
+    ["a", REPO_ADDRESS],
+    ["p", OWNER],
+    ["subject", "Fix the broken workflow"],
+  ]);
+});
+
+test("mentioning the repo owner does not tag them twice", () => {
+  // A duplicate `p` notifies once and reads as two participants everywhere the
+  // tag list is rendered.
+  const tags = buildGitIssueTags({
+    repoAddress: REPO_ADDRESS,
+    repoOwner: OWNER,
+    title: "Hello",
+    recipients: [OWNER.toUpperCase(), OWNER],
+  });
+  assert.equal(tags.filter((tag) => tag[0] === "p").length, 1);
+});
+
+test("a malformed mention is refused rather than published", () => {
+  assert.throws(() =>
+    buildGitIssueTags({
+      repoAddress: REPO_ADDRESS,
+      repoOwner: OWNER,
+      title: "Hello",
+      recipients: ["not-a-pubkey"],
+    }),
+  );
+});
+
+test("issue status tags bind the exact root, repo, owner and author", () => {
+  const issueId = "a".repeat(64);
+  const author = "b".repeat(64);
+  assert.deepEqual(
+    buildGitStatusTags({
+      issueId,
+      repoAddress: REPO_ADDRESS,
+      repoOwner: OWNER,
+      issueAuthor: author,
+    }),
+    [
+      ["e", issueId, "", "root"],
+      ["a", REPO_ADDRESS],
+      ["p", OWNER],
+      ["p", author],
+    ],
+  );
+});
+
+test("an issue authored by the repo owner is not p-tagged twice", () => {
+  const issueId = "a".repeat(64);
+  const tags = buildGitStatusTags({
+    issueId,
+    repoAddress: REPO_ADDRESS,
+    repoOwner: OWNER,
+    issueAuthor: OWNER.toUpperCase(),
+  });
+  assert.equal(tags.filter((tag) => tag[0] === "p").length, 1);
+});
+
+test("a status change from the author or repo owner moves the issue", () => {
+  // The reader's own rule, exercised end to end: a published 1631 from a
+  // trusted actor must be what the panel then shows.
+  const root = {
+    id: "a".repeat(64),
+    kind: 1621,
+    pubkey: AUTHOR,
+    created_at: 100,
+    content: "body",
+    tags: [
+      ["a", REPO_ADDRESS],
+      ["subject", "Broken"],
+    ],
+  };
+  const resolved = {
+    id: "c".repeat(64),
+    kind: 1631,
+    pubkey: AUTHOR,
+    created_at: 200,
+    content: "",
+    tags: [["e", root.id, "", "root"]],
+  };
+
+  assert.equal(eventToProjectIssue(root, [], []).status, "Backlog");
+  const done = eventToProjectIssue(root, [resolved], []);
+  assert.equal(done.status, "Done");
+  assert.equal(done.statusCreatedAt, 200);
+
+  // And the same event from anybody else changes nothing, which is why the
+  // control is only offered to the two trusted pubkeys.
+  const impostor = { ...resolved, id: "d".repeat(64), pubkey: ATTACKER };
+  assert.equal(eventToProjectIssue(root, [impostor], []).status, "Backlog");
+});
+
+test("two status changes in one second stay ordered", () => {
+  // `latestStatusForIssue` sorts by created_at, so without the bump the second
+  // change resolves by tie-break rather than by what the person last did.
+  const issue = { statusCreatedAt: 500 };
+  assert.equal(nextProjectIssueStatusCreatedAt(issue, 500), 501);
+  assert.equal(nextProjectIssueStatusCreatedAt(issue, 900), 900);
+  assert.equal(
+    nextProjectIssueStatusCreatedAt({ statusCreatedAt: null }, 42),
+    42,
+  );
+});
+
+test("the lifecycle actors rule has one implementation", () => {
+  const root = {
+    id: "a".repeat(64),
+    kind: 1621,
+    pubkey: AUTHOR,
+    created_at: 1,
+    content: "",
+    tags: [["a", REPO_ADDRESS]],
+  };
+  const issue = eventToProjectIssue(root, [], []);
+  assert.deepEqual(
+    [...allowedActorsForProjectIssue(issue)].sort(),
+    [...allowedActorsForRoot(root)].sort(),
+  );
+  assert.ok(allowedActorsForProjectIssue(issue).has(AUTHOR.toLowerCase()));
+  assert.ok(allowedActorsForProjectIssue(issue).has(OWNER.toLowerCase()));
+  assert.ok(!allowedActorsForProjectIssue(issue).has(ATTACKER.toLowerCase()));
 });

@@ -28,6 +28,7 @@ export type ProjectIssue = {
   recipients: string[];
   status: ProjectIssueStatus;
   statusEventId: string | null;
+  statusCreatedAt: number | null;
   updatedAt: number;
   comments: ProjectIssueComment[];
 };
@@ -41,6 +42,8 @@ export const PROJECT_ISSUE_STATUS: {
   CLOSED: "Closed";
 };
 
+export function allowedActorsForRoot(rootEvent: RelayEvent): Set<string>;
+export function allowedActorsForProjectIssue(issue: ProjectIssue): Set<string>;
 export function getTag(event: RelayEvent, name: string): string | undefined;
 export function getAllTags(event: RelayEvent, name: string): string[];
 export function getImetaTags(event: RelayEvent): string[][];
@@ -59,9 +62,15 @@ export function buildGitIssueTags(input: {
   repoOwner: string;
   title: string;
   labels?: string[];
+  recipients?: string[];
 }): string[][];
 export function buildGitStatusTags(input: {
   issueId: string;
   repoAddress?: string | null;
   repoOwner?: string | null;
+  issueAuthor?: string | null;
 }): string[][];
+export function nextProjectIssueStatusCreatedAt(
+  issue: ProjectIssue,
+  now: number,
+): number;

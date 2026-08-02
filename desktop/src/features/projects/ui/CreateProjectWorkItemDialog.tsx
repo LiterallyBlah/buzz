@@ -15,6 +15,16 @@ const FIELD_CONTROL_CLASS =
 export type CreateProjectWorkItemDialogInput = {
   title: string;
   body: string;
+  /**
+   * Pubkeys the caller collected alongside the form, when it renders a
+   * picker into `children`.
+   *
+   * Carried through here rather than left for the caller to close over,
+   * because the submit that reads the title and body is this component's —
+   * two sources for one submission is how the recipients silently stop
+   * arriving the day the form gains another field.
+   */
+  recipients?: string[];
 };
 
 export function CreateProjectWorkItemDialog({
@@ -26,6 +36,7 @@ export function CreateProjectWorkItemDialog({
   onCreate,
   onOpenChange,
   open,
+  recipients,
   submitDisabled = false,
   title,
   titlePlaceholder,
@@ -38,6 +49,7 @@ export function CreateProjectWorkItemDialog({
   onCreate: (input: CreateProjectWorkItemDialogInput) => Promise<void>;
   onOpenChange: (open: boolean) => void;
   open: boolean;
+  recipients?: string[];
   submitDisabled?: boolean;
   title: string;
   titlePlaceholder: string;
@@ -70,7 +82,11 @@ export function CreateProjectWorkItemDialog({
     submitInFlightRef.current = true;
     setErrorMessage(null);
     try {
-      await onCreate({ title: trimmedTitle, body: body.trim() });
+      await onCreate({
+        title: trimmedTitle,
+        body: body.trim(),
+        recipients,
+      });
       onOpenChange(false);
     } catch (error) {
       setErrorMessage(

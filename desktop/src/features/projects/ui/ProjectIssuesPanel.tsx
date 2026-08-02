@@ -10,6 +10,19 @@ import {
   useProjectIssuesQuery,
 } from "@/features/projects/hooks";
 import {
+  type ProjectIssueLifecycleStatus,
+  useUpdateProjectIssueStatusMutation,
+} from "@/features/projects/issueMutations";
+import { allowedActorsForProjectIssue } from "@/features/projects/projectIssues.mjs";
+import { useIdentityQuery } from "@/shared/api/hooks";
+import { Button } from "@/shared/ui/button";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@/shared/ui/dropdown-menu";
+import {
   resolveUserLabel,
   type UserProfileLookup,
 } from "@/features/profile/lib/identity";
@@ -161,6 +174,102 @@ function IssueRow({
 }
 
 /** Full issue conversation and comment composer. */
+/**
+ * The status changes offered for an issue in its current state.
+ *
+ * Only transitions that move somewhere: offering "Close" on a closed issue
+ * publishes an event that changes nothing and leaves the panel looking
+ * unresponsive.
+ */
+function issueStatusActions(
+  status: ProjectIssue["status"],
+): { label: string; status: ProjectIssueLifecycleStatus }[] {
+  const actions: { label: string; status: ProjectIssueLifecycleStatus }[] = [];
+  if (status !== "Done")
+    actions.push({ label: "Mark done", status: "resolved" });
+  if (status !== "Closed")
+    actions.push({ label: "Close issue", status: "closed" });
+  if (status === "Done" || status === "Closed") {
+    actions.push({ label: "Reopen issue", status: "open" });
+  }
+  if (status !== "Triage")
+    actions.push({ label: "Move to triage", status: "draft" });
+  return actions;
+}
+
+/**
+ * Issue status controls (V11: the desktop could change PR status and not issue
+ * status, so closing an issue was CLI-only).
+ *
+ * Shown only to the two pubkeys `allowedActorsForProjectIssue` trusts — the issue
+ * author and the repo owner. Anyone else's status event is discarded by the
+ * reader, so offering them the control would produce a published event and a
+ * panel that never changes.
+ */
+function ProjectIssueStatusControls({
+  issue,
+  project,
+}: {
+  issue: ProjectIssue;
+  project: Project;
+}) {
+  const identityQuery = useIdentityQuery();
+  const statusMutation = useUpdateProjectIssueStatusMutation(project);
+  const self = identityQuery.data?.pubkey
+    ? normalizePubkey(identityQuery.data.pubkey)
+    : null;
+  const canChangeStatus = React.useMemo(
+    () => (self ? allowedActorsForProjectIssue(issue).has(self) : false),
+    [issue, self],
+  );
+
+  const handleStatusChange = React.useCallback(
+    async (status: ProjectIssueLifecycleStatus) => {
+      try {
+        await statusMutation.mutateAsync({ issue, status });
+        toast.success("Issue status updated.");
+      } catch (error) {
+        toast.error(
+          error instanceof Error
+            ? error.message
+            : "Failed to update issue status.",
+        );
+      }
+    },
+    [issue, statusMutation],
+  );
+
+  if (!canChangeStatus) return null;
+  const actions = issueStatusActions(issue.status);
+  if (actions.length === 0) return null;
+
+  return (
+    <DropdownMenu>
+      <DropdownMenuTrigger asChild>
+        <Button
+          data-testid="project-issue-status-trigger"
+          disabled={statusMutation.isPending}
+          size="sm"
+          variant="outline"
+        >
+          {statusMutation.isPending ? "Updating…" : "Change status"}
+        </Button>
+      </DropdownMenuTrigger>
+      <DropdownMenuContent align="end">
+        {actions.map((action) => (
+          <DropdownMenuItem
+            data-testid={`project-issue-status-${action.status}`}
+            key={action.status}
+            onSelect={() => void handleStatusChange(action.status)}
+          >
+            {action.label}
+          </DropdownMenuItem>
+        ))}
+      </DropdownMenuContent>
+    </DropdownMenu>
+  );
+}
+
 export function ProjectIssueDetail({
   issue,
   profiles,
@@ -216,12 +325,15 @@ export function ProjectIssueDetail({
               <CircleDot className="h-3.5 w-3.5" />
               Issue from {authorLabel}
             </p>
-            <h3 className="mt-1 line-clamp-2 text-base font-semibold text-foreground">
-              {issue.title}{" "}
-              <span className="font-normal text-muted-foreground">
-                #{issue.id.slice(0, 8)}
-              </span>
-            </h3>
+            <div className="flex items-start justify-between gap-3">
+              <h3 className="mt-1 line-clamp-2 text-base font-semibold text-foreground">
+                {issue.title}{" "}
+                <span className="font-normal text-muted-foreground">
+                  #{issue.id.slice(0, 8)}
+                </span>
+              </h3>
+              <ProjectIssueStatusControls issue={issue} project={project} />
+            </div>
           </div>
           {issue.content ? (
             <ProjectRichContent content={issue.content} tags={issue.tags} />

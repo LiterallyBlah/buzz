@@ -583,8 +583,12 @@ export function ProjectDetailScreen(props: ProjectDetailScreenProps) {
     [goProject, projectId, pullRequestsQuery],
   );
   const handleCreateIssue = React.useCallback(
-    async ({ body, title }: CreateIssueDialogInput) => {
-      const issueId = await createIssueMutation.mutateAsync({ body, title });
+    async ({ body, recipients, title }: CreateIssueDialogInput) => {
+      const issueId = await createIssueMutation.mutateAsync({
+        body,
+        recipients,
+        title,
+      });
       toast.success("Issue created.");
       await issuesQuery.refetch();
       setSelectedIssueId(issueId);

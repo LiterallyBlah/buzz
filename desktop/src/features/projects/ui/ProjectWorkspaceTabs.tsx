@@ -504,6 +504,7 @@ export function WorkspaceTabs({
         onCreate={createIssueAction.onCreate}
         onOpenChange={setCreateIssueOpen}
         open={createIssueOpen}
+        profiles={profiles}
         projectName={project.name}
       />
     </Tabs>

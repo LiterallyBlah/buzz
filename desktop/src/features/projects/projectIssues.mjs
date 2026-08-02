@@ -38,8 +38,24 @@ function repoOwnerFromAddress(repoAddress) {
  * to the root author or a maintainer).
  */
 export function allowedActorsForRoot(rootEvent) {
-  const allowed = new Set([rootEvent.pubkey.toLowerCase()]);
-  const owner = repoOwnerFromAddress(getTag(rootEvent, "a"));
+  return lifecycleActors(rootEvent.pubkey, getTag(rootEvent, "a"));
+}
+
+/** The same rule, for a root that has already been parsed into a model. */
+export function allowedActorsForProjectIssue(issue) {
+  return lifecycleActors(issue.author, issue.repoAddress);
+}
+
+/**
+ * The one place the rule lives.
+ *
+ * Two adapters, one predicate: a UI that decided who may change a status by a
+ * second implementation would eventually offer a control whose events the
+ * reader discards — a button that publishes and changes nothing.
+ */
+function lifecycleActors(authorPubkey, repoAddress) {
+  const allowed = new Set([String(authorPubkey ?? "").toLowerCase()]);
+  const owner = repoOwnerFromAddress(repoAddress);
   if (owner) allowed.add(owner);
   return allowed;
 }
@@ -114,6 +130,7 @@ export function eventToProjectIssue(
     recipients: getAllTags(issue, "p"),
     status: statusFromEvent(issue, latestStatus),
     statusEventId: latestStatus?.id ?? null,
+    statusCreatedAt: latestStatus?.created_at ?? null,
     updatedAt:
       [
         ...comments,
@@ -139,6 +156,7 @@ export function buildGitIssueTags({
   repoOwner,
   title,
   labels = [],
+  recipients = [],
 }) {
   if (!repoAddress.startsWith("30617:")) {
     throw new Error("Issue repo address must reference a kind:30617 repo.");
@@ -165,17 +183,56 @@ export function buildGitIssueTags({
     if (trimmed) tags.push(["t", trimmed]);
   }
 
+  // Mentioned participants. The repo owner is already tagged above, so a
+  // selection that includes them adds nothing: a duplicate `p` would notify
+  // once and read as two participants everywhere the tag list is rendered.
+  const tagged = new Set([repoOwner.toLowerCase()]);
+  for (const recipient of recipients) {
+    const pubkey = String(recipient ?? "").toLowerCase();
+    if (!/^[a-f0-9]{64}$/.test(pubkey)) {
+      throw new Error("Mentioned pubkeys must be 64 hex characters.");
+    }
+    if (tagged.has(pubkey)) continue;
+    tagged.add(pubkey);
+    tags.push(["p", pubkey]);
+  }
+
   return tags;
 }
 
-export function buildGitStatusTags({ issueId, repoAddress, repoOwner }) {
+export function buildGitStatusTags({
+  issueId,
+  repoAddress,
+  repoOwner,
+  issueAuthor,
+}) {
   if (!/^[a-fA-F0-9]{64}$/.test(issueId)) {
     throw new Error("Issue ID must be 64 hex characters.");
   }
   const tags = [["e", issueId, "", "root"]];
   if (repoAddress) tags.push(["a", repoAddress]);
-  if (repoOwner && /^[a-fA-F0-9]{64}$/.test(repoOwner)) {
-    tags.push(["p", repoOwner.toLowerCase()]);
+  // Owner and author both, deduped. `allowedActorsForRoot` trusts exactly
+  // these two to change a root's lifecycle, so they are also the two people a
+  // status change is about — and an author who is not notified learns their
+  // issue was closed only by looking.
+  const tagged = new Set();
+  for (const pubkey of [repoOwner, issueAuthor]) {
+    const normalized = String(pubkey ?? "").toLowerCase();
+    if (!/^[a-f0-9]{64}$/.test(normalized) || tagged.has(normalized)) continue;
+    tagged.add(normalized);
+    tags.push(["p", normalized]);
   }
   return tags;
+}
+
+/**
+ * Keep consecutive status changes ordered across whole-second Nostr timestamps.
+ *
+ * `latestStatusForIssue` picks by `created_at` descending, so two changes in
+ * the same second resolve by sort tie-break rather than by what the person
+ * actually did last. The same guard exists for pull requests
+ * (`nextProjectPullRequestStatusCreatedAt`) for the same reason.
+ */
+export function nextProjectIssueStatusCreatedAt(issue, now) {
+  return Math.max(now, (issue.statusCreatedAt ?? 0) + 1);
 }
