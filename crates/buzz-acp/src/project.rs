@@ -117,8 +117,15 @@ pub(crate) enum ProjectReplacement {
 
 pub(crate) use requests::{
     AuthorityVerdict, CatchUpFrame, CatchUpOutcome, EndOfStoredEvents, FrameAdmission,
-    IntentAdmission, OpenOutcome, OpenedHistoryPage, ProjectRequestIdentity, ProjectRequests,
+    IntentAdmission, OpenOutcome, OpenedHistoryPage, ProjectRequests, ReplayableRequest,
 };
+
+/// Named by the fail-closed proofs, which compose the durable record a registry
+/// is born over. Production reaches it through `ProjectRequests::new` without
+/// naming it, so the export is scoped rather than allowed module-wide — a
+/// genuinely dead export still surfaces.
+#[allow(unused_imports)]
+pub(crate) use requests::DurableRecord;
 
 /// Named by the replacement wire tests today; the run loop consumes it when
 /// dispatch moves behind the narrow replacement capability. Scoped to this one
@@ -276,7 +283,7 @@ mod requests {
         ///
         /// `None` when that question constrains nothing; see
         /// [`Self::from_filters`], which this is.
-        pub(crate) fn new(subscription: ProjectSubscription, filter: Value) -> Option<Self> {
+        fn new(subscription: ProjectSubscription, filter: Value) -> Option<Self> {
             Self::from_filters(subscription, vec![filter])
         }
 
@@ -294,10 +301,18 @@ mod requests {
         /// branch refuses the request rather than silently widening it: one
         /// unbounded filter among several would admit everything through the OR
         /// regardless of how narrow its siblings were.
-        pub(crate) fn from_filters(
-            subscription: ProjectSubscription,
-            filters: Vec<Value>,
-        ) -> Option<Self> {
+        /// **Private to this module, and that is the point.** The class is
+        /// half of a request's identity; a caller able to name it is a caller
+        /// able to name a watched generation, a discovery under the enrolment
+        /// id, or a catch-up that would be recorded durably. Every route into
+        /// this type now goes through a semantic [`ProjectRequests`] operation
+        /// that stamps the class and the wire id from what the registry itself
+        /// knows — see [`ProjectRequests::open_discovery`],
+        /// [`ProjectRequests::record_discovery_intent`],
+        /// [`ProjectRequests::replace_enrolment`],
+        /// [`ProjectRequests::replace_watched`] and
+        /// [`ProjectRequests::open_history_page`].
+        fn from_filters(subscription: ProjectSubscription, filters: Vec<Value>) -> Option<Self> {
             if !bounded_filters(&filters) {
                 return None;
             }
@@ -724,7 +739,8 @@ mod requests {
         authority: Arc<RegistrationAuthority>,
     }
 
-    /// What `ProjectRequests::open_request` decided.
+    /// What [`ProjectRequests::open_discovery`] or
+    /// [`ProjectRequests::open_replayed`] decided.
     ///
     /// `Sent` means the REQ reached the socket and the registration was then
     /// installed. Nothing else in the crate can produce it: there is no
@@ -744,10 +760,39 @@ mod requests {
         /// reservation to undo. Durable intent survives, because the intent is
         /// still what we want; the write is what failed.
         WriteFailed(String),
-        /// A catch-up cannot be opened here: its wire id has to name one
-        /// transport attempt, and only [`ProjectRequests::open_history_page`]
-        /// mints those. Nothing written, nothing recorded.
-        NotOpenableHere,
+        /// The filters would not build a bounded request, so no identity was
+        /// minted. Nothing written, nothing recorded.
+        ///
+        /// The refusal belongs to the owner rather than to its caller. When the
+        /// caller built the identity it also decided this, one call earlier,
+        /// and a decision made outside the owner is a decision a second caller
+        /// can make differently.
+        UnboundedFilters,
+    }
+
+    /// One request a registry intends and would re-ask for on a connection.
+    ///
+    /// **A token, not a description.** Its fields are private to this module
+    /// and [`ProjectRequests::replayable`] is its only producer, so the only
+    /// way to hold one is to have asked a registry what *it* intends — out of
+    /// a durable record that same call has just validated end to end. The
+    /// reconnect path can therefore re-open a request without ever naming an
+    /// id, a class or a generation, which is the thing that must not be
+    /// nameable outside the owner.
+    ///
+    /// The id is readable because a log line and a retry decision need it. It
+    /// is a `&str` out of a struct nobody else can build, which grants nothing:
+    /// [`ProjectRequests::open_replayed`] consumes the token, not the string.
+    #[derive(Debug)]
+    pub(crate) struct ReplayableRequest {
+        sub_id: String,
+        identity: ProjectRequestIdentity,
+    }
+
+    impl ReplayableRequest {
+        pub(crate) fn sub_id(&self) -> &str {
+            &self.sub_id
+        }
     }
 
     /// What [`ProjectRequests::replace_request`] decided.
@@ -817,12 +862,18 @@ mod requests {
         enrolment: bool,
     }
 
-    /// What [`ProjectRequests::record_intent`] decided.
+    /// What [`ProjectRequests::record_discovery_intent`] decided.
     #[derive(Debug, PartialEq)]
     pub(crate) enum IntentAdmission {
         Recorded,
         AlreadyIntended,
-        Conflict { held: Box<ProjectRequestIdentity> },
+        Conflict {
+            held: Box<ProjectRequestIdentity>,
+        },
+        /// The filters would not build a bounded request. Nothing recorded —
+        /// intent replays verbatim, so an unbounded filter admitted here is a
+        /// REQ for everything on the relay written by the next connection.
+        UnboundedFilters,
     }
 
     /// Proof that the relay reported end-of-stored-events for a request this
@@ -1020,28 +1071,56 @@ mod requests {
     ///   request is not re-sent on the connection that refused it.
     #[derive(Debug, Default)]
     pub(crate) struct ProjectRequests {
-        intent: HashMap<String, ProjectRequestIdentity>,
+        /// Everything a reconnect replays, and the allocation that entitles it
+        /// to. See [`DurableRecord`].
+        record: DurableRecord,
         live: HashMap<String, LiveRegistration>,
         suspended: HashMap<String, String>,
         /// This registry's own allocation, stamped into every authority it
         /// mints so another registry's proofs can never be mistaken for its.
         epoch: Arc<RegistryEpoch>,
+    }
+
+    /// The durable record a registry derives its current intent from.
+    ///
+    /// **A description of persisted state, and nothing else.** It holds no live
+    /// registrations, no epoch, no connection and no way to mint an authority;
+    /// a caller holding one holds no capability [`ProjectRequests`] has. Its
+    /// only operation is [`Self::derive_current`], which reads and refuses and
+    /// changes nothing.
+    ///
+    /// That is why the fail-closed proofs live against it. They need a record
+    /// production cannot produce — two watched intents, a class under the wrong
+    /// id, a generation this allocator never issued — and until now they
+    /// reached into the registry through test-only mutators to plant one. Five
+    /// entry points able to install, remove or renumber durable truth on a
+    /// registry that had already installed things is authority outside the
+    /// owner, whatever it is called, and it made "the registry is the sole
+    /// producer of installed-current truth" true only modulo `cfg(test)`. A
+    /// record is now composed before a registry exists and handed to
+    /// [`ProjectRequests::over`] at birth, so nothing can alter a registry in
+    /// flight and the owner carries no test-only entry point at all.
+    #[derive(Debug, Default, Clone)]
+    pub(crate) struct DurableRecord {
+        /// Local policy. It outlives connections, and only local action removes
+        /// it.
+        intent: HashMap<String, ProjectRequestIdentity>,
         /// Next incarnation to hand out. Only ever increases.
         next_incarnation: u64,
         /// Set once the incarnation space is spent. Never cleared.
         ///
-        /// Deliberately survives [`Self::clear_connection`]: a reconnect must
-        /// not restore the ability to mint authority the process has already
-        /// spent.
+        /// Deliberately survives [`ProjectRequests::clear_connection`]: a
+        /// reconnect must not restore the ability to mint authority the process
+        /// has already spent.
         incarnations_exhausted: bool,
         /// Next watched generation to hand out. Only ever increases.
         ///
         /// **Allocator state, not current state.** Which generation is
         /// installed is not stored anywhere: it is read out of `intent` by
-        /// [`Self::current_watched`], because durable intent is what a
-        /// reconnect actually replays and a field beside it is a second copy
-        /// that has to be kept in agreement. Two attempts at that agreement
-        /// have failed so far — the run loop's copy, then this struct's.
+        /// [`Self::derive_current`], because durable intent is what a reconnect
+        /// actually replays and a field beside it is a second copy that has to
+        /// be kept in agreement. Two attempts at that agreement have failed so
+        /// far — the run loop's copy, then this struct's.
         ///
         /// This counter is genuinely separate: an *attempt* may burn a
         /// generation without installing one. Reusing the number after a failed
@@ -1050,21 +1129,250 @@ mod requests {
         /// exists to prevent.
         next_watched_generation: u64,
         /// Set once the watched generation space is spent. Never cleared, and
-        /// survives [`Self::clear_connection`] for the same reason
+        /// survives [`ProjectRequests::clear_connection`] for the same reason
         /// [`Self::incarnations_exhausted`] does.
         watched_generations_exhausted: bool,
     }
 
-    impl ProjectRequests {
-        pub(crate) fn new() -> Self {
+    impl DurableRecord {
+        /// What a registry starts life over in production: nothing recorded,
+        /// both allocators at zero.
+        pub(crate) fn empty() -> Self {
             Self::default()
+        }
+
+        /// Read the whole of current project state out of durable intent, or
+        /// refuse.
+        ///
+        /// **One walk, all the invariants, shared by both replacements.** An
+        /// enrolment replacement is blocked by a corrupt *watched* intent and
+        /// vice versa, which is deliberate: durable intent is one record, and a
+        /// registry willing to write into a record it has just found to be
+        /// inconsistent is a registry that reconciles corruption by ignoring
+        /// it.
+        ///
+        /// **Every entry, not merely the ones with a generation in them.** The
+        /// rule is one rule: a class has exactly one id it may be recorded
+        /// under, and an entry whose key is not that id is not a narrower
+        /// record — it is an entry this owner never wrote. An earlier revision
+        /// checked only watched and enrolment and said so in a comment, which
+        /// read as coverage while leaving `Discovery` and `RootCatchUp` to fall
+        /// through a catch-all: a discovery class under an arbitrary key passed
+        /// every replacement and was replayed verbatim onto the next
+        /// connection, and a catch-up page — which is never durable at all,
+        /// because its filter carries a bound the cursor walks past — could sit
+        /// in the record and be re-asked forever.
+        ///
+        /// The invariants, each of which is a way the id and the identity under
+        /// it can disagree:
+        ///
+        /// - discovery intent lives under [`super::discovery_sub_id`] and
+        ///   nothing else does;
+        /// - enrolment intent lives under [`super::PROJECT_ENROL_SUB_ID`] and
+        ///   nothing else does — an enrolment class under some other id would
+        ///   be replaced without ever being retired, and a foreign class under
+        ///   the enrolment id would be retired by an enrolment replacement that
+        ///   never installed it;
+        /// - a watched intent's key is `watched_sub_id(generation)` for the
+        ///   generation its own class carries — the key is what goes on the
+        ///   wire and the class is what admits inbound frames, so a pair that
+        ///   disagrees asks one question and answers another;
+        /// - a watched generation is one this registry's own allocator issued;
+        /// - at most one watched intent — more than one has no single
+        ///   predecessor, and choosing between them retires one and leaves the
+        ///   other durable beside the successor;
+        /// - a root catch-up is never durable, under any id.
+        ///
+        /// Duplicates need no separate check for the singleton classes: their
+        /// canonical id is the map key, and a map holds one value per key. The
+        /// only class that can appear twice is watched, under two different
+        /// generations, and that is the count below.
+        ///
+        /// Nothing here mutates and nothing here writes. A record that fails is
+        /// a record whose registry refuses to emit bytes, retire a predecessor,
+        /// burn a generation or replay — see [`ProjectRequests::replayable`],
+        /// which asks this same question before it hands anything back.
+        fn derive_current(&self) -> Result<CurrentIntent, String> {
+            let mut watched: Vec<(&str, u64)> = Vec::new();
+            let mut enrolment = false;
+
+            for (id, identity) in &self.intent {
+                match identity.subscription() {
+                    super::ProjectSubscription::Discovery => {
+                        let expected = super::discovery_sub_id();
+                        if id != &expected {
+                            return Err(format!(
+                                "discovery intent is held under id {id} rather than {expected}"
+                            ));
+                        }
+                    }
+                    super::ProjectSubscription::RootCatchUp { root, stream } => {
+                        // A catch-up filter carries the page bound the cursor
+                        // is currently at, and the cursor walks it backwards.
+                        // Replaying one re-asks for a page already collected,
+                        // under an id minted for a transport attempt that ended
+                        // with the connection. There is no id under which this
+                        // is a correct durable record, so the class is refused
+                        // rather than its key checked.
+                        return Err(format!(
+                            "durable intent holds a root catch-up under id {id} \
+                             (root {root}, {stream:?}); catch-up pages are re-derived from \
+                             their own cursor and are never durable"
+                        ));
+                    }
+                    super::ProjectSubscription::Watched { generation } => {
+                        let expected = super::watched_sub_id(*generation);
+                        if id != &expected {
+                            return Err(format!(
+                                "watched intent under id {id} carries generation {generation}, \
+                                 whose id is {expected}"
+                            ));
+                        }
+                        // Allocator provenance. A generation at or above the
+                        // allocator's next value was never handed out by this
+                        // registry, so durable intent is claiming an identity
+                        // the only thing entitled to mint one has no record of.
+                        // Retiring it would CLOSE an id the relay never opened
+                        // under this process; treating it as current would let
+                        // an outside writer choose the predecessor. Neither is
+                        // a reconciliation, so neither is done.
+                        //
+                        // Once the space is spent the allocator has issued
+                        // every generation including `u64::MAX`, and `next`
+                        // stops advancing — so the comparison alone would
+                        // reject the last legitimately issued generation. The
+                        // exhausted flag is what distinguishes "never reached"
+                        // from "reached and saturated".
+                        if !self.watched_generations_exhausted
+                            && *generation >= self.next_watched_generation
+                        {
+                            return Err(format!(
+                                "watched intent {id} carries generation {generation}, which this \
+                                 allocator has never issued (next is {})",
+                                self.next_watched_generation
+                            ));
+                        }
+                        watched.push((id.as_str(), *generation));
+                    }
+                    super::ProjectSubscription::Enrolment => {
+                        if id != super::PROJECT_ENROL_SUB_ID {
+                            return Err(format!(
+                                "enrolment intent is held under id {id} rather than {}",
+                                super::PROJECT_ENROL_SUB_ID
+                            ));
+                        }
+                        enrolment = true;
+                    }
+                }
+            }
+
+            match watched.len() {
+                0 => Ok(CurrentIntent {
+                    watched: None,
+                    enrolment,
+                }),
+                1 => Ok(CurrentIntent {
+                    watched: Some(watched[0].1),
+                    enrolment,
+                }),
+                _ => {
+                    // Sorted so the report is the same on every run — a
+                    // `HashMap` would otherwise name the intruder in a
+                    // different order each time and the failure would read as
+                    // flaky rather than deterministic.
+                    watched.sort_unstable();
+                    let ids: Vec<&str> = watched.iter().map(|(id, _)| *id).collect();
+                    Err(format!(
+                        "durable intent holds {} watched generations ({}); \
+                         exactly one may be current",
+                        ids.len(),
+                        ids.join(", ")
+                    ))
+                }
+            }
+        }
+
+        /// Record an intent under an id and a class the caller chooses.
+        ///
+        /// The id and the class are taken separately on purpose. Every
+        /// invariant [`Self::derive_current`] enforces is a way for those two
+        /// to disagree, and a builder that derived one from the other could not
+        /// express the disagreement — so the refusals would be unprovable and
+        /// the checks would be decoration.
+        #[cfg(test)]
+        pub(crate) fn with_intent(
+            mut self,
+            sub_id: &str,
+            subscription: super::ProjectSubscription,
+            filter: Value,
+        ) -> Self {
+            let identity = ProjectRequestIdentity::new(subscription, filter)
+                .expect("a composed record's filter must be bounded");
+            self.intent.insert(sub_id.to_string(), identity);
+            self
+        }
+
+        /// Start the allocators at `next_watched` and `next_incarnation`.
+        ///
+        /// Says only where allocation *begins*. It installs no generation,
+        /// mints no authority and registers nothing live — exhaustion still has
+        /// to be reached by burning, through the same `checked_add` production
+        /// uses. There is no state here a caller could not reach by allocating
+        /// enough times, only a way to reach it in one step.
+        #[cfg(test)]
+        pub(crate) fn with_allocators(mut self, next_watched: u64, next_incarnation: u64) -> Self {
+            self.next_watched_generation = next_watched;
+            self.next_incarnation = next_incarnation;
+            self
+        }
+    }
+
+    impl ProjectRequests {
+        /// A registry over an empty record.
+        pub(crate) fn new() -> Self {
+            Self::over(DurableRecord::empty())
+        }
+
+        /// A registry over `record`.
+        ///
+        /// Production reaches this only through [`Self::new`], because nothing
+        /// in production has a non-empty record to hand it. What a caller may
+        /// supply is durable *intent* and allocator position — never a live
+        /// registration, never an epoch, never an authority — so a registry
+        /// born over a corrupt record still has to decide what to do about it,
+        /// which is the thing being proved.
+        pub(crate) fn over(record: DurableRecord) -> Self {
+            Self {
+                record,
+                ..Self::default()
+            }
+        }
+
+        /// Record the discovery subscription's durable intent, with no socket.
+        ///
+        /// **The semantic entry point.** The caller submits what it wants
+        /// discovered; the id and the class are this registry's, stamped here.
+        /// A caller that supplied them could record a discovery class under any
+        /// key it liked — an entry no replacement would ever retire, replayed
+        /// verbatim by the next connection.
+        pub(crate) fn record_discovery_intent(&mut self, filters: Vec<Value>) -> IntentAdmission {
+            let Some(identity) =
+                ProjectRequestIdentity::from_filters(ProjectSubscription::Discovery, filters)
+            else {
+                return IntentAdmission::UnboundedFilters;
+            };
+            let sub_id = super::discovery_sub_id();
+            self.record_intent(&sub_id, identity)
         }
 
         /// Record durable intent without registering anything.
         ///
         /// For commands that arrive while disconnected. Fail-closed against
         /// both maps, since intent recorded now is replayed verbatim later.
-        pub(crate) fn record_intent(
+        ///
+        /// Private: the id and the identity arrive here already paired, and the
+        /// only things allowed to pair them are the semantic operations above.
+        fn record_intent(
             &mut self,
             sub_id: &str,
             identity: ProjectRequestIdentity,
@@ -1076,7 +1384,7 @@ mod requests {
                     };
                 }
             }
-            match self.intent.entry(sub_id.to_string()) {
+            match self.record.intent.entry(sub_id.to_string()) {
                 Entry::Vacant(slot) => {
                     slot.insert(identity);
                     IntentAdmission::Recorded
@@ -1137,7 +1445,7 @@ mod requests {
         /// `None` means nothing was live under this id — and nothing changed:
         /// no suspension recorded, no intent touched.
         ///
-        /// One method rather than `close_active` then `suspend`, because the
+        /// One method rather than a bare close then a suspend, because the
         /// invariant is "only a request we actually sent on this connection can
         /// be refused", and a two-step ceremony makes that true only for as
         /// long as every caller performs both steps, in order, against the same
@@ -1372,13 +1680,13 @@ mod requests {
         /// ancient one — in release builds only, where no debug panic could
         /// warn anyone.
         fn burn_incarnation(&mut self) -> Option<RequestIncarnation> {
-            if self.incarnations_exhausted {
+            if self.record.incarnations_exhausted {
                 return None;
             }
-            let taken = RequestIncarnation(self.next_incarnation);
-            match self.next_incarnation.checked_add(1) {
-                Some(next) => self.next_incarnation = next,
-                None => self.incarnations_exhausted = true,
+            let taken = RequestIncarnation(self.record.next_incarnation);
+            match self.record.next_incarnation.checked_add(1) {
+                Some(next) => self.record.next_incarnation = next,
+                None => self.record.incarnations_exhausted = true,
             }
             Some(taken)
         }
@@ -1390,13 +1698,13 @@ mod requests {
         /// *attempt*: a failed write consumes it and it is never handed out
         /// again, because the number may already have been seen on the wire.
         fn burn_watched_generation(&mut self) -> Option<u64> {
-            if self.watched_generations_exhausted {
+            if self.record.watched_generations_exhausted {
                 return None;
             }
-            let taken = self.next_watched_generation;
-            match self.next_watched_generation.checked_add(1) {
-                Some(next) => self.next_watched_generation = next,
-                None => self.watched_generations_exhausted = true,
+            let taken = self.record.next_watched_generation;
+            match self.record.next_watched_generation.checked_add(1) {
+                Some(next) => self.record.next_watched_generation = next,
+                None => self.record.watched_generations_exhausted = true,
             }
             Some(taken)
         }
@@ -1416,7 +1724,7 @@ mod requests {
         /// the successor, which is the defect this whole design removes — so
         /// the caller is told the registry cannot answer, and installs nothing.
         pub(crate) fn current_watched(&self) -> Result<Option<u64>, String> {
-            self.derive_current().map(|current| current.watched)
+            self.record.derive_current().map(|current| current.watched)
         }
 
         /// Whether an enrolment request's durable intent is current.
@@ -1425,196 +1733,9 @@ mod requests {
         /// same rule: the id is fixed, so the question is whether *that* id
         /// holds enrolment intent — not whether a boolean somewhere was set.
         fn enrolment_current(&self) -> Result<bool, String> {
-            self.derive_current().map(|current| current.enrolment)
-        }
-
-        /// Read the whole of current project state out of durable intent, or
-        /// refuse.
-        ///
-        /// **One walk, all the invariants, shared by both replacements.** An
-        /// enrolment replacement is blocked by a corrupt *watched* intent and
-        /// vice versa, which is deliberate: durable intent is one record, and a
-        /// registry willing to write into a record it has just found to be
-        /// inconsistent is a registry that reconciles corruption by ignoring
-        /// it.
-        ///
-        /// The invariants, each of which is a way the id and the identity under
-        /// it can disagree:
-        ///
-        /// - at most one watched intent — more than one has no single
-        ///   predecessor, and choosing between them retires one and leaves the
-        ///   other durable beside the successor;
-        /// - a watched intent's key is `watched_sub_id(generation)` for the
-        ///   generation its own class carries — the key is what goes on the
-        ///   wire and the class is what admits inbound frames, so a pair that
-        ///   disagrees asks one question and answers another;
-        /// - enrolment intent lives under [`super::PROJECT_ENROL_SUB_ID`] and
-        ///   nothing else does — an enrolment class under some other id would
-        ///   be replaced without ever being retired, and a foreign class under
-        ///   the enrolment id would be retired by an enrolment replacement that
-        ///   never installed it.
-        ///
-        /// Discovery and root catch-up are not checked here. Their ids are not
-        /// derived from a generation this owner allocates, so they are not the
-        /// disagreement this function exists to catch — saying so rather than
-        /// letting the omission read as coverage.
-        fn derive_current(&self) -> Result<CurrentIntent, String> {
-            let mut watched: Vec<(&str, u64)> = Vec::new();
-            let mut enrolment = false;
-
-            for (id, identity) in &self.intent {
-                match identity.subscription() {
-                    super::ProjectSubscription::Watched { generation } => {
-                        let expected = super::watched_sub_id(*generation);
-                        if id != &expected {
-                            return Err(format!(
-                                "watched intent under id {id} carries generation {generation}, \
-                                 whose id is {expected}"
-                            ));
-                        }
-                        // Allocator provenance. A generation at or above the
-                        // allocator's next value was never handed out by this
-                        // registry, so durable intent is claiming an identity
-                        // the only thing entitled to mint one has no record of.
-                        // Retiring it would CLOSE an id the relay never opened
-                        // under this process; treating it as current would let
-                        // an outside writer choose the predecessor. Neither is
-                        // a reconciliation, so neither is done.
-                        //
-                        // Once the space is spent the allocator has issued
-                        // every generation including `u64::MAX`, and `next`
-                        // stops advancing — so the comparison alone would
-                        // reject the last legitimately issued generation. The
-                        // exhausted flag is what distinguishes "never reached"
-                        // from "reached and saturated".
-                        if !self.watched_generations_exhausted
-                            && *generation >= self.next_watched_generation
-                        {
-                            return Err(format!(
-                                "watched intent {id} carries generation {generation}, which this \
-                                 allocator has never issued (next is {})",
-                                self.next_watched_generation
-                            ));
-                        }
-                        watched.push((id.as_str(), *generation));
-                    }
-                    super::ProjectSubscription::Enrolment => {
-                        if id != super::PROJECT_ENROL_SUB_ID {
-                            return Err(format!(
-                                "enrolment intent is held under id {id} rather than {}",
-                                super::PROJECT_ENROL_SUB_ID
-                            ));
-                        }
-                        enrolment = true;
-                    }
-                    _ => {
-                        if id == super::PROJECT_ENROL_SUB_ID {
-                            return Err(format!(
-                                "the enrolment id {id} holds a {:?} intent",
-                                identity.subscription()
-                            ));
-                        }
-                    }
-                }
-            }
-
-            match watched.len() {
-                0 => Ok(CurrentIntent {
-                    watched: None,
-                    enrolment,
-                }),
-                1 => Ok(CurrentIntent {
-                    watched: Some(watched[0].1),
-                    enrolment,
-                }),
-                _ => {
-                    // Sorted so the report is the same on every run — a
-                    // `HashMap` would otherwise name the intruder in a
-                    // different order each time and the failure would read as
-                    // flaky rather than deterministic.
-                    watched.sort_unstable();
-                    let ids: Vec<&str> = watched.iter().map(|(id, _)| *id).collect();
-                    Err(format!(
-                        "durable intent holds {} watched generations ({}); \
-                         exactly one may be current",
-                        ids.len(),
-                        ids.join(", ")
-                    ))
-                }
-            }
-        }
-
-        /// Test hook: install a watched intent outside the semantic owner.
-        ///
-        /// The only way to reach the state a generic subscribe command used to
-        /// make reachable in production. It exists so the fail-closed
-        /// derivation can be proved to fail closed; production has no route to
-        /// it, which is the point of the regression that uses it.
-        #[cfg(test)]
-        pub(crate) fn force_watched_intent(&mut self, generation: u64, filter: Value) {
-            self.force_intent(
-                &super::watched_sub_id(generation),
-                super::ProjectSubscription::Watched { generation },
-                filter,
-            );
-        }
-
-        /// Test hook: install intent under an arbitrary id and class.
-        ///
-        /// The id and the class are taken separately on purpose. Every
-        /// invariant [`Self::derive_current`] enforces is a way for those two to
-        /// disagree, and a hook that derived one from the other could not
-        /// express the disagreement — so the refusals would be unprovable and
-        /// the checks would be decoration.
-        #[cfg(test)]
-        pub(crate) fn force_intent(
-            &mut self,
-            sub_id: &str,
-            subscription: super::ProjectSubscription,
-            filter: Value,
-        ) {
-            let identity = ProjectRequestIdentity::new(subscription, filter)
-                .expect("test intent filter must be bounded");
-            self.intent.insert(sub_id.to_string(), identity);
-        }
-
-        /// Test hook: remove a watched intent, undoing
-        /// [`Self::force_watched_intent`].
-        ///
-        /// So the fail-closed regression can show the owner recovers once the
-        /// ambiguity is gone. A registry that refused forever afterwards would
-        /// also pass an assertion that it refused once.
-        ///
-        /// **`intent` only, deliberately.** This used to remove from `live` as
-        /// well. Nothing needed it — the generations it undoes are seeded by
-        /// [`Self::force_watched_intent`], which never installs anything live,
-        /// so the removal was a no-op in every caller. What it cost was the one
-        /// property that makes these hooks safe to keep: with it, a test-only
-        /// entry point could retire installed truth, which is exactly the
-        /// authority the contract says the registry alone may hold. Together
-        /// the two seeders can now write corrupt *intent* and nothing else,
-        /// which is all the fail-closed proofs need and all they may have.
-        #[cfg(test)]
-        pub(crate) fn clear_watched_intent(&mut self, generation: u64) {
-            self.intent.remove(&super::watched_sub_id(generation));
-        }
-
-        /// Test hook: start the allocators near their ceilings.
-        ///
-        /// Sets only where allocation *begins*. It cannot install a generation,
-        /// mint an authority or register anything live — exhaustion still has
-        /// to be reached by burning, through the same `checked_add` production
-        /// uses. That distinction is why this is not the "ceremony is not
-        /// provenance" lever: there is no state here a caller could not reach
-        /// by allocating enough times, only a way to reach it in one step.
-        #[cfg(test)]
-        pub(crate) fn seed_allocators_for_exhaustion(
-            &mut self,
-            next_watched: u64,
-            next_incarnation: u64,
-        ) {
-            self.next_watched_generation = next_watched;
-            self.next_incarnation = next_incarnation;
+            self.record
+                .derive_current()
+                .map(|current| current.enrolment)
         }
 
         /// Replace the watched-roots subscription with one carrying `filters`.
@@ -1683,7 +1804,8 @@ mod requests {
         /// intent verbatim, so intent that already asks this is intent the next
         /// connection will install unchanged.
         fn intent_asks_exactly(&self, sub_id: &str, filters: &[Value]) -> bool {
-            self.intent
+            self.record
+                .intent
                 .get(sub_id)
                 .is_some_and(|held| held.filters().eq(filters.iter()))
         }
@@ -1797,10 +1919,10 @@ mod requests {
             sub_id: &str,
             identity: ProjectRequestIdentity,
         ) {
-            self.intent.insert(sub_id.to_string(), identity);
+            self.record.intent.insert(sub_id.to_string(), identity);
             if let Some(prior) = predecessor {
                 if prior != sub_id {
-                    self.intent.remove(prior);
+                    self.record.intent.remove(prior);
                     self.live.remove(prior);
                     self.suspended.remove(prior);
                 }
@@ -1842,7 +1964,7 @@ mod requests {
             {
                 return ReplaceOutcome::Unchanged;
             }
-            if self.incarnations_exhausted {
+            if self.record.incarnations_exhausted {
                 return ReplaceOutcome::RequestIncarnationExhausted;
             }
 
@@ -1856,15 +1978,18 @@ mod requests {
             // because the intent is still what we want. The difference is that
             // here it may *overwrite* a predecessor's intent under the same id,
             // so the prior value is kept to be put back if the write fails.
-            let displaced = self.intent.insert(sub_id.to_string(), identity.clone());
+            let displaced = self
+                .record
+                .intent
+                .insert(sub_id.to_string(), identity.clone());
 
             if let Err(e) = sink.write_project_req(text).await {
                 match displaced {
                     Some(prior) => {
-                        self.intent.insert(sub_id.to_string(), prior);
+                        self.record.intent.insert(sub_id.to_string(), prior);
                     }
                     None => {
-                        self.intent.remove(sub_id);
+                        self.record.intent.remove(sub_id);
                     }
                 }
                 return ReplaceOutcome::WriteFailed(e);
@@ -1876,10 +2001,10 @@ mod requests {
             let Some(incarnation) = self.burn_incarnation() else {
                 match displaced {
                     Some(prior) => {
-                        self.intent.insert(sub_id.to_string(), prior);
+                        self.record.intent.insert(sub_id.to_string(), prior);
                     }
                     None => {
-                        self.intent.remove(sub_id);
+                        self.record.intent.remove(sub_id);
                     }
                 }
                 return ReplaceOutcome::RequestIncarnationExhausted;
@@ -1899,7 +2024,7 @@ mod requests {
             let retired = match predecessor {
                 Some(prior_id) if prior_id != sub_id => {
                     self.live.remove(prior_id);
-                    self.intent.remove(prior_id);
+                    self.record.intent.remove(prior_id);
                     self.suspended.remove(prior_id);
 
                     // Best-effort. The predecessor is already retired locally,
@@ -1922,6 +2047,41 @@ mod requests {
             ReplaceOutcome::Replaced { retired }
         }
 
+        /// Open the discovery subscription over `filters`.
+        ///
+        /// **The semantic entry point**, and the connected half of
+        /// [`Self::record_discovery_intent`]. The id and the class are stamped
+        /// here; the caller submits the question and nothing else.
+        pub(crate) async fn open_discovery<S: ProjectReqSink>(
+            &mut self,
+            sink: &mut S,
+            filters: Vec<Value>,
+        ) -> OpenOutcome {
+            let Some(identity) =
+                ProjectRequestIdentity::from_filters(ProjectSubscription::Discovery, filters)
+            else {
+                return OpenOutcome::UnboundedFilters;
+            };
+            let sub_id = super::discovery_sub_id();
+            self.open_request(sink, &sub_id, identity).await
+        }
+
+        /// Re-open one request this registry itself intends.
+        ///
+        /// The argument is the whole point: a [`ReplayableRequest`] is minted
+        /// only by [`Self::replayable`], out of a durable record that has just
+        /// been validated end to end. So the reconnect path re-asks exactly
+        /// what this owner recorded, and cannot name an id, a class or a
+        /// generation of its own — it has none to name.
+        pub(crate) async fn open_replayed<S: ProjectReqSink>(
+            &mut self,
+            sink: &mut S,
+            request: ReplayableRequest,
+        ) -> OpenOutcome {
+            let ReplayableRequest { sub_id, identity } = request;
+            self.open_request(sink, &sub_id, identity).await
+        }
+
         /// Decide, write the REQ, then install the registration.
         ///
         /// **The registry writes.** There is no `confirm_sent(&str)`, and no
@@ -1936,24 +2096,20 @@ mod requests {
         /// cannot carry a different question from the one registered — the
         /// caller no longer supplies the bytes at all.
         ///
-        /// **Not for catch-ups.** They go through [`Self::open_history_page`],
-        /// which mints their wire id. Refusing here is what makes that the only
-        /// route: an id a caller chose could be worn by two page attempts in
-        /// turn, and a frame is admitted by looking up whichever registration is
-        /// live under the id it carries.
-        pub(crate) async fn open_request<S: ProjectReqSink>(
+        /// **Not for catch-ups**, and no longer by a check. They go through
+        /// [`Self::open_history_page`], which mints their wire id; this
+        /// function is private and its two callers are
+        /// [`Self::open_discovery`], which stamps `Discovery`, and
+        /// [`Self::open_replayed`], whose argument can only have come from a
+        /// record [`DurableRecord::derive_current`] found valid — and a valid
+        /// record holds no catch-up at all. The `NotOpenableHere` outcome that
+        /// used to guard this went with the caller that could reach it.
+        async fn open_request<S: ProjectReqSink>(
             &mut self,
             sink: &mut S,
             sub_id: &str,
             identity: ProjectRequestIdentity,
         ) -> OpenOutcome {
-            if matches!(
-                identity.subscription,
-                ProjectSubscription::RootCatchUp { .. }
-            ) {
-                return OpenOutcome::NotOpenableHere;
-            }
-
             // ---- Preflight. Nothing enters `live`. -------------------------
             //
             // An async operation has three exits, not two: `Ok`, `Err`, and
@@ -1972,14 +2128,14 @@ mod requests {
                     }
                 };
             }
-            if let Some(intended) = self.intent.get(sub_id) {
+            if let Some(intended) = self.record.intent.get(sub_id) {
                 if *intended != identity {
                     return OpenOutcome::Conflict {
                         held: Box::new(intended.clone()),
                     };
                 }
             }
-            if self.incarnations_exhausted {
+            if self.record.incarnations_exhausted {
                 return OpenOutcome::Exhausted;
             }
             let text = match serde_json::to_string(&identity.req_frame(sub_id)) {
@@ -1990,7 +2146,9 @@ mod requests {
             // Durable intent is the one thing recorded before the write,
             // because it must outlive a failed one — the intent is still what
             // we want; the write is what failed. It confers no authority.
-            self.intent.insert(sub_id.to_string(), identity.clone());
+            self.record
+                .intent
+                .insert(sub_id.to_string(), identity.clone());
 
             // ---- The only await in this operation. -------------------------
             if let Err(e) = sink.write_project_req(text).await {
@@ -2021,15 +2179,6 @@ mod requests {
             OpenOutcome::Sent
         }
 
-        /// Close a live registration **without** suspending it.
-        ///
-        /// For local decisions — a watched hand-off retiring its predecessor —
-        /// as distinct from a relay refusal, which must go through
-        /// [`Self::refuse_live`].
-        pub(crate) fn close_active(&mut self, sub_id: &str) -> Option<ProjectRequestIdentity> {
-            self.live.remove(sub_id).map(|live| live.identity)
-        }
-
         pub(crate) fn suspension(&self, sub_id: &str) -> Option<&str> {
             self.suspended.get(sub_id).map(String::as_str)
         }
@@ -2046,26 +2195,40 @@ mod requests {
             self.suspended.clear();
         }
 
-        /// What to (re-)send, in deterministic order.
+        /// What to (re-)send, in deterministic order — or why nothing may be.
+        ///
+        /// **The whole record is validated first, and a record that fails
+        /// replays nothing.** Replay is where durable intent becomes bytes, so
+        /// it is the last place a non-canonical entry can be caught before a
+        /// relay is asked a question this owner never wrote. Handing back the
+        /// entries that happen to look canonical would be reconciling an
+        /// inconsistent record by ignoring the part that is not — the same
+        /// refusal [`Self::replace_watched`] and [`Self::replace_enrolment`]
+        /// already make, for the same reason, on the same walk.
         ///
         /// On an existing connection, suspended requests are skipped: the
         /// relay already refused them here, and a proactive resubscribe must
         /// not quietly retry on the connection that said no. A fresh
         /// connection has had its suspensions cleared, so everything intended
         /// is offered once.
-        pub(crate) fn replayable(&self) -> Vec<(String, ProjectRequestIdentity)> {
-            let mut out: Vec<(String, ProjectRequestIdentity)> = self
+        pub(crate) fn replayable(&self) -> Result<Vec<ReplayableRequest>, String> {
+            self.record.derive_current()?;
+            let mut out: Vec<ReplayableRequest> = self
+                .record
                 .intent
                 .iter()
                 .filter(|(id, _)| !self.suspended.contains_key(*id))
-                .map(|(id, identity)| (id.clone(), identity.clone()))
+                .map(|(id, identity)| ReplayableRequest {
+                    sub_id: id.clone(),
+                    identity: identity.clone(),
+                })
                 .collect();
-            out.sort_by(|a, b| a.0.cmp(&b.0));
-            out
+            out.sort_by(|a, b| a.sub_id.cmp(&b.sub_id));
+            Ok(out)
         }
 
         pub(crate) fn intent(&self, sub_id: &str) -> Option<&ProjectRequestIdentity> {
-            self.intent.get(sub_id)
+            self.record.intent.get(sub_id)
         }
 
         pub(crate) fn live_len(&self) -> usize {
@@ -2074,17 +2237,7 @@ mod requests {
 
         #[cfg(test)]
         pub(crate) fn intent_len(&self) -> usize {
-            self.intent.len()
-        }
-
-        /// Test-only: wind the incarnation counter near its ceiling.
-        ///
-        /// Exhaustion needs 2^64 registrations to reach honestly, which is not
-        /// a test anyone can run. Not available in production builds, where
-        /// setting this would be a way to *cause* the reuse it guards against.
-        #[cfg(test)]
-        pub(crate) fn force_next_incarnation(&mut self, next: u64) {
-            self.next_incarnation = next;
+            self.record.intent.len()
         }
     }
 }
@@ -6100,9 +6253,40 @@ mod tests {
 
     // ── Sub ids ──────────────────────────────────────────────────────────────
 
-    fn ident(subscription: ProjectSubscription) -> ProjectRequestIdentity {
-        ProjectRequestIdentity::new(subscription, json!({ "kinds": [30617] }))
-            .expect("a filter naming kinds constrains events")
+    /// The filters production's discovery subscription carries.
+    ///
+    /// Read from the production builder rather than spelled out again: the
+    /// class and the id are no longer nameable from out here, so the only thing
+    /// a test may supply is the same question production supplies.
+    fn discovery_filters() -> Vec<Value> {
+        discovery_subscription(true).expect("enabled")
+    }
+
+    /// A second, narrower discovery question — the same class, a different
+    /// filter, which is what a conflict is made of.
+    fn other_discovery_filters() -> Vec<Value> {
+        vec![json!({ "kinds": [30617], "authors": [AGENT] })]
+    }
+
+    /// Does durable intent under `sub_id` ask exactly `filters`?
+    ///
+    /// The identity itself cannot be built out here to compare against, which
+    /// is the point of this tranche. What a test may read is what the request
+    /// asks — through the same accessor the registry's own comparisons use.
+    fn intent_asks(requests: &ProjectRequests, sub_id: &str, filters: &[Value]) -> bool {
+        requests
+            .intent(sub_id)
+            .is_some_and(|held| held.filters().eq(filters.iter()))
+    }
+
+    /// The ids a reconnect would re-ask for, in the order it would ask them.
+    fn replay_ids(requests: &ProjectRequests) -> Vec<String> {
+        requests
+            .replayable()
+            .expect("a canonical durable record")
+            .iter()
+            .map(|request| request.sub_id().to_string())
+            .collect()
     }
 
     #[test]
@@ -6129,26 +6313,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_frame_is_classified_from_the_record_we_wrote_not_the_id_it_carries() {
-        // The substantive inversion. The id spells a catch-up for ROOT; we
-        // registered it as watched generation 7. What comes back is what we
-        // wrote down, because the relay does not get to name a class into
-        // existence — and neither does an id's spelling.
+    async fn a_frames_class_comes_from_the_registry_not_from_the_id_it_carries() {
+        // The substantive inversion, now made twice over. The class used to be
+        // the caller's to supply beside an id of its choosing, so this test
+        // registered a catch-up-shaped id as watched generation 7 and read the
+        // watched class back. That pairing no longer exists: `open_discovery`
+        // stamps both halves, so the only class a well-formed id can carry is
+        // the one this registry minted for it — and an id spelled like a
+        // catch-up for ROOT, never opened, still has no class at all.
         let mut requests = ProjectRequests::new();
-        let misleading = format!("proj-catchup-c-{ROOT}-1");
         assert_eq!(
-            open_request_on_test_socket(
-                &mut requests,
-                &misleading,
-                ident(ProjectSubscription::Watched { generation: 7 }),
-            )
-            .await,
+            open_discovery_on_test_socket(&mut requests, discovery_filters()).await,
             OpenOutcome::Sent
         );
 
         assert_eq!(
-            requests.match_frame(&misleading),
-            Some(&ProjectSubscription::Watched { generation: 7 })
+            requests.match_frame(&discovery_sub_id()),
+            Some(&ProjectSubscription::Discovery)
+        );
+        assert!(
+            requests
+                .match_frame(&format!("proj-catchup-c-{ROOT}-1"))
+                .is_none(),
+            "an id nobody opened classifies as nothing, however it is spelled"
         );
     }
 
@@ -6161,29 +6348,29 @@ mod tests {
         // is only a delay.
         let mut requests = ProjectRequests::new();
         let sub_id = discovery_sub_id();
-        let original = ident(ProjectSubscription::Discovery);
         assert_eq!(
-            open_request_on_test_socket(&mut requests, &sub_id, original.clone()).await,
+            open_discovery_on_test_socket(&mut requests, discovery_filters()).await,
             OpenOutcome::Sent
         );
 
-        let usurper = ident(ProjectSubscription::Watched { generation: 9 });
-        assert_eq!(
-            open_request_on_test_socket(&mut requests, &sub_id, usurper).await,
-            OpenOutcome::Conflict {
-                held: Box::new(original.clone())
-            }
-        );
+        assert!(matches!(
+            open_discovery_on_test_socket(&mut requests, other_discovery_filters()).await,
+            OpenOutcome::Conflict { .. }
+        ));
 
-        assert_eq!(requests.intent(&sub_id), Some(&original));
+        assert!(intent_asks(&requests, &sub_id, &discovery_filters()));
         assert_eq!(
             requests.match_frame(&sub_id),
             Some(&ProjectSubscription::Discovery)
         );
         assert_eq!(
-            requests.replayable(),
-            vec![(sub_id, original)],
+            replay_ids(&requests),
+            vec![sub_id.clone()],
             "and the refused identity is not what a reconnect would re-ask"
+        );
+        assert!(
+            intent_asks(&requests, &sub_id, &discovery_filters()),
+            "the reconnect re-asks the original question, not the refused one"
         );
     }
 
@@ -6191,48 +6378,84 @@ mod tests {
     async fn an_open_differing_only_in_filter_is_a_conflict_not_a_no_op() {
         // Same class, different question. When the live registry stored only
         // the class it answered "already live", emitted no REQ, and let the
-        // other filter through as what the next connection would ask for.
+        // other filter through as what the next connection would ask for. The
+        // class is now the registry's, so *only* the filter can differ — which
+        // makes this the whole of what the comparison has left to catch.
         let mut requests = ProjectRequests::new();
         let sub_id = discovery_sub_id();
-        let filter_a = ProjectRequestIdentity::new(
-            ProjectSubscription::Discovery,
-            json!({ "kinds": [30617] }),
-        )
-        .expect("bounded");
-        let filter_b = ProjectRequestIdentity::new(
-            ProjectSubscription::Discovery,
-            json!({ "kinds": [30617], "authors": ["deadbeef"] }),
-        )
-        .expect("bounded");
         assert_eq!(
-            open_request_on_test_socket(&mut requests, &sub_id, filter_a.clone()).await,
+            open_discovery_on_test_socket(&mut requests, discovery_filters()).await,
             OpenOutcome::Sent
         );
-        assert_eq!(
-            open_request_on_test_socket(&mut requests, &sub_id, filter_b).await,
-            OpenOutcome::Conflict {
-                held: Box::new(filter_a.clone())
-            }
-        );
-        assert_eq!(requests.intent(&sub_id), Some(&filter_a));
+        assert!(matches!(
+            open_discovery_on_test_socket(&mut requests, other_discovery_filters()).await,
+            OpenOutcome::Conflict { .. }
+        ));
+        assert!(intent_asks(&requests, &sub_id, &discovery_filters()));
     }
 
     #[tokio::test]
     async fn an_identical_open_is_already_live_and_emits_no_second_request() {
         let mut requests = ProjectRequests::new();
-        let sub_id = discovery_sub_id();
-        let identity = ident(ProjectSubscription::Discovery);
         assert_eq!(
-            open_request_on_test_socket(&mut requests, &sub_id, identity.clone()).await,
+            open_discovery_on_test_socket(&mut requests, discovery_filters()).await,
             OpenOutcome::Sent
         );
         assert_eq!(
-            open_request_on_test_socket(&mut requests, &sub_id, identity).await,
+            open_discovery_on_test_socket(&mut requests, discovery_filters()).await,
             OpenOutcome::AlreadyLive,
             "this exact request is live; asking again must not re-send"
         );
         assert_eq!(requests.live_len(), 1);
         assert_eq!(requests.intent_len(), 1);
+    }
+
+    #[tokio::test]
+    async fn an_open_whose_filters_constrain_nothing_is_refused_and_records_nothing() {
+        // The refusal belongs to the owner. When the caller built the identity
+        // it also made this decision, one call earlier, and a decision made
+        // outside the owner is one a second caller can make differently — the
+        // shape that let an unbounded REQ be recorded as intent and replayed
+        // onto the next connection.
+        let mut requests = ProjectRequests::new();
+        let narrow = json!({ "kinds": [30617] });
+        for unbounded in [
+            Vec::new(),
+            vec![json!({})],
+            vec![json!({ "limit": 500 })],
+            // Not an object at all — including the two-filters-in-one-element
+            // mistake, which is refused rather than merely unmatchable.
+            vec![json!([{ "kinds": [30617] }])],
+            vec![json!("everything")],
+            vec![Value::Null],
+            // Narrow branch, unbounded branch. The OR makes it unbounded.
+            vec![narrow.clone(), json!({})],
+            vec![json!({}), narrow.clone()],
+        ] {
+            assert_eq!(
+                open_discovery_on_test_socket(&mut requests, unbounded.clone()).await,
+                OpenOutcome::UnboundedFilters,
+                "must refuse: {unbounded:?}"
+            );
+            assert_eq!(
+                requests.record_discovery_intent(unbounded.clone()),
+                IntentAdmission::UnboundedFilters,
+                "and the offline half refuses the same shapes: {unbounded:?}"
+            );
+        }
+        assert_eq!(requests.live_len(), 0, "nothing became answerable");
+        assert_eq!(requests.intent_len(), 0, "and nothing is replayed");
+
+        // The positive control: the gate is not achieved by refusing
+        // everything, and a limit is fine *alongside* something selective.
+        assert_eq!(
+            open_discovery_on_test_socket(
+                &mut requests,
+                vec![json!({ "kinds": [30617], "limit": 500 })]
+            )
+            .await,
+            OpenOutcome::Sent
+        );
     }
 
     #[tokio::test]
@@ -6245,12 +6468,11 @@ mod tests {
         // to come from a real dead socket.
         let mut requests = ProjectRequests::new();
         let sub_id = discovery_sub_id();
-        let identity = ident(ProjectSubscription::Discovery);
         let mut socket = test_socket().await;
         socket.client.close(None).await.expect("close");
         assert!(matches!(
             requests
-                .open_request(&mut socket.client, &sub_id, identity.clone())
+                .open_discovery(&mut socket.client, discovery_filters())
                 .await,
             OpenOutcome::WriteFailed(_)
         ));
@@ -6259,8 +6481,8 @@ mod tests {
             requests.match_frame(&sub_id).is_none(),
             "nothing answerable"
         );
-        assert_eq!(requests.intent(&sub_id), Some(&identity));
-        assert_eq!(requests.replayable().len(), 1);
+        assert!(intent_asks(&requests, &sub_id, &discovery_filters()));
+        assert_eq!(replay_ids(&requests), vec![sub_id]);
     }
 
     #[tokio::test]
@@ -6270,27 +6492,25 @@ mod tests {
         // survive it.
         let mut requests = ProjectRequests::new();
         let sub_id = discovery_sub_id();
-        let identity = ident(ProjectSubscription::Discovery);
-        open_request_on_test_socket(&mut requests, &sub_id, identity.clone()).await;
+        open_discovery_on_test_socket(&mut requests, discovery_filters()).await;
 
         assert!(requests.refuse_live(&sub_id, "restricted: nope").is_some());
 
         assert_eq!(requests.suspension(&sub_id), Some("restricted: nope"));
         assert!(
-            requests.replayable().is_empty(),
+            replay_ids(&requests).is_empty(),
             "a proactive resubscribe on this connection must skip it"
         );
-        assert_eq!(
-            requests.intent(&sub_id),
-            Some(&identity),
+        assert!(
+            intent_asks(&requests, &sub_id, &discovery_filters()),
             "but local policy survives the relay's opinion"
         );
 
         requests.clear_connection();
         assert_eq!(requests.suspension(&sub_id), None);
         assert_eq!(
-            requests.replayable(),
-            vec![(sub_id, identity)],
+            replay_ids(&requests),
+            vec![sub_id],
             "and a new connection asks once more"
         );
     }
@@ -6392,8 +6612,12 @@ mod tests {
         }
     }
 
-    /// A watched-root identity over the given roots, built the production way.
-    fn watched_enrolments_for(roots: &[&str]) -> ProjectRequestIdentity {
+    /// Watched-root filters over the given roots, built the production way.
+    ///
+    /// Filters, not an identity: the class and the generation are the
+    /// registry's to stamp, and `replace_watched` is the only thing that
+    /// stamps them.
+    fn watched_filters_for(roots: &[&str]) -> Vec<Value> {
         let mut enrolments = ProjectEnrolments::new();
         for root in roots {
             enrolments
@@ -6402,21 +6626,13 @@ mod tests {
         }
         let filters = watched_roots_filters(&enrolments, 0);
         assert!(!filters.is_empty(), "watched filters must not be empty");
-        ProjectRequestIdentity::from_filters(
-            ProjectSubscription::Watched {
-                generation: roots.len() as u64,
-            },
-            filters,
-        )
-        .expect("bounded")
+        filters
     }
 
-    /// An enrolment identity over the given discovered coordinates.
-    fn enrolment_identity_for(coords: &[&str]) -> ProjectRequestIdentity {
+    /// Enrolment filters over the given discovered coordinates.
+    fn enrolment_filters_for(coords: &[&str]) -> Vec<Value> {
         let discovered = known(coords);
-        let filter = enrolment_filter(&discovered, AGENT, 0).expect("filter");
-        ProjectRequestIdentity::from_filters(ProjectSubscription::Enrolment, vec![filter])
-            .expect("bounded")
+        vec![enrolment_filter(&discovered, AGENT, 0).expect("filter")]
     }
 
     /// **A second discovered repository widens the enrolment filter.**
@@ -6431,10 +6647,9 @@ mod tests {
         let mut socket = wire_socket().await;
         let id = PROJECT_ENROL_SUB_ID;
 
-        let first = enrolment_identity_for(&[&coord()]);
         assert_eq!(
             requests
-                .replace_request(&mut socket.client, None, id, first)
+                .replace_enrolment(&mut socket.client, enrolment_filters_for(&[&coord()]))
                 .await,
             ReplaceOutcome::Replaced { retired: None }
         );
@@ -6444,10 +6659,12 @@ mod tests {
         let first_text = frame.to_string();
 
         let second_coord = format!("30617:{OWNER}:second-repo");
-        let widened = enrolment_identity_for(&[&coord(), &second_coord]);
         assert_eq!(
             requests
-                .replace_request(&mut socket.client, Some(id), id, widened)
+                .replace_enrolment(
+                    &mut socket.client,
+                    enrolment_filters_for(&[&coord(), &second_coord])
+                )
                 .await,
             ReplaceOutcome::Replaced { retired: None },
             "same-id replacement retires nothing: the relay's REQ replacement does it"
@@ -6475,21 +6692,20 @@ mod tests {
 
         let gen0 = watched_sub_id(0);
         let gen1 = watched_sub_id(1);
-        let roots_a = watched_enrolments_for(&[ROOT]);
-        let roots_b = watched_enrolments_for(&[ROOT, OTHER_ROOT]);
 
         requests
-            .replace_request(&mut socket.client, None, &gen0, roots_a)
+            .replace_watched(&mut socket.client, watched_filters_for(&[ROOT]))
             .await;
         let _ = socket.next_frame().await;
 
         assert_eq!(
             requests
-                .replace_request(&mut socket.client, Some(&gen0), &gen1, roots_b)
+                .replace_watched(&mut socket.client, watched_filters_for(&[ROOT, OTHER_ROOT]))
                 .await,
             ReplaceOutcome::Replaced {
                 retired: Some(gen0.clone())
-            }
+            },
+            "the registry allocates generation 1 and names generation 0 as its own predecessor"
         );
 
         let frames = socket.drain_frames().await;
@@ -6510,25 +6726,13 @@ mod tests {
         let mut requests = ProjectRequests::new();
         let mut socket = wire_socket().await;
 
-        let gen0 = watched_sub_id(0);
-        let gen1 = watched_sub_id(1);
         requests
-            .replace_request(
-                &mut socket.client,
-                None,
-                &gen0,
-                watched_enrolments_for(&[ROOT]),
-            )
+            .replace_watched(&mut socket.client, watched_filters_for(&[ROOT]))
             .await;
         let _ = socket.next_frame().await;
 
         requests
-            .replace_request(
-                &mut socket.client,
-                Some(&gen0),
-                &gen1,
-                watched_enrolments_for(&[ROOT, OTHER_ROOT]),
-            )
+            .replace_watched(&mut socket.client, watched_filters_for(&[ROOT, OTHER_ROOT]))
             .await;
 
         let req = socket.next_frame().await;
@@ -6548,9 +6752,8 @@ mod tests {
 
         let gen0 = watched_sub_id(0);
         let gen1 = watched_sub_id(1);
-        let original = watched_enrolments_for(&[ROOT]);
         requests
-            .replace_request(&mut socket.client, None, &gen0, original.clone())
+            .replace_watched(&mut socket.client, watched_filters_for(&[ROOT]))
             .await;
         let _ = socket.next_frame().await;
 
@@ -6565,21 +6768,15 @@ mod tests {
         .expect("close the client transport");
         drop(socket.server);
         let outcome = requests
-            .replace_request(
-                &mut socket.client,
-                Some(&gen0),
-                &gen1,
-                watched_enrolments_for(&[ROOT, OTHER_ROOT]),
-            )
+            .replace_watched(&mut socket.client, watched_filters_for(&[ROOT, OTHER_ROOT]))
             .await;
 
         assert!(
             matches!(outcome, ReplaceOutcome::WriteFailed(_)),
             "expected a write failure, got {outcome:?}"
         );
-        assert_eq!(
-            requests.intent(&gen0),
-            Some(&original),
+        assert!(
+            intent_asks(&requests, &gen0, &watched_filters_for(&[ROOT])),
             "the predecessor's durable intent was discarded on a failed successor"
         );
         assert!(
@@ -6595,105 +6792,91 @@ mod tests {
         let mut requests = ProjectRequests::new();
         let mut socket = wire_socket().await;
 
-        let mut previous: Option<String> = None;
-        for generation in 0..3u64 {
-            let id = watched_sub_id(generation);
-            let roots: Vec<&str> = if generation == 0 {
-                vec![ROOT]
-            } else {
-                vec![ROOT, OTHER_ROOT]
-            };
+        // Three genuinely different root sets, so each replacement is a real
+        // change and burns its own generation — repeating a set would report
+        // `Unchanged` and allocate nothing, which is a different property with
+        // its own test.
+        for roots in [vec![ROOT], vec![ROOT, OTHER_ROOT], vec![OTHER_ROOT]] {
             requests
-                .replace_request(
-                    &mut socket.client,
-                    previous.as_deref(),
-                    &id,
-                    watched_enrolments_for(&roots),
-                )
+                .replace_watched(&mut socket.client, watched_filters_for(&roots))
                 .await;
             let _ = socket.drain_frames().await;
-            previous = Some(id);
         }
 
         requests.clear_connection();
-        let replay = requests.replayable();
+        let replay = replay_ids(&requests);
         assert_eq!(
-            replay.len(),
-            1,
-            "every generation is still intended: {:?}",
-            replay.iter().map(|(id, _)| id).collect::<Vec<_>>()
-        );
-        assert_eq!(
-            replay[0].0,
-            watched_sub_id(2),
-            "replayed the wrong generation"
+            replay,
+            vec![watched_sub_id(2)],
+            "every retired generation must be gone from durable intent"
         );
     }
 
-    /// The authority distinction is preserved: `open_request` still refuses a
-    /// changed identity, and replacement is the only operation permitted to
+    /// The authority distinction is preserved: opening still refuses to change
+    /// an id's identity, and replacement is the only operation permitted to
     /// make that change.
     ///
     /// A metadata conflict therefore cannot masquerade as a successful
     /// replacement — the two outcomes come from different operations, and the
     /// one that refuses has not been loosened.
+    ///
+    /// The two halves are shown on the two subscriptions that have them.
+    /// Opening is discovery's only route and it has no replacement; enrolment
+    /// has only a replacement. Neither is reachable from the other, which is
+    /// itself the distinction: an id cannot be reclassified by asking again.
     #[tokio::test]
     async fn a_metadata_conflict_cannot_masquerade_as_replacement() {
         let mut requests = ProjectRequests::new();
-        let mut socket = wire_socket().await;
-        let id = PROJECT_ENROL_SUB_ID;
 
-        requests
-            .replace_request(
-                &mut socket.client,
-                None,
-                id,
-                enrolment_identity_for(&[&coord()]),
-            )
-            .await;
+        assert_eq!(
+            open_discovery_on_test_socket(&mut requests, discovery_filters()).await,
+            OpenOutcome::Sent
+        );
+        let refused = open_discovery_on_test_socket(&mut requests, other_discovery_filters()).await;
+        assert!(
+            matches!(refused, OpenOutcome::Conflict { .. }),
+            "opening must still refuse to change an id's identity, got {refused:?}"
+        );
+
+        let mut socket = wire_socket().await;
+        assert_eq!(
+            requests
+                .replace_enrolment(&mut socket.client, enrolment_filters_for(&[&coord()]))
+                .await,
+            ReplaceOutcome::Replaced { retired: None }
+        );
         let _ = socket.next_frame().await;
 
         let second = format!("30617:{OWNER}:second-repo");
-        let widened = enrolment_identity_for(&[&coord(), &second]);
-
-        let refused = requests
-            .open_request(&mut socket.client, id, widened.clone())
-            .await;
-        assert!(
-            matches!(refused, OpenOutcome::Conflict { .. }),
-            "open_request must still refuse to change an id's identity, got {refused:?}"
-        );
-
-        let replaced = requests
-            .replace_request(&mut socket.client, Some(id), id, widened)
-            .await;
         assert_eq!(
-            replaced,
+            requests
+                .replace_enrolment(
+                    &mut socket.client,
+                    enrolment_filters_for(&[&coord(), &second])
+                )
+                .await,
             ReplaceOutcome::Replaced { retired: None },
             "replacement is the operation permitted to make that change"
         );
     }
 
-    /// Open a request the only way one can be opened.
+    /// Open the discovery subscription the only way one can be opened.
     ///
-    /// Goes through `ProjectRequests::open_request` against a **real paired
+    /// Goes through `ProjectRequests::open_discovery` against a **real paired
     /// socket**. It is async for the same reason production is: the registry
     /// performs the write, and there is no synchronous shortcut for a test to
     /// take because there is none for anyone.
     ///
-    /// Named for the operation it performs. The previous name, `reserve_sent`,
-    /// described the deleted two-stage reserve-then-promote model — and being
-    /// the helper most tests copy, it was the most likely of all the stale
-    /// names to propagate.
-    async fn open_request_on_test_socket(
+    /// It takes filters and nothing else, because that is all the operation
+    /// takes. The id and the class used to be arguments here too, and being the
+    /// helper most tests copy, it was the widest route to a caller-selected
+    /// identity in the file.
+    async fn open_discovery_on_test_socket(
         requests: &mut ProjectRequests,
-        sub_id: &str,
-        identity: ProjectRequestIdentity,
+        filters: Vec<Value>,
     ) -> OpenOutcome {
         let mut socket = test_socket().await;
-        requests
-            .open_request(&mut socket.client, sub_id, identity)
-            .await
+        requests.open_discovery(&mut socket.client, filters).await
     }
 
     #[tokio::test]
@@ -6711,12 +6894,7 @@ mod tests {
             "an id that was never opened yields no witness"
         );
 
-        open_request_on_test_socket(
-            &mut requests,
-            &sub_id,
-            ident(ProjectSubscription::Discovery),
-        )
-        .await;
+        open_discovery_on_test_socket(&mut requests, discovery_filters()).await;
         let witness = requests
             .witness_end_of_stored_events(&sub_id)
             .expect("a live request yields one");
@@ -6741,9 +6919,8 @@ mod tests {
         // about the gap the replacement had to recover.
         let mut requests = ProjectRequests::new();
         let sub_id = discovery_sub_id();
-        let identity = ident(ProjectSubscription::Discovery);
 
-        open_request_on_test_socket(&mut requests, &sub_id, identity.clone()).await;
+        open_discovery_on_test_socket(&mut requests, discovery_filters()).await;
         let before = requests
             .witness_end_of_stored_events(&sub_id)
             .expect("live");
@@ -6751,7 +6928,7 @@ mod tests {
 
         // Connection dies; the identical request is re-sent on the next one.
         requests.clear_connection();
-        open_request_on_test_socket(&mut requests, &sub_id, identity).await;
+        open_discovery_on_test_socket(&mut requests, discovery_filters()).await;
         let after = requests
             .witness_end_of_stored_events(&sub_id)
             .expect("live again");
@@ -6785,14 +6962,15 @@ mod tests {
         // a boundary minted an eternity earlier — the exact substitution this
         // type exists to prevent — and it would happen only in the build where
         // no panic could warn anyone.
-        let mut requests = ProjectRequests::new();
+        // Born at the last usable value: exhaustion needs 2^64 registrations to
+        // reach honestly, which is not a test anyone can run. The allocator
+        // position is all the record supplies — nothing here is installed,
+        // registered or minted.
+        let mut requests =
+            ProjectRequests::over(DurableRecord::empty().with_allocators(0, u64::MAX));
         let sub_id = discovery_sub_id();
-        let identity = ident(ProjectSubscription::Discovery);
-
-        // Wind to the last usable value.
-        requests.force_next_incarnation(u64::MAX);
         assert!(matches!(
-            open_request_on_test_socket(&mut requests, &sub_id, identity.clone()).await,
+            open_discovery_on_test_socket(&mut requests, discovery_filters()).await,
             OpenOutcome::Sent
         ));
         let last = requests.live_incarnation(&sub_id).expect("live");
@@ -6803,7 +6981,7 @@ mod tests {
         // The space is now spent. The next registration must refuse.
         requests.clear_connection();
         assert_eq!(
-            open_request_on_test_socket(&mut requests, &sub_id, identity.clone()).await,
+            open_discovery_on_test_socket(&mut requests, discovery_filters()).await,
             OpenOutcome::Exhausted,
             "no wrap, no reuse — a refusal"
         );
@@ -6819,7 +6997,7 @@ mod tests {
         // A reconnect must not restore spent authority.
         requests.clear_connection();
         assert_eq!(
-            open_request_on_test_socket(&mut requests, &sub_id, identity).await,
+            open_discovery_on_test_socket(&mut requests, discovery_filters()).await,
             OpenOutcome::Exhausted,
             "exhaustion survives reconnect"
         );
@@ -6835,29 +7013,25 @@ mod tests {
     async fn exhaustion_does_not_disturb_requests_already_live() {
         // Refusing new registrations must not retroactively invalidate one that
         // was legitimately opened before the space ran out.
-        let mut requests = ProjectRequests::new();
+        let mut requests =
+            ProjectRequests::over(DurableRecord::empty().with_allocators(0, u64::MAX));
         let discovery = discovery_sub_id();
         let watched = watched_sub_id(0);
 
-        requests.force_next_incarnation(u64::MAX);
-        open_request_on_test_socket(
-            &mut requests,
-            &discovery,
-            ident(ProjectSubscription::Discovery),
-        )
-        .await;
+        open_discovery_on_test_socket(&mut requests, discovery_filters()).await;
         let witness = requests
             .witness_end_of_stored_events(&discovery)
             .expect("live");
 
+        // A different request, refused by the same spent allocator. It goes
+        // through the watched replacement because that is the only route a
+        // watched subscription has.
+        let mut socket = test_socket().await;
         assert_eq!(
-            open_request_on_test_socket(
-                &mut requests,
-                &watched,
-                ident(ProjectSubscription::Watched { generation: 0 })
-            )
-            .await,
-            OpenOutcome::Exhausted
+            requests
+                .replace_watched(&mut socket.client, watched_filters_for(&[ROOT]))
+                .await,
+            ReplaceOutcome::RequestIncarnationExhausted
         );
 
         assert!(
@@ -6875,12 +7049,11 @@ mod tests {
         // later request.
         let mut requests = ProjectRequests::new();
         let sub_id = discovery_sub_id();
-        let identity = ident(ProjectSubscription::Discovery);
         let mut seen = Vec::new();
 
         for _ in 0..8 {
             assert_eq!(
-                open_request_on_test_socket(&mut requests, &sub_id, identity.clone()).await,
+                open_discovery_on_test_socket(&mut requests, discovery_filters()).await,
                 OpenOutcome::Sent
             );
             seen.push(requests.live_incarnation(&sub_id).expect("live"));
@@ -6899,18 +7072,11 @@ mod tests {
         let mut requests = ProjectRequests::new();
         let discovery = discovery_sub_id();
         let watched = watched_sub_id(0);
-        open_request_on_test_socket(
-            &mut requests,
-            &discovery,
-            ident(ProjectSubscription::Discovery),
-        )
-        .await;
-        open_request_on_test_socket(
-            &mut requests,
-            &watched,
-            ident(ProjectSubscription::Watched { generation: 0 }),
-        )
-        .await;
+        let mut socket = test_socket().await;
+        open_discovery_on_test_socket(&mut requests, discovery_filters()).await;
+        requests
+            .replace_watched(&mut socket.client, watched_filters_for(&[ROOT]))
+            .await;
 
         assert_ne!(
             requests.live_incarnation(&discovery),
@@ -6929,12 +7095,7 @@ mod tests {
     async fn a_witness_is_not_current_once_its_request_is_refused() {
         let mut requests = ProjectRequests::new();
         let sub_id = discovery_sub_id();
-        open_request_on_test_socket(
-            &mut requests,
-            &sub_id,
-            ident(ProjectSubscription::Discovery),
-        )
-        .await;
+        open_discovery_on_test_socket(&mut requests, discovery_filters()).await;
         let witness = requests
             .witness_end_of_stored_events(&sub_id)
             .expect("live");
@@ -6952,12 +7113,7 @@ mod tests {
         // this agent recorded when it sent the REQ.
         let mut requests = ProjectRequests::new();
         let sub_id = discovery_sub_id();
-        open_request_on_test_socket(
-            &mut requests,
-            &sub_id,
-            ident(ProjectSubscription::Discovery),
-        )
-        .await;
+        open_discovery_on_test_socket(&mut requests, discovery_filters()).await;
 
         for _ in 0..3 {
             assert!(requests.witness_end_of_stored_events(&sub_id).is_some());
@@ -6975,12 +7131,7 @@ mod tests {
         // complete must not be believed about the request it just declined.
         let mut requests = ProjectRequests::new();
         let sub_id = discovery_sub_id();
-        open_request_on_test_socket(
-            &mut requests,
-            &sub_id,
-            ident(ProjectSubscription::Discovery),
-        )
-        .await;
+        open_discovery_on_test_socket(&mut requests, discovery_filters()).await;
         requests.refuse_live(&sub_id, "restricted: nope");
 
         assert_eq!(requests.witness_end_of_stored_events(&sub_id), None);
@@ -6994,9 +7145,8 @@ mod tests {
         // cannot suspend anything, regardless of what the caller does.
         let mut requests = ProjectRequests::new();
         let sub_id = discovery_sub_id();
-        let identity = ident(ProjectSubscription::Discovery);
         assert_eq!(
-            requests.record_intent(&sub_id, identity.clone()),
+            requests.record_discovery_intent(discovery_filters()),
             IntentAdmission::Recorded
         );
 
@@ -7006,10 +7156,10 @@ mod tests {
             "intent is not evidence that we asked on this connection"
         );
         assert_eq!(requests.suspension(&sub_id), None);
-        assert_eq!(requests.intent(&sub_id), Some(&identity));
+        assert!(intent_asks(&requests, &sub_id, &discovery_filters()));
         assert_eq!(
-            requests.replayable(),
-            vec![(sub_id, identity)],
+            replay_ids(&requests),
+            vec![sub_id],
             "and the next connection still asks"
         );
     }
@@ -7018,115 +7168,124 @@ mod tests {
     async fn clearing_a_connection_keeps_policy_and_drops_everything_answerable() {
         let mut requests = ProjectRequests::new();
         let sub_id = watched_sub_id(0);
-        let identity = ident(ProjectSubscription::Watched { generation: 0 });
-        open_request_on_test_socket(&mut requests, &sub_id, identity.clone()).await;
+        let mut socket = test_socket().await;
+        requests
+            .replace_watched(&mut socket.client, watched_filters_for(&[ROOT]))
+            .await;
 
         requests.clear_connection();
 
         assert!(requests.match_frame(&sub_id).is_none());
-        assert_eq!(requests.intent(&sub_id), Some(&identity));
+        assert!(intent_asks(
+            &requests,
+            &sub_id,
+            &watched_filters_for(&[ROOT])
+        ));
     }
 
-    #[tokio::test]
-    async fn overlapping_watched_generations_are_both_live_until_the_old_one_closes() {
-        // A watched REQ replacement runs alongside its predecessor on purpose,
-        // so both ids must answer during the hand-off — and the older one must
-        // stop the moment it is closed, not before.
-        let mut requests = ProjectRequests::new();
-        let old = watched_sub_id(1);
-        let new = watched_sub_id(2);
-        open_request_on_test_socket(
-            &mut requests,
-            &old,
-            ident(ProjectSubscription::Watched { generation: 1 }),
-        )
-        .await;
-        open_request_on_test_socket(
-            &mut requests,
-            &new,
-            ident(ProjectSubscription::Watched { generation: 2 }),
-        )
-        .await;
-        assert_eq!(requests.live_len(), 2);
-
-        assert!(requests.match_frame(&old).is_some());
-        assert!(requests.match_frame(&new).is_some());
-
-        requests.close_active(&old);
-        assert!(requests.match_frame(&old).is_none());
-        assert!(requests.match_frame(&new).is_some());
-    }
+    // Deleted 2026-08-02: `overlapping_watched_generations_are_both_live_until_the_old_one_closes`.
+    //
+    // It opened two watched generations side by side through
+    // `open_request_on_test_socket`, asserted both answered, then closed the
+    // older with `close_active`. Neither call exists for any caller now: a
+    // watched generation is allocated and installed only by `replace_watched`,
+    // which retires its own predecessor as part of the same operation, and the
+    // bare close it used went with it. So there is no longer a way to leave two
+    // generations live and then retire one by hand.
+    //
+    // Its subject survives in the two assertions that were doing the work.
+    // That the successor is live before the predecessor stops being so is
+    // `the_successor_req_precedes_the_predecessor_close`, on the wire rather
+    // than in the map — the REQ is written before the CLOSE, which is the
+    // ordering the overlap existed for. That the retired one then answers
+    // nothing is `a_retired_project_request_stops_being_answerable`.
 
     #[test]
     fn recording_intent_while_disconnected_is_fail_closed_too() {
         // Intent recorded while disconnected is replayed verbatim by the next
         // connection, so admitting a conflict here admits it everywhere.
+        //
+        // The conflicting submission is a second *question*, because the class
+        // is no longer the caller's to vary. That is the narrower and harder
+        // case: two requests that differ only in what they ask are exactly
+        // what a registry storing the class alone could not tell apart.
         let mut requests = ProjectRequests::new();
         let sub_id = discovery_sub_id();
-        let original = ident(ProjectSubscription::Discovery);
         assert_eq!(
-            requests.record_intent(&sub_id, original.clone()),
+            requests.record_discovery_intent(discovery_filters()),
             IntentAdmission::Recorded
         );
         assert_eq!(
-            requests.record_intent(&sub_id, original.clone()),
+            requests.record_discovery_intent(discovery_filters()),
             IntentAdmission::AlreadyIntended
         );
-        assert_eq!(
-            requests.record_intent(
-                &sub_id,
-                ident(ProjectSubscription::Watched { generation: 4 })
-            ),
-            IntentAdmission::Conflict {
-                held: Box::new(original.clone())
-            }
-        );
-        assert_eq!(requests.intent(&sub_id), Some(&original));
+        assert!(matches!(
+            requests.record_discovery_intent(other_discovery_filters()),
+            IntentAdmission::Conflict { .. }
+        ));
+        assert!(intent_asks(&requests, &sub_id, &discovery_filters()));
         assert_eq!(requests.live_len(), 0, "recording intent registers nothing");
     }
 
     #[tokio::test]
-    async fn every_subscription_class_survives_a_round_trip_through_the_owner() {
+    async fn every_subscription_class_reaches_the_wire_through_its_own_operation() {
         // Positive control: the gate is not achieved by refusing everything.
+        //
+        // One operation per class, which is what replaced the single
+        // `open_request(sub_id, identity)` this test used to walk a class list
+        // through. The id and the generation below are *assertions* about what
+        // the registry stamped, not arguments handed to it.
         let mut requests = ProjectRequests::new();
-        for (sub_id, class) in [
-            (discovery_sub_id(), ProjectSubscription::Discovery),
-            (
-                PROJECT_ENROL_SUB_ID.to_string(),
-                ProjectSubscription::Enrolment,
-            ),
-            (
-                watched_sub_id(7),
-                ProjectSubscription::Watched { generation: 7 },
-            ),
-        ] {
-            assert_eq!(
-                open_request_on_test_socket(&mut requests, &sub_id, ident(class.clone())).await,
-                OpenOutcome::Sent,
-                "{sub_id}"
-            );
-            assert_eq!(requests.match_frame(&sub_id), Some(&class), "{sub_id}");
-        }
-        assert_eq!(requests.live_len(), 3);
+        let mut socket = wire_socket().await;
 
-        // The fourth class is absent on purpose: a catch-up cannot be opened
-        // through this path at all, because its wire id has to name one
-        // transport attempt and only `open_history_page` mints those.
-        let mut socket = test_socket().await;
         assert_eq!(
             requests
-                .open_request(
-                    &mut socket.client,
-                    "proj-catchup-c-anything",
-                    ident(ProjectSubscription::RootCatchUp {
-                        root: ROOT.to_string(),
-                        stream: HistoryStream::Comments,
-                    })
-                )
+                .open_discovery(&mut socket.client, discovery_filters())
                 .await,
-            OpenOutcome::NotOpenableHere
+            OpenOutcome::Sent
         );
-        assert_eq!(requests.live_len(), 3, "and it recorded nothing");
+        assert_eq!(
+            requests
+                .replace_enrolment(&mut socket.client, enrolment_filters_for(&[&coord()]))
+                .await,
+            ReplaceOutcome::Replaced { retired: None }
+        );
+        assert_eq!(
+            requests
+                .replace_watched(&mut socket.client, watched_filters_for(&[ROOT]))
+                .await,
+            ReplaceOutcome::Replaced { retired: None }
+        );
+
+        assert_eq!(
+            requests.match_frame(&discovery_sub_id()),
+            Some(&ProjectSubscription::Discovery)
+        );
+        assert_eq!(
+            requests.match_frame(PROJECT_ENROL_SUB_ID),
+            Some(&ProjectSubscription::Enrolment)
+        );
+        assert_eq!(
+            requests.match_frame(&watched_sub_id(0)),
+            Some(&ProjectSubscription::Watched { generation: 0 }),
+            "the first watched replacement is generation 0, allocated by the registry"
+        );
+        assert_eq!(requests.live_len(), 3);
+
+        // The fourth class is absent on purpose, and no longer by a refusal a
+        // caller could reach: a catch-up's wire id has to name one transport
+        // attempt, only `open_history_page` mints those, and no operation on
+        // this registry accepts a catch-up class from outside at all.
+        let ids: Vec<String> = replay_ids(&requests);
+        assert_eq!(
+            ids,
+            vec![
+                discovery_sub_id(),
+                PROJECT_ENROL_SUB_ID.to_string(),
+                watched_sub_id(0)
+            ],
+            "and the durable record holds exactly the three replayable classes"
+        );
     }
 
     // ── Root extraction ──────────────────────────────────────────────────────
@@ -7181,6 +7340,29 @@ mod tests {
         Addressing::WatchedRoot,
     ];
 
+    /// Does the live registration installed for `filters` admit `event`?
+    ///
+    /// Through the production admission boundary, which is the only route
+    /// left: the identity is minted inside the registry, so what a test can
+    /// hold is the admission a real inbound frame would be checked against.
+    /// `replace_watched` is the operation that installs one over arbitrary
+    /// filters; the generation it stamps is its own.
+    async fn watched_admits(filters: Vec<Value>, event: &nostr::Event) -> bool {
+        let mut requests = ProjectRequests::new();
+        let mut socket = test_socket().await;
+        assert!(
+            matches!(
+                requests.replace_watched(&mut socket.client, filters).await,
+                ReplaceOutcome::Replaced { .. }
+            ),
+            "the filters under test must install, or the admission proves nothing"
+        );
+        requests
+            .admit_frame(&watched_sub_id(0))
+            .expect("the replacement is live on this connection")
+            .admits(event)
+    }
+
     /// A filter key this code does not understand admits nothing.
     ///
     /// The direction matters. A matcher that skipped what it could not check
@@ -7188,25 +7370,27 @@ mod tests {
     /// enforcing — the failure would be invisible precisely because the filter
     /// looked more specific than the check. Refusing instead turns that into a
     /// visible outage rather than a silent widening.
-    #[test]
-    fn a_filter_constraint_this_code_cannot_check_admits_nothing() {
+    #[tokio::test]
+    async fn a_filter_constraint_this_code_cannot_check_admits_nothing() {
         let keys = Keys::generate();
         let event = signed(&keys, KIND_TEXT_NOTE, vec![tag(&["e", ROOT, "", "root"])]);
 
-        let understood = ProjectRequestIdentity::new(
-            ProjectSubscription::Watched { generation: 0 },
-            json!({ "kinds": [KIND_TEXT_NOTE], "#e": [ROOT] }),
-        )
-        .expect("the positive control is a bounded filter");
-        assert!(understood.admits(&event), "the positive control");
+        assert!(
+            watched_admits(
+                vec![json!({ "kinds": [KIND_TEXT_NOTE], "#e": [ROOT] })],
+                &event
+            )
+            .await,
+            "the positive control"
+        );
 
-        // All still constructible: each names at least one selective
-        // constraint, so it is a *narrow* request this code cannot evaluate —
-        // not an unbounded one. The distinction matters, and the two failures
-        // are opposite: an unreadable filter admits nothing, an unbounded one
-        // admits everything. Only the second is refused at construction, and
-        // `a_request_that_constrains_nothing_cannot_be_built` is where that is
-        // asserted.
+        // All still installable: each names at least one selective constraint,
+        // so it is a *narrow* request this code cannot evaluate — not an
+        // unbounded one. The distinction matters, and the two failures are
+        // opposite: an unreadable filter admits nothing, an unbounded one
+        // admits everything. Only the second is refused at installation, and
+        // `no_route_installs_a_request_that_constrains_nothing` is where that
+        // is asserted.
         for unreadable in [
             json!({ "kinds": [KIND_TEXT_NOTE], "#e": [ROOT], "search": "anything" }),
             json!({ "kinds": [KIND_TEXT_NOTE], "#e": [ROOT], "unknown": 1 }),
@@ -7215,13 +7399,8 @@ mod tests {
             json!({ "#e": [7] }),
             json!({ "since": "soon" }),
         ] {
-            let identity = ProjectRequestIdentity::new(
-                ProjectSubscription::Watched { generation: 0 },
-                unreadable.clone(),
-            )
-            .expect("unreadable is not the same as unbounded");
             assert!(
-                !identity.admits(&event),
+                !watched_admits(vec![unreadable.clone()], &event).await,
                 "must refuse rather than skip: {unreadable}"
             );
         }
@@ -7234,31 +7413,30 @@ mod tests {
     /// dangerous looseness is the one in between — matching the kinds of one
     /// branch and the tags of another describes a request nobody sent, and a
     /// matcher that merged the branches into one constraint set would admit it.
-    #[test]
-    fn a_request_admits_an_event_matching_any_one_of_its_filters_entirely() {
+    #[tokio::test]
+    async fn a_request_admits_an_event_matching_any_one_of_its_filters_entirely() {
         const OTHER: &str = "48be1cc2000000000000000000000000000000000000000000000000000000ac";
         let keys = Keys::generate();
-
-        let identity = ProjectRequestIdentity::from_filters(
-            ProjectSubscription::Watched { generation: 0 },
-            vec![
-                json!({ "kinds": [KIND_TEXT_NOTE], "#e": [ROOT] }),
-                json!({ "kinds": [KIND_GIT_PULL_REQUEST], "#E": [OTHER] }),
-            ],
-        )
-        .expect("two filters is not empty");
+        let both = vec![
+            json!({ "kinds": [KIND_TEXT_NOTE], "#e": [ROOT] }),
+            json!({ "kinds": [KIND_GIT_PULL_REQUEST], "#E": [OTHER] }),
+        ];
 
         // Either branch, satisfied whole.
-        assert!(identity.admits(&signed(
-            &keys,
-            KIND_TEXT_NOTE,
-            vec![tag(&["e", ROOT, "", "root"])]
-        )));
-        assert!(identity.admits(&signed(
-            &keys,
-            KIND_GIT_PULL_REQUEST,
-            vec![tag(&["E", OTHER])]
-        )));
+        assert!(
+            watched_admits(
+                both.clone(),
+                &signed(&keys, KIND_TEXT_NOTE, vec![tag(&["e", ROOT, "", "root"])])
+            )
+            .await
+        );
+        assert!(
+            watched_admits(
+                both.clone(),
+                &signed(&keys, KIND_GIT_PULL_REQUEST, vec![tag(&["E", OTHER])])
+            )
+            .await
+        );
 
         // Half of each. Neither filter is satisfied, so neither admits.
         for crossed in [
@@ -7270,23 +7448,34 @@ mod tests {
             ),
         ] {
             assert!(
-                !identity.admits(&crossed),
+                !watched_admits(both.clone(), &crossed).await,
                 "a filter is satisfied whole or not at all"
             );
         }
 
         // And one unreadable branch does not become a licence for the other:
         // an event matching only the branch this code cannot check is refused.
-        let with_unreadable = ProjectRequestIdentity::from_filters(
-            ProjectSubscription::Watched { generation: 0 },
-            vec![
-                json!({ "kinds": [KIND_TEXT_NOTE], "#e": [ROOT] }),
-                json!({ "kinds": [KIND_GIT_PULL_REQUEST], "unknown": 1 }),
-            ],
-        )
-        .expect("two filters");
-        assert!(!with_unreadable.admits(&signed(&keys, KIND_GIT_PULL_REQUEST, Vec::new())));
+        assert!(
+            !watched_admits(
+                vec![
+                    json!({ "kinds": [KIND_TEXT_NOTE], "#e": [ROOT] }),
+                    json!({ "kinds": [KIND_GIT_PULL_REQUEST], "unknown": 1 }),
+                ],
+                &signed(&keys, KIND_GIT_PULL_REQUEST, Vec::new())
+            )
+            .await
+        );
     }
+
+    // Renamed 2026-08-02: `a_request_that_constrains_nothing_cannot_be_built`
+    // is now `no_route_installs_a_request_that_constrains_nothing`, below.
+    //
+    // Not a deletion — same shapes, same table, one more axis. It asserted
+    // against `ProjectRequestIdentity::from_filters`, which this tranche made
+    // private to the registry, so the assertion had to move to the operations.
+    // Moving it was an improvement rather than a concession: a constructor that
+    // refuses is only as good as the routes that go through it, and the new
+    // name says what is now being claimed.
 
     /// A request that constrains nothing cannot be built — by any route.
     ///
@@ -7306,10 +7495,10 @@ mod tests {
     /// applied lazily: one unbounded branch among narrow ones admits everything
     /// through the OR, so the *whole list* has to be refused, not just that
     /// branch.
-    #[test]
-    fn a_request_that_constrains_nothing_cannot_be_built() {
+    #[tokio::test]
+    async fn no_route_installs_a_request_that_constrains_nothing() {
         let narrow = json!({ "kinds": [KIND_TEXT_NOTE], "#e": [ROOT] });
-        for unbounded in [
+        let unbounded_shapes = [
             Vec::new(),
             vec![json!({})],
             vec![json!({ "limit": 500 })],
@@ -7321,35 +7510,92 @@ mod tests {
             // Narrow branch, unbounded branch. The OR makes it unbounded.
             vec![narrow.clone(), json!({})],
             vec![json!({}), narrow.clone()],
-        ] {
+        ];
+
+        // Every replacement route, connected and offline. The refusal used to
+        // be provable only against the constructor, which is now private —
+        // and the constructor was never the thing at risk. What matters is
+        // that no *operation* installs one, and that refusing costs nothing:
+        // a watched refusal decides before allocation, so the generation the
+        // next legitimate replacement takes is still 0.
+        for unbounded in &unbounded_shapes {
+            let mut requests = ProjectRequests::new();
+            let mut socket = test_socket().await;
+            assert_eq!(
+                requests
+                    .replace_watched(&mut socket.client, unbounded.clone())
+                    .await,
+                ReplaceOutcome::InvalidFilters,
+                "connected watched: {unbounded:?}"
+            );
+            assert_eq!(
+                requests.replace_watched_intent(unbounded.clone()),
+                ReplaceOutcome::InvalidFilters,
+                "offline watched: {unbounded:?}"
+            );
+            assert_eq!(
+                requests
+                    .replace_enrolment(&mut socket.client, unbounded.clone())
+                    .await,
+                ReplaceOutcome::InvalidFilters,
+                "connected enrolment: {unbounded:?}"
+            );
+            assert_eq!(
+                requests.replace_enrolment_intent(unbounded.clone()),
+                ReplaceOutcome::InvalidFilters,
+                "offline enrolment: {unbounded:?}"
+            );
+            assert_eq!(requests.intent_len(), 0, "nothing recorded: {unbounded:?}");
+            assert_eq!(requests.live_len(), 0, "nothing live: {unbounded:?}");
+
+            assert_eq!(
+                requests
+                    .replace_watched(&mut socket.client, watched_filters_for(&[ROOT]))
+                    .await,
+                ReplaceOutcome::Replaced { retired: None }
+            );
             assert!(
-                ProjectRequestIdentity::from_filters(
-                    ProjectSubscription::Watched { generation: 0 },
-                    unbounded.clone(),
-                )
-                .is_none(),
-                "must refuse: {unbounded:?}"
+                requests.match_frame(&watched_sub_id(0)).is_some(),
+                "four refusals must not have burned a generation: {unbounded:?}"
             );
         }
+    }
+
+    /// One filter rides as the third REQ element, not as an array.
+    ///
+    /// Asserted off the wire rather than against `req_frame`, because the
+    /// claim is about the bytes a relay receives. `["REQ", id, [f]]` is not
+    /// the frame NIP-01 describes, and it would make the request unmatchable
+    /// as well as unparseable.
+    #[tokio::test]
+    async fn a_single_filter_rides_as_the_third_req_element() {
+        let mut requests = ProjectRequests::new();
+        let mut socket = wire_socket().await;
+        assert_eq!(
+            requests
+                .open_discovery(&mut socket.client, discovery_filters())
+                .await,
+            OpenOutcome::Sent
+        );
+        assert_eq!(
+            socket.next_frame().await,
+            json!(["REQ", discovery_sub_id(), { "kinds": [30617] }])
+        );
 
         // A limit is fine *alongside* something selective — which is what every
-        // catch-up page carries.
-        assert!(ProjectRequestIdentity::new(
-            ProjectSubscription::Watched { generation: 0 },
-            json!({ "kinds": [KIND_TEXT_NOTE], "#e": [ROOT], "limit": 500 }),
-        )
-        .is_some());
-
-        let single = ProjectRequestIdentity::new(
-            ProjectSubscription::Discovery,
-            json!({ "kinds": [30617] }),
-        )
-        .expect("a filter naming kinds constrains events");
-        assert_eq!(single.filters().count(), 1);
+        // catch-up page carries — and it reaches the wire whole.
+        let mut requests = ProjectRequests::new();
+        let mut socket = wire_socket().await;
+        let with_limit = json!({ "kinds": [KIND_TEXT_NOTE], "#e": [ROOT], "limit": 500 });
         assert_eq!(
-            single.req_frame("proj-discovery"),
-            json!(["REQ", "proj-discovery", { "kinds": [30617] }]),
-            "one filter rides as the third REQ element, not as an array"
+            requests
+                .replace_watched(&mut socket.client, vec![with_limit.clone()])
+                .await,
+            ReplaceOutcome::Replaced { retired: None }
+        );
+        assert_eq!(
+            socket.next_frame().await,
+            json!(["REQ", watched_sub_id(0), with_limit])
         );
     }
 
@@ -7943,14 +8189,7 @@ mod tests {
                 for limit in [0, 1, 4, usize::MAX] {
                     let filter = catch_up_filter(ROOT, stream, until, limit);
                     assert!(
-                        ProjectRequestIdentity::new(
-                            ProjectSubscription::RootCatchUp {
-                                root: ROOT.to_string(),
-                                stream,
-                            },
-                            filter.clone(),
-                        )
-                        .is_some(),
+                        requests::bounded_filters(std::slice::from_ref(&filter)),
                         "{stream:?} until={until} limit={limit}: {filter}"
                     );
                 }
@@ -8060,11 +8299,7 @@ mod tests {
         let sub_id = discovery_sub_id();
 
         // Build the operation and drop it without driving it to completion.
-        drop(requests.open_request(
-            &mut socket.client,
-            &sub_id,
-            ident(ProjectSubscription::Discovery),
-        ));
+        drop(requests.open_discovery(&mut socket.client, discovery_filters()));
 
         assert!(
             requests.match_frame(&sub_id).is_none(),
@@ -8236,11 +8471,7 @@ mod tests {
         socket.client.close(None).await.expect("close the socket");
 
         let outcome = requests
-            .open_request(
-                &mut socket.client,
-                &sub_id,
-                ident(ProjectSubscription::Discovery),
-            )
+            .open_discovery(&mut socket.client, discovery_filters())
             .await;
         assert!(
             matches!(outcome, OpenOutcome::WriteFailed(_)),
@@ -8257,26 +8488,10 @@ mod tests {
 
         // A later successful open is a *new* registration, not a resurrection.
         assert_eq!(
-            open_request_on_test_socket(
-                &mut requests,
-                &sub_id,
-                ident(ProjectSubscription::Discovery)
-            )
-            .await,
+            open_discovery_on_test_socket(&mut requests, discovery_filters()).await,
             OpenOutcome::Sent
         );
         assert!(requests.match_frame(&sub_id).is_some());
-    }
-
-    fn identity_for_binding() -> ProjectRequestIdentity {
-        ProjectRequestIdentity::new(
-            ProjectSubscription::RootCatchUp {
-                root: ROOT.to_string(),
-                stream: HistoryStream::Comments,
-            },
-            catch_up_filter(ROOT, HistoryStream::Comments, 1_000, 4),
-        )
-        .expect("a catch-up filter names kinds and a root tag")
     }
 
     /// A registry that opens pages the way the driver will have to.

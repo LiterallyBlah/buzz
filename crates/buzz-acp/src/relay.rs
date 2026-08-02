@@ -1039,7 +1039,7 @@ impl Drop for HarnessRelay {
     }
 }
 
-/// What [`send_project_subscribe`] did.
+/// What [`send_project_discovery`] or [`send_project_replay`] did.
 ///
 /// Replaces a `bool` that conflated a locally refused command with a dead
 /// socket. The caller treated every `false` as "reconnect", so a metadata
@@ -1057,6 +1057,14 @@ enum ProjectSendOutcome {
     AlreadyOpen,
     /// The live registry refused. The socket is fine; our bookkeeping is not.
     MetadataConflict,
+    /// The registry refused the filters as unbounded. Nothing written, nothing
+    /// recorded, socket fine.
+    ///
+    /// Separate from [`Self::MetadataConflict`] because they are different
+    /// faults with different owners: a conflict says this id belongs to another
+    /// request, and this says the question itself asks the relay for
+    /// everything.
+    UnboundedFilters,
     /// The incarnation space is spent. No REQ was written and none ever will
     /// be — distinct from a conflict, which is about *this* id and could in
     /// principle clear, and from a write failure, which is about the socket.
@@ -1496,31 +1504,32 @@ fn apply_command_to_state(state: &mut BgState, cmd: RelayCommand) {
             state.clear_channel_state(&channel_id);
         }
         RelayCommand::SubscribeProjectDiscovery { filters } => {
-            // The id and the class are stamped here, from the one place that
-            // names them. A command that carried them was a command that could
-            // name a watched generation.
-            let sub_id = crate::project::discovery_sub_id();
             // Offline: record the intent only — nothing becomes answerable
             // until a REQ is actually written for it. Fail-closed all the same,
             // because a conflicting command accepted while disconnected would
             // be opened verbatim by the next connection's replay.
-            let Some(identity) = crate::project::ProjectRequestIdentity::from_filters(
-                crate::project::ProjectSubscription::Discovery,
-                filters,
-            ) else {
-                // Recording this as intent would replay a filterless REQ onto
-                // the next connection, which asks the relay for everything.
-                warn!(sub_id, "refusing a project subscription with no filters");
-                return;
-            };
-            if let crate::project::IntentAdmission::Conflict { held } =
-                state.project_requests.record_intent(&sub_id, identity)
-            {
-                warn!(
-                    sub_id,
-                    ?held,
-                    "refusing conflicting project intent while disconnected — keeping the original"
-                );
+            //
+            // The command carries filters and nothing else. The id, the class
+            // and the refusal of an unbounded filter all belong to the registry
+            // — a command that carried them was a command that could name a
+            // watched generation, and a caller that decided boundedness was a
+            // second place that had to agree with the owner.
+            match state.project_requests.record_discovery_intent(filters) {
+                crate::project::IntentAdmission::Conflict { held } => {
+                    warn!(
+                        ?held,
+                        "refusing conflicting project discovery intent while disconnected — \
+                         keeping the original"
+                    );
+                }
+                crate::project::IntentAdmission::UnboundedFilters => {
+                    // Recording this as intent would replay a filterless REQ
+                    // onto the next connection, which asks the relay for
+                    // everything.
+                    warn!("refusing a project discovery subscription with no filters");
+                }
+                crate::project::IntentAdmission::Recorded
+                | crate::project::IntentAdmission::AlreadyIntended => {}
             }
         }
         RelayCommand::ReplaceProject {
@@ -1735,26 +1744,19 @@ async fn execute_connected_command(
             true
         }
         RelayCommand::SubscribeProjectDiscovery { filters } => {
-            let sub_id = crate::project::discovery_sub_id();
             // Intent and registration are decided together, in one operation
             // that either fully succeeds or records nothing. Admitting intent
             // first and consulting the registry second left a refused identity
             // sitting in intent, and the next reconnect installed it.
-            let Some(identity) = crate::project::ProjectRequestIdentity::from_filters(
-                crate::project::ProjectSubscription::Discovery,
-                filters,
-            ) else {
-                // Nothing written, nothing registered, and the socket is fine —
-                // a filterless REQ asks the relay for everything.
-                warn!(sub_id, "refusing a project subscription with no filters");
-                return true;
-            };
-            match send_project_subscribe(ws, state, &sub_id, identity).await {
+            match send_project_discovery(ws, state, filters).await {
                 ProjectSendOutcome::Sent | ProjectSendOutcome::AlreadyOpen => true,
                 // The socket is fine; our own bookkeeping disagreed. Tearing
                 // the connection down here is what let a refusal be replayed
                 // into effect on the next one.
                 ProjectSendOutcome::MetadataConflict => true,
+                // Our own filters were unusable. Nothing written, nothing
+                // recorded, and the connection is unaffected.
+                ProjectSendOutcome::UnboundedFilters => true,
                 // Terminal, but not a transport failure — the socket stays.
                 ProjectSendOutcome::Exhausted => true,
                 ProjectSendOutcome::WriteFailed => false,
@@ -1941,7 +1943,7 @@ async fn execute_connected_command(
 #[allow(clippy::too_many_arguments)]
 async fn run_background_task(
     mut ws: WsStream,
-    initial_handshake_buffer: std::collections::VecDeque<RelayMessage>,
+    initial_handshake_buffer: ingress::HandshakeBuffer,
     event_tx: mpsc::Sender<Option<BuzzEvent>>,
     observer_control_tx: mpsc::Sender<Event>,
     mut cmd_rx: mpsc::Receiver<RelayCommand>,
@@ -1952,7 +1954,7 @@ async fn run_background_task(
 ) {
     let mut state = BgState::new();
 
-    let handshake_ok = process_handshake_buffer(
+    let handshake_ok = ingress::process_handshake_buffer(
         &mut ws,
         initial_handshake_buffer,
         &event_tx,
@@ -2190,37 +2192,37 @@ async fn run_background_task(
         }
 
         tokio::select! {
-                   raw = ws.next() => {
+                   // The read is the branch future because it is cancel-safe;
+                   // the dispatch runs in the body, where `select!` cannot drop
+                   // it part way through. Both belong to `ingress`, and so does
+                   // the frame that passes between them.
+                   read = ingress::read_frame(&mut ws) => {
                        // Determine if the socket is lost.
-                       let socket_lost = match raw {
-                           Some(Ok(msg)) => {
-                               if matches!(msg, Message::Pong(_)) {
-                                   last_pong = Instant::now();
-                                   ping_sent = false;
-                                   false // pong is healthy — not a socket loss
-                               } else {
-                                   !handle_ws_message(
-                                       msg,
-                                       &mut ws,
-                                       &event_tx,
-                                       &observer_control_tx,
-                                       &mut state,
-                                       &keys,
-                                       &relay_url,
-                                       &agent_pubkey_hex,
-                                       auth_tag.as_ref(),
-                                   )
-                                   .await
+                       let socket_lost = match read {
+                           ingress::FrameRead::Frame(frame) => {
+                               match ingress::dispatch_frame(
+                                   frame,
+                                   &mut ws,
+                                   &event_tx,
+                                   &observer_control_tx,
+                                   &mut state,
+                                   &keys,
+                                   &relay_url,
+                                   &agent_pubkey_hex,
+                                   auth_tag.as_ref(),
+                               )
+                               .await
+                               {
+                                   ingress::FrameDispatch::Pong => {
+                                       last_pong = Instant::now();
+                                       ping_sent = false;
+                                       false // pong is healthy — not a socket loss
+                                   }
+                                   ingress::FrameDispatch::Handled => false,
+                                   ingress::FrameDispatch::Lost => true,
                                }
                            }
-                           Some(Err(e)) => {
-                               warn!("WebSocket error in background task: {e}");
-                               true
-                           }
-                           None => {
-                               debug!("WebSocket stream ended");
-                               true
-                           }
+                           ingress::FrameRead::Lost => true,
                        };
 
                        if socket_lost {
@@ -2443,13 +2445,389 @@ async fn run_background_task(
     }
 }
 
+/// The connected inbound path.
+///
+/// **Why this is a module and not two loose functions.** The phase contract
+/// requires the canonical scenario's inbound events to cross the same reader
+/// that installed the requests they answer, and names "direct midpoint
+/// injection replaces the connected path" as a mutant the suite must catch.
+/// While the scenario owned the step between `ws.next()` and
+/// [`super::handle_ws_message`], it could not: an edit that read the real frame
+/// off the socket, discarded it and passed a locally rebuilt `Message::Text` to
+/// the handler produced byte-identical input, and no assertion separates a
+/// transported value from a reconstruction of itself.
+///
+/// The composition moves here instead. [`InboundFrame`]'s field is private to
+/// this module and [`read_frame`] is its only producer, so nothing outside —
+/// the test module included, since it is a sibling of this module rather than a
+/// descendant — can present bytes to the handler that did not come off a
+/// connection. The substitution has nowhere to happen rather than being
+/// forbidden by convention.
+///
+/// **Why the read and the dispatch stay separable.** The runtime races the read
+/// against commands and the ping timer in a `select!`, where every branch
+/// future is dropped as soon as another branch completes. `ws.next()` is
+/// cancel-safe; a fused read-and-dispatch is not, and a frame cancelled part
+/// way through `handle_ws_message` would be lost. So the read is the branch
+/// future and the dispatch runs in the branch body, which cannot be cancelled.
+/// Both halves live here and both are used by the runtime and by the canonical
+/// scenario alike; what a caller cannot do is put anything of its own between
+/// them.
+mod ingress {
+    use super::*;
+
+    /// A frame that came off a live relay connection.
+    ///
+    /// Opaque on purpose — see the module comment.
+    pub(super) struct InboundFrame(Message);
+
+    impl InboundFrame {
+        /// The message this frame carries.
+        ///
+        /// Consuming, and deliberately without a counterpart: a frame can be
+        /// unwrapped but not built, so unwrapping one is not a route back to
+        /// presenting bytes of a caller's own choosing to the handler.
+        pub(super) fn into_message(self) -> Message {
+            self.0
+        }
+    }
+
+    /// The frames a connection delivered before its handshake finished.
+    ///
+    /// Opaque for the same reason [`InboundFrame`] is. The NIP-42 exchange has
+    /// to read the socket to find its `AUTH` and its `OK`, and everything else
+    /// that arrives in the meantime is a frame the relay sent on that
+    /// connection — it must reach the handler, so this is the one production
+    /// path that hands the dispatch a message it did not read a moment earlier.
+    ///
+    /// That made it the remaining way to put chosen bytes in front of
+    /// [`super::handle_ws_message`]: `process_handshake_buffer` is reachable
+    /// from the sibling test module, and a `VecDeque<RelayMessage>` is a
+    /// caller's to fill. So the collection is a type whose only constructor is
+    /// empty and whose only writers are the two handshake readers below, each
+    /// of which pushes exactly what it took off `ws`. A caller can hold one; it
+    /// cannot put anything in it.
+    #[derive(Debug)]
+    pub(super) struct HandshakeBuffer(std::collections::VecDeque<RelayMessage>);
+
+    impl HandshakeBuffer {
+        /// A buffer holding nothing.
+        ///
+        /// The only way to make one, and it carries no frames on purpose:
+        /// [`wait_for_auth_challenge`] and [`wait_for_any_ok`] are what fill
+        /// it, out of a socket.
+        pub(super) fn empty() -> Self {
+            Self(std::collections::VecDeque::new())
+        }
+
+        /// How many frames arrived during the handshake.
+        pub(super) fn len(&self) -> usize {
+            self.0.len()
+        }
+
+        /// Take the first buffered message satisfying `wanted`.
+        ///
+        /// The handshake readers check here first: a challenge or an OK may
+        /// already have been buffered by the previous reader.
+        fn take_first(&mut self, wanted: impl Fn(&RelayMessage) -> bool) -> Option<RelayMessage> {
+            let idx = self.0.iter().position(wanted)?;
+            self.0.remove(idx)
+        }
+
+        /// File a message that came off the socket.
+        ///
+        /// Private to this module: the pushers are the two readers below, and
+        /// nothing else may add to what the dispatch will later be handed.
+        fn push(&mut self, msg: RelayMessage) {
+            self.0.push_back(msg);
+        }
+    }
+
+    /// What [`read_frame`] took off the connection.
+    pub(super) enum FrameRead {
+        /// A frame, ready for [`dispatch_frame`].
+        Frame(InboundFrame),
+        /// The connection is gone; nothing was read.
+        Lost,
+    }
+
+    /// What dispatching a frame did to the connection.
+    #[derive(Debug, PartialEq, Eq)]
+    pub(super) enum FrameDispatch {
+        /// The frame was handled and the connection is healthy.
+        Handled,
+        /// The frame was the relay's pong — the peer is alive.
+        Pong,
+        /// The frame signals the connection should be dropped.
+        Lost,
+    }
+
+    /// Take the next frame off `ws`.
+    ///
+    /// Cancel-safe: it awaits `ws.next()` and nothing else, so a `select!` that
+    /// drops it loses no frame.
+    pub(super) async fn read_frame(ws: &mut WsStream) -> FrameRead {
+        match ws.next().await {
+            Some(Ok(msg)) => FrameRead::Frame(InboundFrame(msg)),
+            Some(Err(e)) => {
+                warn!("WebSocket error in background task: {e}");
+                FrameRead::Lost
+            }
+            None => {
+                debug!("WebSocket stream ended");
+                FrameRead::Lost
+            }
+        }
+    }
+
+    /// Hand a frame that came off the connection to the production handler.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) async fn dispatch_frame(
+        frame: InboundFrame,
+        ws: &mut WsStream,
+        event_tx: &mpsc::Sender<Option<BuzzEvent>>,
+        observer_control_tx: &mpsc::Sender<Event>,
+        state: &mut BgState,
+        keys: &Keys,
+        relay_url: &str,
+        agent_pubkey_hex: &str,
+        auth_tag: Option<&nostr::Tag>,
+    ) -> FrameDispatch {
+        if matches!(frame.0, Message::Pong(_)) {
+            return FrameDispatch::Pong;
+        }
+        if handle_ws_message(
+            frame,
+            ws,
+            event_tx,
+            observer_control_tx,
+            state,
+            keys,
+            relay_url,
+            agent_pubkey_hex,
+            auth_tag,
+        )
+        .await
+        {
+            FrameDispatch::Handled
+        } else {
+            FrameDispatch::Lost
+        }
+    }
+
+    /// Replay messages buffered during the NIP-42 handshake.
+    ///
+    /// The connection may have delivered EVENTs and EOSEs while we were waiting
+    /// for the challenge and OK. Those messages would otherwise be silently
+    /// discarded, so they are re-encoded and pushed through the same handler
+    /// every connected frame crosses.
+    ///
+    /// This lives inside `ingress` because it is the one production path that
+    /// legitimately builds a frame rather than reading one, and the constructor
+    /// that lets it do so must not be reachable from anywhere else. Its
+    /// argument is a [`HandshakeBuffer`] for the other half of the same
+    /// reason: the function is reachable from outside, so what it may be given
+    /// must not be.
+    ///
+    /// Returns `false` if any buffered message signals the connection should be
+    /// dropped.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) async fn process_handshake_buffer(
+        ws: &mut WsStream,
+        buffer: HandshakeBuffer,
+        event_tx: &mpsc::Sender<Option<BuzzEvent>>,
+        observer_control_tx: &mpsc::Sender<Event>,
+        state: &mut BgState,
+        keys: &Keys,
+        relay_url: &str,
+        agent_pubkey_hex: &str,
+        auth_tag: Option<&nostr::Tag>,
+    ) -> bool {
+        if buffer.0.is_empty() {
+            return true;
+        }
+        debug!("processing {} buffered handshake message(s)", buffer.len());
+        for relay_msg in buffer.0 {
+            // Re-encode to text so we can reuse the handler. This is slightly
+            // wasteful but keeps it the single source of truth for dispatch.
+            let text = match &relay_msg {
+                RelayMessage::Event {
+                    subscription_id,
+                    event,
+                } => serde_json::to_string(&json!(["EVENT", subscription_id, event])).ok(),
+                RelayMessage::Eose { subscription_id } => {
+                    serde_json::to_string(&json!(["EOSE", subscription_id])).ok()
+                }
+                RelayMessage::Notice { message } => {
+                    serde_json::to_string(&json!(["NOTICE", message])).ok()
+                }
+                RelayMessage::Closed {
+                    subscription_id,
+                    message,
+                } => serde_json::to_string(&json!(["CLOSED", subscription_id, message])).ok(),
+                RelayMessage::Ok {
+                    event_id,
+                    accepted,
+                    message,
+                } => serde_json::to_string(&json!(["OK", event_id, accepted, message])).ok(),
+                // AUTH in the buffer is stale — skip it.
+                RelayMessage::Auth { .. } => None,
+            };
+            if let Some(text) = text {
+                let outcome = dispatch_frame(
+                    InboundFrame(Message::Text(text.into())),
+                    ws,
+                    event_tx,
+                    observer_control_tx,
+                    state,
+                    keys,
+                    relay_url,
+                    agent_pubkey_hex,
+                    auth_tag,
+                )
+                .await;
+                if outcome == FrameDispatch::Lost {
+                    debug!("buffered message signalled connection loss");
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    /// Wait for an `AUTH` challenge from the relay, buffering any other messages.
+    pub(super) async fn wait_for_auth_challenge(
+        ws: &mut WsStream,
+        buffer: &mut HandshakeBuffer,
+        timeout_dur: Duration,
+    ) -> Result<String, RelayError> {
+        // Check if there's already one buffered.
+        if let Some(RelayMessage::Auth { challenge }) =
+            buffer.take_first(|m| matches!(m, RelayMessage::Auth { .. }))
+        {
+            return Ok(challenge);
+        }
+
+        let deadline = tokio::time::Instant::now() + timeout_dur;
+
+        loop {
+            let remaining = deadline
+                .checked_duration_since(tokio::time::Instant::now())
+                .unwrap_or(Duration::ZERO);
+
+            if remaining.is_zero() {
+                return Err(RelayError::NoAuthChallenge);
+            }
+
+            let raw = timeout(remaining, ws.next())
+                .await
+                .map_err(|_| RelayError::NoAuthChallenge)?
+                .ok_or(RelayError::ConnectionClosed)?
+                .map_err(|e| RelayError::WebSocket(Box::new(e)))?;
+
+            match raw {
+                Message::Text(text) => {
+                    let msg = parse_relay_message(&text)?;
+                    match msg {
+                        RelayMessage::Auth { challenge } => return Ok(challenge),
+                        other => buffer.push(other),
+                    }
+                }
+                Message::Ping(data) => {
+                    ws_send_timeout(ws, Message::Pong(data), WS_SEND_TIMEOUT_SECS)
+                        .await
+                        .map_err(|_| RelayError::Timeout)?;
+                }
+                Message::Close(_) => return Err(RelayError::ConnectionClosed),
+                _ => {}
+            }
+        }
+    }
+
+    /// Response from an `OK` relay message.
+    pub(super) struct OkResponse {
+        pub(super) event_id: String,
+        pub(super) accepted: bool,
+        pub(super) message: String,
+    }
+
+    /// Wait for the first `OK` message from the relay (used after sending AUTH).
+    pub(super) async fn wait_for_any_ok(
+        ws: &mut WsStream,
+        buffer: &mut HandshakeBuffer,
+        timeout_dur: Duration,
+    ) -> Result<OkResponse, RelayError> {
+        // Check if there's already one buffered.
+        if let Some(RelayMessage::Ok {
+            event_id,
+            accepted,
+            message,
+        }) = buffer.take_first(|m| matches!(m, RelayMessage::Ok { .. }))
+        {
+            return Ok(OkResponse {
+                event_id,
+                accepted,
+                message,
+            });
+        }
+
+        let deadline = tokio::time::Instant::now() + timeout_dur;
+
+        loop {
+            let remaining = deadline
+                .checked_duration_since(tokio::time::Instant::now())
+                .unwrap_or(Duration::ZERO);
+
+            if remaining.is_zero() {
+                return Err(RelayError::Timeout);
+            }
+
+            let raw = timeout(remaining, ws.next())
+                .await
+                .map_err(|_| RelayError::Timeout)?
+                .ok_or(RelayError::ConnectionClosed)?
+                .map_err(|e| RelayError::WebSocket(Box::new(e)))?;
+
+            match raw {
+                Message::Text(text) => {
+                    let msg = parse_relay_message(&text)?;
+                    match msg {
+                        RelayMessage::Ok {
+                            event_id,
+                            accepted,
+                            message,
+                        } => {
+                            return Ok(OkResponse {
+                                event_id,
+                                accepted,
+                                message,
+                            });
+                        }
+                        other => buffer.push(other),
+                    }
+                }
+                Message::Ping(data) => {
+                    ws_send_timeout(ws, Message::Pong(data), WS_SEND_TIMEOUT_SECS)
+                        .await
+                        .map_err(|_| RelayError::Timeout)?;
+                }
+                Message::Close(_) => return Err(RelayError::ConnectionClosed),
+                _ => {}
+            }
+        }
+    }
+}
+
 /// Handle a single WebSocket message in the background task.
 ///
 /// Returns `false` if the connection has been lost (Close frame or unrecoverable
 /// error), `true` otherwise.
+///
+/// Reached only through [`ingress::dispatch_frame`], which is the only holder of
+/// a frame to give it.
 #[allow(clippy::too_many_arguments)]
 async fn handle_ws_message(
-    msg: Message,
+    frame: ingress::InboundFrame,
     ws: &mut WsStream,
     event_tx: &mpsc::Sender<Option<BuzzEvent>>,
     observer_control_tx: &mpsc::Sender<Event>,
@@ -2459,7 +2837,7 @@ async fn handle_ws_message(
     agent_pubkey_hex: &str,
     auth_tag: Option<&nostr::Tag>,
 ) -> bool {
-    match msg {
+    match frame.into_message() {
         Message::Text(text) => {
             let relay_msg = match parse_relay_message(&text) {
                 Ok(m) => m,
@@ -3154,76 +3532,6 @@ async fn handle_ws_message(
     }
 }
 
-/// Process messages buffered during the NIP-42 auth handshake.
-///
-/// `do_connect` buffers any non-AUTH/non-OK messages it receives while waiting
-/// for the challenge and OK. Those messages would otherwise be silently
-/// discarded. We replay them through the normal handler here.
-#[allow(clippy::too_many_arguments)]
-/// Returns `false` if any buffered message signals the connection should be dropped.
-async fn process_handshake_buffer(
-    ws: &mut WsStream,
-    buffer: std::collections::VecDeque<RelayMessage>,
-    event_tx: &mpsc::Sender<Option<BuzzEvent>>,
-    observer_control_tx: &mpsc::Sender<Event>,
-    state: &mut BgState,
-    keys: &Keys,
-    relay_url: &str,
-    agent_pubkey_hex: &str,
-    auth_tag: Option<&nostr::Tag>,
-) -> bool {
-    if buffer.is_empty() {
-        return true;
-    }
-    debug!("processing {} buffered handshake message(s)", buffer.len());
-    for relay_msg in buffer {
-        // Re-encode to text so we can reuse handle_ws_message.
-        // This is slightly wasteful but keeps the handler as the single
-        // source of truth for message dispatch.
-        let text = match &relay_msg {
-            RelayMessage::Event {
-                subscription_id,
-                event,
-            } => serde_json::to_string(&json!(["EVENT", subscription_id, event])).ok(),
-            RelayMessage::Eose { subscription_id } => {
-                serde_json::to_string(&json!(["EOSE", subscription_id])).ok()
-            }
-            RelayMessage::Notice { message } => {
-                serde_json::to_string(&json!(["NOTICE", message])).ok()
-            }
-            RelayMessage::Closed {
-                subscription_id,
-                message,
-            } => serde_json::to_string(&json!(["CLOSED", subscription_id, message])).ok(),
-            RelayMessage::Ok {
-                event_id,
-                accepted,
-                message,
-            } => serde_json::to_string(&json!(["OK", event_id, accepted, message])).ok(),
-            // AUTH in the buffer is stale — skip it.
-            RelayMessage::Auth { .. } => None,
-        };
-        if let Some(text) = text {
-            let should_continue = handle_ws_message(
-                Message::Text(text.into()),
-                ws,
-                event_tx,
-                observer_control_tx,
-                state,
-                keys,
-                relay_url,
-                agent_pubkey_hex,
-                auth_tag,
-            )
-            .await;
-            if !should_continue {
-                return false;
-            }
-        }
-    }
-    true
-}
-
 /// Install a replacement socket and hand it the frames it already buffered.
 ///
 /// **The order is the point.** `do_connect` returns a live socket plus whatever
@@ -3244,7 +3552,7 @@ async fn process_handshake_buffer(
 async fn install_replacement_connection(
     ws: &mut WsStream,
     replacement: WsStream,
-    handshake_buffer: std::collections::VecDeque<RelayMessage>,
+    handshake_buffer: ingress::HandshakeBuffer,
     event_tx: &mpsc::Sender<Option<BuzzEvent>>,
     observer_control_tx: &mpsc::Sender<Event>,
     state: &mut BgState,
@@ -3255,7 +3563,7 @@ async fn install_replacement_connection(
 ) -> bool {
     state.retire_project_connection();
     *ws = replacement;
-    process_handshake_buffer(
+    ingress::process_handshake_buffer(
         ws,
         handshake_buffer,
         event_tx,
@@ -3338,9 +3646,37 @@ async fn resubscribe_after_reconnect(
     // unaddressed, and it grew when the second and third request classes
     // arrived. An earlier revision of this comment said only discovery existed,
     // which stopped being true when enrolment landed.
-    for (sub_id, identity) in state.project_requests.replayable() {
-        match send_project_subscribe(ws, state, &sub_id, identity).await {
+    // A record the registry cannot validate replays nothing at all. This is
+    // where durable intent becomes bytes, so a non-canonical entry admitted
+    // here would be a REQ this agent never wrote — and dropping only the bad
+    // entry would install the rest against a record already known to be
+    // inconsistent. The connection is healthy either way; what is broken is
+    // local, and a reconnect cannot repair it.
+    let replayable = match state.project_requests.replayable() {
+        Ok(replayable) => replayable,
+        Err(violation) => {
+            error!(
+                violation,
+                "project durable intent is inconsistent — replaying no project request on this \
+                 connection"
+            );
+            Vec::new()
+        }
+    };
+    for request in replayable {
+        let sub_id = request.sub_id().to_string();
+        match send_project_replay(ws, state, request).await {
             ProjectSendOutcome::Sent | ProjectSendOutcome::AlreadyOpen => {}
+            ProjectSendOutcome::UnboundedFilters => {
+                // Unreachable: an identity only exists because its filters were
+                // bounded when it was minted. Reported rather than ignored,
+                // because a silent arm here would hide the two rules drifting.
+                error!(
+                    sub_id,
+                    "project resubscribe refused its own recorded filters as unbounded — \
+                     internal invariant failure"
+                );
+            }
             ProjectSendOutcome::WriteFailed => {
                 // Do not carry on and report a healthy connection. Intent is
                 // retained but inactive, and there may be no later reconnect to
@@ -4131,26 +4467,42 @@ async fn send_subscribe(
 /// - `WriteFailed` — nothing was registered. Durable intent survives, because
 ///   the intent is still what we want; the write is what failed.
 ///
-/// `identity` carries the filter rather than this function building one: the
-/// registry serialises the REQ from it, so the bytes on the wire cannot differ
-/// from the question that was registered.
-async fn send_project_subscribe(
+/// Neither sender builds an identity or names an id. Discovery submits its
+/// filters and the registry stamps the rest; replay hands back a token the
+/// registry minted from its own validated record. The registry serialises the
+/// REQ from the registration it installs, so the bytes on the wire cannot
+/// differ from the question that was registered.
+async fn send_project_discovery(
     ws: &mut WsStream,
     state: &mut BgState,
-    sub_id: &str,
-    identity: crate::project::ProjectRequestIdentity,
+    filters: Vec<serde_json::Value>,
 ) -> ProjectSendOutcome {
     // The registry performs the write, against the socket itself. It is handed
     // the live `WsStream` rather than a closure: a closure returning
     // `Result<(), E>` could be `|_| async { Ok(()) }`, which manufactures send
-    // authority with no socket in sight. The registry also serialises the REQ
-    // from the registration's own filter, so this function no longer chooses
-    // the bytes that go on the wire.
-    let outcome = state
-        .project_requests
-        .open_request(ws, sub_id, identity)
-        .await;
+    // authority with no socket in sight.
+    let outcome = state.project_requests.open_discovery(ws, filters).await;
+    // For the log line only. The id is the registry's, read back from the one
+    // function that names it rather than chosen here; nothing downstream of
+    // this call takes it as authority.
+    report_project_open(&crate::project::discovery_sub_id(), outcome)
+}
 
+/// Re-open one request the registry itself intends. See
+/// [`crate::project::ReplayableRequest`] — the token is the whole argument, so
+/// this path cannot re-ask a question of its own.
+async fn send_project_replay(
+    ws: &mut WsStream,
+    state: &mut BgState,
+    request: crate::project::ReplayableRequest,
+) -> ProjectSendOutcome {
+    let sub_id = request.sub_id().to_string();
+    let outcome = state.project_requests.open_replayed(ws, request).await;
+    report_project_open(&sub_id, outcome)
+}
+
+/// Turn one registry outcome into the caller-facing outcome, with its log.
+fn report_project_open(sub_id: &str, outcome: crate::project::OpenOutcome) -> ProjectSendOutcome {
     match outcome {
         crate::project::OpenOutcome::Sent => {
             debug!(sub_id, "project REQ sent and registered");
@@ -4194,17 +4546,14 @@ async fn send_project_subscribe(
             );
             ProjectSendOutcome::WriteFailed
         }
-        crate::project::OpenOutcome::NotOpenableHere => {
-            // A catch-up reached the generic sender. Its wire id has to name
-            // one transport attempt, and only `open_history_page` mints those,
-            // so this is a caller mistake rather than a relay condition —
-            // reported as a conflict because that is what it is: an id this
-            // path may not claim.
-            error!(
+        crate::project::OpenOutcome::UnboundedFilters => {
+            // Nothing written, nothing registered, and the socket is fine — a
+            // filterless REQ asks the relay for everything.
+            warn!(
                 sub_id,
-                "a root catch-up cannot be opened through the generic sender"
+                "refusing a project subscription whose filters constrain nothing"
             );
-            ProjectSendOutcome::MetadataConflict
+            ProjectSendOutcome::UnboundedFilters
         }
     }
 }
@@ -4878,7 +5227,7 @@ async fn do_connect(
     relay_url: &str,
     keys: &Keys,
     auth_tag: Option<&nostr::Tag>,
-) -> Result<(WsStream, VecDeque<RelayMessage>), RelayError> {
+) -> Result<(WsStream, ingress::HandshakeBuffer), RelayError> {
     let parsed = relay_url
         .parse::<url::Url>()
         .map_err(|e| RelayError::Http(format!("invalid relay URL: {e}")))?;
@@ -4890,9 +5239,9 @@ async fn do_connect(
     debug!("connected to relay at {relay_url}");
 
     let mut ws = ws;
-    let mut buffer: VecDeque<RelayMessage> = VecDeque::new();
+    let mut buffer = ingress::HandshakeBuffer::empty();
 
-    let challenge = wait_for_auth_challenge(&mut ws, &mut buffer, AUTH_TIMEOUT).await?;
+    let challenge = ingress::wait_for_auth_challenge(&mut ws, &mut buffer, AUTH_TIMEOUT).await?;
 
     send_auth_response(&mut ws, &challenge, relay_url, keys, auth_tag).await?;
 
@@ -4902,7 +5251,7 @@ async fn do_connect(
         // message. Simpler: wait_for_ok accepts any OK (we just sent one event).
         // The event_id in the OK will match whatever we sent.
         // We'll accept the first OK we receive.
-        let ok = wait_for_any_ok(&mut ws, &mut buffer, AUTH_TIMEOUT).await?;
+        let ok = ingress::wait_for_any_ok(&mut ws, &mut buffer, AUTH_TIMEOUT).await?;
         if !ok.accepted {
             return Err(RelayError::AuthFailed(ok.message));
         }
@@ -4911,136 +5260,6 @@ async fn do_connect(
 
     debug!("NIP-42 authentication successful (event {event_id})");
     Ok((ws, buffer))
-}
-
-/// Wait for an `AUTH` challenge from the relay, buffering any other messages.
-async fn wait_for_auth_challenge(
-    ws: &mut WsStream,
-    buffer: &mut VecDeque<RelayMessage>,
-    timeout_dur: Duration,
-) -> Result<String, RelayError> {
-    // Check if there's already one buffered.
-    if let Some(idx) = buffer
-        .iter()
-        .position(|m| matches!(m, RelayMessage::Auth { .. }))
-    {
-        if let Some(RelayMessage::Auth { challenge }) = buffer.remove(idx) {
-            return Ok(challenge);
-        }
-    }
-
-    let deadline = tokio::time::Instant::now() + timeout_dur;
-
-    loop {
-        let remaining = deadline
-            .checked_duration_since(tokio::time::Instant::now())
-            .unwrap_or(Duration::ZERO);
-
-        if remaining.is_zero() {
-            return Err(RelayError::NoAuthChallenge);
-        }
-
-        let raw = timeout(remaining, ws.next())
-            .await
-            .map_err(|_| RelayError::NoAuthChallenge)?
-            .ok_or(RelayError::ConnectionClosed)?
-            .map_err(|e| RelayError::WebSocket(Box::new(e)))?;
-
-        match raw {
-            Message::Text(text) => {
-                let msg = parse_relay_message(&text)?;
-                match msg {
-                    RelayMessage::Auth { challenge } => return Ok(challenge),
-                    other => buffer.push_back(other),
-                }
-            }
-            Message::Ping(data) => {
-                ws_send_timeout(ws, Message::Pong(data), WS_SEND_TIMEOUT_SECS)
-                    .await
-                    .map_err(|_| RelayError::Timeout)?;
-            }
-            Message::Close(_) => return Err(RelayError::ConnectionClosed),
-            _ => {}
-        }
-    }
-}
-
-/// Response from an `OK` relay message.
-struct OkResponse {
-    event_id: String,
-    accepted: bool,
-    message: String,
-}
-
-/// Wait for the first `OK` message from the relay (used after sending AUTH).
-async fn wait_for_any_ok(
-    ws: &mut WsStream,
-    buffer: &mut VecDeque<RelayMessage>,
-    timeout_dur: Duration,
-) -> Result<OkResponse, RelayError> {
-    // Check if there's already one buffered.
-    if let Some(idx) = buffer
-        .iter()
-        .position(|m| matches!(m, RelayMessage::Ok { .. }))
-    {
-        if let Some(RelayMessage::Ok {
-            event_id,
-            accepted,
-            message,
-        }) = buffer.remove(idx)
-        {
-            return Ok(OkResponse {
-                event_id,
-                accepted,
-                message,
-            });
-        }
-    }
-
-    let deadline = tokio::time::Instant::now() + timeout_dur;
-
-    loop {
-        let remaining = deadline
-            .checked_duration_since(tokio::time::Instant::now())
-            .unwrap_or(Duration::ZERO);
-
-        if remaining.is_zero() {
-            return Err(RelayError::Timeout);
-        }
-
-        let raw = timeout(remaining, ws.next())
-            .await
-            .map_err(|_| RelayError::Timeout)?
-            .ok_or(RelayError::ConnectionClosed)?
-            .map_err(|e| RelayError::WebSocket(Box::new(e)))?;
-
-        match raw {
-            Message::Text(text) => {
-                let msg = parse_relay_message(&text)?;
-                match msg {
-                    RelayMessage::Ok {
-                        event_id,
-                        accepted,
-                        message,
-                    } => {
-                        return Ok(OkResponse {
-                            event_id,
-                            accepted,
-                            message,
-                        });
-                    }
-                    other => buffer.push_back(other),
-                }
-            }
-            Message::Ping(data) => {
-                ws_send_timeout(ws, Message::Pong(data), WS_SEND_TIMEOUT_SECS)
-                    .await
-                    .map_err(|_| RelayError::Timeout)?;
-            }
-            Message::Close(_) => return Err(RelayError::ConnectionClosed),
-            _ => {}
-        }
-    }
 }
 
 #[cfg(test)]
@@ -5979,6 +6198,29 @@ mod tests {
     /// One event that is legitimately deliverable on both surfaces: an `h` tag
     /// puts it on a channel REQ, and an `e`-root tag routes it on the
     /// watched-root REQ.
+    /// An event both the enrolment and the watched filter admit.
+    ///
+    /// A kind-1 comment on `root`, on the discovered repository, tagging this
+    /// agent — which is exactly the shape the relay may deliver under both
+    /// subscription ids at once.
+    fn enrolled_and_watched_event(keys: &nostr::Keys, root: &str, ts: u64) -> Event {
+        EventBuilder::new(nostr::Kind::TextNote, "on both project subscriptions")
+            .custom_created_at(nostr::Timestamp::from(ts))
+            .tags([
+                nostr::Tag::parse(vec![
+                    "e".to_string(),
+                    root.to_string(),
+                    String::new(),
+                    "root".to_string(),
+                ])
+                .expect("e tag"),
+                nostr::Tag::parse(vec!["a".to_string(), test_coordinate()]).expect("a tag"),
+                nostr::Tag::parse(vec!["p".to_string(), test_agent_hex()]).expect("p tag"),
+            ])
+            .sign_with_keys(keys)
+            .expect("signing should succeed")
+    }
+
     fn mixed_surface_event(keys: &nostr::Keys, channel_id: Uuid, root: &str, ts: u64) -> Event {
         EventBuilder::new(nostr::Kind::TextNote, "on both surfaces")
             .custom_created_at(nostr::Timestamp::from(ts))
@@ -6000,23 +6242,44 @@ mod tests {
         "a".repeat(64)
     }
 
-    /// Push one EVENT frame through the production dispatch path.
+    /// The agent pubkey the enrolment filter scopes to in these tests.
+    fn test_agent_hex() -> String {
+        "b".repeat(64)
+    }
+
+    /// The repository coordinate `watched_enrolments` enrols under.
+    fn test_coordinate() -> String {
+        format!("30617:{}:repo", "1".repeat(64))
+    }
+
+    /// Write `text` onto a fresh connection and let the production reader take
+    /// it off again.
     ///
-    /// These tests are about *which dedup set the real code spends*, so poking
-    /// `BgState` by hand would assert nothing — the simulation would be the
-    /// thing under test. This goes through `handle_ws_message`.
-    async fn deliver_frame(
+    /// Every narrow frame-level test goes through here rather than calling the
+    /// handler with a `Message` of its own, because it cannot do the latter:
+    /// only `ingress` can produce the frame the handler accepts. The frame
+    /// these helpers deliver is one they wrote themselves, which is why they
+    /// are not the canonical connected proof — but the step between the socket
+    /// and the handler is production's here as it is there.
+    async fn dispatch_over_fresh_connection(
         state: &mut BgState,
-        sub_id: &str,
-        event: &Event,
+        text: String,
         event_tx: &mpsc::Sender<Option<BuzzEvent>>,
-    ) {
-        let (mut ws, _server) = test_ws_pair().await;
+    ) -> bool {
+        use futures_util::SinkExt;
+        let (mut ws, mut server) = test_ws_pair().await;
         let (observer_tx, _observer_rx) = mpsc::channel(8);
         let keys = nostr::Keys::generate();
-        let text = serde_json::to_string(&json!(["EVENT", sub_id, event])).expect("encode frame");
-        let keep_going = handle_ws_message(
-            Message::Text(text.into()),
+        server
+            .send(Message::Text(text.into()))
+            .await
+            .expect("the peer writes the frame");
+        let frame = match ingress::read_frame(&mut ws).await {
+            ingress::FrameRead::Frame(frame) => frame,
+            ingress::FrameRead::Lost => panic!("the connection dropped the frame"),
+        };
+        ingress::dispatch_frame(
+            frame,
             &mut ws,
             event_tx,
             &observer_tx,
@@ -6026,7 +6289,23 @@ mod tests {
             &keys.public_key().to_hex(),
             None,
         )
-        .await;
+        .await
+            != ingress::FrameDispatch::Lost
+    }
+
+    /// Push one EVENT frame through the production dispatch path.
+    ///
+    /// These tests are about *which dedup set the real code spends*, so poking
+    /// `BgState` by hand would assert nothing — the simulation would be the
+    /// thing under test.
+    async fn deliver_frame(
+        state: &mut BgState,
+        sub_id: &str,
+        event: &Event,
+        event_tx: &mpsc::Sender<Option<BuzzEvent>>,
+    ) {
+        let text = serde_json::to_string(&json!(["EVENT", sub_id, event])).expect("encode frame");
+        let keep_going = dispatch_over_fresh_connection(state, text, event_tx).await;
         assert!(keep_going, "dispatch must not signal connection loss");
     }
 
@@ -6201,61 +6480,48 @@ mod tests {
         format!("delivered:{id}")
     }
 
-    /// Read the next EVENT off the retained connection and hand it to
-    /// production frame handling.
+    /// Let the production reader take the next EVENT off the retained
+    /// connection and dispatch it.
     ///
-    /// Nothing here builds a frame. The bytes are whatever [`RelayPeer`] wrote,
-    /// and the **same registered connection** reads them back — so the socket a
-    /// request was registered on is the socket its answer arrives on.
+    /// Nothing here touches the frame. The bytes are whatever [`RelayPeer`]
+    /// wrote, the **same registered connection** they were written to is the
+    /// one they are read back from — so the socket a request was registered on
+    /// is the socket its answer arrives on — and the step between the read and
+    /// the handler belongs to [`ingress`], not to this function.
     ///
-    /// Deliberately not [`deliver_frame`]. That builds a fresh socket per event
-    /// and passes a constructed `Message::Text` straight into
-    /// `handle_ws_message`, so the bytes never cross a connection at all.
+    /// That last part is what closes the "direct midpoint injection replaces
+    /// the connected path" falsifier. This helper used to own the step: it read
+    /// the frame, asserted about it, and called `handle_ws_message` itself, so
+    /// an edit that discarded the transported value and passed a locally
+    /// rebuilt `Message::Text` was byte-identical and went unnoticed. There is
+    /// now nowhere to put that edit — `ingress::InboundFrame` cannot be
+    /// constructed here and the handler takes nothing else. The envelope
+    /// assertions this function used to make went with it; what a frame
+    /// delivered on a registration nobody opened does is production's answer to
+    /// give, and the scenario reads it downstream in the dispatch outcome.
+    ///
+    /// Deliberately not [`deliver_frame`]. That writes a frame of its own onto
+    /// a fresh socket, so it proves nothing about the connection the requests
+    /// were installed on.
     async fn deliver_over_connection(
         state: &mut BgState,
         ws: &mut WsStream,
-        sub_id: &str,
         event_id: nostr::EventId,
         event_tx: &mpsc::Sender<Option<BuzzEvent>>,
         keys: &nostr::Keys,
     ) {
-        let message = timeout(Duration::from_secs(2), ws.next())
-            .await
-            .expect("timed out reading the EVENT off the connection")
-            .expect("the connection closed before the EVENT arrived")
-            .expect("read the EVENT frame");
-
-        // **The first thing on this connection is the EVENT the peer wrote.**
-        //
-        // The envelope is checked against the two public values the peer handed
-        // back — the id it published and the subscription it published on — so
-        // a frame delivered on the wrong registration, or out of order, fails
-        // here. It is checked by projection rather than by string equality
-        // because this function has no serialised frame to compare against, and
-        // that absence is the point: see [`RelayPeer`].
-        let envelope: serde_json::Value =
-            serde_json::from_str(message.to_text().expect("the EVENT frame is text"))
-                .expect("the transported frame is JSON");
-        assert_eq!(
-            envelope[0],
-            json!("EVENT"),
-            "not an EVENT frame: {envelope}"
-        );
-        assert_eq!(
-            envelope[1],
-            json!(sub_id),
-            "the EVENT arrived on a registration this delivery did not name: {envelope}"
-        );
-        assert_eq!(
-            envelope[2]["id"],
-            json!(event_id.to_hex()),
-            "the frame read off this connection is not the event the peer \
-             published: {envelope}"
-        );
-
         let (observer_tx, _observer_rx) = mpsc::channel(8);
-        let keep_going = handle_ws_message(
-            message,
+        let read = timeout(Duration::from_secs(2), ingress::read_frame(ws))
+            .await
+            .expect("timed out reading the EVENT off the connection");
+        let frame = match read {
+            ingress::FrameRead::Frame(frame) => frame,
+            ingress::FrameRead::Lost => {
+                panic!("the connection closed before the EVENT arrived")
+            }
+        };
+        let outcome = ingress::dispatch_frame(
+            frame,
             ws,
             event_tx,
             &observer_tx,
@@ -6266,7 +6532,11 @@ mod tests {
             None,
         )
         .await;
-        assert!(keep_going, "dispatch must not signal connection loss");
+        assert_eq!(
+            outcome,
+            ingress::FrameDispatch::Handled,
+            "dispatch must not signal connection loss"
+        );
 
         // And the sentinel is what follows it, which is what proves the read
         // above consumed the EVENT rather than peeking past it.
@@ -6294,8 +6564,8 @@ mod tests {
     /// ceremony — before the registry, these tests delivered on ids nobody had
     /// asked for and the dispatch accepted them, which was precisely the
     /// defect.
-    /// Open a request the way production does — through `send_project_subscribe`
-    /// against a real socket.
+    /// Open discovery the way production does — through
+    /// `send_project_discovery` against a real socket.
     ///
     /// These helpers used to call `reserve()` directly, which left the
     /// registration in a state production never produces: recorded but never
@@ -6303,17 +6573,13 @@ mod tests {
     /// relay had been asked. Going through the transport is the point — a
     /// helper that can fabricate "sent" is a helper that proves nothing about
     /// what the relay was actually told.
-    async fn open_sent(
-        state: &mut BgState,
-        id: &str,
-        identity: crate::project::ProjectRequestIdentity,
-    ) -> String {
+    ///
+    /// They now take *filters*, because that is all the production senders
+    /// take. The id and the class are the registry's, and the returned string
+    /// is what it stamped — an assertion, not an argument.
+    async fn send_discovery(state: &mut BgState, filters: Vec<Value>) -> ProjectSendOutcome {
         let (mut ws, _server) = test_ws_pair().await;
-        assert_eq!(
-            send_project_subscribe(&mut ws, state, id, identity).await,
-            ProjectSendOutcome::Sent
-        );
-        id.to_string()
+        send_project_discovery(&mut ws, state, filters).await
     }
 
     /// The enrolment state behind a watched-root REQ: `(root, is_pull_request)`.
@@ -6333,7 +6599,7 @@ mod tests {
         enrolments
     }
 
-    /// The watched identity for `roots`, **from the production builder**.
+    /// The watched filters for `roots`, **from the production builder**.
     ///
     /// It used to hand-rebuild one comments/`#e` filter. That looked equivalent
     /// — same kinds accessor, same root-tag accessor — and it was not: the real
@@ -6343,32 +6609,78 @@ mod tests {
     /// hid that the identity could not represent a two-filter one at all.
     ///
     /// `since` is a parameter for the same reason the rest of it is derived: a
-    /// window the fixture invents is a window production never asked for.
-    fn watched_identity(
-        generation: u64,
-        roots: &[(&str, bool)],
-        since: u64,
-    ) -> crate::project::ProjectRequestIdentity {
-        crate::project::ProjectRequestIdentity::from_filters(
-            crate::project::ProjectSubscription::Watched { generation },
-            crate::project::watched_roots_filters(&watched_enrolments(roots), since),
-        )
-        .expect("an enrolled root yields at least one filter")
+    /// window the fixture invents is a window production never asked for. The
+    /// generation is *not* a parameter any more: it is allocated by the
+    /// registry when the replacement installs.
+    fn watched_filters(roots: &[(&str, bool)], since: u64) -> Vec<Value> {
+        crate::project::watched_roots_filters(&watched_enrolments(roots), since)
     }
 
-    async fn open_watched(state: &mut BgState, generation: u64) -> String {
-        open_watched_for(state, generation, &[&test_root_id()]).await
+    /// Install the watched subscription over `roots`, through the registry's
+    /// own replacement — the only route production has — and return the id it
+    /// stamped.
+    async fn open_watched(state: &mut BgState) -> String {
+        open_watched_for(state, &[&test_root_id()]).await
     }
 
-    async fn open_watched_for(state: &mut BgState, generation: u64, roots: &[&str]) -> String {
+    async fn open_watched_for(state: &mut BgState, roots: &[&str]) -> String {
         let issues: Vec<(&str, bool)> = roots.iter().map(|r| (*r, false)).collect();
-        let id = crate::project::watched_sub_id(generation);
-        open_sent(state, &id, watched_identity(generation, &issues, 0)).await
+        open_watched_since(state, &issues, 0).await
+    }
+
+    async fn open_watched_since(state: &mut BgState, roots: &[(&str, bool)], since: u64) -> String {
+        let (mut ws, _server) = test_ws_pair().await;
+        let outcome = state
+            .project_requests
+            .replace_watched(&mut ws, watched_filters(roots, since))
+            .await;
+        assert!(
+            matches!(outcome, crate::project::ReplaceOutcome::Replaced { .. }),
+            "the watched replacement must install, got {outcome:?}"
+        );
+        installed_watched_id(state)
+    }
+
+    /// The watched id the registry currently holds as current.
+    fn installed_watched_id(state: &BgState) -> String {
+        state
+            .project_requests
+            .current_watched()
+            .expect("a canonical durable record")
+            .map(crate::project::watched_sub_id)
+            .expect("a watched generation is installed")
+    }
+
+    /// Install the enrolment subscription over `coordinates`, through the
+    /// registry's own replacement, and return its fixed id.
+    async fn open_enrolment_for(state: &mut BgState, coordinates: &[String]) -> String {
+        let discovered = crate::project::DiscoveredRepositories::for_test(coordinates.to_vec());
+        let filter = crate::project::enrolment_filter(&discovered, &test_agent_hex(), 0)
+            .expect("a discovered repository yields a filter");
+        open_enrolment_with(state, vec![filter]).await
+    }
+
+    /// Install the enrolment subscription over `filters`, through the
+    /// registry's own replacement, and return the id it stamped.
+    async fn open_enrolment_with(state: &mut BgState, filters: Vec<Value>) -> String {
+        let (mut ws, _server) = test_ws_pair().await;
+        let outcome = state
+            .project_requests
+            .replace_enrolment(&mut ws, filters)
+            .await;
+        assert!(
+            matches!(outcome, crate::project::ReplaceOutcome::Replaced { .. }),
+            "the enrolment replacement must install, got {outcome:?}"
+        );
+        crate::project::PROJECT_ENROL_SUB_ID.to_string()
     }
 
     async fn open_discovery(state: &mut BgState) -> String {
-        let id = crate::project::discovery_sub_id();
-        open_sent(state, &id, discovery_identity()).await
+        assert_eq!(
+            send_discovery(state, discovery_filters()).await,
+            ProjectSendOutcome::Sent
+        );
+        crate::project::discovery_sub_id()
     }
 
     /// open → REQ on the wire → observe → EOSE → completion.
@@ -6501,7 +6813,7 @@ mod tests {
         let channel_id = Uuid::new_v4();
         let event = mixed_surface_event(&keys, channel_id, &test_root_id(), 1_000);
 
-        let watched = open_watched(&mut state, 0).await;
+        let watched = open_watched(&mut state).await;
         deliver_frame(&mut state, &watched, &event, &tx).await;
         deliver_frame(&mut state, &channel_sub_id(channel_id), &event, &tx).await;
 
@@ -6531,7 +6843,7 @@ mod tests {
         let event = mixed_surface_event(&keys, channel_id, &test_root_id(), 1_000);
 
         deliver_frame(&mut state, &channel_sub_id(channel_id), &event, &tx).await;
-        let watched = open_watched(&mut state, 0).await;
+        let watched = open_watched(&mut state).await;
         deliver_frame(&mut state, &watched, &event, &tx).await;
 
         let delivered = drain(&mut rx);
@@ -6541,26 +6853,34 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn overlapping_watched_generations_share_one_project_dedup_set() {
-        // A watched-root REQ replacement deliberately overlaps its
-        // predecessor, so the same event arrives under two generations' ids.
-        // One set across all project subscriptions folds that to one delivery;
-        // a per-subscription set would call the second copy new and route the
+    async fn overlapping_project_subscriptions_share_one_dedup_set() {
+        // A comment on a watched root that also tags this agent on a known
+        // repository satisfies the enrolment filter *and* the watched filter,
+        // so the relay is entitled to send it under both ids. One set across
+        // all project subscriptions folds that to one delivery; a
+        // per-subscription set would call the second copy new and route the
         // event twice.
+        //
+        // This used to be posed as two watched *generations* answering at
+        // once, opened by naming their ids and classes directly. That state is
+        // not production-reachable: the registry retires the predecessor's
+        // live registration the instant the successor installs, so a frame
+        // under the retired generation is not admitted at all. The overlap
+        // that does exist is this one, across classes.
         let mut state = BgState::new();
         let (tx, mut rx) = mpsc::channel(16);
         let keys = nostr::Keys::generate();
-        let event = mixed_surface_event(&keys, Uuid::new_v4(), &test_root_id(), 1_000);
+        let event = enrolled_and_watched_event(&keys, &test_root_id(), 1_000);
 
-        let gen1 = open_watched(&mut state, 1).await;
-        let gen2 = open_watched(&mut state, 2).await;
-        deliver_frame(&mut state, &gen1, &event, &tx).await;
-        deliver_frame(&mut state, &gen2, &event, &tx).await;
+        let enrolment = open_enrolment_for(&mut state, &[test_coordinate()]).await;
+        let watched = open_watched(&mut state).await;
+        deliver_frame(&mut state, &enrolment, &event, &tx).await;
+        deliver_frame(&mut state, &watched, &event, &tx).await;
 
         assert_eq!(
             drain(&mut rx).len(),
             1,
-            "the generation overlap must fold to one delivery"
+            "the subscription overlap must fold to one delivery"
         );
     }
 
@@ -6587,7 +6907,7 @@ mod tests {
 
         // Now wedge the queue and drop a project copy of the same event.
         while tx.try_send(None).is_ok() {}
-        let watched = open_watched(&mut state, 0).await;
+        let watched = open_watched(&mut state).await;
         deliver_frame(&mut state, &watched, &event, &tx).await;
 
         assert!(
@@ -6624,40 +6944,35 @@ mod tests {
         json!({ "kinds": [KIND_GIT_REPO_ANNOUNCEMENT] })
     }
 
-    fn identity(
-        subscription: crate::project::ProjectSubscription,
-        filter: Value,
-    ) -> crate::project::ProjectRequestIdentity {
-        crate::project::ProjectRequestIdentity::new(subscription, filter)
-            .expect("test filters constrain events")
+    /// The filters production's discovery subscription carries, from the
+    /// production builder.
+    fn discovery_filters() -> Vec<Value> {
+        crate::project::discovery_subscription(true).expect("enabled")
     }
 
-    fn discovery_identity() -> crate::project::ProjectRequestIdentity {
-        identity(
-            crate::project::ProjectSubscription::Discovery,
-            test_filter(),
-        )
+    /// A second, narrower discovery question. The class is no longer something
+    /// a caller can vary, so a conflicting submission differs in its filter —
+    /// which is the whole of what the registry's comparison has left to catch.
+    fn other_discovery_filters() -> Vec<Value> {
+        vec![json!({ "kinds": [KIND_GIT_REPO_ANNOUNCEMENT], "authors": [test_agent_hex()] })]
+    }
+
+    /// Does durable intent under `sub_id` ask exactly `filters`?
+    ///
+    /// The identity cannot be built out here to compare against — that is the
+    /// point of the owner-stamped operations — so what a test reads is what
+    /// the recorded request asks.
+    fn intent_asks(state: &BgState, sub_id: &str, filters: &[Value]) -> bool {
+        state
+            .project_requests
+            .intent(sub_id)
+            .is_some_and(|held| held.filters().eq(filters.iter()))
     }
 
     /// Feed one non-EVENT frame through the production handler.
     async fn deliver_control_frame(state: &mut BgState, frame: Value) -> bool {
-        let (mut ws, _server) = test_ws_pair().await;
         let (tx, _rx) = mpsc::channel(16);
-        let (observer_tx, _observer_rx) = mpsc::channel(8);
-        let keys = nostr::Keys::generate();
-        let text = serde_json::to_string(&frame).expect("encode");
-        handle_ws_message(
-            Message::Text(text.into()),
-            &mut ws,
-            &tx,
-            &observer_tx,
-            state,
-            &keys,
-            "ws://test",
-            &keys.public_key().to_hex(),
-            None,
-        )
-        .await
+        deliver_control_frame_to(state, frame, &tx).await
     }
 
     /// Replace the connection onto `replacement`, the way production does.
@@ -6676,12 +6991,65 @@ mod tests {
         let (_cmd_tx, mut cmd_rx) = mpsc::channel(4);
         let agent = nostr::Keys::generate().public_key().to_hex();
         assert!(
-            install_replacement_with(state, &mut dead, replacement, VecDeque::new()).await,
+            install_replacement_with(
+                state,
+                &mut dead,
+                replacement,
+                ingress::HandshakeBuffer::empty()
+            )
+            .await,
             "an empty handshake buffer carries no drop signal"
         );
         // `dead` now holds the replacement — production reassigns the same
         // variable for the same reason.
         resubscribe_after_reconnect(&mut dead, &mut cmd_rx, state, &agent, true).await
+    }
+
+    /// A handshake buffer holding `frames`, filled the way production fills
+    /// one: by a NIP-42 reader taking them off a socket while it waits for the
+    /// `AUTH` challenge.
+    ///
+    /// There is no other way to fill one — see [`ingress::HandshakeBuffer`].
+    /// That is deliberate, and this helper is the reason it is affordable: the
+    /// buffered-frame proofs below need a buffer with something in it, and a
+    /// test that could simply construct one would be a test that can hand the
+    /// production dispatch messages of its own choosing, which is the midpoint
+    /// injection the phase forbids. Here the frames are relay JSON written onto
+    /// a wire and read back by `wait_for_auth_challenge`, exactly as a relay
+    /// that sent them before its challenge would have produced.
+    async fn handshake_buffer_from_wire(
+        frames: Vec<serde_json::Value>,
+    ) -> ingress::HandshakeBuffer {
+        use futures_util::SinkExt;
+        let expected = frames.len();
+        let (mut client, mut server) = test_ws_pair().await;
+        for frame in frames {
+            server
+                .send(Message::Text(frame.to_string().into()))
+                .await
+                .expect("the peer writes the buffered frame");
+        }
+        server
+            .send(Message::Text(
+                json!(["AUTH", "challenge-after-the-buffer"])
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .expect("the peer writes the challenge");
+
+        let mut buffer = ingress::HandshakeBuffer::empty();
+        let challenge =
+            ingress::wait_for_auth_challenge(&mut client, &mut buffer, Duration::from_secs(2))
+                .await
+                .expect("the challenge arrives after the frames ahead of it");
+        assert_eq!(challenge, "challenge-after-the-buffer");
+        assert_eq!(
+            buffer.len(),
+            expected,
+            "every frame ahead of the challenge must have been buffered"
+        );
+        buffer
     }
 
     /// Install `replacement` over `ws`, handing it `buffer` as the frames it
@@ -6694,7 +7062,7 @@ mod tests {
         state: &mut BgState,
         ws: &mut WsStream,
         replacement: WsStream,
-        buffer: VecDeque<RelayMessage>,
+        buffer: ingress::HandshakeBuffer,
     ) -> bool {
         let (event_tx, _event_rx) = mpsc::channel(16);
         let (observer_tx, _observer_rx) = mpsc::channel(8);
@@ -6732,7 +7100,7 @@ mod tests {
         let sub_id = crate::project::discovery_sub_id();
 
         assert_eq!(
-            send_project_subscribe(&mut ws, &mut state, &sub_id, discovery_identity()).await,
+            send_project_discovery(&mut ws, &mut state, discovery_filters()).await,
             ProjectSendOutcome::Sent
         );
 
@@ -6754,26 +7122,13 @@ mod tests {
         let (mut ws, server) = test_ws_pair().await;
         let mut state = BgState::new();
 
-        let survivor = crate::project::watched_sub_id(0);
-        assert_eq!(
-            send_project_subscribe(
-                &mut ws,
-                &mut state,
-                &survivor,
-                identity(
-                    crate::project::ProjectSubscription::Watched { generation: 0 },
-                    test_filter(),
-                ),
-            )
-            .await,
-            ProjectSendOutcome::Sent
-        );
+        let survivor = open_watched(&mut state).await;
 
         drop(server);
         let _ = ws.close(None).await;
         let doomed = crate::project::discovery_sub_id();
         assert_eq!(
-            send_project_subscribe(&mut ws, &mut state, &doomed, discovery_identity()).await,
+            send_project_discovery(&mut ws, &mut state, discovery_filters()).await,
             ProjectSendOutcome::WriteFailed
         );
 
@@ -6905,6 +7260,41 @@ mod tests {
     /// replacements are genuinely different questions.
     fn watched_filter(root_byte: u8) -> Value {
         serde_json::json!({ "#e": [format!("{:064x}", root_byte)] })
+    }
+
+    /// A `BgState` whose registry is born over `record`.
+    ///
+    /// **The registry has no test-only entry point.** Durable intent and
+    /// allocator position are composed into a
+    /// [`crate::project::DurableRecord`] — which holds no live registration, no
+    /// epoch and no way to mint an authority — and handed to
+    /// `ProjectRequests::over` before a registry exists. The corruption these
+    /// proofs need can therefore only be present from birth; nothing can reach
+    /// into a registry that has already installed something and install,
+    /// remove or renumber durable truth behind it, which is what the five
+    /// mutators this replaces could do.
+    ///
+    /// The cost is that a proof cannot corrupt a registry mid-flight, so
+    /// "refuse, then recover" is shown as two registries over the same
+    /// allocator position rather than one that is patched between the halves.
+    /// That is the stronger form anyway: the recovery no longer depends on a
+    /// hook to undo the corruption.
+    fn state_over(record: crate::project::DurableRecord) -> BgState {
+        let mut state = BgState::new();
+        state.project_requests = crate::project::ProjectRequests::over(record);
+        state
+    }
+
+    /// `record` plus durable watched intent for `generation`.
+    fn with_watched(
+        record: crate::project::DurableRecord,
+        generation: u64,
+    ) -> crate::project::DurableRecord {
+        record.with_intent(
+            &crate::project::watched_sub_id(generation),
+            crate::project::ProjectSubscription::Watched { generation },
+            watched_filter(9),
+        )
     }
 
     /// **A failed generation must never become the retired predecessor.**
@@ -7187,11 +7577,9 @@ mod tests {
     #[tokio::test]
     async fn spent_watched_generations_refuse_rather_than_reuse() {
         let (mut ws, mut server) = test_ws_pair().await;
-        let mut state = BgState::new();
-
-        state
-            .project_requests
-            .seed_allocators_for_exhaustion(u64::MAX, 0);
+        // Born with the generation allocator at its last usable value.
+        let mut state =
+            state_over(crate::project::DurableRecord::empty().with_allocators(u64::MAX, 0));
 
         // The last generation this process can name installs normally.
         assert!(
@@ -7260,8 +7648,13 @@ mod tests {
     #[tokio::test]
     async fn a_spent_incarnation_space_refuses_the_replacement() {
         let (mut ws, mut server) = test_ws_pair().await;
-        let mut state = BgState::new();
+        // Generations to spare, and one incarnation left. The record supplies
+        // where each allocator begins and nothing else; the space is spent by
+        // burning it, through the same `checked_add` production uses.
+        let mut state =
+            state_over(crate::project::DurableRecord::empty().with_allocators(0, u64::MAX));
 
+        // The last authority this process can mint installs normally.
         assert!(
             submit_replacement(
                 &mut ws,
@@ -7277,21 +7670,6 @@ mod tests {
                 .current_watched()
                 .expect("exactly one watched intent"),
             Some(0)
-        );
-        drain_test_frames(&mut server).await;
-
-        // Burn the incarnation space, leaving generations available.
-        state
-            .project_requests
-            .seed_allocators_for_exhaustion(1, u64::MAX);
-        assert!(
-            submit_replacement(
-                &mut ws,
-                &mut state,
-                crate::project::ProjectReplacement::Watched,
-                vec![watched_filter(2)],
-            )
-            .await
         );
         drain_test_frames(&mut server).await;
 
@@ -7320,13 +7698,13 @@ mod tests {
                 .project_requests
                 .current_watched()
                 .expect("exactly one watched intent"),
-            Some(1),
+            Some(0),
             "the last genuinely installed generation stays current"
         );
         assert!(
             state
                 .project_requests
-                .intent(&crate::project::watched_sub_id(1))
+                .intent(&crate::project::watched_sub_id(0))
                 .is_some(),
             "and its durable intent is preserved"
         );
@@ -7363,38 +7741,24 @@ mod tests {
     /// silently absorbed — and that property is checked against the state
     /// itself, however it arrived.
     ///
-    /// The intruder is installed through a test-only hook because production
-    /// now has no route to it. That is the claim, not a gap in the test.
+    /// The intruder is composed into the record the registry is born over,
+    /// because production has no route to it. That is the claim, not a gap in
+    /// the test.
     #[tokio::test]
     async fn a_watched_generation_from_outside_the_owner_fails_the_replacement_closed() {
         let (mut ws, mut server) = test_ws_pair().await;
-        let mut state = BgState::new();
-
-        // One generation installed the legitimate way.
-        assert!(
-            submit_replacement(
-                &mut ws,
-                &mut state,
-                crate::project::ProjectReplacement::Watched,
-                vec![watched_filter(1)],
-            )
-            .await
-        );
-        assert_eq!(
-            req_ids(&drain_test_frames(&mut server).await),
-            vec![crate::project::watched_sub_id(0)]
-        );
-
-        // And a second one, installed by something other than the owner. The
-        // allocator is advanced past it first so this proves the *ambiguity*
-        // refusal rather than the provenance refusal — they are different
-        // invariants and a test that could pass on either proves neither.
-        state
-            .project_requests
-            .seed_allocators_for_exhaustion(100, 1);
-        state
-            .project_requests
-            .force_watched_intent(99, watched_filter(9));
+        // One generation the owner would have installed, and beside it a second
+        // that something else did. Both are below the allocator's next value,
+        // so this proves the *ambiguity* refusal rather than the provenance
+        // refusal — they are different invariants and a test that could pass on
+        // either proves neither.
+        let mut state = state_over(with_watched(
+            with_watched(
+                crate::project::DurableRecord::empty().with_allocators(100, 1),
+                0,
+            ),
+            99,
+        ));
 
         // The owner refuses rather than choosing a predecessor. Choosing would
         // retire one and leave the other durable beside the successor, which is
@@ -7443,9 +7807,15 @@ mod tests {
             "the report must name both intents so the intruder is identifiable: {violation}"
         );
 
-        // Recovery is possible once the ambiguity is gone: the owner was
-        // blocked by the state, not permanently poisoned by it.
-        state.project_requests.clear_watched_intent(99);
+        // And the same record without the intruder proceeds normally, from the
+        // same allocator position — which is what shows the refusal above
+        // burned nothing and poisoned nothing. A hook that removed 99 from the
+        // registry under test would have proved the same thing about a
+        // registry the hook had just written to.
+        let mut state = state_over(with_watched(
+            crate::project::DurableRecord::empty().with_allocators(100, 1),
+            0,
+        ));
         assert!(
             submit_replacement(
                 &mut ws,
@@ -7482,9 +7852,8 @@ mod tests {
     #[tokio::test]
     async fn a_singly_seeded_watched_intent_becomes_the_predecessor_and_is_retired() {
         let (mut ws, mut server) = test_ws_pair().await;
-        let mut state = BgState::new();
 
-        // Generation 99 installed by something other than the semantic owner —
+        // Generation 99 recorded by something other than the semantic owner —
         // but a generation this allocator *has* issued, so it passes the
         // provenance check and the question under test is the one form 1 asks:
         // does the owner retire intent it did not itself install?
@@ -7492,12 +7861,10 @@ mod tests {
         // A generation the allocator had never issued is a different failure,
         // proved separately below; mixing the two would let this test pass on
         // the wrong refusal.
-        state
-            .project_requests
-            .seed_allocators_for_exhaustion(100, 0);
-        state
-            .project_requests
-            .force_watched_intent(99, watched_filter(9));
+        let mut state = state_over(with_watched(
+            crate::project::DurableRecord::empty().with_allocators(100, 0),
+            99,
+        ));
         assert_eq!(
             state
                 .project_requests
@@ -7558,13 +7925,10 @@ mod tests {
     #[tokio::test]
     async fn a_watched_generation_the_allocator_never_issued_fails_closed() {
         let (mut ws, mut server) = test_ws_pair().await;
-        let mut state = BgState::new();
 
         // The allocator has issued nothing at all, so 99 cannot have come
         // from it.
-        state
-            .project_requests
-            .force_watched_intent(99, watched_filter(9));
+        let mut state = state_over(with_watched(crate::project::DurableRecord::empty(), 99));
 
         assert!(
             submit_replacement(
@@ -7595,8 +7959,9 @@ mod tests {
             "the report must name provenance as the reason: {violation}"
         );
 
-        // And the allocator is untouched: the next valid attempt still takes 0.
-        state.project_requests.clear_watched_intent(99);
+        // And the allocator is untouched: over the same record without the
+        // unissued intent, the next valid attempt still takes 0.
+        let mut state = state_over(crate::project::DurableRecord::empty());
         assert!(
             submit_replacement(
                 &mut ws,
@@ -7623,13 +7988,12 @@ mod tests {
     #[tokio::test]
     async fn a_watched_intent_whose_id_disagrees_with_its_generation_is_refused() {
         let (mut ws, mut server) = test_ws_pair().await;
-        let mut state = BgState::new();
 
-        state.project_requests.force_intent(
+        let mut state = state_over(crate::project::DurableRecord::empty().with_intent(
             &crate::project::watched_sub_id(3),
             crate::project::ProjectSubscription::Watched { generation: 7 },
             watched_filter(9),
-        );
+        ));
 
         assert!(
             submit_replacement(
@@ -7674,10 +8038,11 @@ mod tests {
             ),
         ] {
             let (mut ws, mut server) = test_ws_pair().await;
-            let mut state = BgState::new();
-            state
-                .project_requests
-                .force_intent(&id, class.clone(), watched_filter(9));
+            let mut state = state_over(crate::project::DurableRecord::empty().with_intent(
+                &id,
+                class.clone(),
+                watched_filter(9),
+            ));
 
             // Both replacements refuse: durable intent is one record, and a
             // registry that writes into a record it has just found inconsistent
@@ -7705,6 +8070,191 @@ mod tests {
         }
     }
 
+    /// **Discovery intent lives under the discovery id, and nothing else does.**
+    ///
+    /// The class `derive_current` used to fall through. Discovery has no
+    /// generation, so it was read as "not the disagreement this function exists
+    /// to catch" — but the disagreement is the same one: the key is what goes
+    /// on the wire, and a discovery class under a key no replacement names is
+    /// an entry nothing will ever retire and every reconnect will re-ask.
+    #[tokio::test]
+    async fn discovery_intent_that_is_not_under_the_discovery_id_is_refused() {
+        for id in [
+            "proj-discovery-elsewhere".to_string(),
+            crate::project::watched_sub_id(0),
+            crate::project::PROJECT_ENROL_SUB_ID.to_string(),
+        ] {
+            let (mut ws, mut server) = test_ws_pair().await;
+            let mut state = state_over(crate::project::DurableRecord::empty().with_intent(
+                &id,
+                crate::project::ProjectSubscription::Discovery,
+                watched_filter(9),
+            ));
+
+            for replacement in [
+                crate::project::ProjectReplacement::Watched,
+                crate::project::ProjectReplacement::Enrolment,
+            ] {
+                assert!(
+                    submit_replacement(&mut ws, &mut state, replacement, vec![watched_filter(1)])
+                        .await,
+                    "{id}: an invariant violation is not a transport failure"
+                );
+                let frames = drain_test_frames(&mut server).await;
+                assert!(
+                    frames.is_empty(),
+                    "{id}: nothing may be written: {frames:?}"
+                );
+            }
+
+            let violation = state
+                .project_requests
+                .current_watched()
+                .expect_err("a discovery class under a foreign id must not resolve");
+            assert!(
+                violation.contains(&id) && violation.contains(&crate::project::discovery_sub_id()),
+                "the report must name the id it found and the id the class implies: {violation}"
+            );
+        }
+    }
+
+    /// **A root catch-up is never durable, under any id.**
+    ///
+    /// Its filter carries the page bound its cursor is currently at, and the
+    /// cursor walks that bound backwards; its wire id names one transport
+    /// attempt that ended with the connection. So there is no id under which a
+    /// durable catch-up is correct — the class is refused rather than its key
+    /// checked. Recorded, it would have been re-asked on every reconnect for a
+    /// page the reconstruction had already walked past.
+    #[tokio::test]
+    async fn a_durable_root_catch_up_is_refused_under_every_id() {
+        let root = test_root_id();
+        for id in [
+            format!("proj-catchup-c-{root}-0"),
+            crate::project::discovery_sub_id(),
+            "proj-anything".to_string(),
+        ] {
+            let (mut ws, mut server) = test_ws_pair().await;
+            let mut state = state_over(crate::project::DurableRecord::empty().with_intent(
+                &id,
+                crate::project::ProjectSubscription::RootCatchUp {
+                    root: root.clone(),
+                    stream: crate::project::HistoryStream::Comments,
+                },
+                watched_filter(9),
+            ));
+
+            assert!(
+                submit_replacement(
+                    &mut ws,
+                    &mut state,
+                    crate::project::ProjectReplacement::Watched,
+                    vec![watched_filter(1)],
+                )
+                .await,
+                "{id}: an invariant violation is not a transport failure"
+            );
+            let frames = drain_test_frames(&mut server).await;
+            assert!(
+                frames.is_empty(),
+                "{id}: nothing may be written: {frames:?}"
+            );
+            assert!(
+                state.project_requests.current_watched().is_err(),
+                "{id}: a durable catch-up must not resolve"
+            );
+        }
+    }
+
+    /// **A record the registry cannot validate replays nothing.**
+    ///
+    /// Replay is where durable intent becomes bytes, so it is the last place a
+    /// non-canonical entry can be caught. `replayable()` used to hand back
+    /// every unsuspended entry without asking, so an entry that could not pass
+    /// a replacement was still re-asked verbatim on the next connection — the
+    /// checks and the bytes disagreed about the same record.
+    ///
+    /// Each case pairs the intruder with a *canonical* discovery entry, so the
+    /// refusal cannot be passing because the record was empty: with the
+    /// intruder removed, the same connection replays that entry.
+    #[tokio::test]
+    async fn an_inconsistent_durable_record_replays_no_project_request() {
+        let root = test_root_id();
+        let intruders = [
+            (
+                "a discovery class under a foreign id",
+                "proj-discovery-elsewhere".to_string(),
+                crate::project::ProjectSubscription::Discovery,
+            ),
+            (
+                "a durable root catch-up",
+                format!("proj-catchup-c-{root}-0"),
+                crate::project::ProjectSubscription::RootCatchUp {
+                    root: root.clone(),
+                    stream: crate::project::HistoryStream::Comments,
+                },
+            ),
+            (
+                "an enrolment class under a foreign id",
+                "proj-enrol-elsewhere".to_string(),
+                crate::project::ProjectSubscription::Enrolment,
+            ),
+            (
+                "a watched generation this allocator never issued",
+                crate::project::watched_sub_id(9),
+                crate::project::ProjectSubscription::Watched { generation: 9 },
+            ),
+        ];
+
+        for (why, id, class) in intruders {
+            let canonical = crate::project::DurableRecord::empty().with_intent(
+                &crate::project::discovery_sub_id(),
+                crate::project::ProjectSubscription::Discovery,
+                watched_filter(9),
+            );
+
+            let mut poisoned =
+                state_over(canonical.clone().with_intent(&id, class, watched_filter(8)));
+            assert!(
+                poisoned.project_requests.replayable().is_err(),
+                "{why}: the record must not resolve"
+            );
+
+            let (ws, mut server) = test_ws_pair().await;
+            assert!(
+                matches!(
+                    reconnect_onto(&mut poisoned, ws).await,
+                    ResubscribeResult::Ok
+                ),
+                "{why}: a local inconsistency is not a transport failure"
+            );
+            let frames = drain_test_frames(&mut server).await;
+            assert!(
+                frames.is_empty(),
+                "{why}: a reconnect must write no project REQ: {frames:?}"
+            );
+            assert_eq!(
+                poisoned.project_requests.live_len(),
+                0,
+                "{why}: and register nothing"
+            );
+
+            // The positive control, over the same canonical entry: with the
+            // intruder gone, this connection does replay.
+            let mut clean = state_over(canonical);
+            let (ws, mut server) = test_ws_pair().await;
+            assert!(matches!(
+                reconnect_onto(&mut clean, ws).await,
+                ResubscribeResult::Ok
+            ));
+            assert_eq!(
+                req_ids(&drain_test_frames(&mut server).await),
+                vec![crate::project::discovery_sub_id()],
+                "{why}: the canonical entry on its own is replayed"
+            );
+        }
+    }
+
     /// **The outcomes that decide before allocation spend nothing — proved at
     /// the ceiling.**
     ///
@@ -7721,9 +8271,13 @@ mod tests {
     #[tokio::test]
     async fn no_outcome_that_decides_before_allocation_spends_a_generation() {
         let (mut ws, mut server) = test_ws_pair().await;
-        let mut state = BgState::new();
+        // Born one below the ceiling, so the install below takes the
+        // second-to-last generation and exactly one remains for the final
+        // attempt to prove is still there.
+        let mut state =
+            state_over(crate::project::DurableRecord::empty().with_allocators(u64::MAX - 1, 0));
 
-        // Install one generation, then leave exactly one unallocated.
+        // One generation installed, and exactly one left unallocated.
         assert!(
             submit_replacement(
                 &mut ws,
@@ -7734,9 +8288,6 @@ mod tests {
             .await
         );
         drain_test_frames(&mut server).await;
-        state
-            .project_requests
-            .seed_allocators_for_exhaustion(u64::MAX, 1);
 
         // 1. InvalidFilters — a limit constrains nothing about which events.
         assert!(
@@ -7760,27 +8311,8 @@ mod tests {
             .await
         );
 
-        // 3. InvariantViolation — a second watched intent, then removed, so the
-        //    final valid attempt has a single predecessor to retire.
-        state
-            .project_requests
-            .force_watched_intent(99, watched_filter(9));
-        assert!(
-            submit_replacement(
-                &mut ws,
-                &mut state,
-                crate::project::ProjectReplacement::Watched,
-                vec![watched_filter(2)],
-            )
-            .await
-        );
-        state.project_requests.clear_watched_intent(99);
-
         let frames = drain_test_frames(&mut server).await;
-        assert!(
-            frames.is_empty(),
-            "none of the three may write anything: {frames:?}"
-        );
+        assert!(frames.is_empty(), "neither may write anything: {frames:?}");
 
         // The ceiling is intact: the last generation is still there to take.
         assert!(
@@ -7807,6 +8339,70 @@ mod tests {
         );
     }
 
+    /// **The third outcome that decides before allocation spends nothing
+    /// either.**
+    ///
+    /// Split from the two above because reaching an invariant violation needs a
+    /// durable record production cannot produce, and a registry is born over
+    /// one rather than having one planted in it after it has installed things.
+    ///
+    /// The refusal and the recovery are two registries over the same record
+    /// minus the intruder, at the same allocator position. If the refusal had
+    /// burned the last generation, the second half would have nothing to take.
+    #[tokio::test]
+    async fn an_invariant_violation_spends_no_generation() {
+        let ceiling = || {
+            with_watched(
+                crate::project::DurableRecord::empty().with_allocators(u64::MAX, 1),
+                0,
+            )
+        };
+
+        // Two watched intents, both issued by this allocator, so the refusal is
+        // the ambiguity one and not provenance.
+        let (mut ws, mut server) = test_ws_pair().await;
+        let mut state = state_over(with_watched(ceiling(), 99));
+        assert!(
+            submit_replacement(
+                &mut ws,
+                &mut state,
+                crate::project::ProjectReplacement::Watched,
+                vec![watched_filter(2)],
+            )
+            .await,
+            "an invariant violation is not a transport failure"
+        );
+        let frames = drain_test_frames(&mut server).await;
+        assert!(
+            frames.is_empty(),
+            "an invariant violation may write nothing: {frames:?}"
+        );
+
+        // The same record without the intruder still has the last generation.
+        let (mut ws, mut server) = test_ws_pair().await;
+        let mut state = state_over(ceiling());
+        assert!(
+            submit_replacement(
+                &mut ws,
+                &mut state,
+                crate::project::ProjectReplacement::Watched,
+                vec![watched_filter(2)],
+            )
+            .await
+        );
+        let frames = drain_test_frames(&mut server).await;
+        assert_eq!(
+            req_ids(&frames),
+            vec![crate::project::watched_sub_id(u64::MAX)],
+            "the refused attempt must have burned no generation: {frames:?}"
+        );
+        assert_eq!(
+            close_ids(&frames),
+            vec![crate::project::watched_sub_id(0)],
+            "and the real predecessor is what gets retired: {frames:?}"
+        );
+    }
+
     #[tokio::test]
     async fn an_already_open_request_does_not_emit_a_second_req() {
         // `AlreadyLive` is not permission to re-send. A second REQ under a live
@@ -7814,11 +8410,10 @@ mod tests {
         // request's EOSE indistinguishable from the new one's.
         let (mut ws, mut server) = test_ws_pair().await;
         let mut state = BgState::new();
-        let sub_id = crate::project::discovery_sub_id();
 
         for expected in [ProjectSendOutcome::Sent, ProjectSendOutcome::AlreadyOpen] {
             assert_eq!(
-                send_project_subscribe(&mut ws, &mut state, &sub_id, discovery_identity()).await,
+                send_project_discovery(&mut ws, &mut state, discovery_filters()).await,
                 expected
             );
         }
@@ -7844,17 +8439,13 @@ mod tests {
         let sub_id = crate::project::discovery_sub_id();
 
         assert_eq!(
-            send_project_subscribe(&mut ws, &mut state, &sub_id, discovery_identity()).await,
+            send_project_discovery(&mut ws, &mut state, discovery_filters()).await,
             ProjectSendOutcome::Sent
         );
         assert_eq!(next_test_frame(&mut server).await[0], "REQ");
 
-        let usurper = identity(
-            crate::project::ProjectSubscription::Watched { generation: 9 },
-            json!({ "kinds": [1] }),
-        );
         assert_eq!(
-            send_project_subscribe(&mut ws, &mut state, &sub_id, usurper.clone()).await,
+            send_project_discovery(&mut ws, &mut state, other_discovery_filters()).await,
             ProjectSendOutcome::MetadataConflict
         );
         assert!(
@@ -7863,9 +8454,8 @@ mod tests {
                 .is_err(),
             "no REQ is emitted"
         );
-        assert_eq!(
-            state.project_requests.intent(&sub_id),
-            Some(&discovery_identity()),
+        assert!(
+            intent_asks(&state, &sub_id, &discovery_filters()),
             "the attempted identity is not retained as intent"
         );
 
@@ -7890,20 +8480,15 @@ mod tests {
         // connection would ask for. Same class, different question.
         let (mut ws, mut server) = test_ws_pair().await;
         let mut state = BgState::new();
-        let sub_id = crate::project::discovery_sub_id();
 
         assert_eq!(
-            send_project_subscribe(&mut ws, &mut state, &sub_id, discovery_identity()).await,
+            send_project_discovery(&mut ws, &mut state, discovery_filters()).await,
             ProjectSendOutcome::Sent
         );
         assert_eq!(next_test_frame(&mut server).await[0], "REQ");
 
-        let other_filter = identity(
-            crate::project::ProjectSubscription::Discovery,
-            json!({ "kinds": [KIND_GIT_REPO_ANNOUNCEMENT], "authors": ["deadbeef"] }),
-        );
         assert_eq!(
-            send_project_subscribe(&mut ws, &mut state, &sub_id, other_filter).await,
+            send_project_discovery(&mut ws, &mut state, other_discovery_filters()).await,
             ProjectSendOutcome::MetadataConflict,
             "a different filter is a different request, not an idempotent repeat"
         );
@@ -7936,7 +8521,7 @@ mod tests {
         let (mut ws, mut server) = test_ws_pair().await;
         let sub_id = crate::project::discovery_sub_id();
         assert_eq!(
-            send_project_subscribe(&mut ws, &mut state, &sub_id, discovery_identity()).await,
+            send_project_discovery(&mut ws, &mut state, discovery_filters()).await,
             ProjectSendOutcome::Sent
         );
         assert_eq!(next_test_frame(&mut server).await[0], "REQ");
@@ -8008,7 +8593,7 @@ mod tests {
         assert_eq!(
             state
                 .project_requests
-                .record_intent(&sub_id, discovery_identity()),
+                .record_discovery_intent(discovery_filters()),
             crate::project::IntentAdmission::Recorded
         );
 
@@ -8021,9 +8606,8 @@ mod tests {
             None,
             "an id that was never live cannot be suspended by relay text"
         );
-        assert_eq!(
-            state.project_requests.intent(&sub_id),
-            Some(&discovery_identity()),
+        assert!(
+            intent_asks(&state, &sub_id, &discovery_filters()),
             "and local policy is untouched"
         );
 
@@ -8042,10 +8626,9 @@ mod tests {
         // which project routing is silently dead, with intent retained but
         // inactive and possibly no later reconnect to notice.
         let mut state = BgState::new();
-        let sub_id = crate::project::discovery_sub_id();
         state
             .project_requests
-            .record_intent(&sub_id, discovery_identity());
+            .record_discovery_intent(discovery_filters());
 
         let (mut ws, server) = test_ws_pair().await;
         drop(server);
@@ -8068,17 +8651,8 @@ mod tests {
         // that is easy to hit rather than exotic.
         let (mut ws, mut server) = test_ws_pair().await;
         let mut state = BgState::new();
-        let sub_id = crate::project::watched_sub_id(0);
-        send_project_subscribe(
-            &mut ws,
-            &mut state,
-            &sub_id,
-            identity(
-                crate::project::ProjectSubscription::Watched { generation: 0 },
-                test_filter(),
-            ),
-        )
-        .await;
+        let sub_id = crate::project::discovery_sub_id();
+        send_project_discovery(&mut ws, &mut state, discovery_filters()).await;
         assert_eq!(next_test_frame(&mut server).await[0], "REQ");
 
         state.project_requests.clear_connection();
@@ -8142,22 +8716,8 @@ mod tests {
         frame: Value,
         tx: &mpsc::Sender<Option<BuzzEvent>>,
     ) -> bool {
-        let (mut ws, _server) = test_ws_pair().await;
-        let (observer_tx, _observer_rx) = mpsc::channel(8);
-        let keys = nostr::Keys::generate();
         let text = serde_json::to_string(&frame).expect("encode");
-        handle_ws_message(
-            Message::Text(text.into()),
-            &mut ws,
-            tx,
-            &observer_tx,
-            state,
-            &keys,
-            "ws://test",
-            &keys.public_key().to_hex(),
-            None,
-        )
-        .await
+        dispatch_over_fresh_connection(state, text, tx).await
     }
 
     #[tokio::test]
@@ -8366,31 +8926,21 @@ mod tests {
         // made the reconnect path report a request-ownership disagreement that
         // did not exist — a diagnostic pointing at the wrong subsystem.
         let (mut ws, mut server) = test_ws_pair().await;
-        let mut state = BgState::new();
+        // Born with one incarnation left; the burner below spends it, through
+        // the same `checked_add` production uses.
+        let mut state =
+            state_over(crate::project::DurableRecord::empty().with_allocators(0, u64::MAX));
         let agent = nostr::Keys::generate().public_key().to_hex();
         let sub_id = crate::project::discovery_sub_id();
 
-        // Spend the space.
-        state.project_requests.force_next_incarnation(u64::MAX);
-        let burner = crate::project::watched_sub_id(0);
-        assert_eq!(
-            send_project_subscribe(
-                &mut ws,
-                &mut state,
-                &burner,
-                identity(
-                    crate::project::ProjectSubscription::Watched { generation: 0 },
-                    test_filter(),
-                ),
-            )
-            .await,
-            ProjectSendOutcome::Sent
-        );
-        assert_eq!(next_test_frame(&mut server).await[0], "REQ");
+        // The burner is the watched replacement, which is the only route a
+        // watched subscription has. It spends the last incarnation.
+        let burner = open_watched(&mut state).await;
+        let _ = burner;
 
         // Now nothing further can be opened.
         assert_eq!(
-            send_project_subscribe(&mut ws, &mut state, &sub_id, discovery_identity()).await,
+            send_project_discovery(&mut ws, &mut state, discovery_filters()).await,
             ProjectSendOutcome::Exhausted,
             "reported as itself, not as a conflict"
         );
@@ -8452,7 +9002,7 @@ mod tests {
         let mut state = BgState::new();
         let (tx, _rx) = mpsc::channel(16);
         let discovery = open_discovery(&mut state).await;
-        let watched = open_watched(&mut state, 0).await;
+        let watched = open_watched(&mut state).await;
 
         for id in [&discovery, &watched] {
             assert!(deliver_control_frame_to(&mut state, json!(["EOSE", id]), &tx).await);
@@ -8531,10 +9081,7 @@ mod tests {
                 .is_err(),
             "and must emit no REQ"
         );
-        assert_eq!(
-            state.project_requests.intent(&sub_id),
-            Some(&discovery_identity())
-        );
+        assert!(intent_asks(&state, &sub_id, &discovery_filters()));
     }
 
     /// A subscribe command that constrains nothing opens nothing, on either
@@ -8580,7 +9127,11 @@ mod tests {
                 "{filters:?}: no intent"
             );
             assert!(
-                disconnected.project_requests.replayable().is_empty(),
+                disconnected
+                    .project_requests
+                    .replayable()
+                    .expect("a canonical record")
+                    .is_empty(),
                 "{filters:?}: and nothing for a reconnect to re-ask"
             );
 
@@ -8620,7 +9171,11 @@ mod tests {
                 "{filters:?}: no intent"
             );
             assert!(
-                state.project_requests.replayable().is_empty(),
+                state
+                    .project_requests
+                    .replayable()
+                    .expect("a canonical record")
+                    .is_empty(),
                 "{filters:?}: and a reconnect re-asks nothing"
             );
         }
@@ -8632,21 +9187,14 @@ mod tests {
         // connection, so admitting a conflict here is admitting it everywhere.
         let mut state = BgState::new();
         let sub_id = crate::project::discovery_sub_id();
-        for cmd in [
-            RelayCommand::SubscribeProjectDiscovery {
-                filters: vec![test_filter()],
-            },
-            RelayCommand::SubscribeProjectDiscovery {
-                filters: vec![json!({ "kinds": [1] })],
-            },
-        ] {
-            apply_command_to_state(&mut state, cmd);
+        for filters in [discovery_filters(), other_discovery_filters()] {
+            apply_command_to_state(
+                &mut state,
+                RelayCommand::SubscribeProjectDiscovery { filters },
+            );
         }
 
-        assert_eq!(
-            state.project_requests.intent(&sub_id),
-            Some(&discovery_identity())
-        );
+        assert!(intent_asks(&state, &sub_id, &discovery_filters()));
     }
 
     // ── Only requests this agent opened are answerable ───────────────────────
@@ -8703,7 +9251,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_closed_project_request_stops_being_answerable() {
+    async fn a_retired_project_request_stops_being_answerable() {
         // The half a parser could never express. A subscription id does not
         // stop being well-formed when we stop listening, so late frames for a
         // request we have finished with used to keep working.
@@ -8713,18 +9261,28 @@ mod tests {
         let event_a = mixed_surface_event(&keys, Uuid::new_v4(), &test_root_id(), 1_000);
         let event_b = mixed_surface_event(&keys, Uuid::new_v4(), &test_root_id(), 1_001);
 
-        let watched = open_watched(&mut state, 0).await;
-        deliver_frame(&mut state, &watched, &event_a, &tx).await;
+        let retired = open_watched_for(&mut state, &[&test_root_id()]).await;
+        deliver_frame(&mut state, &retired, &event_a, &tx).await;
         assert_eq!(drain(&mut rx).len(), 1, "open: delivered");
 
-        state.project_requests.close_active(&watched);
-        deliver_frame(&mut state, &watched, &event_b, &tx).await;
+        // The production route that stops a request being answerable: a
+        // watched replacement retires its predecessor's live registration the
+        // instant the successor installs. It used to be `close_active`, a
+        // registry method with no production caller at all.
+        let successor = open_watched_for(&mut state, &[&test_root_id(), &"c".repeat(64)]).await;
+        assert_ne!(retired, successor, "the successor takes a new generation");
 
-        assert!(drain(&mut rx).is_empty(), "closed: not delivered");
+        deliver_frame(&mut state, &retired, &event_b, &tx).await;
+        assert!(drain(&mut rx).is_empty(), "retired: not delivered");
         assert!(
             !state.project_seen_ids.contains(&event_b.id.to_hex()),
-            "a closed request spends nothing"
+            "a retired request spends nothing"
         );
+
+        // The positive control: the successor still answers, so the refusal
+        // above is not the whole surface being dead.
+        deliver_frame(&mut state, &successor, &event_b, &tx).await;
+        assert_eq!(drain(&mut rx).len(), 1, "the successor delivers");
     }
 
     // Deleted 2026-08-01: `a_catch_up_is_bound_to_the_root_we_recorded_not_the_one_the_id_spells`.
@@ -8740,82 +9298,21 @@ mod tests {
     // not one of this page's rows, is
     // `a_catch_up_root_mismatch_does_not_burn_the_correct_rooted_delivery`.
 
-    #[tokio::test]
-    async fn a_refused_reopen_leaves_the_original_class_in_force_on_the_wire() {
-        // The registry's unit tests prove the record survives a conflicting
-        // reopen. This proves the *dispatch* still behaves under it, which is
-        // the thing that actually matters — a retained record that nothing
-        // consults would be bookkeeping theatre.
-        //
-        // The classes are chosen so they disagree observably: under
-        // `RootCatchUp { root_a }` an event for root B is not one of the page's
-        // rows, and under `Watched` the same event is delivered to the consumer
-        // as a routed event. So if the reopen had taken effect, the assertions
-        // below would see a delivery and an intact page.
-        /// A catch-up for `bound` under `id`, holding a page, after a
-        /// conflicting reopen to `Watched` has been refused.
-        async fn after_a_refused_reopen(
-            state: &mut BgState,
-            bound: &crate::project::VerifiedBoundRoot,
-        ) -> String {
-            let id = bind_page_under(state, bound).await;
-            let (mut ws, _server) = test_ws_pair().await;
-            assert!(
-                matches!(
-                    state
-                        .project_requests
-                        .open_request(
-                            &mut ws,
-                            &id,
-                            identity(
-                                crate::project::ProjectSubscription::Watched { generation: 0 },
-                                test_filter(),
-                            ),
-                        )
-                        .await,
-                    crate::project::OpenOutcome::Conflict { .. }
-                ),
-                "re-pointing a live id must be refused"
-            );
-            id
-        }
-
-        let mut state = BgState::new();
-        let (tx, mut rx) = mpsc::channel(16);
-        let (bound_a, keys) = proven_issue_root().await;
-        let root_a = bound_a.binding().root().to_string();
-        let root_b = "b".repeat(64);
-
-        let id = after_a_refused_reopen(&mut state, &bound_a).await;
-
-        let for_b = comment_on_root(&keys, &root_b, 900, "another root's event");
-        deliver_frame(&mut state, &id, &for_b, &tx).await;
-        assert!(
-            drain(&mut rx).is_empty(),
-            "under `Watched` this would have been delivered as a routed event"
-        );
-        assert!(
-            !state.project_seen_ids.contains(&for_b.id.to_hex()),
-            "and it spends nothing"
-        );
-        assert!(
-            page_verdict(&mut state, &root_a, &id, &tx).await.is_err(),
-            "still bound to root A's reconstruction, so root B is not one of its rows"
-        );
-
-        // Positive control, on its own connection because the refusal above is
-        // terminal for that reconstruction: the same refused reopen leaves root
-        // A's own events admissible.
-        let mut state = BgState::new();
-        let id = after_a_refused_reopen(&mut state, &bound_a).await;
-        let for_a = comment_on_root(&keys, &root_a, 900, "its own root's event");
-        deliver_frame(&mut state, &id, &for_a, &tx).await;
-        assert_eq!(
-            page_verdict(&mut state, &root_a, &id, &tx).await,
-            Ok(1),
-            "the original request is unharmed by the refused reopen"
-        );
-    }
+    // Deleted 2026-08-02: `a_refused_reopen_leaves_the_original_class_in_force_on_the_wire`.
+    //
+    // It re-pointed a live catch-up id at a `Watched` identity through
+    // `ProjectRequests::open_request`, and proved the refusal held all the way
+    // to dispatch. That call no longer exists for any caller: `open_request` is
+    // private to the registry, and its two entry points are `open_discovery`,
+    // which stamps `Discovery` under the discovery id, and `open_replayed`,
+    // whose argument the registry mints from its own validated record. Nothing
+    // -- production or test -- can aim an identity of its choosing at an id of
+    // its choosing, so the reopen this guarded against is unrepresentable
+    // rather than refused.
+    //
+    // The surviving half of its subject, that opening refuses to change what an
+    // id holds, is asserted on the one class a caller can still open twice, in
+    // `a_conflicting_send_records_nothing_and_cannot_be_installed_by_a_reconnect`.
 
     // ── The membership subscription accepts only membership kinds ────────────
 
@@ -9004,7 +9501,7 @@ mod tests {
         let keys = nostr::Keys::generate();
         let event = announcement(&keys, 1_000);
 
-        let watched = open_watched(&mut state, 0).await;
+        let watched = open_watched(&mut state).await;
         deliver_frame(&mut state, &watched, &event, &tx).await;
         assert!(
             drain(&mut rx).is_empty(),
@@ -9038,7 +9535,7 @@ mod tests {
             "a rooted event is not an announcement"
         );
 
-        let watched = open_watched(&mut state, 0).await;
+        let watched = open_watched(&mut state).await;
         deliver_frame(&mut state, &watched, &event, &tx).await;
         let delivered = drain(&mut rx);
         assert_eq!(delivered.len(), 1, "the routed delivery survives");
@@ -9099,7 +9596,7 @@ mod tests {
         let (mut ws, mut server) = test_ws_pair().await;
         let discovery_id = crate::project::discovery_sub_id();
         assert_eq!(
-            send_project_subscribe(&mut ws, &mut state, &discovery_id, discovery_identity()).await,
+            send_project_discovery(&mut ws, &mut state, discovery_filters()).await,
             ProjectSendOutcome::Sent
         );
         let frame = next_test_frame(&mut server).await;
@@ -9131,15 +9628,16 @@ mod tests {
         // ── 3. Enrolment REQ, derived from what discovery just admitted ─────
         let filter = crate::project::enrolment_filter(&discovered, &agent_hex, 0)
             .expect("a discovered repository yields an enrolment filter");
-        let identity = crate::project::ProjectRequestIdentity::from_filters(
-            crate::project::ProjectSubscription::Enrolment,
-            vec![filter],
-        )
-        .expect("the enrolment filter is bounded");
         let enrol_id = crate::project::PROJECT_ENROL_SUB_ID.to_string();
-        assert_eq!(
-            send_project_subscribe(&mut ws, &mut state, &enrol_id, identity).await,
-            ProjectSendOutcome::Sent
+        assert!(
+            matches!(
+                state
+                    .project_requests
+                    .replace_enrolment(&mut ws, vec![filter])
+                    .await,
+                crate::project::ReplaceOutcome::Replaced { .. }
+            ),
+            "the enrolment replacement must install"
         );
         let frame = next_test_frame(&mut server).await;
         assert_eq!(frame[0], "REQ");
@@ -9223,20 +9721,26 @@ mod tests {
             !watched.is_empty(),
             "an enrolled root must produce watched-root filters"
         );
-        let identity = crate::project::ProjectRequestIdentity::from_filters(
-            crate::project::ProjectSubscription::Watched { generation: 1 },
-            watched,
-        )
-        .expect("watched filters are bounded");
-        let watched_id = crate::project::watched_sub_id(1);
+        assert!(
+            matches!(
+                state
+                    .project_requests
+                    .replace_watched(&mut ws, watched)
+                    .await,
+                crate::project::ReplaceOutcome::Replaced { .. }
+            ),
+            "the watched replacement must install"
+        );
+        let watched_id = installed_watched_id(&state);
         assert_eq!(
-            send_project_subscribe(&mut ws, &mut state, &watched_id, identity).await,
-            ProjectSendOutcome::Sent
+            watched_id,
+            crate::project::watched_sub_id(0),
+            "the registry stamps the first watched generation, and it is 0"
         );
         let frame = next_test_frame(&mut server).await;
         assert_eq!(
             frame[1], watched_id,
-            "the replacement uses a fresh generation"
+            "the REQ carries the generation the registry allocated"
         );
         assert_eq!(
             req_root_set(&frame),
@@ -9312,17 +9816,7 @@ mod tests {
 
         let filter =
             crate::project::enrolment_filter(&discovered, &agent_hex, 0).expect("enrolment filter");
-        let identity = crate::project::ProjectRequestIdentity::from_filters(
-            crate::project::ProjectSubscription::Enrolment,
-            vec![filter],
-        )
-        .expect("bounded");
-        let enrol_id = crate::project::PROJECT_ENROL_SUB_ID.to_string();
-        let (mut ws, _server) = test_ws_pair().await;
-        assert_eq!(
-            send_project_subscribe(&mut ws, &mut state, &enrol_id, identity).await,
-            ProjectSendOutcome::Sent
-        );
+        let enrol_id = open_enrolment_with(&mut state, vec![filter]).await;
 
         let root_named = |signer: &nostr::Keys, coord: &str, p: &str| {
             EventBuilder::new(
@@ -9564,6 +10058,200 @@ mod tests {
     /// → buzz_cli::run_from_args signs and POSTs the comment
     /// → the capture endpoint accepts it
     /// ```
+    /// One submission the acceptance endpoint took: the exact bytes it
+    /// received, and the event those bytes deserialised and verified as.
+    struct Accepted {
+        body: String,
+        event: Event,
+    }
+
+    /// The local endpoint an agent's reply is submitted to.
+    ///
+    /// Scope, stated so it is not overread: this receives the signed event and
+    /// answers acceptance. It is the transport boundary, not independent relay
+    /// validation — nothing here checks the event against relay policy. What it
+    /// buys is that the reply must be really built, really signed and really
+    /// sent to be observed.
+    struct AcceptanceEndpoint {
+        url: String,
+        accepted: std::sync::Arc<std::sync::Mutex<Vec<Accepted>>>,
+        refused: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    /// Serve `/events`, accepting only bodies that verify as signed events.
+    ///
+    /// **Acceptance is conditional on the signature, and conditional here.**
+    /// The handler deserialises the exact body it was given as an
+    /// [`nostr::Event`] and calls `verify()` — which checks that the id is the
+    /// hash of the serialised event *and* that the signature is the claimed
+    /// author's over that id — before the submission is recorded or acceptance
+    /// is returned. Anything else is refused, kept out of `accepted`, and
+    /// answered `accepted: false`.
+    ///
+    /// This used to be a `serde_json::Value` projection that recorded every
+    /// body and always answered `accepted: true`, with the deserialisation and
+    /// `verify()` done afterwards by the scenario's own assertions. That
+    /// ordering made the check decorative: the child had already been told
+    /// "accepted" and the collection already held the body, so deleting the
+    /// later `verify()` left the scenario green. Verification now precedes both
+    /// effects it is supposed to guard, and
+    /// [`the_acceptance_endpoint_refuses_what_does_not_verify`] is what fails
+    /// if it is dropped.
+    ///
+    /// The exact bytes are retained beside the parsed event, because the claim
+    /// is about what the child sent — re-encoding a parsed value and asserting
+    /// on that would check this harness's own round-trip.
+    async fn spawn_acceptance_endpoint() -> AcceptanceEndpoint {
+        let accepted: std::sync::Arc<std::sync::Mutex<Vec<Accepted>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let refused: std::sync::Arc<std::sync::Mutex<Vec<String>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let app = {
+            let accepted = accepted.clone();
+            let refused = refused.clone();
+            axum::Router::new().route(
+                "/events",
+                axum::routing::post(move |body: String| {
+                    let accepted = accepted.clone();
+                    let refused = refused.clone();
+                    async move {
+                        let verified = serde_json::from_str::<Event>(&body)
+                            .ok()
+                            .filter(|event| event.verify().is_ok());
+                        match verified {
+                            Some(event) => {
+                                let id = event.id.to_hex();
+                                accepted
+                                    .lock()
+                                    .expect("acceptance sink")
+                                    .push(Accepted { body, event });
+                                axum::Json(serde_json::json!({
+                                    "event_id": id,
+                                    "accepted": true,
+                                    "message": "",
+                                }))
+                            }
+                            None => {
+                                refused.lock().expect("refusal sink").push(body);
+                                axum::Json(serde_json::json!({
+                                    "event_id": "",
+                                    "accepted": false,
+                                    "message": "submission does not verify as a signed event",
+                                }))
+                            }
+                        }
+                    }
+                }),
+            )
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind the capture endpoint");
+        let addr = listener.local_addr().expect("capture endpoint address");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        AcceptanceEndpoint {
+            url: format!("http://{addr}"),
+            accepted,
+            refused,
+        }
+    }
+
+    /// The negative control for the acceptance endpoint.
+    ///
+    /// Three bodies that a `Value`-projecting endpoint would have taken: one
+    /// that is not JSON at all, one that is a well-formed object carrying every
+    /// field name an event has, and one that is a genuinely signed event whose
+    /// content was edited afterwards — the last being the shape that matters,
+    /// because every field an assertion reads is present and correct-looking
+    /// and only the signature disagrees.
+    ///
+    /// None of them may be recorded or accepted. Delete the `verify()` from the
+    /// handler and the tampered body sails through, which is what makes that
+    /// call load-bearing rather than ornamental.
+    #[tokio::test]
+    async fn the_acceptance_endpoint_refuses_what_does_not_verify() {
+        let endpoint = spawn_acceptance_endpoint().await;
+        let author = nostr::Keys::generate();
+        let genuine = EventBuilder::new(nostr::Kind::Custom(1), "as signed")
+            .sign_with_keys(&author)
+            .expect("sign the genuine event");
+
+        let tampered = {
+            let mut body: serde_json::Value =
+                serde_json::to_value(&genuine).expect("encode the genuine event");
+            body["content"] = json!("not what was signed");
+            serde_json::to_string(&body).expect("encode the tampered body")
+        };
+        let impostor = serde_json::to_string(&json!({
+            "id": "b".repeat(64),
+            "pubkey": author.public_key().to_hex(),
+            "created_at": 1,
+            "kind": 1,
+            "tags": [],
+            "content": "never signed",
+            "sig": "c".repeat(128),
+        }))
+        .expect("encode the impostor body");
+
+        let post = |body: String| {
+            let url = format!("{}/events", endpoint.url);
+            async move {
+                reqwest::Client::new()
+                    .post(url)
+                    .body(body)
+                    .send()
+                    .await
+                    .expect("the endpoint answered")
+                    .json::<serde_json::Value>()
+                    .await
+                    .expect("the answer is JSON")
+            }
+        };
+
+        for (label, body) in [
+            ("not JSON", "{{{ not an event".to_string()),
+            ("an unsigned impostor", impostor),
+            ("a tampered signed event", tampered),
+        ] {
+            let answer = post(body).await;
+            assert_eq!(
+                answer["accepted"],
+                json!(false),
+                "the endpoint accepted {label}: {answer}"
+            );
+        }
+        assert!(
+            endpoint
+                .accepted
+                .lock()
+                .expect("acceptance sink")
+                .is_empty(),
+            "a submission that does not verify was recorded as accepted"
+        );
+        assert_eq!(
+            endpoint.refused.lock().expect("refusal sink").len(),
+            3,
+            "the endpoint did not see all three submissions"
+        );
+
+        // And the genuine article, so the refusals above are not simply an
+        // endpoint that refuses everything.
+        let answer = post(serde_json::to_string(&genuine).expect("encode the genuine body")).await;
+        assert_eq!(
+            answer["accepted"],
+            json!(true),
+            "the endpoint refused a genuinely signed event: {answer}"
+        );
+        let accepted = endpoint.accepted.lock().expect("acceptance sink");
+        assert_eq!(accepted.len(), 1, "exactly the genuine event is accepted");
+        assert_eq!(
+            accepted[0].event.id, genuine.id,
+            "the accepted event is not the one submitted"
+        );
+    }
+
     #[tokio::test]
     async fn phase_a_end_to_end_relay_bytes_reach_the_agents_stdin() {
         // A protocol stub hanging forever would be a tedious way to end the
@@ -9641,15 +10329,16 @@ mod tests {
             }
 
             // Every EVENT below crosses the retained connection: the relay peer
-            // signs and writes it, and the socket the requests were registered
-            // on reads it. No fresh socket, and no `Message::Text` handed
-            // directly to `handle_ws_message` — the id is all this scenario
-            // ever holds of an inbound event.
+            // signs and writes it on the subscription it was told to, and
+            // `ingress` reads it back off the socket the requests were
+            // registered on. No fresh socket, and no `Message::Text` this
+            // scenario could hand to the handler even if it wanted to — the id
+            // is all it ever holds of an inbound event.
             macro_rules! deliver {
-                ($sub_id:expr, $event_id:expr) => {{
+                ($event_id:expr) => {{
                     let mut guard = subscriber.inner.lock().await;
                     let (state, ws) = &mut *guard;
-                    deliver_over_connection(state, ws, $sub_id, $event_id, &tx, &agent).await;
+                    deliver_over_connection(state, ws, $event_id, &tx, &agent).await;
                 }};
             }
 
@@ -9659,7 +10348,7 @@ mod tests {
                 let mut guard = subscriber.inner.lock().await;
                 let (state, ws) = &mut *guard;
                 assert_eq!(
-                    send_project_subscribe(ws, state, &discovery_id, discovery_identity()).await,
+                    send_project_discovery(ws, state, discovery_filters()).await,
                     ProjectSendOutcome::Sent
                 );
             }
@@ -9684,7 +10373,7 @@ mod tests {
                     },
                 )
                 .await;
-            deliver!(&discovery_id, announcement);
+            deliver!(announcement);
             assert_eq!(drive_all!(), crate::ProjectDispatched::DiscoveryChanged);
 
             let seen = readable_frames(&mut server_rx).await;
@@ -9723,7 +10412,7 @@ mod tests {
                     },
                 )
                 .await;
-            deliver!(&discovery_id, other_announcement);
+            deliver!(other_announcement);
             assert_eq!(drive_all!(), crate::ProjectDispatched::DiscoveryChanged);
 
             let seen = readable_frames(&mut server_rx).await;
@@ -9783,7 +10472,7 @@ mod tests {
                     },
                 )
                 .await;
-            deliver!(&enrol_id, root);
+            deliver!(root);
 
             let route_key = match drive_all!() {
                 crate::ProjectDispatched::Queued { key, queued, .. } => {
@@ -9819,7 +10508,7 @@ mod tests {
                     },
                 )
                 .await;
-            deliver!(&enrol_id, second);
+            deliver!(second);
             drive_all!();
 
             let seen = readable_frames(&mut server_rx).await;
@@ -9863,7 +10552,13 @@ mod tests {
                 let mut guard = subscriber.inner.lock().await;
                 let (state, ws) = &mut *guard;
                 assert!(
-                    install_replacement_with(state, ws, replacement_client, VecDeque::new()).await,
+                    install_replacement_with(
+                        state,
+                        ws,
+                        replacement_client,
+                        ingress::HandshakeBuffer::empty()
+                    )
+                    .await,
                     "the replacement connection installs"
                 );
                 let (_reconnect_tx, mut reconnect_rx) = mpsc::channel(1);
@@ -9947,7 +10642,7 @@ mod tests {
                     },
                 )
                 .await;
-            deliver!(&crate::project::watched_sub_id(1), comment);
+            deliver!(comment);
             match drive_all!() {
                 crate::ProjectDispatched::Queued { key, queued, .. } => {
                     assert!(queued, "the comment must enter the queue");
@@ -9977,49 +10672,8 @@ mod tests {
             );
 
             // ── the endpoint the agent's reply is submitted to ───────────────
-            //
-            // Scope, stated so it is not overread: this receives the signed
-            // event and returns acceptance. It is the transport boundary, not
-            // independent relay validation — nothing here checks the event
-            // against relay policy. What it buys is that the reply must be
-            // really built, really signed and really sent to be observed.
-            //
-            // **The exact bytes**, retained verbatim. Axum will accept any JSON
-            // this child sends, so the only thing separating a real signed
-            // event from a plausible object carrying the right field names is
-            // deserialising these bytes as `nostr::Event` and verifying them —
-            // which cannot be done to a projection already parsed into
-            // `serde_json::Value` and read field by field.
-            let submissions: std::sync::Arc<std::sync::Mutex<Vec<String>>> =
-                std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-            let events_url = {
-                let sink = submissions.clone();
-                let app = axum::Router::new().route(
-                    "/events",
-                    axum::routing::post(move |body: String| {
-                        let sink = sink.clone();
-                        async move {
-                            let event: serde_json::Value =
-                                serde_json::from_str(&body).unwrap_or(serde_json::Value::Null);
-                            let id = event["id"].as_str().unwrap_or_default().to_string();
-                            sink.lock().expect("submission sink").push(body);
-                            axum::Json(serde_json::json!({
-                                "event_id": id,
-                                "accepted": true,
-                                "message": "",
-                            }))
-                        }
-                    }),
-                );
-                let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-                    .await
-                    .expect("bind the capture endpoint");
-                let addr = listener.local_addr().expect("capture endpoint address");
-                tokio::spawn(async move {
-                    let _ = axum::serve(listener, app).await;
-                });
-                format!("http://{addr}")
-            };
+            let endpoint = spawn_acceptance_endpoint().await;
+            let events_url = endpoint.url.clone();
 
             // ── a stub agent, entered through the production spawn path ──────
             //
@@ -10410,7 +11064,19 @@ for line in sys.stdin:
             );
 
             // ── the submission, as the endpoint received it ──────────────────
-            let submitted = submissions.lock().expect("submission sink").clone();
+            //
+            // Everything in here has already been deserialised from the exact
+            // body and cryptographically verified — that is the condition of
+            // being in this collection at all, and
+            // `the_acceptance_endpoint_refuses_what_does_not_verify` is what
+            // holds the endpoint to it. So `verify()` is not repeated below:
+            // repeating it here is what made it deletable last time.
+            let refused = endpoint.refused.lock().expect("refusal sink").clone();
+            assert!(
+                refused.is_empty(),
+                "the endpoint refused a submission from this child: {refused:?}"
+            );
+            let submitted = endpoint.accepted.lock().expect("acceptance sink");
             assert_eq!(
                 submitted.len(),
                 1,
@@ -10426,28 +11092,13 @@ for line in sys.stdin:
                 cli["stderr"].as_str().unwrap_or_default()
             );
 
-            // ── the signature, before anything is read off the event ─────────
+            // ── what the endpoint verified, projected ────────────────────────
             //
-            // The capture endpoint accepts arbitrary JSON, so up to this line
-            // nothing distinguishes a signed event from an object carrying the
-            // right field names. `verify()` checks that the id is the hash of
-            // the serialised event *and* that the signature is the claimed
-            // author's over that id — so every projection asserted below is a
-            // projection of something the agent actually signed, rather than of
-            // something that merely said so.
-            //
-            // Deserialising the exact captured body is the point. Re-encoding a
-            // parsed `Value` and verifying that would check the harness's own
-            // round-trip, not the bytes the child sent.
-            let signed: Event = serde_json::from_str(&submitted[0]).unwrap_or_else(|e| {
-                panic!(
-                    "the captured body is not a nostr event: {e}\nbody: {}",
-                    submitted[0]
-                )
-            });
-            signed
-                .verify()
-                .expect("the captured submission does not verify");
+            // `signed` is the event the endpoint deserialised out of the exact
+            // body and verified before accepting it, so every projection below
+            // is a projection of something the agent actually signed rather
+            // than of something that merely said so.
+            let signed = &submitted[0].event;
 
             assert_eq!(
                 signed.kind.as_u16(),
@@ -10464,9 +11115,16 @@ for line in sys.stdin:
                 "the published body is not what the agent wrote"
             );
 
-            // Tags are read off the verified event for the same reason.
+            // Tags are read off the exact accepted body, which is the same
+            // bytes `signed` was verified from — the endpoint keeps both, and
+            // the assertion below ties them together before any tag is read.
             let event: serde_json::Value =
-                serde_json::from_str(&submitted[0]).expect("the captured body is JSON");
+                serde_json::from_str(&submitted[0].body).expect("the captured body is JSON");
+            assert_eq!(
+                event["id"],
+                json!(signed.id.to_hex()),
+                "the retained body is not the event that was verified"
+            );
 
             let tags: Vec<Vec<String>> = event["tags"]
                 .as_array()
@@ -10605,19 +11263,22 @@ for line in sys.stdin:
         }
     }
 
-    /// `from_filters` refuses a filter that constrains nothing, so building the
-    /// production discovery identity through it says the startup REQ is a
-    /// bounded request rather than a subscription to the whole relay.
-    #[test]
-    fn the_production_discovery_filter_is_a_bounded_request() {
+    /// The registry refuses filters that constrain nothing, so opening
+    /// discovery with the production filter says the startup REQ is a bounded
+    /// request rather than a subscription to the whole relay.
+    ///
+    /// Asserted through the operation rather than through a constructor: the
+    /// constructor is private to the registry now, and it was never the thing
+    /// at risk — what matters is that the production filter survives the route
+    /// production takes.
+    #[tokio::test]
+    async fn the_production_discovery_filter_is_a_bounded_request() {
         let filters = crate::project::discovery_subscription(true)
             .expect("the flag-on decision must be to open discovery");
-        assert!(
-            crate::project::ProjectRequestIdentity::from_filters(
-                crate::project::ProjectSubscription::Discovery,
-                filters,
-            )
-            .is_some(),
+        let mut state = BgState::new();
+        assert_eq!(
+            send_discovery(&mut state, filters).await,
+            ProjectSendOutcome::Sent,
             "the production discovery filter must constrain events"
         );
     }
@@ -10691,7 +11352,7 @@ for line in sys.stdin:
         // burned nothing on the way past. (The boundary above delivers a
         // `StoredEventsComplete`, which is not what is being counted here.)
         drain(&mut rx);
-        let watched = open_watched(&mut state, 0).await;
+        let watched = open_watched(&mut state).await;
         deliver_frame(&mut state, &watched, &event, &tx).await;
         let delivered = drain(&mut rx);
         assert_eq!(delivered.len(), 1, "the routed delivery survives");
@@ -10794,13 +11455,7 @@ for line in sys.stdin:
 
         // The real watched request for one issue root, from the production
         // builder, with the window it would be sent with.
-        let id = crate::project::watched_sub_id(0);
-        open_sent(
-            &mut state,
-            &id,
-            watched_identity(0, &[(&watched_root, false)], 1_000),
-        )
-        .await;
+        let id = open_watched_since(&mut state, &[(&watched_root, false)], 1_000).await;
 
         let comment_kind = crate::project::HistoryStream::Comments.kinds()[0] as u16;
         let pr_update_kind = crate::project::HistoryStream::PullRequestUpdates.kinds()[0] as u16;
@@ -10887,7 +11542,6 @@ for line in sys.stdin:
         let issue_root = "a".repeat(64);
         let pr_root = "b".repeat(64);
         let roots = [(issue_root.as_str(), false), (pr_root.as_str(), true)];
-        let identity = watched_identity(0, &roots, 0);
 
         // ---- The bytes, through a concrete paired socket. ------------------
         //
@@ -10896,11 +11550,17 @@ for line in sys.stdin:
         // key: this is the assertion that would have caught `["REQ", id, [a, b]]`.
         let mut state = BgState::new();
         let (mut ws, mut server) = test_ws_pair().await;
-        let id = crate::project::watched_sub_id(0);
-        assert_eq!(
-            send_project_subscribe(&mut ws, &mut state, &id, identity.clone()).await,
-            ProjectSendOutcome::Sent
+        assert!(
+            matches!(
+                state
+                    .project_requests
+                    .replace_watched(&mut ws, watched_filters(&roots, 0))
+                    .await,
+                crate::project::ReplaceOutcome::Replaced { .. }
+            ),
+            "the watched replacement must install"
         );
+        let id = installed_watched_id(&state);
         let written = next_test_frame(&mut server).await;
 
         let produced = crate::project::project_req_frames(
@@ -10983,11 +11643,14 @@ for line in sys.stdin:
         // would stay green, since the first connection asked correctly.
         state.project_requests.clear_connection();
         let (mut replacement, mut replacement_server) = test_ws_pair().await;
-        let replayable = state.project_requests.replayable();
+        let replayable = state
+            .project_requests
+            .replayable()
+            .expect("a canonical durable record");
         assert_eq!(replayable.len(), 1, "one request to re-ask: {replayable:?}");
-        for (sub_id, identity) in replayable {
+        for request in replayable {
             assert_eq!(
-                send_project_subscribe(&mut replacement, &mut state, &sub_id, identity).await,
+                send_project_replay(&mut replacement, &mut state, request).await,
                 ProjectSendOutcome::Sent
             );
         }
@@ -11018,13 +11681,10 @@ for line in sys.stdin:
         let discovered = crate::project::DiscoveredRepositories::for_test([coordinate.clone()]);
         let filter = crate::project::enrolment_filter(&discovered, &agent, 0)
             .expect("a known coordinate yields a filter");
-        let id = "proj-enrolment-test".to_string();
-        open_sent(
-            &mut state,
-            &id,
-            identity(crate::project::ProjectSubscription::Enrolment, filter),
-        )
-        .await;
+        // The id is the registry's, not a name this test invents: an enrolment
+        // class recorded under `proj-enrolment-test` is exactly the
+        // caller-selected identity this tranche removed.
+        let id = open_enrolment_with(&mut state, vec![filter]).await;
 
         let kind = buzz_core::kind::KIND_TEXT_NOTE as u16;
         let root = test_root_id();
@@ -11283,7 +11943,7 @@ for line in sys.stdin:
         // has to actually be watching this root, or the frame is refused before
         // it can spend anything — which is the point of the check, not a way
         // around setting the fixture up properly.
-        let watched = open_watched_for(&mut state, 0, &[&root]).await;
+        let watched = open_watched_for(&mut state, &[&root]).await;
         deliver_frame(&mut state, &watched, &comment, &tx).await;
         assert_eq!(drain(&mut rx).len(), 1, "the live delivery happens");
         assert!(state.project_seen_ids.contains(&comment.id.to_hex()));
@@ -11652,19 +12312,12 @@ for line in sys.stdin:
         let sub_id = bind_page_under(&mut state, &bound).await;
 
         let row = comment_on_root(&keys, &root, 900, "buffered by the new socket");
-        let buffered = VecDeque::from(vec![
-            RelayMessage::Event {
-                subscription_id: sub_id.clone(),
-                event: Box::new(row.clone()),
-            },
-            RelayMessage::Eose {
-                subscription_id: sub_id.clone(),
-            },
-            RelayMessage::Closed {
-                subscription_id: sub_id.clone(),
-                message: "error: whatever".to_string(),
-            },
-        ]);
+        let buffered = handshake_buffer_from_wire(vec![
+            json!(["EVENT", sub_id, row]),
+            json!(["EOSE", sub_id]),
+            json!(["CLOSED", sub_id, "error: whatever"]),
+        ])
+        .await;
 
         let (mut dead, _dead_server) = test_ws_pair().await;
         let (replacement, _server) = test_ws_pair().await;
