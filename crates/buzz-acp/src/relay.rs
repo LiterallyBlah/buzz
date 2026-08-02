@@ -554,6 +554,22 @@ enum RelayCommand {
         subscription: crate::project::ProjectSubscription,
         filters: Vec<Value>,
     },
+    /// Replace a live project subscription, transactionally.
+    ///
+    /// Distinct from [`RelayCommand::SubscribeProject`] because the registry
+    /// distinguishes them: opening refuses to change the identity held under an
+    /// id, and replacement is the operation permitted to. Folding them into one
+    /// command would put that decision at the call site rather than in the
+    /// registry that owns it.
+    ReplaceProject {
+        /// The subscription being retired, when the successor takes a new id.
+        /// `None` for a first install; equal to `sub_id` when the relay's own
+        /// REQ replacement does the retiring.
+        predecessor: Option<String>,
+        sub_id: String,
+        subscription: crate::project::ProjectSubscription,
+        filters: Vec<Value>,
+    },
 }
 
 type WsStream = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
@@ -936,6 +952,28 @@ impl HarnessRelay {
     ) -> Result<(), RelayError> {
         self.cmd_tx
             .send(RelayCommand::SubscribeProject {
+                sub_id: sub_id.to_string(),
+                subscription,
+                filters,
+            })
+            .await
+            .map_err(|_| RelayError::ConnectionClosed)
+    }
+
+    /// Replace a live project subscription, transactionally.
+    ///
+    /// See [`RelayCommand::ReplaceProject`] for why this is not
+    /// [`Self::subscribe_project`] with different arguments.
+    pub async fn replace_project_subscription(
+        &self,
+        predecessor: Option<&str>,
+        sub_id: &str,
+        subscription: crate::project::ProjectSubscription,
+        filters: Vec<Value>,
+    ) -> Result<(), RelayError> {
+        self.cmd_tx
+            .send(RelayCommand::ReplaceProject {
+                predecessor: predecessor.map(str::to_string),
                 sub_id: sub_id.to_string(),
                 subscription,
                 filters,
@@ -1468,6 +1506,25 @@ fn apply_command_to_state(state: &mut BgState, cmd: RelayCommand) {
                 );
             }
         }
+        RelayCommand::ReplaceProject {
+            predecessor,
+            sub_id,
+            subscription,
+            filters,
+        } => {
+            // Offline: move the durable intent only. No REQ can be written with
+            // no socket, but the intent must still move or the next connection
+            // replays the predecessor and the replacement is silently lost.
+            let Some(identity) =
+                crate::project::ProjectRequestIdentity::from_filters(subscription, filters)
+            else {
+                warn!(sub_id, "refusing a project replacement with no filters");
+                return;
+            };
+            state
+                .project_requests
+                .replace_intent(predecessor.as_deref(), &sub_id, identity);
+        }
         RelayCommand::SubscribeMembership => {
             state.membership_sub_active = true;
         }
@@ -1655,6 +1712,51 @@ async fn execute_connected_command(
                 // Terminal, but not a transport failure — the socket stays.
                 ProjectSendOutcome::Exhausted => true,
                 ProjectSendOutcome::WriteFailed => false,
+            }
+        }
+        RelayCommand::ReplaceProject {
+            predecessor,
+            sub_id,
+            subscription,
+            filters,
+        } => {
+            let Some(identity) =
+                crate::project::ProjectRequestIdentity::from_filters(subscription, filters)
+            else {
+                warn!(sub_id, "refusing a project replacement with no filters");
+                return true;
+            };
+            match state
+                .project_requests
+                .replace_request(ws, predecessor.as_deref(), &sub_id, identity)
+                .await
+            {
+                crate::project::ReplaceOutcome::Replaced { retired } => {
+                    debug!(sub_id, ?retired, "project subscription replaced");
+                    true
+                }
+                crate::project::ReplaceOutcome::Unchanged => {
+                    debug!(
+                        sub_id,
+                        "project subscription already current — no REQ written"
+                    );
+                    true
+                }
+                crate::project::ReplaceOutcome::Exhausted => {
+                    error!(
+                        sub_id,
+                        "project request incarnations exhausted — no further project \
+                         subscription can be opened or replaced"
+                    );
+                    true
+                }
+                // The predecessor is intact, so the agent keeps answering on the
+                // subscription it already had. Only a write failure may take the
+                // connection down, and this is one.
+                crate::project::ReplaceOutcome::WriteFailed(e) => {
+                    warn!(sub_id, "project replacement write failed: {e}");
+                    false
+                }
             }
         }
         RelayCommand::SubscribeMembership => {

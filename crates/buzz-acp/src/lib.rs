@@ -1727,10 +1727,10 @@ async fn tokio_main() -> Result<()> {
     // phase's job and is deliberately absent here rather than half-present.
     let mut project_enrolments = project::ProjectEnrolments::new();
 
-    // Bumped every time the watched-root REQ is replaced. The relay keeps
-    // answering the previous request until it processes the replacement, so the
-    // generation is what tells one incarnation's frames from the next.
-    let mut project_watch_generation: u64 = 0;
+    // What the loop has installed. Held across events because a replacement
+    // must name the generation it supersedes, and that is only knowable from
+    // the last one issued.
+    let mut project_subscriptions = ProjectSubscriptions::default();
 
     // The agent's own identity, in both spellings, from one source — so the
     // `p`-tag check and visible-mention detection cannot end up pointed at
@@ -1983,11 +1983,17 @@ async fn tokio_main() -> Result<()> {
                             // fail-closed default would silently reinterpret
                             // every project event as DM policy.
                             // The dispatch context is built here, per event,
-                            // from live state. It holds no channel resolver, so
-                            // the channel lookup described above is not merely
-                            // avoided by this arm — it is unreachable from the
-                            // function this arm calls.
-                            let dispatched = handle_project_event(
+                            // from live state. It holds no channel resolver and
+                            // no relay capability, so neither a channel lookup
+                            // nor a subscription is reachable from the gate.
+                            //
+                            // Subscription upkeep travels with dispatch in
+                            // `dispatch_project_event` rather than being open
+                            // -coded here: inline, the code that decides when
+                            // to issue a REQ was unreachable from any test, and
+                            // that is exactly where the enrolment-widening
+                            // defect lived.
+                            let dispatched = dispatch_project_event(
                                 &mut ProjectDispatch {
                                     identity: project::ProjectIdentity {
                                         agent: &project_agent_identity,
@@ -2000,76 +2006,14 @@ async fn tokio_main() -> Result<()> {
                                     enrolments: &mut project_enrolments,
                                     queue: &mut queue,
                                 },
+                                &relay,
+                                &mut project_subscriptions,
+                                &pubkey_hex,
+                                startup_watermark,
                                 &project_event,
-                            );
+                            )
+                            .await;
                             tracing::debug!(?dispatched, "project dispatch");
-
-                            // Subscription upkeep is the loop's job, not the
-                            // gate's: dispatch decides, the loop performs I/O.
-                            // That is why `ProjectDispatch` holds no relay
-                            // handle — a gate that could open subscriptions
-                            // could also open one for an event it just refused.
-                            match dispatched {
-                                // A newly discovered coordinate widens the
-                                // enrolment filter, and the filter is derived
-                                // from the discovered set, so the REQ has to be
-                                // replaced for the new project to be visible at
-                                // all. Nothing arrives for an undiscovered
-                                // repository, which is why discovery precedes
-                                // enrolment rather than running beside it.
-                                ProjectDispatched::DiscoveryChanged => {
-                                    if let Some(filter) = project::enrolment_filter(
-                                        &discovered_repositories,
-                                        &pubkey_hex,
-                                        startup_watermark,
-                                    ) {
-                                        if let Err(e) = relay
-                                            .subscribe_project(
-                                                project::PROJECT_ENROL_SUB_ID,
-                                                project::ProjectSubscription::Enrolment,
-                                                vec![filter],
-                                            )
-                                            .await
-                                        {
-                                            tracing::warn!("enrolment subscribe error: {e}");
-                                        }
-                                    }
-                                }
-                                // A root joined or rejoined the watched set.
-                                // The watched REQ names every root explicitly,
-                                // so it is replaced under a fresh generation —
-                                // the generation is what lets the relay's old
-                                // request and its replacement be told apart
-                                // while both are briefly answerable.
-                                ProjectDispatched::Enrolled
-                                | ProjectDispatched::Queued {
-                                    watch_changed: true,
-                                    ..
-                                } => {
-                                    let filters = project::watched_roots_filters(
-                                        &project_enrolments,
-                                        startup_watermark,
-                                    );
-                                    if !filters.is_empty() {
-                                        project_watch_generation += 1;
-                                        let sub_id =
-                                            project::watched_sub_id(project_watch_generation);
-                                        if let Err(e) = relay
-                                            .subscribe_project(
-                                                &sub_id,
-                                                project::ProjectSubscription::Watched {
-                                                    generation: project_watch_generation,
-                                                },
-                                                filters,
-                                            )
-                                            .await
-                                        {
-                                            tracing::warn!("watched-roots subscribe error: {e}");
-                                        }
-                                    }
-                                }
-                                _ => {}
-                            }
                         }
                         Some(BuzzEvent::Channel { channel_id, event }) => {
                             let buzz_event = ChannelEvent { channel_id, event };
@@ -2913,6 +2857,135 @@ fn should_report_refusal(degradation: project::Degradation, refused_total: u64) 
         project::Degradation::BecameDegraded => true,
         project::Degradation::AlreadyDegraded => refused_total.is_power_of_two(),
     }
+}
+
+/// The one relay capability project dispatch needs.
+///
+/// Deliberately not the relay handle. A handle can subscribe to channels,
+/// unsubscribe, publish and reconnect; dispatch needs exactly one of those and
+/// should not be able to reach the rest. It is also a *replacement* capability
+/// rather than a subscribe one, because retirement is where the two
+/// subscription defects lived and a method that can only add cannot express it.
+pub(crate) trait ProjectSubscriber {
+    fn replace_project_subscription(
+        &self,
+        predecessor: Option<&str>,
+        sub_id: &str,
+        subscription: project::ProjectSubscription,
+        filters: Vec<serde_json::Value>,
+    ) -> impl std::future::Future<Output = Result<(), relay::RelayError>>;
+}
+
+impl ProjectSubscriber for relay::HarnessRelay {
+    async fn replace_project_subscription(
+        &self,
+        predecessor: Option<&str>,
+        sub_id: &str,
+        subscription: project::ProjectSubscription,
+        filters: Vec<serde_json::Value>,
+    ) -> Result<(), relay::RelayError> {
+        relay::HarnessRelay::replace_project_subscription(
+            self,
+            predecessor,
+            sub_id,
+            subscription,
+            filters,
+        )
+        .await
+    }
+}
+
+/// Where the run loop's project subscriptions live.
+///
+/// Held across events because a replacement has to name the generation it
+/// supersedes, and that predecessor is only knowable from the last one issued.
+#[derive(Debug, Default)]
+pub(crate) struct ProjectSubscriptions {
+    /// The watched-root generation currently installed, if any.
+    watched: Option<u64>,
+    /// Whether an enrolment REQ has been issued at all. The id is fixed, so a
+    /// replacement names itself as its own predecessor once one exists.
+    enrolment_issued: bool,
+}
+
+/// Dispatch one project event **and bring subscriptions into line with it.**
+///
+/// Extracted from the run loop's `select!` so the loop and the connected
+/// harness call the same function. Inline, it was unreachable: no test could
+/// enter `run()`, so the code that decides *when* to issue a REQ had none — and
+/// that is exactly where the enrolment-widening defect lived.
+///
+/// Dispatch decides; this performs the I/O the decision implies. The gate still
+/// holds no relay capability of its own, so a refused event cannot reach a
+/// subscription.
+pub(crate) async fn dispatch_project_event(
+    dispatch: &mut ProjectDispatch<'_>,
+    subscriber: &impl ProjectSubscriber,
+    subscriptions: &mut ProjectSubscriptions,
+    agent_pubkey_hex: &str,
+    since: u64,
+    project_event: &project::ProjectEvent,
+) -> ProjectDispatched {
+    let dispatched = handle_project_event(dispatch, project_event);
+
+    match dispatched {
+        // A newly discovered coordinate widens the enrolment filter, and the
+        // filter is derived from the discovered set — so the REQ is *replaced*,
+        // not re-opened. Re-opening kept the first repository's identity
+        // forever, because the id is fixed and opening refuses to change it.
+        ProjectDispatched::DiscoveryChanged => {
+            if let Some(filter) =
+                project::enrolment_filter(dispatch.discovered, agent_pubkey_hex, since)
+            {
+                let id = project::PROJECT_ENROL_SUB_ID;
+                let predecessor = subscriptions.enrolment_issued.then_some(id);
+                if let Err(e) = subscriber
+                    .replace_project_subscription(
+                        predecessor,
+                        id,
+                        project::ProjectSubscription::Enrolment,
+                        vec![filter],
+                    )
+                    .await
+                {
+                    tracing::warn!("enrolment replacement error: {e}");
+                } else {
+                    subscriptions.enrolment_issued = true;
+                }
+            }
+        }
+        // A root joined or rejoined the watched set. The watched REQ names every
+        // root explicitly, so the successor takes a fresh generation and the
+        // predecessor is retired once the successor is installed.
+        ProjectDispatched::Enrolled
+        | ProjectDispatched::Queued {
+            watch_changed: true,
+            ..
+        } => {
+            let filters = project::watched_roots_filters(dispatch.enrolments, since);
+            if !filters.is_empty() {
+                let generation = subscriptions.watched.map_or(0, |g| g + 1);
+                let sub_id = project::watched_sub_id(generation);
+                let predecessor = subscriptions.watched.map(project::watched_sub_id);
+                if let Err(e) = subscriber
+                    .replace_project_subscription(
+                        predecessor.as_deref(),
+                        &sub_id,
+                        project::ProjectSubscription::Watched { generation },
+                        filters,
+                    )
+                    .await
+                {
+                    tracing::warn!("watched-roots replacement error: {e}");
+                } else {
+                    subscriptions.watched = Some(generation);
+                }
+            }
+        }
+        _ => {}
+    }
+
+    dispatched
 }
 
 /// Everything the project branch is permitted to touch.
@@ -4352,6 +4425,181 @@ mod project_discovery_ingestion_tests {
                 }
             ),
             "the same root re-mentioned must not churn the subscription, got {again:?}"
+        );
+    }
+
+    /// A subscriber that records what the orchestration asked for.
+    ///
+    /// The narrow capability is what makes this possible: dispatch needs one
+    /// method, so a test can supply one method. Handing it the relay handle
+    /// would have required a relay.
+    #[derive(Default)]
+    struct RecordingSubscriber {
+        calls: std::sync::Mutex<Vec<(Option<String>, String, String)>>,
+    }
+
+    impl ProjectSubscriber for RecordingSubscriber {
+        async fn replace_project_subscription(
+            &self,
+            predecessor: Option<&str>,
+            sub_id: &str,
+            subscription: project::ProjectSubscription,
+            filters: Vec<serde_json::Value>,
+        ) -> Result<(), relay::RelayError> {
+            self.calls.lock().unwrap().push((
+                predecessor.map(str::to_string),
+                sub_id.to_string(),
+                format!(
+                    "{subscription:?}|{}",
+                    serde_json::to_string(&filters).unwrap()
+                ),
+            ));
+            Ok(())
+        }
+    }
+
+    /// **The orchestration issues an enrolment replacement, and widens it.**
+    ///
+    /// This is the coverage whose absence let the enrolment defect ship. The
+    /// REQ-issuing code lived inline in `run()`, which no test could enter, so
+    /// nothing ever observed whether discovery actually produced a REQ — let
+    /// alone a second one carrying the second repository.
+    #[tokio::test]
+    async fn discovery_drives_an_enrolment_replacement_that_widens() {
+        let owner_a = Keys::generate();
+        let owner_b = Keys::generate();
+        let agent = Keys::generate();
+        let agent_identity = project::AgentIdentity::new(&agent.public_key()).unwrap();
+        let agent_hex = agent.public_key().to_hex();
+        let humans = std::collections::BTreeSet::new();
+        let externals = std::collections::BTreeSet::new();
+        let mut discovered = project::DiscoveredRepositories::new();
+        let mut enrolments = project::ProjectEnrolments::new();
+        let mut queue = EventQueue::new(config::DedupMode::Queue);
+        let subscriber = RecordingSubscriber::default();
+        let mut subscriptions = ProjectSubscriptions::default();
+
+        for keys in [&owner_a, &owner_b] {
+            let announcement = proven_announcement(keys, "repo").await;
+            dispatch_project_event(
+                &mut dispatch_over(
+                    &agent_identity,
+                    None,
+                    &humans,
+                    &externals,
+                    &mut discovered,
+                    &mut enrolments,
+                    &mut queue,
+                ),
+                &subscriber,
+                &mut subscriptions,
+                &agent_hex,
+                0,
+                &project::ProjectEvent::Discovery { announcement },
+            )
+            .await;
+        }
+
+        let calls = subscriber.calls.lock().unwrap().clone();
+        assert_eq!(calls.len(), 2, "each discovery must issue a REQ: {calls:?}");
+
+        assert_eq!(calls[0].0, None, "the first enrolment REQ replaces nothing");
+        assert_eq!(calls[0].1, project::PROJECT_ENROL_SUB_ID);
+
+        assert_eq!(
+            calls[1].0.as_deref(),
+            Some(project::PROJECT_ENROL_SUB_ID),
+            "the second names the first as its predecessor — without this the \
+             registry refuses the identity change and the filter never widens"
+        );
+        assert_eq!(calls[1].1, project::PROJECT_ENROL_SUB_ID);
+        assert_ne!(
+            calls[0].2, calls[1].2,
+            "the second REQ carries the same filter as the first: it did not widen"
+        );
+        assert!(
+            calls[1].2.contains(&owner_b.public_key().to_hex()),
+            "the second repository is absent from the widened filter"
+        );
+    }
+
+    /// An authorised root drives a watched-root replacement under a fresh
+    /// generation, naming the predecessor it supersedes.
+    #[tokio::test]
+    async fn an_enrolled_root_drives_a_watched_replacement_with_a_predecessor() {
+        let owner = Keys::generate();
+        let agent = Keys::generate();
+        let agent_identity = project::AgentIdentity::new(&agent.public_key()).unwrap();
+        let owner_hex = owner.public_key().to_hex();
+        let agent_hex = agent.public_key().to_hex();
+        let humans = std::collections::BTreeSet::new();
+        let externals = std::collections::BTreeSet::new();
+        let mut discovered = project::DiscoveredRepositories::new();
+        let mut enrolments = project::ProjectEnrolments::new();
+        let mut queue = EventQueue::new(config::DedupMode::Queue);
+        let subscriber = RecordingSubscriber::default();
+        let mut subscriptions = ProjectSubscriptions::default();
+
+        macro_rules! drive {
+            ($ev:expr) => {
+                dispatch_project_event(
+                    &mut dispatch_over(
+                        &agent_identity,
+                        Some(&owner_hex),
+                        &humans,
+                        &externals,
+                        &mut discovered,
+                        &mut enrolments,
+                        &mut queue,
+                    ),
+                    &subscriber,
+                    &mut subscriptions,
+                    &agent_hex,
+                    0,
+                    $ev,
+                )
+                .await
+            };
+        }
+
+        drive!(&project::ProjectEvent::Discovery {
+            announcement: proven_announcement(&owner, "proj").await,
+        });
+
+        for body in ["first issue", "second issue"] {
+            let root = root_event(
+                &owner,
+                &agent,
+                "proj",
+                buzz_core::kind::KIND_GIT_ISSUE,
+                body,
+            );
+            let verified = project::VerifiedProjectEvent::verify(root)
+                .await
+                .expect("valid");
+            let route = project::ProjectRoute::derive(&verified).expect("routes");
+            drive!(&project::ProjectEvent::Routed {
+                source: project::ProjectSubscription::Enrolment,
+                route,
+                event: verified,
+            });
+        }
+
+        let calls = subscriber.calls.lock().unwrap().clone();
+        let watched: Vec<_> = calls
+            .iter()
+            .filter(|(_, id, _)| id.starts_with("proj-roots-"))
+            .collect();
+        assert_eq!(watched.len(), 2, "each new root replaces the watched REQ");
+        assert_eq!(watched[0].0, None, "the first watched REQ replaces nothing");
+        assert_eq!(
+            watched[1].0.as_deref(),
+            Some(watched[0].1.as_str()),
+            "the successor must name the generation it retires"
+        );
+        assert_ne!(
+            watched[0].1, watched[1].1,
+            "the successor must take a fresh generation id"
         );
     }
 

@@ -1288,6 +1288,31 @@ mod requests {
             }
             Some(taken)
         }
+        /// Record a replacement's durable intent while disconnected.
+        ///
+        /// The offline half of [`Self::replace_request`]: no REQ can be written
+        /// with no socket, but the *intent* still has to move, or the next
+        /// connection replays the predecessor and the replacement is lost.
+        ///
+        /// Unlike [`Self::record_intent`] this is permitted to overwrite, for
+        /// the same reason replacement may and opening may not. It writes no
+        /// live registration, so nothing becomes answerable here.
+        pub(crate) fn replace_intent(
+            &mut self,
+            predecessor: Option<&str>,
+            sub_id: &str,
+            identity: ProjectRequestIdentity,
+        ) {
+            self.intent.insert(sub_id.to_string(), identity);
+            if let Some(prior) = predecessor {
+                if prior != sub_id {
+                    self.intent.remove(prior);
+                    self.live.remove(prior);
+                    self.suspended.remove(prior);
+                }
+            }
+        }
+
         /// Replace a live project subscription, transactionally.
         ///
         /// **Why this is not `open_request`.** `open_request` refuses to change
