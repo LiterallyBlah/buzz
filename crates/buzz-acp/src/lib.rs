@@ -2092,6 +2092,8 @@ async fn tokio_main() -> Result<()> {
     // unsolicited prompts, which is the safe direction to lose state in.
     let mut call_ledger = peer_call::CallLedger::new();
 
+    let mut project_seen_ids = ProjectSeenIds::new();
+
     // No project-subscription state is held here. What is installed, which
     // generation it carries and which predecessor it retires all live in the
     // background registry, because that is the only component that knows.
@@ -2360,12 +2362,14 @@ async fn tokio_main() -> Result<()> {
                             // no relay capability, so neither a channel lookup
                             // nor a subscription is reachable from the gate.
                             //
-                            // Subscription upkeep travels with dispatch in
-                            // `dispatch_project_event` rather than being open
-                            // -coded here: inline, the code that decides when
-                            // to issue a REQ was unreachable from any test, and
-                            // that is exactly where the enrolment-widening
-                            // defect lived.
+                            // Subscription upkeep, dedup and the flush all
+                            // travel with dispatch rather than being open-coded
+                            // here. Inline, none of it was reachable from a
+                            // test — and the two defects that lived in this arm
+                            // were exactly the parts no test could enter: the
+                            // REQ-widening decision, and then the missing flush
+                            // that left a project-only runtime queueing turns
+                            // nobody ran.
                             // Resolved before the gate, because the NIP-OA
                             // lookup is async and the gate is not.
                             let project_sibling = attest_project_sibling(
@@ -2375,28 +2379,30 @@ async fn tokio_main() -> Result<()> {
                                 &ctx.rest_client,
                             )
                             .await;
-                            let dispatched = dispatch_project_event(
-                                &mut ProjectDispatch {
-                                    identity: project::ProjectIdentity {
-                                        agent: &project_agent_identity,
-                                        agent_owner: owner_cache.get(),
-                                        approved_humans: &project_approved_humans,
-                                        approved_external_agents:
-                                            &project_approved_external_agents,
-                                    },
+                            dispatch_and_flush_project_event(
+                                &mut ProjectArm {
+                                    identity: &project_agent_identity,
+                                    owner: owner_cache.get(),
+                                    approved_humans: &project_approved_humans,
+                                    approved_external_agents:
+                                        &project_approved_external_agents,
                                     discovered: &mut discovered_repositories,
                                     enrolments: &mut project_enrolments,
-                                    queue: &mut queue,
-                                    sibling: project_sibling,
                                     ledger: &mut call_ledger,
+                                    seen: &mut project_seen_ids,
+                                    agent_pubkey_hex: &pubkey_hex,
+                                    startup_watermark,
                                 },
+                                project_sibling,
                                 &relay,
-                                &pubkey_hex,
-                                startup_watermark,
                                 &project_event,
+                                &mut pool,
+                                &mut queue,
+                                &ctx,
+                                &mut typing_channels,
+                                pool_ready,
                             )
                             .await;
-                            tracing::debug!(?dispatched, "project dispatch");
                         }
                         Some(BuzzEvent::Channel { channel_id, event }) => {
                             let buzz_event = ChannelEvent { channel_id, event };
@@ -3397,6 +3403,116 @@ impl ProjectSubscriber for relay::HarnessRelay {
     }
 }
 
+/// The run loop's project state, grouped so the project arm can be entered
+/// without standing up a relay connection.
+///
+/// Every field is a `&mut` borrow of something [`tokio_main`] owns; this holds
+/// no state of its own. It exists because the arm's body — dispatch, then flush
+/// — could not otherwise be reached: `run()` parses CLI arguments, installs a
+/// global tracing subscriber and connects a relay before the `select!` is even
+/// built, so nothing could enter it, and the missing flush lived there
+/// unobserved.
+pub(crate) struct ProjectArm<'a> {
+    pub(crate) identity: &'a project::AgentIdentity,
+    pub(crate) owner: Option<&'a str>,
+    pub(crate) approved_humans: &'a std::collections::BTreeSet<String>,
+    pub(crate) approved_external_agents: &'a std::collections::BTreeSet<String>,
+    pub(crate) discovered: &'a mut project::DiscoveredRepositories,
+    pub(crate) enrolments: &'a mut project::ProjectEnrolments,
+    pub(crate) ledger: &'a mut peer_call::CallLedger,
+    pub(crate) seen: &'a mut ProjectSeenIds,
+    pub(crate) agent_pubkey_hex: &'a str,
+    pub(crate) startup_watermark: u64,
+}
+
+/// One project event, from arrival to a running turn.
+///
+/// **Queueing is not dispatching.** This is the whole of finding 2: the arm
+/// dispatched the event, recorded that it had queued, and returned to the
+/// `select!`. The channel arm has always flushed after admitting an event, and
+/// for a runtime with channels the project queue got flushed too — by the next
+/// channel event, or by a heartbeat that only flushes when it already knows
+/// there is work. A project-only runtime has neither, so "project-only
+/// operation is valid" meant accepting work and leaving it there.
+///
+/// The flush is the ordinary pool path, not a project-specific one, so queue
+/// ownership, in-flight accounting and activity stay a single mechanism.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn dispatch_and_flush_project_event(
+    arm: &mut ProjectArm<'_>,
+    sibling: Option<project::VerifiedSibling>,
+    subscriber: &impl ProjectSubscriber,
+    project_event: &project::ProjectEvent,
+    pool: &mut AgentPool,
+    queue: &mut EventQueue,
+    ctx: &Arc<PromptContext>,
+    typing_channels: &mut HashMap<Uuid, ThreadTags>,
+    pool_ready: bool,
+) -> ProjectDispatched {
+    let dispatched = dispatch_project_event(
+        &mut ProjectDispatch {
+            identity: project::ProjectIdentity {
+                agent: arm.identity,
+                agent_owner: arm.owner,
+                approved_humans: arm.approved_humans,
+                approved_external_agents: arm.approved_external_agents,
+            },
+            discovered: arm.discovered,
+            enrolments: arm.enrolments,
+            queue,
+            sibling,
+            ledger: arm.ledger,
+        },
+        arm.seen,
+        subscriber,
+        arm.agent_pubkey_hex,
+        arm.startup_watermark,
+        project_event,
+    )
+    .await;
+    tracing::debug!(?dispatched, "project dispatch");
+
+    if pool_ready && matches!(dispatched, ProjectDispatched::Queued { queued: true, .. }) {
+        for (channel_id, thread_tags) in dispatch_pending(pool, queue, ctx) {
+            typing_channels.insert(channel_id, thread_tags);
+        }
+    }
+    dispatched
+}
+
+/// Project event ids that have already been dispatched, across every
+/// subscription generation.
+///
+/// The relay task spends an id per *live* project source already, and that is
+/// not this. Its domain deliberately excludes catch-up rows — sharing one would
+/// make a history page read short by exactly the events already seen live — so
+/// a root delivered live on the enrolment REQ and again as a replayed row
+/// during the watched-REQ replacement passes both checks and is dispatched
+/// twice. On an issue that is two model turns and two replies.
+///
+/// One set per runtime, consulted at the single point every generation
+/// converges on. Bounded and two-generation, the same shape as the channel and
+/// relay dedups, so a long-lived runtime cannot grow it without limit.
+pub(crate) struct ProjectSeenIds(relay::TwoGenDedup);
+
+impl ProjectSeenIds {
+    pub(crate) fn new() -> Self {
+        Self(relay::TwoGenDedup::new(relay::SEEN_ID_LIMIT))
+    }
+
+    /// Record `id`. Returns `true` when it is new — i.e. when this delivery is
+    /// the one that gets to act.
+    pub(crate) fn insert(&mut self, id: String) -> bool {
+        self.0.insert(id)
+    }
+}
+
+impl Default for ProjectSeenIds {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Dispatch one project event **and bring subscriptions into line with it.**
 ///
 /// Extracted from the run loop's `select!` so the loop and the connected
@@ -3407,13 +3523,38 @@ impl ProjectSubscriber for relay::HarnessRelay {
 /// Dispatch decides; this performs the I/O the decision implies. The gate still
 /// holds no relay capability of its own, so a refused event cannot reach a
 /// subscription.
+///
+/// It is also where a project event id is **spent**. One delivery, one effect,
+/// whatever the event arrived on — see [`ProjectSeenIds`] for why the relay
+/// task's own dedup cannot answer that question, and why the answer has to live
+/// here rather than in the run loop: the connected harness reaches production
+/// through this function and would otherwise bypass the gate entirely.
 pub(crate) async fn dispatch_project_event(
     dispatch: &mut ProjectDispatch<'_>,
+    seen: &mut ProjectSeenIds,
     subscriber: &impl ProjectSubscriber,
     agent_pubkey_hex: &str,
     since: u64,
     project_event: &project::ProjectEvent,
 ) -> ProjectDispatched {
+    // Spent before the gate, and only for routed events.
+    //
+    // A routed event carries an id and an immutable meaning: the same id
+    // decides the same way every time, so refusing the second delivery cannot
+    // lose an effect the first did not already have. Discovery is excluded
+    // because ingesting an announcement is a set insert — idempotent by
+    // construction, and spending ids for it would make the ceiling a function
+    // of how often the relay repeats itself.
+    if let project::ProjectEvent::Routed { event, .. } = project_event {
+        if !seen.insert(event.id()) {
+            tracing::debug!(
+                event_id = %event.id(),
+                "duplicate project event across subscriptions — already dispatched"
+            );
+            return ProjectDispatched::Ignored;
+        }
+    }
+
     let dispatched = handle_project_event(dispatch, project_event);
 
     match dispatched {
@@ -4380,6 +4521,7 @@ fn dispatch_pending(
             None => break,
         };
         let channel_id = batch.channel_id;
+        let is_project_batch = batch.project_origin().is_some();
         let typing_scope = batch
             .events
             .last()
@@ -4450,7 +4592,20 @@ fn dispatch_pending(
                 steer_tx,
             },
         );
-        dispatched_channels.push((channel_id, typing_scope));
+        // A typing indicator is a channel-scoped NIP-29 write: it carries an
+        // `h` tag naming the channel it belongs to. A project route key is a
+        // UUIDv5 of a root and names no channel, so reporting one here would
+        // publish a typing frame `h`-tagged to a channel that does not exist —
+        // the same mistake `observer_route_for` exists to avoid. A project turn
+        // already announces itself, as NIP-PA activity on its root.
+        //
+        // Read from the batch rather than from the key's shape: a UUID cannot
+        // be asked whether it names a channel.
+        if is_project_batch {
+            tracing::debug!(key = %channel_id, "project batch dispatched — no typing indicator");
+        } else {
+            dispatched_channels.push((channel_id, typing_scope));
+        }
     }
     tracing::debug!(
         dispatched = dispatched_channels.len(),
@@ -5957,6 +6112,7 @@ mod project_discovery_ingestion_tests {
         let mut enrolments = project::ProjectEnrolments::new();
         let mut queue = EventQueue::new(config::DedupMode::Queue);
         let mut ledger = peer_call::CallLedger::new();
+        let mut seen = ProjectSeenIds::new();
         let subscriber = RecordingSubscriber::default();
 
         for keys in [&owner_a, &owner_b] {
@@ -5972,6 +6128,7 @@ mod project_discovery_ingestion_tests {
                     &mut queue,
                     &mut ledger,
                 ),
+                &mut seen,
                 &subscriber,
                 &agent_hex,
                 0,
@@ -6022,6 +6179,7 @@ mod project_discovery_ingestion_tests {
         let mut enrolments = project::ProjectEnrolments::new();
         let mut queue = EventQueue::new(config::DedupMode::Queue);
         let mut ledger = peer_call::CallLedger::new();
+        let mut seen = ProjectSeenIds::new();
         let subscriber = RecordingSubscriber::default();
 
         macro_rules! drive {
@@ -6037,6 +6195,7 @@ mod project_discovery_ingestion_tests {
                         &mut queue,
                         &mut ledger,
                     ),
+                    &mut seen,
                     &subscriber,
                     &agent_hex,
                     0,
@@ -10683,5 +10842,500 @@ mod observer_bus_startup_tests {
             "an unconfigured harness allocated an observer bus nobody reads"
         );
         assert!(!encrypted_telemetry_enabled(&config));
+    }
+}
+
+/// The project arm as a running system: an enrolled root, a real pool, and a
+/// child that records what it was asked to do.
+///
+/// Everything else about project routing is proved against `handle_project_event`,
+/// which is the right level for an authority decision and the wrong level for
+/// these two defects. Both were failures of *composition*: dispatch worked, the
+/// queue worked, the pool worked, and a project-only runtime still ran nothing —
+/// because the arm never flushed — and still ran a root twice — because two
+/// subscriptions each delivered it. Neither is visible from inside any of the
+/// parts.
+#[cfg(test)]
+mod project_runtime_tests {
+    use std::collections::{BTreeSet, HashMap};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use nostr::{EventBuilder, Keys};
+
+    use super::*;
+    use crate::config::{DedupMode, PermissionMode};
+    use crate::pool::{ChannelInfoResolver, OwnedAgent, PromptContext};
+    use crate::queue::EventQueue;
+    use crate::relay::RestClient;
+
+    /// A child that speaks just enough ACP to complete a turn, and writes every
+    /// `session/prompt` it receives to a file.
+    ///
+    /// The file is the assertion. Counting prompts *inside* the harness would
+    /// count what the harness decided to send; counting them here counts what
+    /// crossed the process boundary, which is the thing the live run observed
+    /// happening twice — and, before the flush existed, never.
+    const RECORDING_AGENT: &str = r#"
+import json, os, sys
+log = os.environ["BUZZ_TEST_PROMPT_LOG"]
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    try:
+        msg = json.loads(line)
+    except ValueError:
+        continue
+    mid = msg.get("id")
+    if mid is None:
+        continue
+    method = msg.get("method")
+    if method == "session/prompt":
+        with open(log, "a") as f:
+            f.write(line + "\n")
+        result = {"stopReason": "end_turn"}
+    elif method == "session/new":
+        result = {"sessionId": "test-session"}
+    elif method == "initialize":
+        result = {"protocolVersion": 1}
+    else:
+        result = {}
+    sys.stdout.write(json.dumps({"jsonrpc": "2.0", "id": mid, "result": result}) + "\n")
+    sys.stdout.flush()
+"#;
+
+    /// Accepts every replacement. What a REQ replacement contains is proved
+    /// against `RecordingSubscriber` in the dispatch tests above; these
+    /// scenarios are about what reaches the child, and a subscriber that
+    /// refused would stop them before that.
+    struct NoopSubscriber;
+
+    impl ProjectSubscriber for NoopSubscriber {
+        async fn submit_project_replacement(
+            &self,
+            _replacement: project::ProjectReplacement,
+            _filters: Vec<serde_json::Value>,
+        ) -> Result<(), relay::RelayError> {
+            Ok(())
+        }
+    }
+
+    /// A temp path plus the agent wired to write to it.
+    struct PromptRecorder {
+        path: std::path::PathBuf,
+    }
+
+    impl PromptRecorder {
+        fn new() -> Self {
+            let path = std::env::temp_dir()
+                .join(format!("buzz-acp-prompts-{}.jsonl", uuid::Uuid::new_v4()));
+            Self { path }
+        }
+
+        async fn agent(&self, index: usize) -> OwnedAgent {
+            let acp = crate::acp::AcpClient::spawn(
+                "python3",
+                &[
+                    "-u".to_string(),
+                    "-c".to_string(),
+                    RECORDING_AGENT.to_string(),
+                ],
+                &[(
+                    "BUZZ_TEST_PROMPT_LOG".to_string(),
+                    self.path.to_string_lossy().to_string(),
+                )],
+                false,
+            )
+            .await
+            .expect("spawn recording agent");
+            OwnedAgent {
+                index,
+                acp,
+                state: Default::default(),
+                model_capabilities: None,
+                desired_model: None,
+                model_overridden: false,
+                agent_name: "unknown".into(),
+                goose_system_prompt_supported: None,
+                protocol_version: 1,
+            }
+        }
+
+        /// Every `session/prompt` the child has received so far.
+        ///
+        /// Polled rather than read once: dispatch spawns the turn on the pool's
+        /// join set, so the prompt crosses the pipe after the call returns.
+        async fn prompts(&self, at_least: usize) -> Vec<String> {
+            for _ in 0..200 {
+                let seen = self.read();
+                if seen.len() >= at_least {
+                    return seen;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            self.read()
+        }
+
+        fn read(&self) -> Vec<String> {
+            std::fs::read_to_string(&self.path)
+                .unwrap_or_default()
+                .lines()
+                .filter(|l| !l.trim().is_empty())
+                .map(str::to_string)
+                .collect()
+        }
+    }
+
+    impl Drop for PromptRecorder {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+
+    /// A relay that answers everything with an empty array, immediately.
+    ///
+    /// Not decoration. A project turn's first pass still runs the channel-info
+    /// resolve and canvas fetch that every channel turn runs — keyed on a route
+    /// key that names no channel, so both are always empty. Pointed at a closed
+    /// port those two doomed requests spend their full connect timeout, which
+    /// is ten seconds of a test proving nothing about connect timeouts.
+    async fn empty_relay() -> String {
+        use axum::{Json, Router};
+        let app = Router::new().fallback(|| async { Json(serde_json::json!([])) });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move { axum::serve(listener, app).await.expect("serve") });
+        format!("http://{addr}")
+    }
+
+    fn test_ctx(agent_keys: &Keys, base_url: String) -> Arc<PromptContext> {
+        let rest = || RestClient {
+            http: reqwest::Client::new(),
+            base_url: base_url.clone(),
+            keys: agent_keys.clone(),
+            auth_tag_json: None,
+        };
+        Arc::new(PromptContext {
+            mcp_servers: vec![],
+            initial_message: None,
+            idle_timeout: Duration::from_secs(30),
+            max_turn_duration: Duration::from_secs(60),
+            turn_liveness_interval: Duration::ZERO,
+            dedup_mode: DedupMode::Queue,
+            system_prompt: None,
+            session_title: None,
+            team_instructions: None,
+            heartbeat_prompt: None,
+            base_prompt: None,
+            cwd: ".".to_string(),
+            rest_client: rest(),
+            channel_info: ChannelInfoResolver::new(HashMap::new(), rest()),
+            context_message_limit: 0,
+            max_turns_per_session: 0,
+            permission_mode: PermissionMode::Default,
+            agent_keys: agent_keys.clone(),
+            agent_owner_pubkey: None,
+            memory_enabled: false,
+            harness_name: "goose".to_string(),
+            relay_url: "ws://127.0.0.1:1".to_string(),
+        })
+    }
+
+    fn issue_root(owner: &Keys, agent: &Keys, repo_id: &str) -> nostr::Event {
+        let coord = format!("30617:{}:{repo_id}", owner.public_key().to_hex());
+        EventBuilder::new(
+            nostr::Kind::Custom(buzz_core::kind::KIND_GIT_ISSUE as u16),
+            "the test suite is flaky on the second fixture",
+        )
+        .tags([
+            nostr::Tag::parse(["a", &coord]).unwrap(),
+            nostr::Tag::parse(["p", &agent.public_key().to_hex()]).unwrap(),
+        ])
+        .sign_with_keys(owner)
+        .expect("sign")
+    }
+
+    async fn routed(
+        event: nostr::Event,
+        source: project::ProjectSubscription,
+    ) -> project::ProjectEvent {
+        let verified = project::VerifiedProjectEvent::verify(event)
+            .await
+            .expect("valid");
+        let route = project::ProjectRoute::derive(&verified).expect("routes");
+        project::ProjectEvent::Routed {
+            source,
+            route,
+            event: verified,
+        }
+    }
+
+    /// The whole runtime for one scenario, with **no channels at all**.
+    struct Runtime {
+        owner: Keys,
+        agent: Keys,
+        identity: project::AgentIdentity,
+        humans: BTreeSet<String>,
+        externals: BTreeSet<String>,
+        discovered: project::DiscoveredRepositories,
+        enrolments: project::ProjectEnrolments,
+        ledger: peer_call::CallLedger,
+        seen: ProjectSeenIds,
+        queue: EventQueue,
+        pool: AgentPool,
+        ctx: Arc<PromptContext>,
+        typing: HashMap<uuid::Uuid, crate::queue::ThreadTags>,
+        subscriber: NoopSubscriber,
+    }
+
+    impl Runtime {
+        async fn new(recorder: &PromptRecorder) -> Self {
+            let owner = Keys::generate();
+            let agent = Keys::generate();
+            let identity = project::AgentIdentity::new(&agent.public_key()).unwrap();
+            let mut humans = BTreeSet::new();
+            humans.insert(owner.public_key().to_hex());
+            let ctx = test_ctx(&agent, empty_relay().await);
+            Self {
+                owner,
+                agent,
+                identity,
+                humans,
+                externals: BTreeSet::new(),
+                discovered: project::DiscoveredRepositories::new(),
+                enrolments: project::ProjectEnrolments::new(),
+                ledger: peer_call::CallLedger::new(),
+                seen: ProjectSeenIds::new(),
+                queue: EventQueue::new(DedupMode::Queue),
+                // One available child, and zero channel subscriptions: this is
+                // the project-only shape the defect hid in.
+                pool: AgentPool::from_slots(vec![Some(recorder.agent(0).await)]),
+                ctx,
+                typing: HashMap::new(),
+                subscriber: NoopSubscriber,
+            }
+        }
+
+        async fn drive(&mut self, event: &project::ProjectEvent) -> ProjectDispatched {
+            let owner_hex = self.owner.public_key().to_hex();
+            let agent_hex = self.agent.public_key().to_hex();
+            dispatch_and_flush_project_event(
+                &mut ProjectArm {
+                    identity: &self.identity,
+                    owner: Some(&owner_hex),
+                    approved_humans: &self.humans,
+                    approved_external_agents: &self.externals,
+                    discovered: &mut self.discovered,
+                    enrolments: &mut self.enrolments,
+                    ledger: &mut self.ledger,
+                    seen: &mut self.seen,
+                    agent_pubkey_hex: &agent_hex,
+                    startup_watermark: 0,
+                },
+                None,
+                &self.subscriber,
+                event,
+                &mut self.pool,
+                &mut self.queue,
+                &self.ctx,
+                &mut self.typing,
+                true,
+            )
+            .await
+        }
+
+        async fn discover(&mut self, repo_id: &str) {
+            let announcement = proven_announcement_for(&self.owner, repo_id).await;
+            self.drive(&project::ProjectEvent::Discovery { announcement })
+                .await;
+        }
+    }
+
+    async fn proven_announcement_for(
+        keys: &Keys,
+        identifier: &str,
+    ) -> project::VerifiedAnnouncement {
+        let event = EventBuilder::new(
+            nostr::Kind::Custom(buzz_core::kind::KIND_GIT_REPO_ANNOUNCEMENT as u16),
+            "announcement",
+        )
+        .tags([nostr::Tag::parse(vec!["d".to_string(), identifier.to_string()]).expect("d tag")])
+        .sign_with_keys(keys)
+        .expect("sign");
+        project::VerifiedAnnouncement::prove(
+            project::VerifiedProjectEvent::verify(event)
+                .await
+                .expect("valid"),
+        )
+        .expect("well-formed")
+    }
+
+    /// A project-only runtime runs the turn it queues.
+    ///
+    /// The reported failure: three live runtimes authenticated, discovered the
+    /// repository, enrolled the root, logged `queued=true` — and every child
+    /// received only `initialize`. Nothing else ever arrives for a runtime with
+    /// no channels, so the queue was never flushed by anyone.
+    #[tokio::test]
+    async fn an_addressed_root_reaches_the_child_with_no_channels_configured() {
+        let recorder = PromptRecorder::new();
+        let mut rt = Runtime::new(&recorder).await;
+        rt.discover("demo").await;
+
+        let root = issue_root(&rt.owner, &rt.agent, "demo");
+        let dispatched = rt
+            .drive(&routed(root, project::ProjectSubscription::Enrolment).await)
+            .await;
+
+        assert!(
+            matches!(dispatched, ProjectDispatched::Queued { queued: true, .. }),
+            "precondition: the root must be admitted — got {dispatched:?}"
+        );
+        let prompts = recorder.prompts(1).await;
+        assert_eq!(
+            prompts.len(),
+            1,
+            "the child received no session/prompt: queued work was never dispatched"
+        );
+        assert!(
+            prompts[0].contains("flaky on the second fixture"),
+            "the prompt did not carry the issue: {}",
+            prompts[0]
+        );
+        assert!(
+            rt.typing.is_empty(),
+            "a project route key names no channel — a typing frame would be h-tagged to nothing"
+        );
+    }
+
+    /// One root delivered on two subscriptions is one turn.
+    ///
+    /// The live run logged the identical root twice, during the
+    /// enrolment-to-watched replacement window. The relay task's own dedup does
+    /// not cover it: its live domain deliberately excludes catch-up rows, so the
+    /// same event can legitimately arrive by two routes that each believe they
+    /// are first.
+    #[tokio::test]
+    async fn the_same_root_on_two_subscriptions_runs_one_turn() {
+        let recorder = PromptRecorder::new();
+        let mut rt = Runtime::new(&recorder).await;
+        rt.discover("demo").await;
+
+        let root = issue_root(&rt.owner, &rt.agent, "demo");
+        let first = rt
+            .drive(&routed(root.clone(), project::ProjectSubscription::Enrolment).await)
+            .await;
+        assert!(
+            matches!(first, ProjectDispatched::Queued { queued: true, .. }),
+            "the first delivery must be admitted — got {first:?}"
+        );
+
+        // The same signed event, arriving on the successor subscription.
+        let second = rt
+            .drive(
+                &routed(
+                    root.clone(),
+                    project::ProjectSubscription::Watched { generation: 1 },
+                )
+                .await,
+            )
+            .await;
+        assert!(
+            matches!(second, ProjectDispatched::Ignored),
+            "the second delivery of one event must not be admitted — got {second:?}"
+        );
+
+        let prompts = recorder.prompts(1).await;
+        assert_eq!(
+            prompts.len(),
+            1,
+            "one root, two subscriptions, {} prompts — the issue would get two replies",
+            prompts.len()
+        );
+    }
+
+    /// Dedup is by event id, not by root: a second, distinct comment on the same
+    /// root in the same second is different work and is still admitted.
+    ///
+    /// Without this the "fix" for a double delivery is indistinguishable from
+    /// dropping the conversation after its first message — and a same-second
+    /// event is exactly what a timestamp-based dedup would lose.
+    ///
+    /// Admission is the assertion, not a second prompt: the root's turn is
+    /// still in flight under this route key, so the comment waits for it. That
+    /// queue-behind is ordinary per-channel serialisation and is proved in the
+    /// queue's own tests; what is in question here is only whether the event
+    /// survives the dedup.
+    #[tokio::test]
+    async fn a_distinct_same_second_event_on_one_root_is_not_deduped_away() {
+        let recorder = PromptRecorder::new();
+        let mut rt = Runtime::new(&recorder).await;
+        rt.discover("demo").await;
+
+        let root = issue_root(&rt.owner, &rt.agent, "demo");
+        let root_id = root.id.to_hex();
+        let created = root.created_at;
+        let route_key = {
+            let verified = project::VerifiedProjectEvent::verify(root.clone())
+                .await
+                .expect("valid");
+            project::ProjectRoute::derive(&verified)
+                .expect("routes")
+                .key()
+        };
+        rt.drive(&routed(root.clone(), project::ProjectSubscription::Enrolment).await)
+            .await;
+        rt.drive(
+            &routed(
+                root,
+                project::ProjectSubscription::Watched { generation: 1 },
+            )
+            .await,
+        )
+        .await;
+        // The root's own turn is running; the queue is empty behind it.
+        recorder.prompts(1).await;
+        assert_eq!(rt.queue.queued_event_count(&route_key), 0);
+
+        // Same root, same timestamp, different event.
+        let comment = EventBuilder::new(nostr::Kind::TextNote, "and it fails on CI too")
+            .tags([
+                nostr::Tag::parse([
+                    "a",
+                    &format!("30617:{}:demo", rt.owner.public_key().to_hex()),
+                ])
+                .unwrap(),
+                nostr::Tag::parse(["e", &root_id, "", "root"]).unwrap(),
+            ])
+            .custom_created_at(created)
+            .sign_with_keys(&rt.owner)
+            .expect("sign");
+        let dispatched = rt
+            .drive(
+                &routed(
+                    comment,
+                    project::ProjectSubscription::Watched { generation: 1 },
+                )
+                .await,
+            )
+            .await;
+
+        assert!(
+            matches!(dispatched, ProjectDispatched::Queued { queued: true, .. }),
+            "a distinct event on a watched root is work — got {dispatched:?}"
+        );
+        assert_eq!(
+            rt.queue.queued_event_count(&route_key),
+            1,
+            "deduping by root or by timestamp rather than by event id loses the conversation"
+        );
+        assert_eq!(
+            recorder.read().len(),
+            1,
+            "it waits for the turn in flight rather than starting a second one"
+        );
     }
 }

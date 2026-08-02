@@ -41,7 +41,7 @@ fn event_channel_capacity() -> usize {
 }
 /// Maximum number of seen event IDs before the dedup set is rotated.
 /// Two-generation dedup: each generation holds up to SEEN_ID_LIMIT/2 entries.
-const SEEN_ID_LIMIT: usize = 12_000;
+pub(crate) const SEEN_ID_LIMIT: usize = 12_000;
 
 /// Interval between client-initiated WebSocket pings.
 const PING_INTERVAL: Duration = Duration::from_secs(30);
@@ -1119,14 +1119,14 @@ enum ProjectSendOutcome {
 /// 12,000, the worst case is that an ID seen 6,001+ inserts ago may be
 /// replayed as new. This is acceptable for Nostr event dedup where the
 /// `since` filter provides the primary replay protection.
-struct TwoGenDedup {
+pub(crate) struct TwoGenDedup {
     current: HashSet<String>,
     previous: HashSet<String>,
     limit: usize,
 }
 
 impl TwoGenDedup {
-    fn new(limit: usize) -> Self {
+    pub(crate) fn new(limit: usize) -> Self {
         Self {
             current: HashSet::new(),
             previous: HashSet::new(),
@@ -1134,12 +1134,12 @@ impl TwoGenDedup {
         }
     }
 
-    fn contains(&self, id: &str) -> bool {
+    pub(crate) fn contains(&self, id: &str) -> bool {
         self.current.contains(id) || self.previous.contains(id)
     }
 
     /// Insert `id`. Returns `true` if it was new (not a duplicate).
-    fn insert(&mut self, id: String) -> bool {
+    pub(crate) fn insert(&mut self, id: String) -> bool {
         if self.contains(&id) {
             return false;
         }
@@ -10303,6 +10303,7 @@ mod tests {
             let mut enrolments = crate::project::ProjectEnrolments::new();
             let mut queue = crate::queue::EventQueue::new(crate::config::DedupMode::Queue);
             let mut ledger = crate::peer_call::CallLedger::new();
+            let mut seen = crate::ProjectSeenIds::new();
             let humans = std::collections::BTreeSet::new();
             let externals = std::collections::BTreeSet::new();
 
@@ -10342,6 +10343,7 @@ mod tests {
                                     sibling: None,
                                     ledger: &mut ledger,
                                 },
+                                &mut seen,
                                 &subscriber,
                                 &agent_hex,
                                 0,
