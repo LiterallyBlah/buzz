@@ -2964,7 +2964,32 @@ pub(crate) async fn dispatch_project_event(
         } => {
             let filters = project::watched_roots_filters(dispatch.enrolments, since);
             if !filters.is_empty() {
-                let generation = subscriptions.watched.map_or(0, |g| g + 1);
+                // **Checked, and fail-closed on exhaustion.**
+                //
+                // `g + 1` panics in debug and wraps to zero in release. Wrapping
+                // is the worse half: generation zero is a wire identity this
+                // process may already have used, so a wrapped successor would
+                // reuse it — and the behaviour would differ by build mode,
+                // which is the last property an authority decision should have.
+                //
+                // Exhaustion therefore emits no command at all. The predecessor
+                // stays live and its durable intent stays intact, so the agent
+                // keeps answering on the subscription it has; it simply stops
+                // widening. Losing the ability to watch new roots is a bounded
+                // loss. Reusing a generation is not.
+                let generation = match subscriptions.watched {
+                    None => Some(0),
+                    Some(current) => current.checked_add(1),
+                };
+                let Some(generation) = generation else {
+                    tracing::error!(
+                        current = subscriptions.watched,
+                        "watched-root generations exhausted — refusing to reuse one; \
+                         the existing watched subscription is retained and no further \
+                         root can be added to it"
+                    );
+                    return dispatched;
+                };
                 let sub_id = project::watched_sub_id(generation);
                 let predecessor = subscriptions.watched.map(project::watched_sub_id);
                 if let Err(e) = subscriber
@@ -4600,6 +4625,100 @@ mod project_discovery_ingestion_tests {
         assert_ne!(
             watched[0].1, watched[1].1,
             "the successor must take a fresh generation id"
+        );
+    }
+
+    /// **Exhausted watched generations fail closed, identically in both build
+    /// modes.**
+    ///
+    /// The bug this pins was `g + 1`: a panic in debug, and in release a wrap
+    /// to generation zero — a wire identity this process may already have used.
+    /// Reusing one would let a retired request's frames be admitted under a
+    /// successor's authority, and the behaviour would depend on build mode.
+    ///
+    /// This test asserts the *refusal*, so it proves the same outcome under
+    /// `cargo test` and `cargo test --release`. A test that asserted the panic
+    /// would pass in debug and prove nothing about the mode where it matters.
+    #[tokio::test]
+    async fn exhausted_watched_generations_refuse_rather_than_reuse() {
+        let owner = Keys::generate();
+        let agent = Keys::generate();
+        let agent_identity = project::AgentIdentity::new(&agent.public_key()).unwrap();
+        let owner_hex = owner.public_key().to_hex();
+        let agent_hex = agent.public_key().to_hex();
+        let humans = std::collections::BTreeSet::new();
+        let externals = std::collections::BTreeSet::new();
+        let mut discovered = project::DiscoveredRepositories::new();
+        let mut enrolments = project::ProjectEnrolments::new();
+        let mut queue = EventQueue::new(config::DedupMode::Queue);
+        let subscriber = RecordingSubscriber::default();
+
+        // The last generation this process can name.
+        let mut subscriptions = ProjectSubscriptions {
+            watched: Some(u64::MAX),
+            enrolment_issued: true,
+        };
+
+        macro_rules! drive {
+            ($ev:expr) => {
+                dispatch_project_event(
+                    &mut dispatch_over(
+                        &agent_identity,
+                        Some(&owner_hex),
+                        &humans,
+                        &externals,
+                        &mut discovered,
+                        &mut enrolments,
+                        &mut queue,
+                    ),
+                    &subscriber,
+                    &mut subscriptions,
+                    &agent_hex,
+                    0,
+                    $ev,
+                )
+                .await
+            };
+        }
+
+        drive!(&project::ProjectEvent::Discovery {
+            announcement: proven_announcement(&owner, "proj").await,
+        });
+        let after_discovery = subscriber.calls.lock().unwrap().len();
+
+        let root = root_event(
+            &owner,
+            &agent,
+            "proj",
+            buzz_core::kind::KIND_GIT_ISSUE,
+            "a root that would need a new generation",
+        );
+        let verified = project::VerifiedProjectEvent::verify(root)
+            .await
+            .expect("valid");
+        let route = project::ProjectRoute::derive(&verified).expect("routes");
+        drive!(&project::ProjectEvent::Routed {
+            source: project::ProjectSubscription::Enrolment,
+            route,
+            event: verified,
+        });
+
+        let calls = subscriber.calls.lock().unwrap().clone();
+        assert_eq!(
+            calls.len(),
+            after_discovery,
+            "an exhausted generation space must emit no replacement command: {calls:?}"
+        );
+        assert!(
+            !calls
+                .iter()
+                .any(|(_, id, _)| id == &project::watched_sub_id(0)),
+            "generation zero was reused"
+        );
+        assert_eq!(
+            subscriptions.watched,
+            Some(u64::MAX),
+            "the predecessor generation must be retained on refusal"
         );
     }
 
