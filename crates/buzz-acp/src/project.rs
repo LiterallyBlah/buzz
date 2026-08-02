@@ -3663,6 +3663,24 @@ impl ProjectOrigin {
             "issue"
         }
     }
+
+    /// The CLI surface that answers on this class of root.
+    ///
+    /// The two commands emit the identical event — `buzz pr comment` delegates
+    /// to the issue path, one builder, one shape — so this is not about which
+    /// one works. It is about the prompt not contradicting itself: the sentence
+    /// above the command says "to reply on this pull request", and following it
+    /// with `buzz issues comment` invites the agent to conclude that the harness
+    /// has handed it the wrong command and to go looking for a better one. The
+    /// class is already known here, so naming the matching surface costs
+    /// nothing.
+    pub(crate) fn reply_command(&self) -> &'static str {
+        if self.is_pull_request {
+            "buzz pr comment"
+        } else {
+            "buzz issues comment"
+        }
+    }
 }
 
 /// Validate a root event as an enrolment candidate. **Fails closed.**

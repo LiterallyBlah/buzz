@@ -9988,6 +9988,208 @@ mod tests {
         }
     }
 
+    /// **A pull-request turn's reply lands on the pull request.**
+    ///
+    /// The issue path already has its end-to-end scenario. This is the half that
+    /// did not: the class flows from a real signed `kind:1618` root through the
+    /// real candidate validation into the origin, the prompt is rendered by
+    /// production code, the command is read *out of that prompt text* the way
+    /// the stub agent reads it, and the argv runs through
+    /// [`buzz_cli::run_from_args`] — the real clap parser and the real dispatch.
+    ///
+    /// ```text
+    /// signed kind:1618 root → validate_enrolment_candidate → ProjectOrigin
+    /// → queue::format_prompt → the command parsed out of the prompt
+    /// → buzz_cli::run_from_args signs and POSTs
+    /// → the acceptance endpoint verifies the signature
+    /// → a / marked-root e / p / no h asserted on the PR root
+    /// ```
+    ///
+    /// Nothing here builds an argv. If `format_project_context` emitted a
+    /// command that does not parse — or one that parses and names the wrong
+    /// root — the CLI exits non-zero or the captured event points elsewhere, and
+    /// this fails.
+    ///
+    /// Destination and identity are passed as **explicit flags**, not left to
+    /// the environment. `--relay` and `--private-key` override their
+    /// `BUZZ_RELAY_URL` / `BUZZ_PRIVATE_KEY` fallbacks, so an operator shell
+    /// that has those set cannot make this test publish anywhere real. That is
+    /// not hypothetical: an earlier step of this project did exactly that.
+    #[tokio::test]
+    async fn a_pull_request_turn_replies_on_the_pull_request_through_the_real_cli() {
+        let owner = nostr::Keys::generate();
+        let asker = nostr::Keys::generate();
+        let agent = nostr::Keys::generate();
+        let coordinate = format!("30617:{}:pr-repo", owner.public_key().to_hex());
+
+        // The class comes from a real root through the real validation — not
+        // from a boolean a test chose. A `for_test` origin here would prove that
+        // the prompt renders whatever flag it is handed, which is not the claim.
+        let pr_root = EventBuilder::new(
+            nostr::Kind::Custom(buzz_core::kind::KIND_GIT_PULL_REQUEST as u16),
+            "please review the reconnect fix",
+        )
+        .tags([nostr::Tag::parse(["a", &coordinate]).expect("a tag")])
+        .sign_with_keys(&owner)
+        .expect("sign the pull request root");
+        let verified = crate::project::VerifiedProjectEvent::verify(pr_root.clone())
+            .await
+            .expect("a freshly signed root verifies");
+        let discovered = crate::project::DiscoveredRepositories::for_test([coordinate.clone()]);
+        let candidate = crate::project::validate_enrolment_candidate(&verified, &discovered)
+            .expect("a signed PR root naming a discovered coordinate is a candidate");
+        assert!(
+            candidate.is_pull_request(),
+            "kind 1618 must classify as a pull request, or this proves nothing"
+        );
+        let origin = crate::project::ProjectOrigin::from_candidate(&candidate);
+
+        // The turn: somebody comments on the PR and the agent is woken.
+        let triggering = EventBuilder::new(nostr::Kind::TextNote, "any thoughts?")
+            .tags([
+                nostr::Tag::parse(["a", &coordinate]).expect("a tag"),
+                nostr::Tag::parse(["e", &pr_root.id.to_hex(), "", "root"]).expect("e tag"),
+                nostr::Tag::parse(["p", &agent.public_key().to_hex()]).expect("p tag"),
+            ])
+            .sign_with_keys(&asker)
+            .expect("sign the comment");
+
+        let batch = crate::queue::FlushBatch {
+            channel_id: crate::project::project_route_key(&pr_root.id.to_hex())
+                .expect("the root keys"),
+            events: vec![crate::queue::BatchEvent {
+                event: triggering,
+                prompt_tag: "@mention".into(),
+                received_at: std::time::Instant::now(),
+                project: Some(origin),
+            }],
+            cancelled_events: vec![],
+            cancel_reason: None,
+        };
+        let prompt = crate::queue::format_prompt(
+            &batch,
+            &crate::queue::FormatPromptArgs {
+                project: batch.project_origin(),
+                ..Default::default()
+            },
+        )
+        .join("\n\n");
+
+        // Read the command the way the stub agent does: the first line that
+        // starts a `buzz ` invocation, following backslash continuations.
+        let lines: Vec<&str> = prompt.lines().collect();
+        let start = lines
+            .iter()
+            .position(|l| l.trim_start().starts_with("buzz "))
+            .expect("the prompt must contain a runnable reply command");
+        let mut command = String::new();
+        for line in &lines[start..] {
+            let trimmed = line.trim();
+            if let Some(head) = trimmed.strip_suffix('\\') {
+                command.push_str(head);
+                command.push(' ');
+            } else {
+                command.push_str(trimmed);
+                break;
+            }
+        }
+        let argv: Vec<String> = command.split_whitespace().map(str::to_owned).collect();
+        assert_eq!(
+            argv.first().map(String::as_str),
+            Some("buzz"),
+            "the parsed command is not an invocation: {command:?}"
+        );
+        assert_eq!(
+            &argv[1..3],
+            ["pr", "comment"],
+            "a pull-request turn was handed {:?}",
+            &argv[1..3]
+        );
+
+        let endpoint = spawn_acceptance_endpoint().await;
+        let mut invocation = vec![
+            "buzz".to_string(),
+            "--relay".to_string(),
+            endpoint.url.clone(),
+            "--private-key".to_string(),
+            agent.secret_key().to_secret_hex(),
+        ];
+        invocation.extend(argv[1..].iter().cloned());
+        invocation.push("--content".to_string());
+        // The prompt's own `--content -` reads stdin; supply the body directly
+        // so the in-process run needs no stdin of its own. Every other argument
+        // is the prompt's.
+        let body = "Reviewed — the reconnect path is right.";
+        let content_flag = invocation
+            .iter()
+            .position(|a| a == "--content")
+            .expect("the command must carry --content");
+        invocation.truncate(content_flag);
+        invocation.push("--content".to_string());
+        invocation.push(body.to_string());
+
+        let code = buzz_cli::run_from_args(invocation).await;
+        assert_eq!(
+            code, 0,
+            "the command in the prompt did not run: {command:?}"
+        );
+
+        let accepted = endpoint.accepted.lock().expect("acceptance sink");
+        assert_eq!(
+            accepted.len(),
+            1,
+            "exactly one reply reached the acceptance endpoint"
+        );
+        let event = &accepted[0].event;
+        assert_eq!(event.kind.as_u16(), 1, "a project comment is a kind:1");
+        assert_eq!(event.content, body);
+        assert_eq!(
+            event.pubkey.to_hex(),
+            agent.public_key().to_hex(),
+            "the reply is signed by the agent whose key the invocation named"
+        );
+
+        let values = |key: &str| -> Vec<String> {
+            event
+                .tags
+                .iter()
+                .filter_map(|t| {
+                    let s = t.as_slice();
+                    (s.first().map(String::as_str) == Some(key))
+                        .then(|| s.get(1).cloned())
+                        .flatten()
+                })
+                .collect()
+        };
+        assert_eq!(
+            values("a"),
+            vec![coordinate.clone()],
+            "the reply left the repository it belongs to"
+        );
+        let marked_root = event.tags.iter().any(|t| {
+            let s = t.as_slice();
+            s.first().map(String::as_str) == Some("e")
+                && s.get(1).map(String::as_str) == Some(pr_root.id.to_hex().as_str())
+                && s.get(3).map(String::as_str) == Some("root")
+        });
+        assert!(
+            marked_root,
+            "the reply is not attached to the pull request that woke it"
+        );
+        assert!(
+            values("p").contains(&asker.public_key().to_hex()),
+            "the reply notifies nobody, so the person who asked never sees it"
+        );
+        assert!(
+            values("h").is_empty(),
+            "an `h` would scope the reply to a channel and take it out of the project"
+        );
+        assert!(
+            endpoint.refused.lock().expect("refusal sink").is_empty(),
+            "the endpoint refused a submission"
+        );
+    }
+
     /// The negative control for the acceptance endpoint.
     ///
     /// Three bodies that a `Value`-projecting endpoint would have taken: one

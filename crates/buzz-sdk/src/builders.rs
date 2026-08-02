@@ -3302,6 +3302,51 @@ mod tests {
         assert!(has_tag(&ev, "p", &agent));
     }
 
+    /// The two halves of the shape nothing else asserted: the root `e` is
+    /// *marked* `root`, and there is no `h`.
+    ///
+    /// Both are load-bearing and both are invisible in a passing test that only
+    /// checks tag values. The marker is what NIP-10 clients group by, so an
+    /// unmarked `e` leaves the comment attached to nothing in particular. And an
+    /// `h` would make the relay store this kind:1 channel-scoped rather than
+    /// community-global (`channel_id IS NULL`, `crates/buzz-db/src/event.rs`) —
+    /// the comment would be a message in a channel nobody is reading, and the
+    /// project's `#a` filter would never see it.
+    #[test]
+    fn a_project_comment_marks_its_root_and_names_no_channel() {
+        let repo = GitRepoCoord {
+            owner: "a".repeat(64),
+            id: "repo".to_string(),
+        };
+        let root = event_id().to_hex();
+        let ev = sign(
+            build_git_comment(
+                &repo,
+                "attached to the root",
+                &GitCommentMeta {
+                    root_event: root.clone(),
+                    parent_event: None,
+                    recipients: vec!["b".repeat(64)],
+                },
+            )
+            .unwrap(),
+        );
+
+        let marked_root = ev.tags.iter().any(|t| {
+            let s = t.as_slice();
+            s.first().map(String::as_str) == Some("e")
+                && s.get(1).map(String::as_str) == Some(root.as_str())
+                && s.get(3).map(String::as_str) == Some("root")
+        });
+        assert!(marked_root, "the root `e` tag carries no `root` marker");
+
+        assert!(
+            tag_values(&ev, "h").is_empty(),
+            "a project comment must name no channel: an `h` scopes it to a \
+             channel and takes it out of the project's own filter"
+        );
+    }
+
     /// One event shape serves both root kinds.
     ///
     /// The builder never sees the root's kind — a root is an event id, and the

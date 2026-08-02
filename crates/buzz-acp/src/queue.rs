@@ -1373,11 +1373,18 @@ fn format_project_context(
         );
     }
 
+    // The command matches the class named in the sentence above it. Both
+    // surfaces emit the identical event, so this is not about which one works —
+    // it is that "to reply on this pull request" followed by an issue command
+    // reads like a mistake, and an agent that doubts the command it was given
+    // goes looking for another one.
+    let command = project.reply_command();
+
     format!(
         "{header}\n\n\
          To reply on this {class}:\n\n\
          ```bash\n\
-         buzz issues comment \\\n  \
+         {command} \\\n  \
            --repo-owner {repo_owner} \\\n  \
            --repo-id {repo_id} \\\n  \
            --root {root} \\\n  \
@@ -2213,6 +2220,67 @@ mod tests {
             prompt.contains(&format!("--to {asker}")),
             "reply command does not notify the asker: {prompt}"
         );
+    }
+
+    /// The command names the class the sentence above it names.
+    ///
+    /// Both surfaces emit the identical event — `buzz pr comment` delegates to
+    /// the issue path — so a PR turn told to run `buzz issues comment` would
+    /// still *work*. It would also read as a mistake: "To reply on this pull
+    /// request:" followed by an issue command is exactly the kind of visible
+    /// inconsistency that sends an agent looking for a command it was not given.
+    /// Asserted as a pair, because a test that only checked the PR case would
+    /// pass just as well if both classes were told to use `buzz pr comment`.
+    #[test]
+    fn a_pull_request_turn_is_given_the_pull_request_command() {
+        let owner = "a".repeat(64);
+        let root = "b".repeat(64);
+        let coordinate = format!("30617:{owner}:my-repo");
+
+        let render = |is_pr: bool| {
+            let origin = crate::project::ProjectOrigin::for_test(&coordinate, &root, is_pr);
+            let batch = FlushBatch {
+                channel_id: Uuid::new_v4(),
+                events: vec![BatchEvent {
+                    event: make_event("please look"),
+                    prompt_tag: "@mention".into(),
+                    received_at: Instant::now(),
+                    project: Some(origin),
+                }],
+                cancelled_events: vec![],
+                cancel_reason: None,
+            };
+            format_prompt(
+                &batch,
+                &FormatPromptArgs {
+                    project: batch.project_origin(),
+                    ..Default::default()
+                },
+            )
+            .join("\n\n")
+        };
+
+        let pull_request = render(true);
+        assert!(
+            pull_request.contains("To reply on this pull request"),
+            "the PR turn does not name its class"
+        );
+        assert!(
+            pull_request.contains("buzz pr comment"),
+            "a pull-request turn was given the issue command"
+        );
+        assert!(
+            !pull_request.contains("buzz issues comment"),
+            "the PR turn was given both commands and left to choose"
+        );
+
+        let issue = render(false);
+        assert!(issue.contains("To reply on this issue"));
+        assert!(
+            issue.contains("buzz issues comment"),
+            "an issue turn was given the pull-request command"
+        );
+        assert!(!issue.contains("buzz pr comment"));
     }
 
     /// The channel hints and the project section are alternatives, not
