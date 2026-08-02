@@ -1448,58 +1448,63 @@ fn rule_applies_to_channel(rule: &SubscriptionRule, channel_id: Uuid) -> bool {
     }
 }
 
+/// Build a minimal Config for testing without CLI parsing.
+///
+/// Crate-visible so tests outside this module can drive a decision from a real
+/// `Config` rather than from a bool the test chose. A control that starts at a
+/// bool cannot show that the configuration reaches the decision at all.
+#[cfg(test)]
+pub(crate) fn test_config(mode: SubscribeMode) -> Config {
+    Config {
+        keys: nostr::Keys::generate(),
+        relay_url: "ws://localhost:3000".into(),
+        agent_command: "goose".into(),
+        agent_args: vec!["acp".into()],
+        mcp_command: "".into(),
+        idle_timeout_secs: DEFAULT_IDLE_TIMEOUT_SECS,
+        max_turn_duration_secs: DEFAULT_MAX_TURN_DURATION_SECS,
+        agents: 1,
+        heartbeat_interval_secs: 0,
+        turn_liveness_secs: 10,
+        heartbeat_prompt: None,
+        system_prompt: None,
+        team_instructions: None,
+        initial_message: None,
+        subscribe_mode: mode,
+        dedup_mode: DedupMode::Queue,
+        multiple_event_handling: MultipleEventHandling::Queue,
+        ignore_self: true,
+        kinds_override: None,
+        channels_override: None,
+        no_mention_filter: false,
+        config_path: PathBuf::from("./buzz-acp.toml"),
+        context_message_limit: 12,
+        max_turns_per_session: 0,
+        presence_enabled: true,
+        typing_enabled: true,
+        memory_enabled: true,
+        model: None,
+        session_title: None,
+        permission_mode: PermissionMode::BypassPermissions,
+        respond_to: RespondTo::Anyone,
+        respond_to_allowlist: HashSet::new(),
+        allowed_respond_to: Vec::new(),
+        persona_env_vars: vec![],
+        has_generated_codex_config: false,
+        relay_observer: false,
+        lazy_pool: false,
+        project_routing_enabled: false,
+        agent_owner: None,
+        no_base_prompt: false,
+        base_prompt_content: None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::filter::{ChannelScope, SubscriptionRule};
     use clap::{Parser, ValueEnum};
-
-    /// Build a minimal Config for testing without CLI parsing.
-    fn test_config(mode: SubscribeMode) -> Config {
-        Config {
-            keys: nostr::Keys::generate(),
-            relay_url: "ws://localhost:3000".into(),
-            agent_command: "goose".into(),
-            agent_args: vec!["acp".into()],
-            mcp_command: "".into(),
-            idle_timeout_secs: DEFAULT_IDLE_TIMEOUT_SECS,
-            max_turn_duration_secs: DEFAULT_MAX_TURN_DURATION_SECS,
-            agents: 1,
-            heartbeat_interval_secs: 0,
-            turn_liveness_secs: 10,
-            heartbeat_prompt: None,
-            system_prompt: None,
-            team_instructions: None,
-            initial_message: None,
-            subscribe_mode: mode,
-            dedup_mode: DedupMode::Queue,
-            multiple_event_handling: MultipleEventHandling::Queue,
-            ignore_self: true,
-            kinds_override: None,
-            channels_override: None,
-            no_mention_filter: false,
-            config_path: PathBuf::from("./buzz-acp.toml"),
-            context_message_limit: 12,
-            max_turns_per_session: 0,
-            presence_enabled: true,
-            typing_enabled: true,
-            memory_enabled: true,
-            model: None,
-            session_title: None,
-            permission_mode: PermissionMode::BypassPermissions,
-            respond_to: RespondTo::Anyone,
-            respond_to_allowlist: HashSet::new(),
-            allowed_respond_to: Vec::new(),
-            persona_env_vars: vec![],
-            has_generated_codex_config: false,
-            relay_observer: false,
-            lazy_pool: false,
-            project_routing_enabled: false,
-            agent_owner: None,
-            no_base_prompt: false,
-            base_prompt_content: None,
-        }
-    }
 
     fn make_rule(
         name: &str,

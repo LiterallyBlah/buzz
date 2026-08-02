@@ -1369,18 +1369,7 @@ async fn tokio_main() -> Result<()> {
     // The class passed here is what every inbound frame on this id will be
     // classified as; the id's spelling carries no authority. Registration
     // happens in lockstep with the write inside the relay task.
-    match project::discovery_subscription(config.project_routing_enabled) {
-        Some((sub_id, class, filters)) => {
-            if let Err(e) = relay.subscribe_project(&sub_id, class, filters).await {
-                tracing::warn!("repository discovery subscribe error: {e}");
-            } else {
-                tracing::info!(sub_id, "subscribed to repository announcements");
-            }
-        }
-        None => {
-            tracing::debug!("project routing disabled — no project subscriptions opened");
-        }
-    }
+    open_startup_project_subscriptions(&config, &relay).await;
 
     let presence_publisher = relay.event_publisher();
     let presence_keys = config.keys.clone();
@@ -2863,6 +2852,64 @@ fn should_report_refusal(degradation: project::Degradation, refused_total: u64) 
 /// should not be able to reach the rest. It is also a *replacement* capability
 /// rather than a subscribe one, because retirement is where the two
 /// subscription defects lived and a method that can only add cannot express it.
+/// The one capability startup needs: open a project subscription.
+///
+/// Separate from [`ProjectSubscriber`] because startup opens and never
+/// replaces, and the driver replaces and never opens. Merging them would hand
+/// each side a lever it has no business holding.
+pub(crate) trait ProjectOpener {
+    fn subscribe_project(
+        &self,
+        sub_id: &str,
+        class: project::ProjectSubscription,
+        filters: Vec<serde_json::Value>,
+    ) -> impl std::future::Future<Output = Result<(), relay::RelayError>>;
+}
+
+impl ProjectOpener for relay::HarnessRelay {
+    async fn subscribe_project(
+        &self,
+        sub_id: &str,
+        class: project::ProjectSubscription,
+        filters: Vec<serde_json::Value>,
+    ) -> Result<(), relay::RelayError> {
+        relay::HarnessRelay::subscribe_project(self, sub_id, class, filters).await
+    }
+}
+
+/// Open the startup project subscriptions this configuration calls for.
+///
+/// **Extracted from `tokio_main` so the decision is reachable.** Inline, it was
+/// provable only by running all of startup, so the control test that stood in
+/// for it asserted on `project_req_frames` — a helper no production code calls.
+/// A gate that had stopped working would not have shown up there.
+///
+/// Discovery is the one project subscription that depends on no prior state:
+/// `kind:30617` announcements are what *produces* the discovered set, so it can
+/// be opened at startup. Enrolment and watched-root REQs derive their filters
+/// from discovery and enrolment state, so they belong to the driver.
+///
+/// The class passed here is what every inbound frame on this id will be
+/// classified as; the id's spelling carries no authority. Registration happens
+/// in lockstep with the write inside the relay task.
+pub(crate) async fn open_startup_project_subscriptions(
+    config: &config::Config,
+    opener: &impl ProjectOpener,
+) {
+    match project::discovery_subscription(config.project_routing_enabled) {
+        Some((sub_id, class, filters)) => {
+            if let Err(e) = opener.subscribe_project(&sub_id, class, filters).await {
+                tracing::warn!("repository discovery subscribe error: {e}");
+            } else {
+                tracing::info!(sub_id, "subscribed to repository announcements");
+            }
+        }
+        None => {
+            tracing::debug!("project routing disabled — no project subscriptions opened");
+        }
+    }
+}
+
 /// **Submission, not installation.** The future resolves when the background
 /// task has accepted the command, which says nothing about whether a REQ was
 /// written or a subscription installed. Implementors must not report anything

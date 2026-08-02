@@ -9350,55 +9350,106 @@ for line in sys.stdin:
         .expect("the end-to-end scenario must not hang");
     }
 
-    /// The flag-off control, through the harness the scenario uses.
+    /// Opens through the production command path, so the control ends at bytes.
+    struct SocketOpener {
+        inner: tokio::sync::Mutex<(BgState, WsStream)>,
+    }
+
+    impl crate::ProjectOpener for SocketOpener {
+        async fn subscribe_project(
+            &self,
+            sub_id: &str,
+            class: crate::project::ProjectSubscription,
+            filters: Vec<serde_json::Value>,
+        ) -> Result<(), RelayError> {
+            let mut guard = self.inner.lock().await;
+            let (state, ws) = &mut *guard;
+            execute_connected_command(
+                ws,
+                state,
+                &"0".repeat(64),
+                RelayCommand::SubscribeProject {
+                    sub_id: sub_id.to_string(),
+                    subscription: class,
+                    filters,
+                },
+            )
+            .await;
+            Ok(())
+        }
+    }
+
+    /// **The startup gate, from configuration through to bytes.**
     ///
-    /// The same socket and the same production write path as
-    /// [`phase_a_end_to_end_relay_bytes_reach_the_agents_stdin`], driven from
-    /// the decision production actually makes. With the flag off nothing is
-    /// written, and because every other project REQ derives its filter from
-    /// discovery state, nothing downstream has anything to fire on — no
-    /// announcement arrives, so no repository is discovered, so no root is
-    /// enrolled or watched.
+    /// Both halves run the whole chain production runs:
     ///
-    /// The asymmetry is the point: a control that writes no bytes because the
-    /// harness never asked it to would pass against a flag that gates nothing.
+    /// ```text
+    /// config.project_routing_enabled
+    ///   → project::discovery_subscription
+    ///   → open_startup_project_subscriptions
+    ///   → RelayCommand::SubscribeProject
+    ///   → the socket
+    /// ```
+    ///
+    /// The previous control asserted on `project_req_frames`, which no
+    /// production code calls, and then on `discovery_subscription(false)`
+    /// directly — one boundary short in each case. Neither could fail if the
+    /// startup path stopped consulting the flag, because neither ran it.
+    ///
+    /// The asymmetry is the point: a control that writes no bytes because
+    /// nothing asked it to would pass against a flag that gates nothing. So the
+    /// flag-on half must write exactly one REQ over the same opener.
     #[tokio::test]
-    async fn the_flag_off_control_writes_no_bytes_where_the_flag_on_control_writes_a_req() {
-        let (mut client, mut server) = test_ws_pair().await;
-        let mut state = BgState::new();
+    async fn the_startup_gate_runs_from_config_to_the_socket() {
+        for (enabled, expected) in [(false, 0usize), (true, 1usize)] {
+            let (client, mut server) = test_ws_pair().await;
+            let opener = SocketOpener {
+                inner: tokio::sync::Mutex::new((BgState::new(), client)),
+            };
 
-        assert!(
-            crate::project::discovery_subscription(false).is_none(),
-            "the flag-off decision must be to open nothing"
-        );
-        assert!(
-            readable_frames(&mut server).await.is_empty(),
-            "a disabled harness put bytes on the socket before anything asked it to"
-        );
+            let mut config = crate::config::test_config(crate::config::SubscribeMode::All);
+            config.project_routing_enabled = enabled;
 
-        let (sub_id, class, filters) = crate::project::discovery_subscription(true)
+            crate::open_startup_project_subscriptions(&config, &opener).await;
+
+            let seen = readable_frames(&mut server).await;
+            assert_eq!(
+                seen.len(),
+                expected,
+                "project_routing_enabled={enabled} must write {expected} frame(s): {seen:?}"
+            );
+            if enabled {
+                assert_eq!(seen[0][0], "REQ");
+                assert_eq!(
+                    seen[0][1],
+                    crate::project::discovery_sub_id(),
+                    "the flag-on gate opened something other than discovery"
+                );
+                // The registration exists on the connection, so this is an
+                // opened subscription rather than bytes that happened to leave.
+                let guard = opener.inner.lock().await;
+                assert!(
+                    guard
+                        .0
+                        .project_requests
+                        .match_frame(&crate::project::discovery_sub_id())
+                        .is_some(),
+                    "the discovery REQ was written but never registered"
+                );
+            }
+        }
+    }
+
+    /// `from_filters` refuses a filter that constrains nothing, so building the
+    /// production discovery identity through it says the startup REQ is a
+    /// bounded request rather than a subscription to the whole relay.
+    #[test]
+    fn the_production_discovery_filter_is_a_bounded_request() {
+        let (_sub_id, class, filters) = crate::project::discovery_subscription(true)
             .expect("the flag-on decision must be to open discovery");
-        // `from_filters` refuses a filter that constrains nothing, so this also
-        // says the production discovery filter is a bounded request rather than
-        // a subscription to the whole relay.
-        let identity = crate::project::ProjectRequestIdentity::from_filters(class, filters)
-            .expect("the production discovery filter must constrain events");
-        assert_eq!(
-            send_project_subscribe(&mut client, &mut state, &sub_id, identity).await,
-            ProjectSendOutcome::Sent
-        );
-
-        let seen = readable_frames(&mut server).await;
-        assert_eq!(
-            seen.len(),
-            1,
-            "the flag on writes exactly one REQ: {seen:?}"
-        );
-        assert_eq!(seen[0][0], "REQ");
-        assert_eq!(
-            seen[0][1],
-            crate::project::discovery_sub_id(),
-            "the flag-on control opens something other than discovery"
+        assert!(
+            crate::project::ProjectRequestIdentity::from_filters(class, filters).is_some(),
+            "the production discovery filter must constrain events"
         );
     }
 
