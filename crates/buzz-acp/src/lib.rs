@@ -451,6 +451,40 @@ impl ObserverPublishPacer {
     }
 }
 
+/// May this configuration publish encrypted NIP-AO owner telemetry?
+///
+/// `relay_observer` and nothing else. Kept as a named predicate beside
+/// [`observer_bus_for`] so the two questions cannot drift back together: the
+/// bus is shared, the *encryption and publication* of transcripts is not, and
+/// the whole point of the correction that produced this pair is that one
+/// feature's switch stopped silently answering for the other.
+fn encrypted_telemetry_enabled(config: &Config) -> bool {
+    config.relay_observer
+}
+
+/// The in-process observer bus, when anything in this configuration needs one.
+///
+/// **Two consumers, one bus.** Encrypted NIP-AO telemetry is one of them and
+/// used to be the only one, so the bus was allocated from `relay_observer`
+/// alone. Public NIP-PA project activity is the other, and it reads the same
+/// frames — so with `project_routing_enabled` on and `relay_observer` off, the
+/// activity publisher was spawned against a handle that did not exist and no
+/// `20003` was ever emitted. The publisher had been carefully un-gated from
+/// `--relay-observer` while its sole input was still gated by it.
+///
+/// The bus itself is cheap and inert: a broadcast channel and a bounded replay
+/// buffer, filled only by `emit` calls the harness makes anyway. What is
+/// expensive — encrypting a frame per owner and publishing it — stays behind
+/// `relay_observer` at [`spawn_relay_observer_publisher`]. So allocating here
+/// for either feature grants neither feature's cost to the other.
+///
+/// Extracted as a function so the combinations can be asserted from the same
+/// `Config` values production reads, rather than only by starting a harness.
+fn observer_bus_for(config: &Config) -> Option<observer::ObserverHandle> {
+    (config.relay_observer || config.project_routing_enabled)
+        .then(observer::ObserverHandle::in_process)
+}
+
 // ── NIP-PA: project activity ──────────────────────────────────────────────────
 
 /// How often a live turn re-announces `working` while it runs.
@@ -1594,9 +1628,7 @@ async fn tokio_main() -> Result<()> {
 
     tracing::info!("buzz-acp starting: {}", config.summary());
 
-    let observer = config
-        .relay_observer
-        .then(observer::ObserverHandle::in_process);
+    let observer = observer_bus_for(&config);
     if let Some(handle) = &observer {
         handle.emit(
             "harness_started",
@@ -1741,7 +1773,7 @@ async fn tokio_main() -> Result<()> {
     let mut relay_observer_control_rx = None;
     let mut relay_observer_publisher_task = None;
     let mut relay_observer_publisher = None;
-    if config.relay_observer {
+    if encrypted_telemetry_enabled(&config) {
         if let (Some(observer), Some(owner_pubkey_hex)) =
             (observer.clone(), owner_cache.pubkey.clone())
         {
@@ -10525,5 +10557,131 @@ mod project_activity_tests {
                 .is_some_and(serde_json::Value::is_null),
             "a project turn must not claim a channel: {json}"
         );
+    }
+}
+
+/// Startup wiring: which configuration allocates the observer bus, and which
+/// one publishes what.
+///
+/// The candidate this corrects claimed project activity was "deliberately not
+/// behind `--relay-observer`". The publisher was not. Its only input was: the
+/// bus itself was allocated from `relay_observer` alone, so the supported
+/// default — project routing on, telemetry off — emitted no `20003` at all.
+///
+/// These drive the production predicates with real [`Config`] values rather
+/// than starting a harness, and the first case carries a real turn frame
+/// through the real publisher task so "the bus exists" is not the whole claim.
+#[cfg(test)]
+mod observer_bus_startup_tests {
+    use super::*;
+    use crate::config::{test_config, SubscribeMode};
+
+    const ROOT: &str = "48be1cc2000000000000000000000000000000000000000000000000000000ab";
+
+    fn config_with(relay_observer: bool, project_routing: bool) -> Config {
+        let mut config = test_config(SubscribeMode::All);
+        config.relay_observer = relay_observer;
+        config.project_routing_enabled = project_routing;
+        config
+    }
+
+    /// The reported failure, as a test: project routing on and telemetry off
+    /// must still produce a bus, and a real project turn frame on that bus must
+    /// still reach the wire as a signed `20003`.
+    #[tokio::test]
+    async fn project_routing_alone_publishes_activity_from_a_real_turn_frame() {
+        let config = config_with(false, true);
+        let observer = observer_bus_for(&config)
+            .expect("project routing needs the observer bus: it is the publisher's only input");
+        assert!(
+            !encrypted_telemetry_enabled(&config),
+            "sharing the bus must not switch on owner telemetry"
+        );
+
+        let keys = nostr::Keys::generate();
+        let agent_hex = keys.public_key().to_hex().to_ascii_lowercase();
+        let (publisher, mut published) = relay::RelayEventPublisher::test_pair();
+        let rx = observer.subscribe();
+        let task = tokio::spawn(run_project_activity_publisher(
+            rx,
+            publisher,
+            keys,
+            agent_hex.clone(),
+        ));
+
+        // A turn frame exactly as the pool emits one, through the production
+        // context builder.
+        observer.emit(
+            "turn_started",
+            Some(0),
+            &observer::context_for_turn(
+                observer::TurnRoute::Project(observer::ProjectRouteRef {
+                    coordinate: format!("30617:{}:buzz", "a".repeat(64)),
+                    root: ROOT.to_string(),
+                }),
+                None,
+                "turn-1".to_string(),
+                "2026-08-02T00:00:00Z".to_string(),
+            ),
+            serde_json::json!({}),
+        );
+
+        let event = tokio::time::timeout(std::time::Duration::from_secs(5), published.recv())
+            .await
+            .expect("the activity publisher produced nothing within 5s")
+            .expect("publisher channel closed");
+        task.abort();
+
+        assert_eq!(
+            event.kind.as_u16(),
+            buzz_core::kind::KIND_PROJECT_ACTIVITY as u16
+        );
+        let tag = |key: &str| {
+            event.tags.iter().find_map(|t| {
+                let s = t.as_slice();
+                (s.first().map(String::as_str) == Some(key))
+                    .then(|| s.get(1).cloned())
+                    .flatten()
+            })
+        };
+        assert_eq!(tag("e").as_deref(), Some(ROOT));
+        assert_eq!(tag("state").as_deref(), Some("working"));
+        assert_eq!(tag("agent").as_deref(), Some(agent_hex.as_str()));
+    }
+
+    /// The other half of the separation: telemetry alone keeps its bus and its
+    /// publisher, and does not switch on project activity.
+    #[test]
+    fn telemetry_alone_keeps_its_own_path() {
+        let config = config_with(true, false);
+        assert!(
+            observer_bus_for(&config).is_some(),
+            "owner telemetry lost the bus it has always had"
+        );
+        assert!(encrypted_telemetry_enabled(&config));
+        assert!(
+            !config.project_routing_enabled,
+            "sharing the bus must not switch on project routing"
+        );
+    }
+
+    /// Both features on is one bus, not two.
+    #[test]
+    fn both_features_share_one_bus() {
+        let config = config_with(true, true);
+        assert!(observer_bus_for(&config).is_some());
+        assert!(encrypted_telemetry_enabled(&config));
+    }
+
+    /// Neither feature: no bus at all. The bus is cheap but not free, and a
+    /// deployment that asked for neither should carry neither.
+    #[test]
+    fn neither_feature_allocates_nothing() {
+        let config = config_with(false, false);
+        assert!(
+            observer_bus_for(&config).is_none(),
+            "an unconfigured harness allocated an observer bus nobody reads"
+        );
+        assert!(!encrypted_telemetry_enabled(&config));
     }
 }
