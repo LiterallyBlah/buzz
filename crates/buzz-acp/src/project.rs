@@ -1472,6 +1472,30 @@ mod requests {
                                  whose id is {expected}"
                             ));
                         }
+                        // Allocator provenance. A generation at or above the
+                        // allocator's next value was never handed out by this
+                        // registry, so durable intent is claiming an identity
+                        // the only thing entitled to mint one has no record of.
+                        // Retiring it would CLOSE an id the relay never opened
+                        // under this process; treating it as current would let
+                        // an outside writer choose the predecessor. Neither is
+                        // a reconciliation, so neither is done.
+                        //
+                        // Once the space is spent the allocator has issued
+                        // every generation including `u64::MAX`, and `next`
+                        // stops advancing — so the comparison alone would
+                        // reject the last legitimately issued generation. The
+                        // exhausted flag is what distinguishes "never reached"
+                        // from "reached and saturated".
+                        if !self.watched_generations_exhausted
+                            && *generation >= self.next_watched_generation
+                        {
+                            return Err(format!(
+                                "watched intent {id} carries generation {generation}, which this \
+                                 allocator has never issued (next is {})",
+                                self.next_watched_generation
+                            ));
+                        }
                         watched.push((id.as_str(), *generation));
                     }
                     super::ProjectSubscription::Enrolment => {

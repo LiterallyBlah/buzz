@@ -410,13 +410,38 @@ fn build_client_capabilities() -> serde_json::Value {
     })
 }
 
+/// What [`AcpClient::shutdown`] actually managed to do to the child.
+///
+/// **Returned rather than only logged.** `shutdown` used to be `-> ()` while
+/// its own body distinguished three outcomes internally: a reaped child, a
+/// `wait` error, and a five-second timeout it described in a `warn!` as
+/// "abandoning". A caller had no way to tell those apart, so an API documented
+/// as guaranteed cleanup could return normally having left a live process
+/// behind. The distinction existed; it just was not anyone's to see.
+///
+/// Production callers may still decide that a failed reap is only worth a log.
+/// What they may no longer do is be unable to find out.
+#[derive(Debug)]
+pub enum ChildReap {
+    /// The child exited and was reaped. Carries its exit status.
+    Reaped(std::process::ExitStatus),
+    /// `wait` itself failed. The child's disposition is unknown.
+    WaitError(String),
+    /// The child had not exited five seconds after SIGKILL. It was abandoned
+    /// to `Drop` and the OS, and may still be running.
+    TimedOut,
+}
+
 impl AcpClient {
     /// Kill the agent subprocess and wait for it to exit (no zombies).
     ///
     /// `Drop` only calls `start_kill()` (sends SIGKILL but doesn't reap).
     /// Call this when you need guaranteed cleanup — e.g., in `run_models`
     /// before process exit.
-    pub async fn shutdown(&mut self) {
+    ///
+    /// Returns what actually happened; see [`ChildReap`]. A `TimedOut` result
+    /// means the child may still be running.
+    pub async fn shutdown(&mut self) -> ChildReap {
         // Kill the entire process group when possible. The child was spawned
         // with process_group(0), so its PID == its PGID. Killing the group
         // ensures subprocesses (MCP servers, tool processes) are cleaned up
@@ -434,9 +459,15 @@ impl AcpClient {
         // give up and let Drop/OS handle it. An unbounded wait here would
         // wedge the harness during respawn or shutdown if a child is stuck.
         match tokio::time::timeout(std::time::Duration::from_secs(5), self.child.wait()).await {
-            Ok(Ok(_)) => {}
-            Ok(Err(e)) => tracing::debug!("child wait error after kill: {e}"),
-            Err(_) => tracing::warn!("child did not exit within 5s after SIGKILL — abandoning"),
+            Ok(Ok(status)) => ChildReap::Reaped(status),
+            Ok(Err(e)) => {
+                tracing::debug!("child wait error after kill: {e}");
+                ChildReap::WaitError(e.to_string())
+            }
+            Err(_) => {
+                tracing::warn!("child did not exit within 5s after SIGKILL — abandoning");
+                ChildReap::TimedOut
+            }
         }
     }
 

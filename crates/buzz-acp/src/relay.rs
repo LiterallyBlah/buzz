@@ -6052,16 +6052,48 @@ mod tests {
     ) {
         use futures_util::SinkExt;
         let text = serde_json::to_string(&json!(["EVENT", sub_id, event])).expect("encode frame");
+
+        // The peer writes the EVENT and, immediately behind it, a sentinel.
+        // Both are read back below, in order. See the assertions after dispatch
+        // for why the sentinel is here.
+        let sentinel = serde_json::to_string(&json!(["NOTICE", format!("delivered:{}", event.id)]))
+            .expect("encode sentinel");
         server
-            .send(Message::Text(text.into()))
+            .send(Message::Text(text.clone().into()))
             .await
             .expect("the relay peer writes the EVENT");
+        server
+            .send(Message::Text(sentinel.clone().into()))
+            .await
+            .expect("the relay peer writes the sentinel");
 
         let message = timeout(Duration::from_secs(2), ws.next())
             .await
             .expect("timed out reading the EVENT off the connection")
             .expect("the connection closed before the EVENT arrived")
             .expect("read the EVENT frame");
+
+        // **The first thing on this connection is the EVENT.**
+        //
+        // What this proves, exactly: the connection is live, the peer's write
+        // arrived, and the stream is consumed in order — so a frame left queued
+        // or delivered out of order fails here.
+        //
+        // What it does not prove, stated because the phase contract names
+        // "direct midpoint injection replaces the connected path" as a mutant
+        // this suite should catch: **no assertion here can catch it.** The
+        // injection would be an edit to this helper, and any value a helper can
+        // assert is a value the same helper can fabricate — the transported
+        // bytes and a locally constructed `Message::Text` have identical
+        // contents by definition, so no comparison distinguishes them. The
+        // property is held by construction and by review of this function, not
+        // by a test. Writing an assertion that appeared to cover it would be
+        // the self-matching proof this file has been burned by before.
+        assert_eq!(
+            message.to_text().expect("the EVENT frame is text"),
+            text,
+            "the frame handled below did not come off this connection"
+        );
 
         let (observer_tx, _observer_rx) = mpsc::channel(8);
         let keep_going = handle_ws_message(
@@ -6077,6 +6109,21 @@ mod tests {
         )
         .await;
         assert!(keep_going, "dispatch must not signal connection loss");
+
+        // And the sentinel is what follows it, which is what proves the read
+        // above consumed the EVENT rather than peeking past it.
+        let echoed = timeout(Duration::from_secs(2), ws.next())
+            .await
+            .expect("timed out reading the sentinel")
+            .expect("the connection closed before the sentinel arrived")
+            .expect("read the sentinel frame");
+        assert_eq!(
+            echoed.to_text().expect("sentinel is text"),
+            sentinel,
+            "the EVENT was not consumed from the connection — it was still \
+             queued when the sentinel was read, so the frame handled above did \
+             not come off this socket"
+        );
     }
 
     /// Open a project request the way production must: recorded before any
@@ -7130,7 +7177,13 @@ mod tests {
             vec![crate::project::watched_sub_id(0)]
         );
 
-        // And one that no allocator ever handed out.
+        // And a second one, installed by something other than the owner. The
+        // allocator is advanced past it first so this proves the *ambiguity*
+        // refusal rather than the provenance refusal — they are different
+        // invariants and a test that could pass on either proves neither.
+        state
+            .project_requests
+            .seed_allocators_for_exhaustion(100, 1);
         state
             .project_requests
             .force_watched_intent(99, watched_filter(9));
@@ -7197,8 +7250,9 @@ mod tests {
         let frames = drain_test_frames(&mut server).await;
         assert_eq!(
             req_ids(&frames),
-            vec![crate::project::watched_sub_id(1)],
-            "the refusal must have burned no generation, so the successor is 1: {frames:?}"
+            vec![crate::project::watched_sub_id(100)],
+            "the refusal must have burned no generation, so the successor is \
+             still the allocator's next: {frames:?}"
         );
         assert_eq!(
             close_ids(&frames),
@@ -7222,7 +7276,17 @@ mod tests {
         let (mut ws, mut server) = test_ws_pair().await;
         let mut state = BgState::new();
 
-        // Nothing this owner allocated — generation 99, from outside.
+        // Generation 99 installed by something other than the semantic owner —
+        // but a generation this allocator *has* issued, so it passes the
+        // provenance check and the question under test is the one form 1 asks:
+        // does the owner retire intent it did not itself install?
+        //
+        // A generation the allocator had never issued is a different failure,
+        // proved separately below; mixing the two would let this test pass on
+        // the wrong refusal.
+        state
+            .project_requests
+            .seed_allocators_for_exhaustion(100, 0);
         state
             .project_requests
             .force_watched_intent(99, watched_filter(9));
@@ -7248,7 +7312,7 @@ mod tests {
         let frames = drain_test_frames(&mut server).await;
         assert_eq!(
             req_ids(&frames),
-            vec![crate::project::watched_sub_id(0)],
+            vec![crate::project::watched_sub_id(100)],
             "the successor takes this owner's next generation: {frames:?}"
         );
         assert_eq!(
@@ -7268,7 +7332,76 @@ mod tests {
                 .project_requests
                 .current_watched()
                 .expect("one watched intent resolves"),
-            Some(0),
+            Some(100),
+        );
+    }
+
+    /// **A generation the allocator never issued fails closed.**
+    ///
+    /// Allocator provenance. Durable intent claiming an identity the only
+    /// component entitled to mint one has no record of is a contradiction, not
+    /// a state to reconcile: retiring it would `CLOSE` an id the relay never
+    /// opened under this process, and treating it as current would let whatever
+    /// wrote it choose the predecessor of the next replacement.
+    ///
+    /// Distinct from the two-intent case. There the record is internally
+    /// consistent and merely ambiguous; here a single intent is by itself
+    /// impossible.
+    #[tokio::test]
+    async fn a_watched_generation_the_allocator_never_issued_fails_closed() {
+        let (mut ws, mut server) = test_ws_pair().await;
+        let mut state = BgState::new();
+
+        // The allocator has issued nothing at all, so 99 cannot have come
+        // from it.
+        state
+            .project_requests
+            .force_watched_intent(99, watched_filter(9));
+
+        assert!(
+            submit_replacement(
+                &mut ws,
+                &mut state,
+                crate::project::ProjectReplacement::Watched,
+                vec![watched_filter(1)],
+            )
+            .await,
+            "an invariant violation is not a transport failure"
+        );
+        let frames = drain_test_frames(&mut server).await;
+        assert!(frames.is_empty(), "nothing may be written: {frames:?}");
+        assert!(
+            state
+                .project_requests
+                .intent(&crate::project::watched_sub_id(99))
+                .is_some(),
+            "the unissued intent is not silently retired either"
+        );
+
+        let violation = state
+            .project_requests
+            .current_watched()
+            .expect_err("an unissued generation must not resolve");
+        assert!(
+            violation.contains("never issued"),
+            "the report must name provenance as the reason: {violation}"
+        );
+
+        // And the allocator is untouched: the next valid attempt still takes 0.
+        state.project_requests.clear_watched_intent(99);
+        assert!(
+            submit_replacement(
+                &mut ws,
+                &mut state,
+                crate::project::ProjectReplacement::Watched,
+                vec![watched_filter(1)],
+            )
+            .await
+        );
+        assert_eq!(
+            req_ids(&drain_test_frames(&mut server).await),
+            vec![crate::project::watched_sub_id(0)],
+            "the refused attempt must have burned no generation"
         );
     }
 
@@ -9510,7 +9643,14 @@ mod tests {
             // independent relay validation — nothing here checks the event
             // against relay policy. What it buys is that the reply must be
             // really built, really signed and really sent to be observed.
-            let submissions: std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>> =
+            //
+            // **The exact bytes**, retained verbatim. Axum will accept any JSON
+            // this child sends, so the only thing separating a real signed
+            // event from a plausible object carrying the right field names is
+            // deserialising these bytes as `nostr::Event` and verifying them —
+            // which cannot be done to a projection already parsed into
+            // `serde_json::Value` and read field by field.
+            let submissions: std::sync::Arc<std::sync::Mutex<Vec<String>>> =
                 std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
             let events_url = {
                 let sink = submissions.clone();
@@ -9522,7 +9662,7 @@ mod tests {
                             let event: serde_json::Value =
                                 serde_json::from_str(&body).unwrap_or(serde_json::Value::Null);
                             let id = event["id"].as_str().unwrap_or_default().to_string();
-                            sink.lock().expect("submission sink").push(event);
+                            sink.lock().expect("submission sink").push(body);
                             axum::Json(serde_json::json!({
                                 "event_id": id,
                                 "accepted": true,
@@ -9595,14 +9735,41 @@ for line in sys.stdin:
         text = "".join(b.get("text", "")
                        for b in (msg["params"].get("prompt") or []))
         argv = reply_argv(text)
+        # What the environment handed this process, recorded before anything is
+        # decided from it. The harness reads this back to confirm the
+        # counterprobe was armed: a test proving hostile variables are ignored
+        # proves nothing if no hostile variable ever arrived.
+        cap.write(json.dumps({{"env_seen": {{
+            k: os.environ.get(k)
+            for k in ("BUZZ_RELAY_URL", "BUZZ_PRIVATE_KEY", "BUZZ_AUTH_TAG",
+                      "BUZZ_ACP_TEST_RELAY_URL", "BUZZ_ACP_TEST_KEY")
+        }}}}) + "\n")
+        cap.flush()
         env = dict(os.environ)
         env["BUZZ_ACP_TEST_CLI_ARGV"] = json.dumps(argv)
-        # Set here, not inherited: see the note on `child_env` below.
-        env["BUZZ_RELAY_URL"] = os.environ["BUZZ_ACP_TEST_RELAY_URL"]
-        env["BUZZ_PRIVATE_KEY"] = os.environ["BUZZ_ACP_TEST_KEY"]
+        # **Destination and identity come from this generated source, never
+        # from the environment.** They used to be read out of `os.environ`
+        # under harness-specific names, which left them overrideable by
+        # anything exporting those names — and `AcpClient::spawn` gives the
+        # parent environment precedence, so an ambient value would silently
+        # win. The literals below were written into this program by the same
+        # harness that bound the capture endpoint, so there is no name left to
+        # collide with.
+        env["BUZZ_RELAY_URL"] = {relay_url:?}
+        env["BUZZ_PRIVATE_KEY"] = {agent_key:?}
+        # An ambient auth tag would present delegation this harness never
+        # granted. Removed rather than overwritten: no test value belongs here.
+        env.pop("BUZZ_AUTH_TAG", None)
+        # What the CLI process is actually given, as opposed to what this one
+        # was. Journalled so the harness can assert the removal rather than
+        # trust the line above.
+        cap.write(json.dumps({{"helper_env": {{
+            k: env.get(k)
+            for k in ("BUZZ_RELAY_URL", "BUZZ_PRIVATE_KEY", "BUZZ_AUTH_TAG")
+        }}}}) + "\n")
+        cap.flush()
         proc = subprocess.run(
-            [os.environ["BUZZ_ACP_TEST_EXE"], "--exact",
-             os.environ["BUZZ_ACP_TEST_CLI_HELPER"], "--nocapture"],
+            [{test_exe:?}, "--exact", {cli_helper:?}, "--nocapture"],
             input={reply:?}.encode(),
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
         cap.write(json.dumps({{"cli": {{
@@ -9620,39 +9787,46 @@ for line in sys.stdin:
 "#,
                 path = capture.to_string_lossy(),
                 reply = reply_body,
+                relay_url = events_url,
+                agent_key = agent.secret_key().to_secret_hex(),
+                test_exe = std::env::current_exe()
+                    .expect("this test executable's own path")
+                    .to_string_lossy(),
+                cli_helper = CLI_HELPER_TEST,
             );
 
-            // The child is given only what a real agent process is given: where
-            // the relay is and which key is its own. The argv comes from the
-            // prompt.
+            // **The counterprobe, not the configuration.**
             //
-            // **These names are harness-specific on purpose — do not "simplify"
-            // them to `BUZZ_RELAY_URL` and `BUZZ_PRIVATE_KEY`.** `AcpClient::spawn`
-            // injects `extra_env` only for keys absent from the parent
-            // environment (operator precedence, `acp.rs`). A developer or agent
-            // runtime with those two set therefore has this scenario silently
-            // ignore the capture endpoint below, sign with the operator's real
-            // key, and publish to their real relay. That is not a hypothetical:
-            // it happened on the first run of this step. The stub copies these
-            // into the CLI's own names for the helper process, where nothing
-            // overrides them.
+            // Nothing the child needs is passed here any more — the endpoint,
+            // the key and the helper's own path are literals in the generated
+            // stub above. What this vector carries is hostile: production names
+            // and the former harness-specific names, all pointing somewhere
+            // that is not the capture endpoint and naming a key that is not the
+            // agent's.
+            //
+            // The scenario then requires the submission to arrive at the
+            // capture endpoint signed by the agent anyway. Without this the
+            // isolation claim would be untested — an environment that happened
+            // to be clean passes identically to one that is genuinely ignored.
+            //
+            // This is not hypothetical. When these names were the real
+            // configuration, `AcpClient::spawn`'s operator precedence
+            // (`extra_env` is injected only for keys absent from the parent)
+            // meant a developer or agent runtime with `BUZZ_RELAY_URL` and
+            // `BUZZ_PRIVATE_KEY` set had this scenario ignore its own capture
+            // endpoint, sign with the operator's real key and publish to the
+            // operator's real relay. It happened on the first run of this step.
+            let hostile_relay = "http://127.0.0.1:9/hostile-relay".to_string();
+            let hostile_key = nostr::Keys::generate().secret_key().to_secret_hex();
             let child_env = vec![
+                ("BUZZ_RELAY_URL".to_string(), hostile_relay.clone()),
+                ("BUZZ_PRIVATE_KEY".to_string(), hostile_key.clone()),
                 (
-                    "BUZZ_ACP_TEST_EXE".to_string(),
-                    std::env::current_exe()
-                        .expect("this test executable's own path")
-                        .to_string_lossy()
-                        .into_owned(),
+                    "BUZZ_AUTH_TAG".to_string(),
+                    "hostile-delegation".to_string(),
                 ),
-                (
-                    "BUZZ_ACP_TEST_CLI_HELPER".to_string(),
-                    CLI_HELPER_TEST.to_string(),
-                ),
-                ("BUZZ_ACP_TEST_RELAY_URL".to_string(), events_url.clone()),
-                (
-                    "BUZZ_ACP_TEST_KEY".to_string(),
-                    agent.secret_key().to_secret_hex(),
-                ),
+                ("BUZZ_ACP_TEST_RELAY_URL".to_string(), hostile_relay.clone()),
+                ("BUZZ_ACP_TEST_KEY".to_string(), hostile_key.clone()),
             ];
 
             // **The production spawn and initialise path, not a stamped state.**
@@ -9728,7 +9902,11 @@ for line in sys.stdin:
             // The enclosing 60s timeout is what makes this an assertion: a
             // child that never exits wedges here and fails the scenario rather
             // than leaking quietly past a green result.
-            reclaimed.acp.shutdown().await;
+            let reap = reclaimed.acp.shutdown().await;
+            assert!(
+                matches!(reap, crate::acp::ChildReap::Reaped(_)),
+                "the child was not observably reaped: {reap:?}"
+            );
 
             // ── what the child was actually told ─────────────────────────────
             let captured = std::fs::read_to_string(&capture).expect("the stub captured a journal");
@@ -9809,10 +9987,84 @@ for line in sys.stdin:
                 cli["stdout"].as_str().unwrap_or_default(),
                 cli["stderr"].as_str().unwrap_or_default()
             );
+
+            // **The whole vector.** A prefix assertion passes against an argv
+            // that names the right command and then addresses the wrong root,
+            // notifies the wrong participant, or drops `--to` entirely — which
+            // is the defect that made the non-author `p` assertion unreachable
+            // in the first place.
             assert_eq!(
-                argv.first().map(String::as_str),
-                Some("buzz"),
-                "the child did not invoke the buzz CLI: {argv:?}"
+                argv,
+                vec![
+                    "buzz".to_string(),
+                    "issues".to_string(),
+                    "comment".to_string(),
+                    "--repo-owner".to_string(),
+                    owner_hex.clone(),
+                    "--repo-id".to_string(),
+                    "e2e-repo".to_string(),
+                    "--root".to_string(),
+                    root.id.to_hex(),
+                    "--to".to_string(),
+                    owner_hex.clone(),
+                    "--content".to_string(),
+                    "-".to_string(),
+                ],
+                "the child ran a different command than the prompt specifies"
+            );
+
+            // ── the counterprobe was armed ───────────────────────────────────
+            //
+            // Read before the submission is examined, because it is what makes
+            // the submission assertion mean anything: the child must have been
+            // holding a relay URL and a key that were not the ones it used.
+            let env_seen = journal
+                .iter()
+                .find_map(|e| e.get("env_seen"))
+                .expect("the child journalled no environment");
+            let saw = |k: &str| env_seen[k].as_str().unwrap_or_default().to_string();
+            assert!(
+                !saw("BUZZ_RELAY_URL").is_empty() && saw("BUZZ_RELAY_URL") != events_url,
+                "the isolation counterprobe was not armed — the child held no \
+                 competing BUZZ_RELAY_URL, so this scenario would pass against \
+                 a harness with no isolation at all: {env_seen:?}"
+            );
+            assert!(
+                !saw("BUZZ_PRIVATE_KEY").is_empty()
+                    && saw("BUZZ_PRIVATE_KEY") != agent.secret_key().to_secret_hex(),
+                "the counterprobe held no competing key: {env_seen:?}"
+            );
+            assert_eq!(
+                saw("BUZZ_ACP_TEST_RELAY_URL"),
+                hostile_relay,
+                "the former test-looking name must also be hostile: {env_seen:?}"
+            );
+            assert_eq!(
+                saw("BUZZ_AUTH_TAG"),
+                "hostile-delegation",
+                "the counterprobe held no competing auth tag: {env_seen:?}"
+            );
+
+            // And what the CLI was actually handed: the capture endpoint, the
+            // agent's own key, and no delegation at all.
+            let helper_env = journal
+                .iter()
+                .find_map(|e| e.get("helper_env"))
+                .expect("the child journalled no helper environment");
+            assert_eq!(
+                helper_env["BUZZ_RELAY_URL"].as_str(),
+                Some(events_url.as_str()),
+                "the CLI was pointed somewhere other than the capture endpoint: {helper_env:?}"
+            );
+            assert_eq!(
+                helper_env["BUZZ_PRIVATE_KEY"].as_str(),
+                Some(agent.secret_key().to_secret_hex().as_str()),
+                "the CLI was given a key that is not the agent's: {helper_env:?}"
+            );
+            assert!(
+                helper_env["BUZZ_AUTH_TAG"].is_null(),
+                "an ambient auth tag reached the CLI as delegation this harness \
+                 never granted: {helper_env:?}"
             );
 
             // ── the submission, as the endpoint received it ──────────────────
@@ -9831,23 +10083,48 @@ for line in sys.stdin:
                 cli["stdout"].as_str().unwrap_or_default(),
                 cli["stderr"].as_str().unwrap_or_default()
             );
-            let event = &submitted[0];
+
+            // ── the signature, before anything is read off the event ─────────
+            //
+            // The capture endpoint accepts arbitrary JSON, so up to this line
+            // nothing distinguishes a signed event from an object carrying the
+            // right field names. `verify()` checks that the id is the hash of
+            // the serialised event *and* that the signature is the claimed
+            // author's over that id — so every projection asserted below is a
+            // projection of something the agent actually signed, rather than of
+            // something that merely said so.
+            //
+            // Deserialising the exact captured body is the point. Re-encoding a
+            // parsed `Value` and verifying that would check the harness's own
+            // round-trip, not the bytes the child sent.
+            let signed: Event = serde_json::from_str(&submitted[0]).unwrap_or_else(|e| {
+                panic!(
+                    "the captured body is not a nostr event: {e}\nbody: {}",
+                    submitted[0]
+                )
+            });
+            signed
+                .verify()
+                .expect("the captured submission does not verify");
 
             assert_eq!(
-                event["kind"].as_u64(),
-                Some(1),
+                signed.kind.as_u16(),
+                1,
                 "a project comment is a kind:1 text note"
             );
             assert_eq!(
-                event["pubkey"].as_str(),
-                Some(agent_hex.as_str()),
+                signed.pubkey.to_hex(),
+                agent_hex,
                 "the comment is not signed by the woken agent"
             );
             assert_eq!(
-                event["content"].as_str(),
-                Some(reply_body),
+                signed.content, reply_body,
                 "the published body is not what the agent wrote"
             );
+
+            // Tags are read off the verified event for the same reason.
+            let event: serde_json::Value =
+                serde_json::from_str(&submitted[0]).expect("the captured body is JSON");
 
             let tags: Vec<Vec<String>> = event["tags"]
                 .as_array()

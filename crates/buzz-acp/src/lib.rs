@@ -2747,8 +2747,8 @@ async fn tokio_main() -> Result<()> {
                 maybe_result = rx_ref.recv() => {
                     if let Some(mut pr) = maybe_result {
                         let idx = pr.agent.index;
-                        pr.agent.acp.shutdown().await;
-                        tracing::debug!(agent = idx, "reaped checked-out agent on shutdown");
+                        let reap = pr.agent.acp.shutdown().await;
+                        report_reap(idx, "checked-out", reap);
                     }
                     // If None, channel closed — tasks are done.
                 }
@@ -2764,16 +2764,16 @@ async fn tokio_main() -> Result<()> {
     // before tasks were aborted.
     while let Ok(mut pr) = pool.result_rx_try_recv() {
         let idx = pr.agent.index;
-        pr.agent.acp.shutdown().await;
-        tracing::debug!(agent = idx, "reaped late-arriving agent on shutdown");
+        let reap = pr.agent.acp.shutdown().await;
+        report_reap(idx, "late-arriving", reap);
     }
     // Explicitly shut down idle agents still sitting in their slots.
     for slot in pool.agents_mut().iter_mut() {
         if let Some(agent) = slot.take() {
             let idx = agent.index;
             let mut acp = agent.acp;
-            acp.shutdown().await;
-            tracing::debug!(agent = idx, "reaped idle agent on shutdown");
+            let reap = acp.shutdown().await;
+            report_reap(idx, "idle", reap);
         }
     }
     drop(pool);
@@ -2788,8 +2788,8 @@ async fn tokio_main() -> Result<()> {
     // shut down returned agents instead of relying on AcpClient::Drop.
     while let Ok(rr) = respawn_rx.try_recv() {
         if let Ok((mut acp, _, _)) = rr.result {
-            acp.shutdown().await;
-            tracing::debug!(agent = rr.index, "reaped respawned agent on shutdown");
+            let reap = acp.shutdown().await;
+            report_reap(rr.index, "respawned", reap);
         }
     }
 
@@ -5088,7 +5088,8 @@ fn spawn_respawn_task(
     respawn_tasks.spawn(async move {
         // Shutdown old agent (reap child, prevent zombie).
         let mut agent = old_agent;
-        agent.acp.shutdown().await;
+        let reap = agent.acp.shutdown().await;
+        report_reap(index, "respawn-predecessor", reap);
         drop(agent);
 
         if !delay.is_zero() {
@@ -5113,10 +5114,37 @@ fn normalized_agent_name(init_result: &serde_json::Value) -> String {
         .to_ascii_lowercase()
 }
 
+/// Report what a shutdown actually did to a child process.
+///
+/// Every one of these call sites previously logged "reaped … agent on
+/// shutdown" unconditionally, on the strength of `shutdown` having returned.
+/// That is precisely the claim [`acp::ChildReap`] exists to stop anyone making
+/// for free: a five-second timeout with the child still running produced the
+/// same reassuring line as a clean exit.
+fn report_reap(index: usize, stage: &'static str, reap: acp::ChildReap) {
+    match reap {
+        acp::ChildReap::Reaped(status) => {
+            tracing::debug!(agent = index, stage, ?status, "agent reaped on shutdown");
+        }
+        acp::ChildReap::WaitError(e) => {
+            tracing::warn!(agent = index, stage, "agent wait failed on shutdown: {e}");
+        }
+        acp::ChildReap::TimedOut => {
+            tracing::warn!(
+                agent = index,
+                stage,
+                "agent did not exit within the shutdown grace period — it may still be running"
+            );
+        }
+    }
+}
+
 async fn shutdown_agent_slots(slots: &mut [Option<OwnedAgent>]) {
     for slot in slots {
         if let Some(mut agent) = slot.take() {
-            agent.acp.shutdown().await;
+            let idx = agent.index;
+            let reap = agent.acp.shutdown().await;
+            report_reap(idx, "slot", reap);
         }
     }
 }
@@ -5124,11 +5152,15 @@ async fn shutdown_agent_slots(slots: &mut [Option<OwnedAgent>]) {
 async fn shutdown_agent_pool(pool: &mut AgentPool) {
     pool.join_set.shutdown().await;
     while let Ok(mut result) = pool.result_rx_try_recv() {
-        result.agent.acp.shutdown().await;
+        let idx = result.agent.index;
+        let reap = result.agent.acp.shutdown().await;
+        report_reap(idx, "pool-result", reap);
     }
     for slot in pool.agents_mut() {
         if let Some(mut agent) = slot.take() {
-            agent.acp.shutdown().await;
+            let idx = agent.index;
+            let reap = agent.acp.shutdown().await;
+            report_reap(idx, "pool-slot", reap);
         }
     }
 }
