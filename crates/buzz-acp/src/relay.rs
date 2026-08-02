@@ -6664,6 +6664,38 @@ mod tests {
             .collect()
     }
 
+    /// Every root id a project REQ frame asks about, deduplicated and sorted.
+    ///
+    /// Reads the `#e` and `#E` branches out of the frame's own filters rather
+    /// than substring-matching the serialised frame. `contains(root)` is
+    /// satisfied by a frame that carries the root *and* by one that carries it
+    /// alongside anything else, or that dropped a sibling root — so it cannot
+    /// express "the complete intended set", which is what the watched successor
+    /// has to carry to keep covering the roots already enrolled.
+    fn req_root_set(frame: &serde_json::Value) -> Vec<String> {
+        let mut roots: Vec<String> = frame
+            .as_array()
+            .map(|f| &f[2..])
+            .unwrap_or_default()
+            .iter()
+            .flat_map(|filter| {
+                ["#e", "#E"].into_iter().flat_map(move |tag| {
+                    filter[tag]
+                        .as_array()
+                        .map(|v| {
+                            v.iter()
+                                .filter_map(|r| r.as_str().map(str::to_string))
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default()
+                })
+            })
+            .collect();
+        roots.sort();
+        roots.dedup();
+        roots
+    }
+
     /// Subscription ids named by `CLOSE` frames, in wire order.
     fn close_ids(frames: &[serde_json::Value]) -> Vec<String> {
         frames
@@ -9560,9 +9592,19 @@ mod tests {
                 crate::project::watched_sub_id(1),
                 "successor first"
             );
-            assert!(
-                seen[0].to_string().contains(&second.id.to_hex()),
-                "the successor must carry the newly enrolled root"
+            //
+            // **The complete set, not merely the new one.** A successor that
+            // carried only the newly enrolled root would pass a `contains`
+            // check while silently dropping the watch on everything enrolled
+            // before it — the agent would stop hearing about the first root
+            // and nothing on the wire would say so.
+            let mut expected_roots = vec![root.id.to_hex(), second.id.to_hex()];
+            expected_roots.sort();
+            assert_eq!(
+                req_root_set(&seen[0]),
+                expected_roots,
+                "the successor must watch every enrolled root, not just the \
+                 newest: {seen:?}"
             );
             assert_eq!(seen[1][0], "CLOSE", "the predecessor is closed second");
             assert_eq!(seen[1][1], crate::project::watched_sub_id(0));
@@ -9621,15 +9663,53 @@ mod tests {
                 !replayed_ids.contains(&crate::project::watched_sub_id(0)),
                 "a retired watched generation was replayed: {replayed_ids:?}"
             );
-            assert!(
-                replayed.iter().any(|f| f[1]
-                    == serde_json::json!(crate::project::watched_sub_id(1))
-                    && f.to_string().contains(&second.id.to_hex())),
-                "the replayed watch must carry the roots the scenario enrolled: {replayed:?}"
+            let replayed_watch = replayed
+                .iter()
+                .find(|f| f[1] == serde_json::json!(crate::project::watched_sub_id(1)))
+                .expect("the current watched generation is replayed");
+            assert_eq!(
+                req_root_set(replayed_watch),
+                expected_roots,
+                "the replayed watch must carry every root the scenario \
+                 enrolled: {replayed_watch:?}"
             );
 
-            // ── the batch the pool claims is the batch the queue produced ────
+            // ── a comment on the watched root, over the live connection ──────
+            //
+            // Discovery and root events both arrive above; the third inbound
+            // class does not, and the watched generation's own admission path
+            // was therefore never crossed by real bytes in this scenario. A
+            // comment is what the watch exists to receive — the enrolment REQ
+            // never matches one, so nothing else here proves a `#e` reference
+            // to an enrolled root is admitted on the generation that asked
+            // for it.
+            //
+            // Delivered on the replacement connection, after the batch below is
+            // taken, so it queues a turn of its own rather than merging into
+            // the one the prompt assertions read.
             let batch = queue.flush_next().expect("the queued turn flushes");
+
+            let comment = EventBuilder::new(
+                nostr::Kind::Custom(buzz_core::kind::KIND_TEXT_NOTE as u16),
+                "any progress on this?",
+            )
+            .tags([
+                nostr::Tag::parse(["a", &coordinate]).expect("a tag"),
+                nostr::Tag::parse(["e", &root.id.to_hex()]).expect("e tag"),
+            ])
+            .sign_with_keys(&owner)
+            .expect("sign");
+            deliver!(&crate::project::watched_sub_id(1), &comment);
+            match drive_all!() {
+                crate::ProjectDispatched::Queued { key, queued, .. } => {
+                    assert!(queued, "the comment must enter the queue");
+                    assert_eq!(
+                        key, route_key,
+                        "a comment routes to the root's session, not one of its own"
+                    );
+                }
+                other => panic!("the watched generation did not admit the comment: {other:?}"),
+            }
             assert_eq!(batch.channel_id, route_key, "flushed under the root key");
             assert!(
                 batch.project_origin().is_some(),
@@ -9893,11 +9973,13 @@ for line in sys.stdin:
                 .try_claim(None)
                 .expect("the agent slot is returned cleanly and claimable again");
 
-            // Guaranteed reaping. `Drop` only best-efforts a SIGKILL and a
-            // non-blocking `try_wait` (`acp.rs:2168`); `shutdown` kills the
-            // process group and waits, which is what the API documents as the
-            // path a caller "SHOULD" take. Leaving the child to `Drop` would
-            // leave the test's own cleanup weaker than production's.
+            // Observed reaping. `Drop` only best-efforts a SIGKILL and a
+            // non-blocking `try_wait`; `shutdown` kills the process group,
+            // waits, and reports which of the three outcomes occurred. Leaving
+            // the child to `Drop` would leave the test's own cleanup weaker
+            // than production's *and* unobservable — the reason the return
+            // type exists is that "it returned" was never the same claim as
+            // "the child is gone".
             //
             // The enclosing 60s timeout is what makes this an assertion: a
             // child that never exits wedges here and fails the scenario rather

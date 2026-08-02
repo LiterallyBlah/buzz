@@ -436,8 +436,10 @@ impl AcpClient {
     /// Kill the agent subprocess and wait for it to exit (no zombies).
     ///
     /// `Drop` only calls `start_kill()` (sends SIGKILL but doesn't reap).
-    /// Call this when you need guaranteed cleanup — e.g., in `run_models`
-    /// before process exit.
+    /// Call this when the child's disposition has to be known — e.g., in
+    /// `run_models` before process exit. It is stronger than `Drop`, not a
+    /// guarantee: a child that ignores SIGKILL for five seconds is abandoned
+    /// and reported as [`ChildReap::TimedOut`].
     ///
     /// Returns what actually happened; see [`ChildReap`]. A `TimedOut` result
     /// means the child may still be running.
@@ -494,7 +496,8 @@ impl AcpClient {
             // Inherit stderr so agent logs are visible in the harness terminal.
             .stderr(Stdio::inherit())
             // Ensure the child is killed when the AcpClient is dropped (best-effort).
-            // Callers MUST still call shutdown().await for guaranteed cleanup.
+            // Callers MUST still call shutdown().await and read its ChildReap:
+            // Drop cannot report, and shutdown does not guarantee.
             .kill_on_drop(true);
 
         // Per-persona env vars (e.g., GOOSE_PROVIDER, BUZZ_AGENT_PROVIDER).
@@ -2200,7 +2203,8 @@ impl Drop for AcpClient {
     fn drop(&mut self) {
         // Best-effort SIGKILL + reap. We cannot `await` in Drop (sync context).
         // Kill the process group when possible so subprocesses don't leak.
-        // Callers SHOULD still call `shutdown().await` for guaranteed reaping.
+        // Callers SHOULD still call `shutdown().await`, which waits and
+        // reports what happened. Neither path guarantees the child is gone.
         match self.child.id() {
             Some(pid) if kill_process_group(pid) => {}
             _ => {
