@@ -11698,6 +11698,62 @@ mod tests {
         );
     }
 
+    /// A root that gave up is never taken as a completed history, even with
+    /// every stream it required already exhausted.
+    ///
+    /// `all_streams_finished` is deliberately narrower than "all streams
+    /// retained", and the difference is invisible along the path production
+    /// takes today: `complete` returns `None` for an abandoned reconstruction,
+    /// so the `Finished` advance that drives `take_completed` cannot be minted
+    /// after a root has given up. That makes the check unfalsifiable by the
+    /// wire — and an unfalsifiable guard on a state that decides whether a
+    /// conversation's history is trusted is exactly the kind that quietly stops
+    /// holding.
+    ///
+    /// So it is pinned here directly. Exhaustion first, abandonment second: the
+    /// order that leaves a reconstruction holding a complete-looking set of
+    /// retained streams and no right to claim them.
+    #[tokio::test]
+    async fn an_abandoned_root_is_never_taken_as_a_completed_history() {
+        let (issue, _) = bound_root(KIND_GIT_ISSUE).await;
+        let mut recon = RootReconstruction::begin(&issue, 1_000, 4, 1_000);
+        let root = recon.root().to_string();
+        let mut h = PageHarness::new();
+
+        // The one stream an issue requires, driven to proven exhaustion.
+        let page = open_for(&mut h, &mut recon, HistoryStream::Comments).await;
+        let sub_id = page.sub_id().to_string();
+        recon.attach(page).map_err(|r| r.error).expect("attaches");
+        let witness = h.witness(&sub_id);
+        match recon.complete(&witness) {
+            Some(StreamAdvance::Finished { .. }) => {}
+            other => panic!("the page completes on its own boundary: {other:?}"),
+        }
+        assert!(
+            recon.all_streams_finished(),
+            "precondition: every stream this root requires has reached exhaustion"
+        );
+
+        // And then it gives up anyway.
+        recon.abandon("the history could not be proven");
+        assert!(
+            !recon.all_streams_finished(),
+            "a root that gave up has proven nothing, whatever its streams hold"
+        );
+
+        let mut router = ProjectReconstructions::new();
+        assert!(router.insert(recon));
+        assert!(
+            router.take_completed(&root).is_none(),
+            "so nothing may take those rows as this root's history"
+        );
+        assert_eq!(
+            router.abandoned().len(),
+            1,
+            "and it stays visible as degraded rather than being consumed by the taking"
+        );
+    }
+
     /// The router hands each root only the frames its own requests admitted.
     #[tokio::test]
     async fn the_router_gives_each_root_only_its_own_frames() {
