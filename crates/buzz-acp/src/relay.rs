@@ -1198,14 +1198,6 @@ struct BgState {
     /// Used as the floor `since` for membership notification replay so events
     /// predating this session are never re-delivered.
     startup_watermark: Option<u64>,
-    /// Has the **current** enrolment request delivered its stored backlog?
-    ///
-    /// False until that request's own EOSE is witnessed, and reset to false
-    /// whenever a replacement enrolment request is opened — a boundary minted
-    /// for the request this one replaced says nothing about this one's backlog.
-    /// Nothing else sets it: a timeout, `NOTICE`, `CLOSED`, reconnect or an
-    /// EOSE for an id we never opened never reaches the arm that does.
-    enrolment_backlog_drained: bool,
     /// Replay floor captured when each channel was first subscribed.
     /// Used as the `since` fallback on reconnect for channels that have no
     /// `last_seen` or `channel_dropped_since`. This prevents channels joined
@@ -1337,7 +1329,6 @@ impl BgState {
             channel_dropped_since: HashMap::new(),
             proactive_resubscribe_needed: false,
             startup_watermark: None,
-            enrolment_backlog_drained: false,
             subscribe_since: HashMap::new(),
             rate_limit_gate: None,
             rate_limited_pending: HashMap::new(),
@@ -1837,12 +1828,6 @@ async fn execute_connected_command(
             // stale one.
             let outcome = match replacement {
                 crate::project::ProjectReplacement::Enrolment => {
-                    // A new request has a new backlog. The boundary minted for
-                    // the request this replaces certifies nothing about it, so
-                    // it is withdrawn here rather than left standing — a stale
-                    // boundary would let a newly reachable coordinate's history
-                    // arrive stamped live and be answered.
-                    state.enrolment_backlog_drained = false;
                     state.project_requests.replace_enrolment(ws, filters).await
                 }
                 crate::project::ProjectReplacement::Watched => {
@@ -3151,23 +3136,41 @@ async fn handle_ws_message(
                         // still be sitting in that queue when the boundary
                         // arrives, and a flag read later would call it live.
                         //
-                        // Two conditions, and the second is the one that keeps
-                        // replay safety from becoming "quietly miss concurrent
-                        // work": a frame is history only if the enrolment
-                        // backlog has not yet drained *and* the event predates
-                        // this process. A root published while the enrolment
-                        // REQ is being replaced is newer than startup, so it is
-                        // live and gets answered, exactly once — the shared
+                        // **A property of the event, not of the subscription.**
+                        //
+                        // This used to also require that the enrolment backlog
+                        // had not drained, and that condition was a defect: the
+                        // enrolment id is fixed, so a *predecessor's* EOSE
+                        // arriving after its successor was registered certified
+                        // a backlog it knew nothing about. The successor's
+                        // remaining stored frames were then stamped live and
+                        // four historical roots were answered on a real relay.
+                        //
+                        // An event created before this process started is
+                        // history, whatever carried it and whenever it arrives.
+                        // That cannot be corrupted by a stale boundary, because
+                        // it does not consult one. A root published during an
+                        // enrolment replacement is newer than startup, so it
+                        // stays live and is answered exactly once — the shared
                         // dedup slot stops the watched REQ answering it again.
+                        //
+                        // The honest limit: `created_at` is the author's clock.
+                        // The relay bounds drift at ±15 minutes on ingest, so an
+                        // event can look up to that far "before" startup while
+                        // being live. It would enrol silently and be answered by
+                        // its next comment rather than immediately. That is the
+                        // conservative direction, and it is the reason the EOSE
+                        // boundary is still worth binding to a generation-
+                        // distinct identity as a second signal — which this
+                        // commit does not yet do.
                         let source = {
                             let class = admission.subscription().clone();
-                            let is_backlog =
+                            let is_history =
                                 matches!(class, crate::project::ProjectSubscription::Enrolment)
-                                    && !state.enrolment_backlog_drained
                                     && state
                                         .startup_watermark
                                         .is_some_and(|w| event.created_at.as_secs() < w);
-                            if is_backlog {
+                            if is_history {
                                 crate::project::ProjectSubscription::EnrolmentReplay
                             } else {
                                 class
@@ -3453,19 +3456,6 @@ async fn handle_ws_message(
                         .witness_end_of_stored_events(&subscription_id)
                     {
                         debug!(sub_id = %subscription_id, "project EOSE");
-
-                        // The replay boundary, and the only thing that mints
-                        // one. `witness_end_of_stored_events` returned `Some`
-                        // only because we hold a live registration under this
-                        // exact id, so a stale or unknown id cannot certify
-                        // that our backlog has drained.
-                        if matches!(
-                            witness.subscription(),
-                            crate::project::ProjectSubscription::Enrolment
-                        ) {
-                            state.enrolment_backlog_drained = true;
-                            debug!("enrolment backlog drained — later frames are live");
-                        }
 
                         // `None` is the ordinary case for discovery, enrolment
                         // and watched requests: they keep delivering after their
@@ -7090,6 +7080,118 @@ mod tests {
 
     /// Install the enrolment subscription over `coordinates`, through the
     /// registry's own replacement, and return its fixed id.
+    /// The stamp a frame receives on the enrolment subscription.
+    ///
+    /// The line these cover is the one that published four historical replies
+    /// on a real relay: it used to require that the enrolment backlog had not
+    /// drained, and the enrolment id is fixed, so a *predecessor's* EOSE
+    /// certified a successor's backlog it knew nothing about. Replay is now a
+    /// property of the event — created before this process, therefore history —
+    /// which no boundary, stale or otherwise, can corrupt.
+    #[tokio::test]
+    async fn an_enrolment_frame_older_than_startup_is_stamped_replay() {
+        let owner = nostr::Keys::generate();
+        let coord = format!("30617:{}:demo", owner.public_key().to_hex());
+        let mut state = BgState::new();
+        state.startup_watermark = Some(1_000);
+        let enrol_id = open_enrolment_for(&mut state, std::slice::from_ref(&coord)).await;
+
+        let historical = project_root_frame(&owner, &coord, 900);
+        let (tx, mut rx) = mpsc::channel(16);
+        deliver_frame(&mut state, &enrol_id, &historical, &tx).await;
+
+        match drain(&mut rx).into_iter().next() {
+            Some(BuzzEvent::Project(crate::project::ProjectEvent::Routed { source, .. })) => {
+                assert_eq!(
+                    source,
+                    crate::project::ProjectSubscription::EnrolmentReplay,
+                    "a root predating startup is history and must not wake anyone"
+                );
+            }
+            other => panic!("expected a project delivery, got {other:?}"),
+        }
+    }
+
+    /// A root published after startup stays live, even while the enrolment
+    /// backlog is still draining.
+    ///
+    /// This is the half that keeps replay safety from becoming "quietly miss
+    /// concurrent work": a root created during an enrolment replacement is
+    /// news, and must be answered exactly once.
+    #[tokio::test]
+    async fn an_enrolment_frame_newer_than_startup_stays_live() {
+        let owner = nostr::Keys::generate();
+        let coord = format!("30617:{}:demo", owner.public_key().to_hex());
+        let mut state = BgState::new();
+        state.startup_watermark = Some(1_000);
+        let enrol_id = open_enrolment_for(&mut state, std::slice::from_ref(&coord)).await;
+
+        let fresh = project_root_frame(&owner, &coord, 1_500);
+        let (tx, mut rx) = mpsc::channel(16);
+        deliver_frame(&mut state, &enrol_id, &fresh, &tx).await;
+
+        match drain(&mut rx).into_iter().next() {
+            Some(BuzzEvent::Project(crate::project::ProjectEvent::Routed { source, .. })) => {
+                assert_eq!(
+                    source,
+                    crate::project::ProjectSubscription::Enrolment,
+                    "a root published after startup is live work"
+                );
+            }
+            other => panic!("expected a project delivery, got {other:?}"),
+        }
+    }
+
+    /// An EOSE cannot change how a later historical frame is stamped.
+    ///
+    /// The reported failure in one test: predecessor boundary, successor
+    /// frames, historical roots answered. The boundary no longer participates
+    /// in this decision, so delivering one — under the enrolment id, at any
+    /// point — leaves the stamp exactly where it was.
+    #[tokio::test]
+    async fn a_boundary_cannot_make_a_historical_frame_live() {
+        let owner = nostr::Keys::generate();
+        let coord = format!("30617:{}:demo", owner.public_key().to_hex());
+        let mut state = BgState::new();
+        state.startup_watermark = Some(1_000);
+        let enrol_id = open_enrolment_for(&mut state, std::slice::from_ref(&coord)).await;
+
+        let (tx, mut rx) = mpsc::channel(16);
+        deliver_control_frame_to(&mut state, json!(["EOSE", enrol_id.clone()]), &tx).await;
+
+        let historical = project_root_frame(&owner, &coord, 900);
+        deliver_frame(&mut state, &enrol_id, &historical, &tx).await;
+
+        match drain(&mut rx)
+            .into_iter()
+            .find(|e| matches!(e, BuzzEvent::Project(_)))
+        {
+            Some(BuzzEvent::Project(crate::project::ProjectEvent::Routed { source, .. })) => {
+                assert_eq!(
+                    source,
+                    crate::project::ProjectSubscription::EnrolmentReplay,
+                    "a boundary must not be able to promote history to live work"
+                );
+            }
+            other => panic!("expected a project delivery, got {other:?}"),
+        }
+    }
+
+    /// A signed, addressed project root at a chosen timestamp.
+    fn project_root_frame(owner: &nostr::Keys, coord: &str, created_at: u64) -> Event {
+        nostr::EventBuilder::new(
+            nostr::Kind::Custom(buzz_core::kind::KIND_GIT_ISSUE as u16),
+            "please look",
+        )
+        .tags([
+            nostr::Tag::parse(["a", coord]).unwrap(),
+            nostr::Tag::parse(["p", &test_agent_hex()]).unwrap(),
+        ])
+        .custom_created_at(nostr::Timestamp::from(created_at))
+        .sign_with_keys(owner)
+        .expect("sign")
+    }
+
     async fn open_enrolment_for(state: &mut BgState, coordinates: &[String]) -> String {
         let discovered = crate::project::DiscoveredRepositories::for_test(coordinates.to_vec());
         let filter = crate::project::enrolment_filter(&discovered, &test_agent_hex(), 0)
