@@ -1360,6 +1360,12 @@ struct BgState {
     /// an event that happened to it — and the plan requires it be visible
     /// rather than inferred from a silence.
     enrolment_history_degraded: Option<String>,
+    /// Roots the walk discovered and has not yet proven it handed on.
+    ///
+    /// `Some` is the state "reconstruction is not finished yet", and it is the
+    /// reason the completion line has one producer rather than being a summary
+    /// the caller assembles. See [`PendingRestorations`].
+    enrolment_restore: Option<PendingRestorations>,
     /// Current position in the exponential backoff ladder.
     ///
     /// Persisted across calls to `wait_for_reconnect` so a flapping link stays at
@@ -1399,6 +1405,7 @@ impl BgState {
             reconstructions: crate::project::ProjectReconstructions::new(),
             enrolment_history: None,
             enrolment_history_degraded: None,
+            enrolment_restore: None,
             backoff_step: 0,
         }
     }
@@ -2184,7 +2191,21 @@ async fn run_background_task(
     // resets this to `None`, allowing the pre-select drain to run again.
     let mut drain_pacing_next: Option<tokio::time::Instant> = None;
 
+    // Retry timer for reconstructed roots the run loop was too busy to take.
+    // Armed from the state rather than from the delivery site: whichever
+    // attempt leaves roots retained leaves `enrolment_restore` set, and this
+    // loop owns when the next attempt happens.
+    let mut restore_retry_next: Option<tokio::time::Instant> = None;
+
     loop {
+        restore_retry_next = match (state.enrolment_restore.is_some(), restore_retry_next) {
+            (true, Some(t)) => Some(t),
+            (true, None) => Some(tokio::time::Instant::now() + ENROLMENT_RESTORE_RETRY_INTERVAL),
+            // Nothing retained: disarm, so a later retention starts a fresh
+            // interval instead of firing against a deadline already past.
+            (false, _) => None,
+        };
+
         if state.proactive_resubscribe_needed {
             state.proactive_resubscribe_needed = false;
             info!("proactive resubscribe triggered by backpressure event loss");
@@ -2587,6 +2608,19 @@ async fn run_background_task(
                        }
                    } => {
                        drain_pacing_next = None;
+                   }
+
+                   // Retained reconstructed roots. `pending()` while nothing is
+                   // retained, so this arm never fires spuriously and never
+                   // blocks the others.
+                   _ = async {
+                       match restore_retry_next {
+                           Some(t) => tokio::time::sleep_until(t).await,
+                           None => std::future::pending::<()>().await,
+                       }
+                   } => {
+                       restore_retry_next = None;
+                       drive_pending_restorations(&mut state, &event_tx);
                    }
                }
 
@@ -3603,20 +3637,15 @@ async fn handle_ws_message(
                                 drive_enrolment_history(ws, state).await;
                             }
                             Some(crate::project::EnrolmentAdvance::Finished { roots }) => {
-                                let found = roots.len();
-                                let restored =
-                                    deliver_reconstructed_roots(state, event_tx, generation, roots)
-                                        .await;
-                                // Discovered, restored and dropped, as the plan
-                                // requires — at `info`, because "reconstruction
-                                // finished and here is what it covered" is the
-                                // one line an operator needs to trust the run.
-                                info!(
-                                    discovered = found,
-                                    restored,
-                                    dropped = found - restored,
-                                    "enrolment history reconstruction complete"
-                                );
+                                // An exhausted walk is not a finished one. The
+                                // roots still have to reach the run loop, and
+                                // the completion line belongs to whichever
+                                // attempt empties the queue — here, or a later
+                                // retry, or never, in which case the walk
+                                // degrades. Nothing is reported from this site.
+                                let outcome =
+                                    begin_restoring_roots(state, event_tx, generation, roots);
+                                debug!(?outcome, "enrolment history walk exhausted");
                             }
                             Some(crate::project::EnrolmentAdvance::Stale) => {
                                 debug!(
@@ -5691,72 +5720,233 @@ const ENROLMENT_HISTORY_PAGE_LIMIT: usize = 64;
 /// which is a degraded walk, not a complete one.
 const RELAY_MAX_LIMIT: usize = 5_000;
 
-/// Hand every reconstructed root to the run loop, as replay.
+/// Roots the walk discovered and has not yet proven it handed to the run loop.
 ///
-/// Returns how many actually reached it. The difference from the input length
-/// is the dropped count, and it is reported rather than smoothed over: a root
-/// lost to backpressure here is a conversation this agent holds no authority
-/// for, and saying "complete" over it would be the same false claim the thirty-
-/// day window used to make.
+/// **Why a queue and not a count.** The relay task may only ever `try_send`:
+/// a blocking send would stall the reader that the run loop's own commands
+/// come back through, which is a deadlock rather than a delay. So a refused
+/// send is routine — and it is a fact about how full the queue was for one
+/// instant, not a fact about how much history exists. The version before this
+/// one let that instant end the walk: it dropped the root, logged
+/// `reconstruction complete` with `dropped = 1`, and left the agent holding
+/// authority over a strict subset of the conversations it had just proven it
+/// was addressed on. The proactive resubscribe it queued could not repair
+/// that either — the walk asks for no further page, an identical scope does
+/// not restart it, and the live tail reaches back only as far as the relay's
+/// accepted skew.
 ///
-/// Every row goes out under [`ProjectSubscription::EnrolmentHistory`], which
-/// `processing_mode_for` maps to `ProcessingMode::Replay` — so these restore
-/// authority and lifecycle and **never create a turn**. Nothing here decides
-/// that; the class the page was registered under does.
+/// So an undeliverable root is *retained*, and the walk stays unfinished
+/// until every root it found is either restored or the retention bound is
+/// spent — at which point the reconstruction is degraded, visibly. Those are
+/// the only three exits, which is what makes the completion line honest.
+struct PendingRestorations {
+    /// The class every retained root goes out under.
+    ///
+    /// Fixed when the walk finished: the generation names the page that proved
+    /// exhaustion, and a retry is the same delivery arriving late, not a new
+    /// one from somewhere else.
+    generation: u64,
+    /// How many roots the walk found. The denominator of every claim made
+    /// about this reconstruction.
+    discovered: usize,
+    /// How many have reached the run loop, across every attempt.
+    restored: usize,
+    /// Still owed, in discovery order.
+    queue: VecDeque<crate::project::VerifiedProjectEvent>,
+    /// Consecutive attempts that may deliver nothing before the reconstruction
+    /// is declared degraded.
+    ///
+    /// Reset by any delivery, so what this bounds is a *stalled* run loop
+    /// rather than a merely slow one: a run loop that keeps draining keeps
+    /// earning attempts, and one that has stopped draining altogether reaches
+    /// the fail-closed state in [`ENROLMENT_RESTORE_STALL_LIMIT`] ticks.
+    stalls_left: u32,
+}
+
+/// What one pass over [`PendingRestorations`] settled.
 ///
-/// They spend the shared `project_seen_ids` slot, so a root that the live tail
-/// has already delivered is not restored a second time — and, in the other
-/// order, a root restored here cannot be re-answered by a later live delivery
-/// of the same event.
-async fn deliver_reconstructed_roots(
+/// **The single producer of "complete".** `Complete` is returned from exactly
+/// one place — the branch where the queue is empty — so there is no path on
+/// which a partial restore can be reported as a whole one. A caller cannot
+/// assemble this verdict from counts it holds itself, which is precisely how
+/// the previous version came to log completion over a dropped root.
+#[derive(Debug, PartialEq, Eq)]
+enum RestoreOutcome {
+    /// Nothing was pending.
+    Idle,
+    /// Every discovered root reached the run loop.
+    Complete,
+    /// Some roots are retained for a later attempt. Carries how many.
+    Retained(usize),
+    /// The walk cannot restore what it found. Fail-closed and visible.
+    Degraded,
+}
+
+/// How long between attempts to hand retained roots on.
+const ENROLMENT_RESTORE_RETRY_INTERVAL: Duration = Duration::from_millis(250);
+
+/// Consecutive fruitless attempts before a retained set degrades the walk.
+///
+/// At [`ENROLMENT_RESTORE_RETRY_INTERVAL`] that is ten seconds of a run loop
+/// that has drained nothing at all. Long enough that an ordinary burst of
+/// turns is absorbed; short enough that an operator learns the agent cannot
+/// prove its authority while it still matters.
+const ENROLMENT_RESTORE_STALL_LIMIT: u32 = 40;
+
+/// Take ownership of the roots a finished walk found, and try to hand them on.
+///
+/// Separate from [`drive_pending_restorations`] only so the retry path and the
+/// first attempt are the same code. Nothing here reports completion.
+fn begin_restoring_roots(
     state: &mut BgState,
     event_tx: &mpsc::Sender<Option<BuzzEvent>>,
     generation: u64,
     roots: Vec<crate::project::VerifiedProjectEvent>,
-) -> usize {
-    let mut restored = 0usize;
-    for verified in roots {
+) -> RestoreOutcome {
+    if let Some(superseded) = state.enrolment_restore.take() {
+        // A restarted walk covers everything the previous one did — it asks
+        // again from the current snapshot boundary — so its own roots subsume
+        // these, and delivery is idempotent through `project_seen_ids` either
+        // way.
+        debug!(
+            retained = superseded.queue.len(),
+            "a fresh reconstruction supersedes an earlier one's retained roots"
+        );
+    }
+    state.enrolment_restore = Some(PendingRestorations {
+        generation,
+        discovered: roots.len(),
+        restored: 0,
+        queue: roots.into(),
+        stalls_left: ENROLMENT_RESTORE_STALL_LIMIT,
+    });
+    drive_pending_restorations(state, event_tx)
+}
+
+/// Hand as many retained roots to the run loop as it will take right now.
+///
+/// Every row goes out under [`crate::project::ProjectSubscription::EnrolmentHistory`],
+/// whose class folds every effect through `ProcessingMode::Replay` — so these
+/// restore authority and lifecycle and **never create a turn**. Nothing here
+/// decides that; the class the page was registered under does.
+///
+/// They spend the shared `project_seen_ids` slot, so a root the live tail has
+/// already delivered is not restored a second time — and, in the other order, a
+/// root restored here cannot be re-answered by a later live delivery of the
+/// same event. A root already holding a slot is counted restored: its authority
+/// is held, which is the whole point of restoring it.
+fn drive_pending_restorations(
+    state: &mut BgState,
+    event_tx: &mpsc::Sender<Option<BuzzEvent>>,
+) -> RestoreOutcome {
+    let Some(mut pending) = state.enrolment_restore.take() else {
+        return RestoreOutcome::Idle;
+    };
+
+    let mut delivered = 0usize;
+    // A refusal the retry cannot repair. Held rather than acted on inside the
+    // loop so that the roots already handed on are still counted.
+    let mut unrestorable: Option<String> = None;
+
+    while let Some(verified) = pending.queue.front().cloned() {
+        let event_id_hex = verified.id();
         let Some(route) = crate::project::ProjectRoute::derive(&verified) else {
             // The page's own scope already refused rows that resolve to no
-            // root, so this is unreachable rather than routine. Counted as
-            // dropped either way: it is a root the agent did not restore.
-            warn!(
-                event_id = %verified.id(),
-                "reconstructed root resolves to no route — not restored"
-            );
-            continue;
+            // root, so this is unreachable rather than routine. If it happens
+            // anyway, no number of retries changes it: it is a root this agent
+            // cannot restore, and the walk must say so rather than wait.
+            unrestorable = Some(format!(
+                "reconstructed root {event_id_hex} resolves to no project route"
+            ));
+            break;
         };
-        let event_id_hex = verified.id();
-        let ts = verified.event().created_at.as_secs();
         if !state.project_seen_ids.insert(event_id_hex.clone()) {
-            // Already delivered live. Its authority is already held, so this is
-            // a restored root by every measure that matters.
-            restored += 1;
+            pending.queue.pop_front();
+            pending.restored += 1;
+            delivered += 1;
             continue;
         }
         let project_event = crate::project::ProjectEvent::Routed {
-            source: crate::project::ProjectSubscription::EnrolmentHistory { generation },
+            source: crate::project::ProjectSubscription::EnrolmentHistory {
+                generation: pending.generation,
+            },
             route,
             event: verified,
             // Restored history, by the only path that produces it.
             mode: crate::project::ProcessingMode::Replay,
         };
         match event_tx.try_send(Some(BuzzEvent::Project(project_event))) {
-            Ok(()) => restored += 1,
-            Err(mpsc::error::TrySendError::Full(_)) => {
-                state.project_seen_ids.remove(&event_id_hex);
-                state.project_dropped_since =
-                    Some(state.project_dropped_since.map_or(ts, |d| d.min(ts)));
-                state.proactive_resubscribe_needed = true;
-                warn!(
-                    event_id = %event_id_hex,
-                    "reconstructed root dropped (backpressure) — proactive resubscribe queued"
-                );
+            Ok(()) => {
+                pending.queue.pop_front();
+                pending.restored += 1;
+                delivered += 1;
             }
-            Err(mpsc::error::TrySendError::Closed(_)) => break,
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                // The slot is released so that a live delivery of the same
+                // root in the meantime is not suppressed by a claim standing
+                // for an event that never arrived. The root stays at the front
+                // of the queue; the retry re-claims it, or finds it already
+                // held and counts it restored.
+                state.project_seen_ids.remove(&event_id_hex);
+                break;
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                state.project_seen_ids.remove(&event_id_hex);
+                unrestorable =
+                    Some("the run loop is gone — no reconstructed root can reach it".to_string());
+                break;
+            }
         }
     }
-    restored
+
+    let retained = pending.queue.len();
+    let discovered = pending.discovered;
+    let restored = pending.restored;
+
+    if let Some(reason) = unrestorable {
+        degrade_enrolment_history(
+            state,
+            format!("{reason}; {restored} of {discovered} roots restored, {retained} retained"),
+        );
+        return RestoreOutcome::Degraded;
+    }
+
+    if retained == 0 {
+        // The one place this line is produced, and it is reachable only with
+        // an empty queue — so `dropped` is zero by construction rather than by
+        // an arithmetic that could disagree with it.
+        info!(
+            discovered,
+            restored,
+            dropped = 0,
+            "enrolment history reconstruction complete"
+        );
+        return RestoreOutcome::Complete;
+    }
+
+    if delivered > 0 {
+        pending.stalls_left = ENROLMENT_RESTORE_STALL_LIMIT;
+    } else {
+        pending.stalls_left = pending.stalls_left.saturating_sub(1);
+    }
+
+    if pending.stalls_left == 0 {
+        degrade_enrolment_history(
+            state,
+            format!(
+                "{retained} of {discovered} reconstructed roots could not be handed to the \
+                 run loop within {ENROLMENT_RESTORE_STALL_LIMIT} attempts"
+            ),
+        );
+        return RestoreOutcome::Degraded;
+    }
+
+    debug!(
+        discovered,
+        restored, retained, "reconstructed roots retained for retry — reconstruction unfinished"
+    );
+    state.enrolment_restore = Some(pending);
+    RestoreOutcome::Retained(retained)
 }
 
 /// Enter the fail-closed degraded state, once.
@@ -7705,10 +7895,20 @@ mod tests {
 
     impl WalkHarness {
         async fn new() -> Self {
+            Self::with_capacity(64).await
+        }
+
+        /// A harness whose run loop can only hold `capacity` events.
+        ///
+        /// The reconstruction's delivery is a `try_send`, so the capacity is
+        /// what decides whether a root is handed on or refused — a test that
+        /// wants to reason about backpressure has to own it rather than hope
+        /// for it.
+        async fn with_capacity(capacity: usize) -> Self {
             let (ws, server) = test_ws_pair().await;
             let owner = nostr::Keys::generate();
             let coordinate = format!("30617:{}:demo", owner.public_key().to_hex());
-            let (tx, rx) = mpsc::channel(64);
+            let (tx, rx) = mpsc::channel(capacity);
             Self {
                 state: BgState::new(),
                 ws,
@@ -7805,6 +8005,22 @@ mod tests {
 
         fn degraded(&self) -> Option<&str> {
             self.state.enrolment_history_degraded.as_deref()
+        }
+
+        /// How many discovered roots are still owed to the run loop.
+        ///
+        /// `None` means nothing is pending, which is the only state in which
+        /// the reconstruction may be spoken of as finished.
+        fn retained(&self) -> Option<usize> {
+            self.state
+                .enrolment_restore
+                .as_ref()
+                .map(|pending| pending.queue.len())
+        }
+
+        /// One more attempt to hand the retained roots on.
+        fn retry_restore(&mut self) -> RestoreOutcome {
+            drive_pending_restorations(&mut self.state, &self.tx)
         }
     }
 
@@ -8044,6 +8260,293 @@ mod tests {
                 "history restores authority and lifecycle; it never runs a turn"
             );
         }
+    }
+
+    /// A root the run loop could not take is **retained**, never dropped.
+    ///
+    /// The counterexample, exactly as reported: an event channel of capacity
+    /// one, an exhausted page carrying two distinct roots, and a receiver that
+    /// does not drain. The version before this one handed the first root on,
+    /// was refused the second, released its dedup claim, queued a proactive
+    /// resubscribe that could not reach back far enough to recover it, and
+    /// logged `enrolment history reconstruction complete` over the hole.
+    ///
+    /// A walk with a root still owed is not finished. That is the whole rule,
+    /// and `retained()` is where the agent says so.
+    #[tokio::test]
+    async fn a_root_the_run_loop_cannot_take_is_retained_not_dropped() {
+        let mut h = WalkHarness::with_capacity(1).await;
+        open_enrolment_for(&mut h.state, std::slice::from_ref(&h.coordinate)).await;
+        let _ = h.next_req().await;
+        h.begin().await;
+        let first_id = h.req().await[1].as_str().expect("an id").to_string();
+
+        // Unsaturated, so the walk proves exhaustion — and two roots against
+        // one slot, so the second cannot be delivered now.
+        h.fill_and_close(&first_id, &[9_000, 8_500]).await;
+
+        assert!(
+            h.state
+                .enrolment_history
+                .as_ref()
+                .is_some_and(|w| w.has_proven_exhaustion()),
+            "the walk did reach the end of history — the question is what it does next"
+        );
+        assert_eq!(
+            h.retained(),
+            Some(1),
+            "the root the channel refused is still owed, so reconstruction is unfinished"
+        );
+        assert!(
+            h.degraded().is_none(),
+            "a full queue for one instant is not yet a failure: {:?}",
+            h.degraded()
+        );
+
+        // The run loop catches up.
+        let first = drain(&mut h.rx);
+        assert_eq!(first.len(), 1, "one slot, one delivery: {first:?}");
+
+        assert_eq!(
+            h.retry_restore(),
+            RestoreOutcome::Complete,
+            "with the queue drained, the retained root reaches the run loop"
+        );
+        assert_eq!(
+            h.retained(),
+            None,
+            "and only then is there nothing left owed"
+        );
+        assert!(h.degraded().is_none());
+
+        let second: Vec<_> = drain(&mut h.rx)
+            .into_iter()
+            .filter_map(|e| match e {
+                BuzzEvent::Project(crate::project::ProjectEvent::Routed {
+                    source, mode, ..
+                }) => Some((source, mode)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(second.len(), 1, "the retained root, restored: {second:?}");
+        assert!(
+            matches!(
+                second[0].0,
+                crate::project::ProjectSubscription::EnrolmentHistory { .. }
+            ),
+            "a retry is the same delivery arriving late — it carries the page's own \
+             class, not a new one: {:?}",
+            second[0].0
+        );
+        assert_eq!(
+            second[0].1,
+            crate::project::ProcessingMode::Replay,
+            "and restores authority without running a turn"
+        );
+    }
+
+    /// A run loop that never drains degrades the reconstruction.
+    ///
+    /// Retention is bounded, or it is just a slower way to lose the root: an
+    /// agent that waits forever for a queue that has stopped moving reports
+    /// nothing at all, which is the same false health as reporting completion.
+    /// The bound is on *consecutive* fruitless attempts, so this counts them
+    /// exactly rather than trusting a wall clock.
+    #[tokio::test]
+    async fn retention_is_bounded_and_ends_in_visible_degradation() {
+        let mut h = WalkHarness::with_capacity(1).await;
+        open_enrolment_for(&mut h.state, std::slice::from_ref(&h.coordinate)).await;
+        let _ = h.next_req().await;
+        h.begin().await;
+        let first_id = h.req().await[1].as_str().expect("an id").to_string();
+
+        h.fill_and_close(&first_id, &[9_000, 8_500]).await;
+        assert_eq!(h.retained(), Some(1));
+
+        // The receiver is never drained. Every attempt from here delivers
+        // nothing, and the first attempt that delivered something reset the
+        // budget — so the walk survives exactly the limit and no further.
+        for attempt in 1..ENROLMENT_RESTORE_STALL_LIMIT {
+            assert_eq!(
+                h.retry_restore(),
+                RestoreOutcome::Retained(1),
+                "attempt {attempt} is still inside the budget"
+            );
+            assert!(
+                h.degraded().is_none(),
+                "and must not degrade early: {:?}",
+                h.degraded()
+            );
+        }
+        assert_eq!(
+            h.retry_restore(),
+            RestoreOutcome::Degraded,
+            "the last attempt of the budget is the one that gives up"
+        );
+
+        let reason = h
+            .degraded()
+            .expect("an agent that cannot restore what it found must say so");
+        assert!(
+            reason.contains('1') && reason.contains('2'),
+            "the degraded state must name how much of what it found is missing: {reason}"
+        );
+        assert_eq!(
+            h.retained(),
+            None,
+            "a degraded reconstruction stops retrying rather than growing a queue forever"
+        );
+        assert_eq!(
+            h.retry_restore(),
+            RestoreOutcome::Idle,
+            "and nothing further is owed by a walk that has already failed"
+        );
+    }
+
+    /// The retry belongs to the running loop, not to a test.
+    ///
+    /// The two tests above drive `drive_pending_restorations` themselves,
+    /// which proves the rule and says nothing about its reachability — and a
+    /// retained root that nothing ever retries is a lost root wearing a
+    /// queue. The only thing that retries one in production is an arm of
+    /// `run_background_task`'s `select!`.
+    ///
+    /// So this starts the real background task over a real socket, gives it an
+    /// event channel of exactly one slot, and then does nothing except drain
+    /// that slot: no further command, no further frame, and no call into the
+    /// restore path. The second root arrives because the loop woke itself up.
+    #[tokio::test]
+    async fn the_background_loop_retries_a_retained_root_on_its_own() {
+        use futures_util::SinkExt;
+
+        let (client, mut server) = test_ws_pair().await;
+        let (event_tx, mut event_rx) = mpsc::channel(1);
+        let (observer_tx, _observer_rx) = mpsc::channel(4);
+        let (cmd_tx, cmd_rx) = mpsc::channel(4);
+        let owner = nostr::Keys::generate();
+        let coordinate = format!("30617:{}:demo", owner.public_key().to_hex());
+
+        let task = tokio::spawn(run_background_task(
+            client,
+            ingress::HandshakeBuffer::empty(),
+            event_tx,
+            observer_tx,
+            cmd_rx,
+            nostr::Keys::generate(),
+            "ws://test".to_string(),
+            test_agent_hex(),
+            None,
+        ));
+
+        cmd_tx
+            .send(RelayCommand::BeginEnrolmentHistory {
+                coordinates: vec![coordinate.clone()],
+                agent: test_agent_hex(),
+            })
+            .await
+            .expect("the loop takes the command");
+
+        // The page the walk opened, read off the wire it wrote it to.
+        let page_id = loop {
+            let frame = next_test_frame(&mut server).await;
+            if frame[0] == "REQ" {
+                break frame[1].as_str().expect("an id").to_string();
+            }
+        };
+
+        // Two roots against one slot, and few enough that the page is
+        // unsaturated — so the walk proves exhaustion and hands them on.
+        let now = nostr::Timestamp::now().as_secs();
+        for offset in [600u64, 1_200] {
+            let root = project_root_frame(&owner, &coordinate, now - offset);
+            server
+                .send(Message::Text(
+                    json!(["EVENT", page_id, root]).to_string().into(),
+                ))
+                .await
+                .expect("the peer writes the row");
+        }
+        server
+            .send(Message::Text(json!(["EOSE", page_id]).to_string().into()))
+            .await
+            .expect("the peer writes the boundary");
+
+        let restored_root = |event: Option<BuzzEvent>| match event {
+            Some(BuzzEvent::Project(crate::project::ProjectEvent::Routed {
+                event, mode, ..
+            })) => {
+                assert_eq!(
+                    mode,
+                    crate::project::ProcessingMode::Replay,
+                    "a reconstructed root restores authority without a turn"
+                );
+                event.id()
+            }
+            other => panic!("expected a restored project root, got {other:?}"),
+        };
+
+        let first = timeout(Duration::from_secs(5), event_rx.recv())
+            .await
+            .expect("the first root fits in the one slot there is")
+            .expect("the loop is running");
+        let first = restored_root(first);
+
+        // From here the test writes nothing and calls nothing. Draining the
+        // slot is the only thing that changed.
+        let second = timeout(Duration::from_secs(5), event_rx.recv())
+            .await
+            .expect(
+                "the retained root must be retried by the loop itself — nothing else \
+                 can deliver it, and the walk will ask for no further page",
+            )
+            .expect("the loop is running");
+        let second = restored_root(second);
+
+        assert_ne!(
+            first, second,
+            "the retry must deliver the root that was refused, not repeat the one that fit"
+        );
+
+        drop(cmd_tx);
+        let _ = timeout(Duration::from_secs(2), task).await;
+    }
+
+    /// A root the live tail already delivered counts as restored.
+    ///
+    /// The other half of the same rule. Retention only terminates if a root
+    /// whose authority is *already held* resolves — otherwise the ordinary
+    /// race between the live tail and the walk (they overlap deliberately)
+    /// would leave a permanent debt, and the bound above would turn every such
+    /// overlap into a degraded agent. It must also not deliver twice: the
+    /// dedup slot is spent, and a second copy would be a second effect.
+    #[tokio::test]
+    async fn a_root_already_delivered_live_is_restored_rather_than_owed() {
+        let mut h = WalkHarness::with_capacity(4).await;
+        let enrol_id = open_enrolment_for(&mut h.state, std::slice::from_ref(&h.coordinate)).await;
+        let _ = h.next_req().await;
+
+        // The tail delivers the root first, as live work.
+        drain_enrolment_backlog(&mut h.state, &enrol_id).await;
+        let root = project_root_frame(&h.owner, &h.coordinate, 9_000);
+        deliver_frame(&mut h.state, &enrol_id, &root, &h.tx).await;
+        assert_eq!(drain(&mut h.rx).len(), 1, "the live delivery happened");
+
+        // …and the walk then finds the same root in history.
+        h.begin().await;
+        let page_id = h.req().await[1].as_str().expect("an id").to_string();
+        h.feed(json!(["EVENT", page_id, root])).await;
+        h.feed(json!(["EOSE", page_id])).await;
+
+        assert_eq!(
+            h.retained(),
+            None,
+            "a root whose authority is already held is restored, not owed forever"
+        );
+        assert!(h.degraded().is_none());
+        assert!(
+            drain(&mut h.rx).is_empty(),
+            "and it is not delivered a second time — the slot is already spent"
+        );
     }
 
     /// A walk that cannot prove completeness is **visibly** degraded.
