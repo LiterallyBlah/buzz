@@ -3588,6 +3588,14 @@ pub(crate) struct EnrolmentCandidate {
     /// coordinate necessarily names an owner, and re-deriving it downstream
     /// gives that proof a second chance to come back as `None`.
     owner: String,
+    /// Who signed the root event, lowercase hex.
+    ///
+    /// **The only moment this is knowable.** A `1632` close names the root by
+    /// `e` and carries no statement about who opened it, so an agent that did
+    /// not keep the root's author when it had the root in hand can never
+    /// afterwards decide whether a closer is the author. The root event is the
+    /// one place the answer exists, and this is the type that has been past it.
+    root_author: String,
     /// `true` for a `1618` pull-request root, `false` for a `1621` issue.
     is_pull_request: bool,
 }
@@ -3605,6 +3613,10 @@ impl EnrolmentCandidate {
         &self.owner
     }
 
+    pub(crate) fn root_author(&self) -> &str {
+        &self.root_author
+    }
+
     pub(crate) fn is_pull_request(&self) -> bool {
         self.is_pull_request
     }
@@ -3616,12 +3628,14 @@ impl EnrolmentCandidate {
         root: &str,
         coordinate: &str,
         owner: &str,
+        root_author: &str,
         is_pull_request: bool,
     ) -> Self {
         Self {
             root: root.to_string(),
             coordinate: coordinate.to_string(),
             owner: owner.to_string(),
+            root_author: root_author.to_string(),
             is_pull_request,
         }
     }
@@ -3732,13 +3746,27 @@ pub(crate) fn decide_project_event(
     let candidate = validate_enrolment_candidate(event, state.discovered);
     let stored = state.enrolments.get(route.root());
 
-    // Lifecycle authority needs the root's author and the repository owner,
-    // which only a validated candidate establishes. Without one there is
-    // nothing to authorise against, so it stays false — a lifecycle event on an
-    // unbound root is refused rather than assumed.
-    let lifecycle_authorised = candidate
-        .as_ref()
-        .is_some_and(|c| lifecycle_actor_allowed(&event.author(), &event.author(), c.owner()));
+    // Lifecycle authority is a property of the root's **stored binding**, and
+    // of nothing the arriving event says about itself.
+    //
+    // The version this replaces asked `validate_enrolment_candidate` for it.
+    // That validator accepts only `1621` and `1618`, so for a `1630`-`1633` it
+    // necessarily returned `None` and the authority was unreachable: every
+    // lifecycle event on every root, however impeccably signed by the owner,
+    // was `Ignore`. A real owner close on a real relay left the watch active,
+    // and the next comment woke a turn on an issue that had been closed.
+    //
+    // Worse than unreachable, it was also incoherent — it passed the *closing*
+    // event's author as the root's author, so the one shape it could ever have
+    // admitted was "anyone who signs a close is the author of the root they are
+    // closing". The stored binding is the only thing that knows who opened the
+    // root, and it learned it from the root's own signature.
+    //
+    // No binding, no authority: a lifecycle event on a root this agent is not
+    // watching has nothing to authorise against and is refused.
+    let lifecycle_authorised = stored.is_some_and(|enrolment| {
+        lifecycle_actor_allowed(&event.author(), &enrolment.root_author, &enrolment.owner)
+    });
 
     let effect = classify_project_event(
         kind_effect,
@@ -3947,6 +3975,10 @@ pub(crate) fn validate_enrolment_candidate(
         root,
         coordinate,
         owner,
+        // The signer of this very event. It is a fact about the root, taken
+        // from the proof that this process verified the signature — never from
+        // a later event's claim about who the author was.
+        root_author: event.author(),
         is_pull_request,
     })
 }
@@ -4019,9 +4051,28 @@ pub(crate) fn follow_up_coordinate_allowed(
 // ── Enrolment sets ────────────────────────────────────────────────────────────
 
 /// One enrolled root.
+///
+/// **The binding is what later events are authorised against, so it carries
+/// everything that authority needs.** A lifecycle event names a root and a
+/// signer and nothing else; if the enrolment does not remember who opened the
+/// root and who owns the repository, there is no way to decide the closer is
+/// one of them, and the only reachable answer becomes "refuse everything". That
+/// was the defect: authority was re-derived from the arriving event, which
+/// could only ever produce a candidate for a root kind, so a valid owner close
+/// was classified `Ignore` and the watch stayed active.
+///
+/// Both fields are functions of the root's own signed event, which is why
+/// carrying them cannot weaken the immutability check below: a root id commits
+/// to its author, and a coordinate to its owner, so a candidate that disagrees
+/// with a stored binding on either is a forged or confused claim exactly as a
+/// coordinate mismatch is.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Enrolment {
     pub coordinate: String,
+    /// Repository owner, from the validated coordinate.
+    pub owner: String,
+    /// Who signed the root event, lowercase hex.
+    pub root_author: String,
     pub is_pull_request: bool,
 }
 
@@ -4090,22 +4141,29 @@ impl ProjectEnrolments {
     /// disagreeing with the stored binding is not a legitimate update — it is a
     /// forged or confused claim, and applying it would silently relocate a live
     /// watch. Both mismatch paths are refused with the existing binding intact.
+    ///
+    /// The mismatch is boxed because it carries two whole bindings and the
+    /// success case carries a discriminant: an unboxed error would make every
+    /// ordinary enrolment pay for the diagnosis of a refusal that, in a healthy
+    /// process, never happens.
     pub(crate) fn enrol(
         &mut self,
         candidate: &EnrolmentCandidate,
-    ) -> Result<EnrolOutcome, BindingMismatch> {
+    ) -> Result<EnrolOutcome, Box<BindingMismatch>> {
         let attempted = Enrolment {
             coordinate: candidate.coordinate().to_string(),
+            owner: candidate.owner().to_string(),
+            root_author: candidate.root_author().to_string(),
             is_pull_request: candidate.is_pull_request(),
         };
 
         if let Some(existing) = self.get(candidate.root()) {
             if *existing != attempted {
-                return Err(BindingMismatch {
+                return Err(Box::new(BindingMismatch {
                     root: candidate.root().to_string(),
                     existing: existing.clone(),
                     attempted,
-                });
+                }));
             }
         }
 
@@ -4505,6 +4563,38 @@ pub(crate) fn classify_kind(kind: u32) -> KindEffect {
         // rule to be got wrong.
         KIND_PEER_CALL | KIND_PEER_CALL_RESULT => KindEffect::Comment,
         _ => KindEffect::Ignore,
+    }
+}
+
+/// What an authorised status event does to a watched root.
+///
+/// Deliberately not `bool`. "Closed" is one of four status kinds and the other
+/// three do not agree with each other, so a boolean at this boundary would be a
+/// mapping decision hidden in a name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LifecycleTransition {
+    /// The root is live work again: watch it and answer on it.
+    Activate,
+    /// The root is finished: keep watching so a reopen is still observed, but
+    /// answer nothing on it.
+    Suspend,
+}
+
+/// Which transition an authorised status event carries.
+///
+/// `None` for every kind [`classify_kind`] does not call `Lifecycle`, so this
+/// cannot be handed a comment and asked to move a watch.
+///
+/// Merged sits with closed rather than with open: a merged pull request is
+/// finished work, and leaving it active would keep answering on a branch that
+/// no longer exists. Draft sits with open — a pull request moved back to draft
+/// is unfinished, not concluded, and its author is usually still asking for
+/// something.
+pub(crate) fn lifecycle_transition(kind: u32) -> Option<LifecycleTransition> {
+    match kind {
+        KIND_GIT_STATUS_OPEN | KIND_GIT_STATUS_DRAFT => Some(LifecycleTransition::Activate),
+        KIND_GIT_STATUS_CLOSED | KIND_GIT_STATUS_MERGED => Some(LifecycleTransition::Suspend),
+        _ => None,
     }
 }
 
@@ -7909,7 +7999,13 @@ mod tests {
         let mut enrolments = ProjectEnrolments::new();
         for root in roots {
             enrolments
-                .enrol(&EnrolmentCandidate::for_test(root, &coord(), OWNER, false))
+                .enrol(&EnrolmentCandidate::for_test(
+                    root,
+                    &coord(),
+                    OWNER,
+                    STRANGER,
+                    false,
+                ))
                 .expect("enrol");
         }
         let filters = watched_roots_filters(&enrolments, 0);
@@ -8575,8 +8671,23 @@ mod tests {
     /// cannot be made to have. These tests exercise `ProjectEnrolments`, not
     /// validation; validation has its own witness-driven tests below.
     fn candidate_at(root: &str, coordinate: &str, pr: bool) -> EnrolmentCandidate {
+        candidate_authored_at(root, coordinate, STRANGER, pr)
+    }
+
+    /// The same fixture with the root's author named.
+    ///
+    /// Separate because the author is exactly what lifecycle authority turns
+    /// on, and a default that happened to equal the owner would make an
+    /// authority test pass for the wrong reason. `candidate_at` therefore
+    /// defaults to a third party who is neither the owner nor this agent.
+    fn candidate_authored_at(
+        root: &str,
+        coordinate: &str,
+        root_author: &str,
+        pr: bool,
+    ) -> EnrolmentCandidate {
         let owner = repo_owner_from_coordinate(coordinate).expect("well-formed coordinate");
-        EnrolmentCandidate::for_test(root, coordinate, &owner, pr)
+        EnrolmentCandidate::for_test(root, coordinate, &owner, root_author, pr)
     }
 
     fn candidate(root: &str, pr: bool) -> EnrolmentCandidate {

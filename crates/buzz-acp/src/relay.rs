@@ -7816,6 +7816,7 @@ mod tests {
                     root,
                     &coordinate,
                     &"1".repeat(64),
+                    &"2".repeat(64),
                     *is_pull_request,
                 ))
                 .expect("a fresh root enrols");
@@ -13604,6 +13605,7 @@ for line in sys.stdin:
                 &"b".repeat(64),
                 &format!("30617:{}:repo", "a".repeat(64)),
                 &"a".repeat(64),
+                &"c".repeat(64),
                 false,
             ))
             .expect("enrol");

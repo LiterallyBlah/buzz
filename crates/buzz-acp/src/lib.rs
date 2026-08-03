@@ -4094,6 +4094,56 @@ enum ProjectDispatched {
         queued: bool,
         watch_changed: bool,
     },
+    /// An authorised status event moved a watched root between the active and
+    /// dormant sets. No turn was run.
+    ///
+    /// Carries the state the root is now in rather than a bare acknowledgement:
+    /// "the close was applied" and "the root is dormant" are the same claim only
+    /// if the transition is read the way the kind meant it, and this is the
+    /// value a caller can check that against.
+    ///
+    /// **No subscription replacement follows.** `all_roots` covers active *and*
+    /// dormant precisely so a reopen stays observable, so the watched-root REQ
+    /// this event arrived on is already the right one. Replacing it here would
+    /// churn a live request for an identical successor.
+    LifecycleApplied { root_state: project::RootState },
+}
+
+/// Move a watched root between active and dormant on an authorised status event.
+///
+/// Reached only with [`project::ProjectEffect::ApplyLifecycle`], which
+/// `classify_project_event` produces only when the signer is the stored root
+/// author or the stored repository owner. Nothing here re-decides that.
+///
+/// A transition that changes nothing — closing a dormant root, reopening an
+/// active one — reports the state it found rather than inventing a change, so a
+/// duplicate status event is idempotent rather than a second event to explain.
+fn apply_project_lifecycle(
+    dispatch: &mut ProjectDispatch<'_>,
+    root: &str,
+    kind: u32,
+) -> ProjectDispatched {
+    let Some(transition) = project::lifecycle_transition(kind) else {
+        // `classify_kind` called this a lifecycle kind and this function does
+        // not recognise it. That is two functions disagreeing about the same
+        // list, and the safe answer is to change no watch.
+        tracing::warn!(root = %root, kind, "authorised lifecycle kind carries no transition");
+        return ProjectDispatched::Ignored;
+    };
+    let changed = match transition {
+        project::LifecycleTransition::Activate => dispatch.enrolments.reopen(root),
+        project::LifecycleTransition::Suspend => dispatch.enrolments.close(root),
+    };
+    let root_state = dispatch.enrolments.state_of(root);
+    tracing::info!(
+        root = %root,
+        kind,
+        ?transition,
+        ?root_state,
+        changed,
+        "authorised lifecycle applied to a watched root"
+    );
+    ProjectDispatched::LifecycleApplied { root_state }
 }
 
 /// Project dispatch entry point.
@@ -4259,6 +4309,21 @@ fn handle_project_event(
             let peer_admission = admit_peer_call_event(dispatch, &decision, event);
             if matches!(peer_admission, PeerAdmission::Refused) {
                 return ProjectDispatched::Ignored;
+            }
+
+            // ── Lifecycle ────────────────────────────────────────────────────
+            //
+            // **Before the origin guard, and that is the point.** A lifecycle
+            // event runs no turn, so `decide_project_event` gives it no
+            // `ProjectOrigin` — an effect that cannot queue must not carry a
+            // binding a caller could queue it by. Reaching the guard first
+            // therefore sent every authorised close into the "refused —
+            // nothing enrolled, queued or spent" branch, which is the second
+            // half of why a valid owner close changed nothing: the authority
+            // was unreachable, and the effect it would have produced had
+            // nowhere to be applied.
+            if matches!(decision.effect, project::ProjectEffect::ApplyLifecycle) {
+                return apply_project_lifecycle(dispatch, route.root(), event.kind());
             }
 
             let Some(origin) = decision.origin.clone() else {
@@ -5479,6 +5544,637 @@ mod project_discovery_ingestion_tests {
                 mode,
             },
         )
+    }
+
+    /// One project process, kept alive across a sequence of events.
+    ///
+    /// [`dispatch_routed`] rebuilds the world per call, which is right for a
+    /// single-event rule and useless for lifecycle: close, comment, reopen and
+    /// comment are four events whose whole meaning is what the *previous* one
+    /// left behind. A fresh enrolment set per step would make every one of them
+    /// pass against a root that was never closed.
+    ///
+    /// It holds the four pieces of state the run loop holds and hands each
+    /// signed event to [`handle_project_event`], the production entry. It
+    /// classifies nothing, and it has no way to reach an enrolment set except
+    /// through that entry — so "the root is dormant" here is a fact the
+    /// production path produced.
+    struct ProjectProcess {
+        agent: project::AgentIdentity,
+        agent_owner: String,
+        humans: std::collections::BTreeSet<String>,
+        externals: std::collections::BTreeSet<String>,
+        discovered: project::DiscoveredRepositories,
+        enrolments: project::ProjectEnrolments,
+        queue: EventQueue,
+        ledger: peer_call::CallLedger,
+    }
+
+    impl ProjectProcess {
+        /// A process that has seen `repo_owner`'s announcement of `repo_id`,
+        /// and whose own owner is `agent_owner`.
+        ///
+        /// The two are separate parameters because lifecycle authority admits
+        /// two distinct signers — the root's author and the repository's owner
+        /// — and a fixture that made them the same key could not tell which one
+        /// a passing test had actually exercised.
+        async fn new(agent: &Keys, agent_owner: &Keys, repo_owner: &Keys, repo_id: &str) -> Self {
+            let mut process = Self {
+                agent: project::AgentIdentity::new(&agent.public_key()).unwrap(),
+                agent_owner: agent_owner.public_key().to_hex(),
+                humans: std::collections::BTreeSet::new(),
+                externals: std::collections::BTreeSet::new(),
+                discovered: project::DiscoveredRepositories::new(),
+                enrolments: project::ProjectEnrolments::new(),
+                queue: EventQueue::new(config::DedupMode::Queue),
+                ledger: peer_call::CallLedger::new(),
+            };
+            let announcement = proven_announcement(repo_owner, repo_id).await;
+            handle_project_event(
+                &mut dispatch_over(
+                    &process.agent,
+                    Some(&process.agent_owner),
+                    &process.humans,
+                    &process.externals,
+                    &mut process.discovered,
+                    &mut process.enrolments,
+                    &mut process.queue,
+                    &mut process.ledger,
+                ),
+                &project::ProjectEvent::Discovery { announcement },
+            );
+            process
+        }
+
+        /// Hand one signed event to the production dispatch, on the state every
+        /// prior event left.
+        async fn deliver(
+            &mut self,
+            source: project::ProjectSubscription,
+            mode: project::ProcessingMode,
+            event: nostr::Event,
+        ) -> ProjectDispatched {
+            let verified = project::VerifiedProjectEvent::verify(event)
+                .await
+                .expect("valid");
+            let route = project::ProjectRoute::derive(&verified).expect("routes");
+            handle_project_event(
+                &mut dispatch_over(
+                    &self.agent,
+                    Some(&self.agent_owner),
+                    &self.humans,
+                    &self.externals,
+                    &mut self.discovered,
+                    &mut self.enrolments,
+                    &mut self.queue,
+                    &mut self.ledger,
+                ),
+                &project::ProjectEvent::Routed {
+                    source,
+                    route,
+                    event: verified,
+                    mode,
+                },
+            )
+        }
+
+        /// The ordinary live delivery: the watched-root REQ this agent's own
+        /// enrolment installed.
+        async fn watched(&mut self, event: nostr::Event) -> ProjectDispatched {
+            self.deliver(
+                project::ProjectSubscription::Watched { generation: 0 },
+                project::ProcessingMode::Live,
+                event,
+            )
+            .await
+        }
+
+        fn root_state(&self, root: &nostr::Event) -> project::RootState {
+            self.enrolments.state_of(&root.id.to_hex())
+        }
+    }
+
+    /// A signed status event on `root`, from whoever `actor` is.
+    fn status_event(
+        actor: &Keys,
+        repo_owner: &Keys,
+        agent: &Keys,
+        repo_id: &str,
+        root: &nostr::Event,
+        kind: u32,
+    ) -> nostr::Event {
+        let coord = format!("30617:{}:{repo_id}", repo_owner.public_key().to_hex());
+        EventBuilder::new(nostr::Kind::Custom(kind as u16), "")
+            .tags([
+                nostr::Tag::parse(["a", &coord]).unwrap(),
+                nostr::Tag::parse(["e", &root.id.to_hex(), "", "root"]).unwrap(),
+                nostr::Tag::parse(["p", &agent.public_key().to_hex()]).unwrap(),
+            ])
+            .sign_with_keys(actor)
+            .expect("sign")
+    }
+
+    /// A follow-up comment carrying the agent's inherited `p` tag.
+    ///
+    /// Deliberately **not** a fresh explicit mention. Desktop copies prior
+    /// participants into every later comment, so this is the shape an ordinary
+    /// reply has — and the shape a closed root must not answer. A comment that
+    /// re-mentions the agent by name is a genuine re-tag and reactivates a
+    /// dormant root by design (`wake_or_enrol`), which is a different rule.
+    fn follow_up_comment(
+        author: &Keys,
+        repo_owner: &Keys,
+        agent: &Keys,
+        repo_id: &str,
+        root: &nostr::Event,
+        body: &str,
+    ) -> nostr::Event {
+        let coord = format!("30617:{}:{repo_id}", repo_owner.public_key().to_hex());
+        EventBuilder::new(nostr::Kind::TextNote, body)
+            .tags([
+                nostr::Tag::parse(["a", &coord]).unwrap(),
+                nostr::Tag::parse(["e", &root.id.to_hex(), "", "root"]).unwrap(),
+                nostr::Tag::parse(["p", &agent.public_key().to_hex()]).unwrap(),
+            ])
+            .sign_with_keys(author)
+            .expect("sign")
+    }
+
+    /// A root opened by `author` on `repo_owner`'s repository.
+    ///
+    /// [`root_event`] signs with the repository owner, which is the common
+    /// case and the one that cannot distinguish root-author authority from
+    /// owner authority.
+    fn root_event_by(
+        author: &Keys,
+        repo_owner: &Keys,
+        agent: &Keys,
+        repo_id: &str,
+        kind: u32,
+        body: &str,
+    ) -> nostr::Event {
+        let coord = format!("30617:{}:{repo_id}", repo_owner.public_key().to_hex());
+        EventBuilder::new(nostr::Kind::Custom(kind as u16), body)
+            .tags([
+                nostr::Tag::parse(["a", &coord]).unwrap(),
+                nostr::Tag::parse(["p", &agent.public_key().to_hex()]).unwrap(),
+            ])
+            .sign_with_keys(author)
+            .expect("sign")
+    }
+
+    /// **The reported blocker, as one ordered scenario.**
+    ///
+    /// A valid owner close did not suspend an enrolled root: lifecycle
+    /// authority was derived from `validate_enrolment_candidate`, which accepts
+    /// only root kinds, so a `1632` could never be authorised — and the effect
+    /// it would have produced had no application in the dispatcher either. The
+    /// close was logged `effect=Ignore`, the watch stayed active, and the next
+    /// comment ran a turn on a closed issue.
+    ///
+    /// Every step here is a signed event through the production entry, on the
+    /// state the step before it left. Asserting the four rules separately, each
+    /// against a freshly built enrolment set, is exactly the test that passed
+    /// while production was broken.
+    #[tokio::test]
+    async fn a_close_suspends_a_watched_root_and_a_reopen_restores_it() {
+        let owner = Keys::generate();
+        let agent = Keys::generate();
+        let mut process = ProjectProcess::new(&agent, &owner, &owner, "demo").await;
+
+        // ── the root is watched ──────────────────────────────────────────────
+        let root = root_event(
+            &owner,
+            &agent,
+            "demo",
+            buzz_core::kind::KIND_GIT_ISSUE,
+            "please look",
+        );
+        let enrolled = process
+            .deliver(
+                project::ProjectSubscription::Enrolment,
+                project::ProcessingMode::Live,
+                root.clone(),
+            )
+            .await;
+        assert!(
+            matches!(enrolled, ProjectDispatched::Queued { queued: true, .. }),
+            "precondition: an addressed root enrols and wakes — got {enrolled:?}"
+        );
+        assert_eq!(process.root_state(&root), project::RootState::Active);
+
+        // ── 1. the owner closes it ───────────────────────────────────────────
+        let closed = process
+            .watched(status_event(
+                &owner,
+                &owner,
+                &agent,
+                "demo",
+                &root,
+                buzz_core::kind::KIND_GIT_STATUS_CLOSED,
+            ))
+            .await;
+        assert_eq!(
+            closed,
+            ProjectDispatched::LifecycleApplied {
+                root_state: project::RootState::Dormant
+            },
+            "an owner's close must suspend the watch, not be ignored"
+        );
+
+        // ── 2. …and a comment on it answers nothing ──────────────────────────
+        let while_closed = process
+            .watched(follow_up_comment(
+                &owner,
+                &owner,
+                &agent,
+                "demo",
+                &root,
+                "CLOSED-COMMENT-MUST-NOT-WAKE",
+            ))
+            .await;
+        assert!(
+            !matches!(while_closed, ProjectDispatched::Queued { queued: true, .. }),
+            "a closed root must not run a turn — got {while_closed:?}"
+        );
+        assert_eq!(
+            process.root_state(&root),
+            project::RootState::Dormant,
+            "and a comment must not quietly revive it"
+        );
+
+        // ── 3. the owner reopens it ──────────────────────────────────────────
+        let reopened = process
+            .watched(status_event(
+                &owner,
+                &owner,
+                &agent,
+                "demo",
+                &root,
+                buzz_core::kind::KIND_GIT_STATUS_OPEN,
+            ))
+            .await;
+        assert_eq!(
+            reopened,
+            ProjectDispatched::LifecycleApplied {
+                root_state: project::RootState::Active
+            },
+            "an authorised reopen must restore the watch"
+        );
+
+        // ── 4. …and the next comment runs exactly one turn ───────────────────
+        let after_reopen = process
+            .watched(follow_up_comment(
+                &owner, &owner, &agent, "demo", &root, "and now?",
+            ))
+            .await;
+        assert!(
+            matches!(after_reopen, ProjectDispatched::Queued { queued: true, .. }),
+            "a reopened root answers again — got {after_reopen:?}"
+        );
+    }
+
+    /// An unauthorised signer cannot move a watch in either direction.
+    ///
+    /// Both directions, because they fail differently: an unauthorised *close*
+    /// that succeeded would silence a live conversation, and an unauthorised
+    /// *reopen* that succeeded would reanimate one the owner ended. A stranger
+    /// who can publish to the relay can publish either.
+    #[tokio::test]
+    async fn an_unauthorised_actor_cannot_close_or_reopen() {
+        let owner = Keys::generate();
+        let agent = Keys::generate();
+        let stranger = Keys::generate();
+        let mut process = ProjectProcess::new(&agent, &owner, &owner, "demo").await;
+
+        let root = root_event(
+            &owner,
+            &agent,
+            "demo",
+            buzz_core::kind::KIND_GIT_ISSUE,
+            "please look",
+        );
+        process
+            .deliver(
+                project::ProjectSubscription::Enrolment,
+                project::ProcessingMode::Live,
+                root.clone(),
+            )
+            .await;
+
+        let refused = process
+            .watched(status_event(
+                &stranger,
+                &owner,
+                &agent,
+                "demo",
+                &root,
+                buzz_core::kind::KIND_GIT_STATUS_CLOSED,
+            ))
+            .await;
+        assert_eq!(
+            refused,
+            ProjectDispatched::Ignored,
+            "a stranger's close must change nothing"
+        );
+        assert_eq!(
+            process.root_state(&root),
+            project::RootState::Active,
+            "and the watch must be exactly where the owner left it"
+        );
+
+        // Now genuinely closed, so the reopen has something to reanimate.
+        process
+            .watched(status_event(
+                &owner,
+                &owner,
+                &agent,
+                "demo",
+                &root,
+                buzz_core::kind::KIND_GIT_STATUS_CLOSED,
+            ))
+            .await;
+        let refused = process
+            .watched(status_event(
+                &stranger,
+                &owner,
+                &agent,
+                "demo",
+                &root,
+                buzz_core::kind::KIND_GIT_STATUS_OPEN,
+            ))
+            .await;
+        assert_eq!(
+            refused,
+            ProjectDispatched::Ignored,
+            "a stranger's reopen must change nothing"
+        );
+        assert_eq!(
+            process.root_state(&root),
+            project::RootState::Dormant,
+            "the root the owner closed stays closed"
+        );
+    }
+
+    /// The root's author may close it, on a repository somebody else owns.
+    ///
+    /// This is the case the stored binding exists for. The version this
+    /// replaces passed the *closing event's* author as the root author, which
+    /// made "author" unfalsifiable — anyone signing a close was the author of
+    /// the root they were closing. Here the root's author and the repository's
+    /// owner are two different keys and only one of them opened the issue, so
+    /// an implementation that reads the wrong one refuses a legitimate close.
+    #[tokio::test]
+    async fn the_stored_root_author_may_close_a_root_on_anothers_repository() {
+        let repo_owner = Keys::generate();
+        let human = Keys::generate();
+        let agent = Keys::generate();
+        let mut process = ProjectProcess::new(&agent, &human, &repo_owner, "demo").await;
+
+        // Opened by the agent's own human, on the repository owner's project.
+        let root = root_event_by(
+            &human,
+            &repo_owner,
+            &agent,
+            "demo",
+            buzz_core::kind::KIND_GIT_ISSUE,
+            "please look",
+        );
+        let enrolled = process
+            .deliver(
+                project::ProjectSubscription::Enrolment,
+                project::ProcessingMode::Live,
+                root.clone(),
+            )
+            .await;
+        assert!(
+            matches!(enrolled, ProjectDispatched::Queued { queued: true, .. }),
+            "precondition: the root enrols — got {enrolled:?}"
+        );
+
+        let closed = process
+            .watched(status_event(
+                &human,
+                &repo_owner,
+                &agent,
+                "demo",
+                &root,
+                buzz_core::kind::KIND_GIT_STATUS_CLOSED,
+            ))
+            .await;
+        assert_eq!(
+            closed,
+            ProjectDispatched::LifecycleApplied {
+                root_state: project::RootState::Dormant
+            },
+            "the author of the root may close it without owning the repository"
+        );
+    }
+
+    /// A reconstructed root carries its author into lifecycle authority.
+    ///
+    /// The restart case. A root restored from history enrols under
+    /// `ProcessingMode::Replay` and runs no turn — and if that path dropped the
+    /// root's author, every root an agent recovered after a restart would be
+    /// permanently unclosable by the person who opened it. The binding has to
+    /// survive the reconstruction, not merely the live delivery.
+    #[tokio::test]
+    async fn a_reconstructed_roots_author_can_still_close_it() {
+        let repo_owner = Keys::generate();
+        let human = Keys::generate();
+        let agent = Keys::generate();
+        let mut process = ProjectProcess::new(&agent, &human, &repo_owner, "demo").await;
+
+        let root = root_event_by(
+            &human,
+            &repo_owner,
+            &agent,
+            "demo",
+            buzz_core::kind::KIND_GIT_ISSUE,
+            "please look",
+        );
+        let restored = process
+            .deliver(
+                project::ProjectSubscription::EnrolmentHistory { generation: 0 },
+                project::ProcessingMode::Replay,
+                root.clone(),
+            )
+            .await;
+        assert!(
+            matches!(restored, ProjectDispatched::Enrolled),
+            "precondition: history restores the watch without a turn — got {restored:?}"
+        );
+
+        let closed = process
+            .watched(status_event(
+                &human,
+                &repo_owner,
+                &agent,
+                "demo",
+                &root,
+                buzz_core::kind::KIND_GIT_STATUS_CLOSED,
+            ))
+            .await;
+        assert_eq!(
+            closed,
+            ProjectDispatched::LifecycleApplied {
+                root_state: project::RootState::Dormant
+            },
+            "a root recovered from history must still know who opened it"
+        );
+    }
+
+    /// A lifecycle event on a root nothing has enrolled is refused.
+    ///
+    /// Fail-closed on the unbound case. There is no stored binding to
+    /// authorise against, and the owner-signed shape of the event is not a
+    /// substitute for one: authorising it would let a status event on an
+    /// unknown root reach the enrolment sets at all.
+    #[tokio::test]
+    async fn a_lifecycle_event_on_an_unwatched_root_is_refused() {
+        let owner = Keys::generate();
+        let agent = Keys::generate();
+        let mut process = ProjectProcess::new(&agent, &owner, &owner, "demo").await;
+
+        // Signed by the owner, well-formed, and naming a root this process
+        // never enrolled.
+        let root = root_event(
+            &owner,
+            &agent,
+            "demo",
+            buzz_core::kind::KIND_GIT_ISSUE,
+            "never delivered",
+        );
+        let refused = process
+            .watched(status_event(
+                &owner,
+                &owner,
+                &agent,
+                "demo",
+                &root,
+                buzz_core::kind::KIND_GIT_STATUS_CLOSED,
+            ))
+            .await;
+        assert_eq!(
+            refused,
+            ProjectDispatched::Ignored,
+            "no binding, no authority — got {refused:?}"
+        );
+        assert_eq!(process.root_state(&root), project::RootState::Unknown);
+    }
+
+    /// A close that names neither the agent nor the repository still applies.
+    ///
+    /// The shape `lifecycle_actor_allowed`'s own documentation is about:
+    /// `GitStatusMeta.repo` is optional, so an owner-signed close carrying only
+    /// its `e` root marker is well-formed, and it arrives on the watched-root
+    /// REQ because that REQ selects by `#e`. Nothing about it says who the
+    /// agent is or which repository it belongs to — the stored binding says
+    /// both. An implementation that reached for the event's own `a` tag, or
+    /// that required a `p`, would refuse the ordinary Desktop close.
+    #[tokio::test]
+    async fn a_close_carrying_only_its_root_marker_still_suspends_the_watch() {
+        let owner = Keys::generate();
+        let agent = Keys::generate();
+        let mut process = ProjectProcess::new(&agent, &owner, &owner, "demo").await;
+
+        let root = root_event(
+            &owner,
+            &agent,
+            "demo",
+            buzz_core::kind::KIND_GIT_ISSUE,
+            "please look",
+        );
+        process
+            .deliver(
+                project::ProjectSubscription::Enrolment,
+                project::ProcessingMode::Live,
+                root.clone(),
+            )
+            .await;
+
+        let bare_close = EventBuilder::new(
+            nostr::Kind::Custom(buzz_core::kind::KIND_GIT_STATUS_CLOSED as u16),
+            "",
+        )
+        .tags([nostr::Tag::parse(["e", &root.id.to_hex(), "", "root"]).unwrap()])
+        .sign_with_keys(&owner)
+        .expect("sign");
+
+        let closed = process.watched(bare_close).await;
+        assert_eq!(
+            closed,
+            ProjectDispatched::LifecycleApplied {
+                root_state: project::RootState::Dormant
+            },
+            "an owner's close needs no `a` and no `p` — the binding supplies both"
+        );
+    }
+
+    /// A merged pull request is finished work; a draft one is not.
+    ///
+    /// The two kinds beside close and reopen. Both are authorised identically,
+    /// so what this pins is the mapping — and the mapping is a judgement, not a
+    /// tautology: merged suspends because answering on a merged branch is
+    /// answering about work that no longer exists, and draft stays active
+    /// because a pull request moved back to draft is unfinished rather than
+    /// concluded.
+    #[tokio::test]
+    async fn merged_suspends_a_pull_request_and_draft_leaves_it_active() {
+        let owner = Keys::generate();
+        let agent = Keys::generate();
+        let mut process = ProjectProcess::new(&agent, &owner, &owner, "demo").await;
+
+        let root = root_event(
+            &owner,
+            &agent,
+            "demo",
+            buzz_core::kind::KIND_GIT_PULL_REQUEST,
+            "review please",
+        );
+        process
+            .deliver(
+                project::ProjectSubscription::Enrolment,
+                project::ProcessingMode::Live,
+                root.clone(),
+            )
+            .await;
+
+        let merged = process
+            .watched(status_event(
+                &owner,
+                &owner,
+                &agent,
+                "demo",
+                &root,
+                buzz_core::kind::KIND_GIT_STATUS_MERGED,
+            ))
+            .await;
+        assert_eq!(
+            merged,
+            ProjectDispatched::LifecycleApplied {
+                root_state: project::RootState::Dormant
+            },
+            "a merged pull request is concluded"
+        );
+
+        let draft = process
+            .watched(status_event(
+                &owner,
+                &owner,
+                &agent,
+                "demo",
+                &root,
+                buzz_core::kind::KIND_GIT_STATUS_DRAFT,
+            ))
+            .await;
+        assert_eq!(
+            draft,
+            ProjectDispatched::LifecycleApplied {
+                root_state: project::RootState::Active
+            },
+            "a draft pull request is unfinished, not finished"
+        );
     }
 
     /// A root replayed from the enrolment backlog restores authority and wakes
