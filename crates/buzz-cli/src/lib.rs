@@ -485,6 +485,26 @@ buzz agents archived"
 /// on would be ones this command asserted rather than ones the signer did.
 #[derive(Subcommand)]
 pub enum ProjectsCmd {
+    /// List roots and comments that address an agent on named repositories
+    #[command(
+        after_help = "Returns raw signed kinds 1621, 1618 and 1, newest first. Use --until with the oldest created_at from the previous page to walk relay history without sampling unrelated global feed events."
+    )]
+    Addressed {
+        #[arg(long = "project", required = true)]
+        projects: Vec<String>,
+        #[arg(long)]
+        mention: String,
+        #[arg(long)]
+        limit: Option<u32>,
+        /// Inclusive upper created_at bound for backwards pagination
+        #[arg(long)]
+        until: Option<u64>,
+    },
+    /// Fetch one issue or pull-request root by exact event id
+    Root {
+        #[arg(long)]
+        event: String,
+    },
     /// List issue and pull-request roots that mention an agent
     #[command(
         after_help = "Scoped to repositories you name, and to roots that `p`-tag the given \
@@ -522,6 +542,15 @@ buzz projects history --root <EVENT_ID> --root <OTHER_EVENT_ID> --limit 50")]
         /// Maximum events to return per query (default 200, maximum 500)
         #[arg(long)]
         limit: Option<u32>,
+        /// Inclusive upper created_at bound for backwards pagination
+        #[arg(long)]
+        until: Option<u64>,
+        /// Query only comments, lifecycle events and peer-call traffic
+        #[arg(long, conflicts_with = "revisions_only")]
+        comments_only: bool,
+        /// Query only pull-request revision events
+        #[arg(long, conflicts_with = "comments_only")]
+        revisions_only: bool,
     },
 }
 
@@ -2396,7 +2425,7 @@ mod tests {
             ("pack", 2),
             ("patches", 4),
             ("pr", 6),
-            ("projects", 2),
+            ("projects", 4),
             ("reactions", 3),
             ("repos", 5),
             ("social", 7),

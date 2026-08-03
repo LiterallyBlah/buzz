@@ -12015,6 +12015,7 @@ mod tests {
                     // these cases were written against.
                     sibling: None,
                     ledger: &mut ledger,
+                    resolved_candidate: None,
                 };
                 crate::handle_project_event(&mut d, $ev)
             }};
@@ -12224,6 +12225,7 @@ mod tests {
                     // these cases were written against.
                     sibling: None,
                     ledger: &mut ledger,
+                    resolved_candidate: None,
                 };
                 crate::handle_project_event(&mut d, $ev)
             }};
@@ -12992,6 +12994,7 @@ mod tests {
                                     queue: &mut queue,
                                     sibling: None,
                                     ledger: &mut ledger,
+                                    resolved_candidate: None,
                                 },
                                 &mut seen,
                                 &subscriber,
@@ -14811,6 +14814,7 @@ for line in sys.stdin:
                     queue: &mut self.queue,
                     sibling: None,
                     ledger: &mut self.ledger,
+                    resolved_candidate: None,
                 },
                 &crate::project::ProjectEvent::Routed {
                     source,

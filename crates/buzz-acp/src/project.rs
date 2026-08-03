@@ -3709,6 +3709,7 @@ pub(crate) fn decide_project_event(
     event: &VerifiedProjectEvent,
     identity: ProjectIdentity<'_>,
     state: ProjectState<'_>,
+    resolved_candidate: Option<&EnrolmentCandidate>,
 ) -> ProjectDecision {
     let ignored = ProjectDecision {
         effect: ProjectEffect::Ignore,
@@ -3720,8 +3721,9 @@ pub(crate) fn decide_project_event(
     // all and must not be pushed further — `resolve_addressing` returns `None`
     // for it rather than guessing.
     let kind_effect = classify_kind(event.kind());
+    let root_state = state.enrolments.state_of(route.root());
     let evidence = AddressingEvidence::resolve(event, identity.agent);
-    let Some(addressing) = resolve_addressing(
+    let Some(mut addressing) = resolve_addressing(
         source,
         kind_effect,
         &evidence,
@@ -3731,6 +3733,26 @@ pub(crate) fn decide_project_event(
     ) else {
         return ignored;
     };
+    let resolved_binding = resolved_candidate.filter(|candidate| {
+        candidate.root() == route.root()
+            && matches!(route.coordinate_claim(), CoordinateClaim::Unique(value) if value == candidate.coordinate())
+    });
+    // On an unknown root, the enrolment subscription's exact `p` transport plus
+    // a separately verified matching root is the complete comment-first proof.
+    // Desktop display-name text is presentation data and cannot be resolved
+    // reliably here. Do not apply this promotion to dormant roots: their copied
+    // participant tags must remain silent unless stronger explicit evidence is
+    // available.
+    if matches!(root_state, RootState::Unknown)
+        && matches!(kind_effect, KindEffect::Comment)
+        && matches!(
+            source,
+            ProjectSubscription::Enrolment | ProjectSubscription::EnrolmentHistory { .. }
+        )
+        && resolved_binding.is_some()
+    {
+        addressing = Addressing::ExplicitMention;
+    }
     let author = classify_project_author(
         event,
         identity.agent,
@@ -3739,11 +3761,13 @@ pub(crate) fn decide_project_event(
         state.sibling,
         identity.approved_external_agents,
     );
-    let root_state = state.enrolments.state_of(route.root());
 
-    // A root event carries its own candidate; a continuation reads the binding
-    // already stored. Both are validated sources — neither is assembled here.
-    let candidate = validate_enrolment_candidate(event, state.discovered);
+    // A root event carries its own candidate; a comment-first mention carries a
+    // separately fetched and verified root candidate. Keep the two witnesses
+    // distinct: the directing comment supplies authority/addressing, while the
+    // root supplies only the durable repository binding.
+    let candidate =
+        validate_enrolment_candidate(event, state.discovered).or_else(|| resolved_binding.cloned());
     let stored = state.enrolments.get(route.root());
 
     // Lifecycle authority is a property of the root's **stored binding**, and
@@ -7501,9 +7525,9 @@ mod sibling {
 /// an agent sharing *this agent's* owner — not an agent belonging to whoever
 /// happens to own the repository being discussed.
 ///
-/// Order matters: self first, so the agent cannot classify itself as an
-/// authorised human; humans before agents, so an owner who also runs agent keys
-/// is treated as the human they are.
+/// Order matters: self first, then trusted agents before generic human lists.
+/// An agent identity must not gain human comment authority merely because it
+/// was also placed in a broad allowed-user list.
 pub(crate) fn classify_project_author(
     event: &VerifiedProjectEvent,
     agent: &AgentIdentity,
@@ -7520,17 +7544,18 @@ pub(crate) fn classify_project_author(
         return ProjectAuthor::SelfAuthored;
     }
 
+    let attested = sibling.is_some_and(|s| agent_owner.is_some_and(|o| s.matches(&author, o)));
+    if attested || approved_external_agents.contains(&author) {
+        return ProjectAuthor::TrustedAgent;
+    }
+
     // Invocation authority comes from the agent's owner, never from the
-    // repository's.
+    // repository's. Explicit agent classification above wins over this generic
+    // human allow-list.
     if agent_owner.is_some_and(|o| o.eq_ignore_ascii_case(&author))
         || approved_humans.contains(&author)
     {
         return ProjectAuthor::AuthorisedHuman;
-    }
-
-    let attested = sibling.is_some_and(|s| agent_owner.is_some_and(|o| s.matches(&author, o)));
-    if attested || approved_external_agents.contains(&author) {
-        return ProjectAuthor::TrustedAgent;
     }
 
     ProjectAuthor::Untrusted

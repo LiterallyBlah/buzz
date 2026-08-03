@@ -2379,6 +2379,21 @@ async fn tokio_main() -> Result<()> {
                                 &ctx.rest_client,
                             )
                             .await;
+                            let resolved_candidate = match resolve_comment_first_candidate(
+                                &project_event,
+                                &project_enrolments,
+                                &discovered_repositories,
+                                &pubkey_hex,
+                                &ctx.rest_client,
+                            )
+                            .await
+                            {
+                                Ok(candidate) => candidate,
+                                Err(error) => {
+                                    tracing::warn!(%error, "comment-first root resolution failed; event remains retryable");
+                                    continue;
+                                }
+                            };
                             dispatch_and_flush_project_event(
                                 &mut ProjectArm {
                                     identity: &project_agent_identity,
@@ -2394,6 +2409,7 @@ async fn tokio_main() -> Result<()> {
                                     startup_watermark,
                                 },
                                 project_sibling,
+                                resolved_candidate,
                                 &relay,
                                 &project_event,
                                 &mut pool,
@@ -3471,10 +3487,61 @@ pub(crate) struct ProjectArm<'a> {
 ///
 /// The flush is the ordinary pool path, not a project-specific one, so queue
 /// ownership, in-flight accounting and activity stay a single mechanism.
+/// Resolve the separately signed root needed by comment-first enrolment.
+///
+/// `Err` is transient and the caller must not dispatch (or spend dedupe) yet.
+/// `Ok(None)` is a definitive non-candidate. Existing active continuations do
+/// not pay an exact-root read on every comment.
+async fn resolve_comment_first_candidate(
+    project_event: &project::ProjectEvent,
+    enrolments: &project::ProjectEnrolments,
+    discovered: &project::DiscoveredRepositories,
+    agent_pubkey_hex: &str,
+    rest: &relay::RestClient,
+) -> Result<Option<project::EnrolmentCandidate>, String> {
+    let project::ProjectEvent::Routed { route, event, .. } = project_event else {
+        return Ok(None);
+    };
+    if event.kind() != buzz_core::kind::KIND_TEXT_NOTE
+        || matches!(
+            enrolments.state_of(route.root()),
+            project::RootState::Active
+        )
+        || !event_mentions_agent(event.event(), agent_pubkey_hex)
+    {
+        return Ok(None);
+    }
+    let root_id = nostr::EventId::from_hex(route.root())
+        .map_err(|e| format!("invalid routed root id: {e}"))?;
+    let value = rest
+        .query(&[nostr::Filter::new()
+            .id(root_id)
+            .kinds([
+                nostr::Kind::Custom(buzz_core::kind::KIND_GIT_ISSUE as u16),
+                nostr::Kind::Custom(buzz_core::kind::KIND_GIT_PULL_REQUEST as u16),
+            ])
+            .limit(2)])
+        .await
+        .map_err(|e| e.to_string())?;
+    let Ok(events) = serde_json::from_value::<Vec<nostr::Event>>(value) else {
+        return Ok(None);
+    };
+    if events.len() != 1 || events[0].id != root_id {
+        return Ok(None);
+    }
+    let Ok(verified) =
+        project::VerifiedProjectEvent::verify(events.into_iter().next().unwrap()).await
+    else {
+        return Ok(None);
+    };
+    Ok(project::validate_enrolment_candidate(&verified, discovered))
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn dispatch_and_flush_project_event(
     arm: &mut ProjectArm<'_>,
     sibling: Option<project::VerifiedSibling>,
+    resolved_candidate: Option<project::EnrolmentCandidate>,
     subscriber: &impl ProjectSubscriber,
     project_event: &project::ProjectEvent,
     pool: &mut AgentPool,
@@ -3496,6 +3563,7 @@ pub(crate) async fn dispatch_and_flush_project_event(
             queue,
             sibling,
             ledger: arm.ledger,
+            resolved_candidate: resolved_candidate.as_ref(),
         },
         arm.seen,
         subscriber,
@@ -3757,6 +3825,9 @@ struct ProjectDispatch<'a> {
     /// disagreed about having seen it is exactly the loop this phase exists to
     /// prevent, and one ledger is the cheapest way for them not to disagree.
     ledger: &'a mut peer_call::CallLedger,
+    /// Separately fetched, signature-verified root evidence for a directing
+    /// comment. It supplies the binding only; the comment remains the authority.
+    resolved_candidate: Option<&'a project::EnrolmentCandidate>,
 }
 
 /// A NIP-OA lookup that already happened, in the shape [`project::SiblingResolver`]
@@ -4344,6 +4415,7 @@ fn handle_project_event(
                     readiness: &project::RootHistoryReadiness::Unknown,
                     sibling: dispatch.sibling.as_ref(),
                 },
+                dispatch.resolved_candidate,
             );
 
             // History restores state; it does not answer anyone.
@@ -4416,7 +4488,8 @@ fn handle_project_event(
                 decision.effect,
                 project::ProjectEffect::Enrol | project::ProjectEffect::EnrolAndWake
             ) {
-                let candidate = project::validate_enrolment_candidate(event, dispatch.discovered);
+                let candidate = project::validate_enrolment_candidate(event, dispatch.discovered)
+                    .or_else(|| dispatch.resolved_candidate.cloned());
                 let Some(candidate) = candidate else {
                     return ProjectDispatched::Ignored;
                 };
@@ -5458,6 +5531,7 @@ mod project_discovery_ingestion_tests {
             // `dispatch_over_sibling` is the variant for peer-call cases.
             sibling: None,
             ledger,
+            resolved_candidate: None,
         }
     }
 
@@ -5490,6 +5564,7 @@ mod project_discovery_ingestion_tests {
             queue,
             sibling,
             ledger,
+            resolved_candidate: None,
         }
     }
 
@@ -12230,6 +12305,14 @@ for line in sys.stdin:
         event: nostr::Event,
         source: project::ProjectSubscription,
     ) -> project::ProjectEvent {
+        routed_mode(event, source, project::ProcessingMode::Live).await
+    }
+
+    async fn routed_mode(
+        event: nostr::Event,
+        source: project::ProjectSubscription,
+        mode: project::ProcessingMode,
+    ) -> project::ProjectEvent {
         let verified = project::VerifiedProjectEvent::verify(event)
             .await
             .expect("valid");
@@ -12238,8 +12321,33 @@ for line in sys.stdin:
             source,
             route,
             event: verified,
-            mode: project::ProcessingMode::Live,
+            mode,
         }
+    }
+
+    fn unaddressed_root(owner: &Keys, repo_id: &str, kind: u32) -> nostr::Event {
+        let coord = format!("30617:{}:{repo_id}", owner.public_key().to_hex());
+        EventBuilder::new(nostr::Kind::Custom(kind as u16), "binding root")
+            .tags([nostr::Tag::parse(["a", &coord]).unwrap()])
+            .sign_with_keys(owner)
+            .expect("sign")
+    }
+
+    fn addressed_comment(
+        owner: &Keys,
+        agent: &Keys,
+        repo_id: &str,
+        root: &nostr::Event,
+    ) -> nostr::Event {
+        let coord = format!("30617:{}:{repo_id}", owner.public_key().to_hex());
+        EventBuilder::new(nostr::Kind::TextNote, "@desktop-agent please take this")
+            .tags([
+                nostr::Tag::parse(["a", &coord]).unwrap(),
+                nostr::Tag::parse(["e", &root.id.to_hex(), "", "root"]).unwrap(),
+                nostr::Tag::parse(["p", &agent.public_key().to_hex()]).unwrap(),
+            ])
+            .sign_with_keys(owner)
+            .expect("sign")
     }
 
     /// The whole runtime for one scenario, with **no channels at all**.
@@ -12288,7 +12396,11 @@ for line in sys.stdin:
             }
         }
 
-        async fn drive(&mut self, event: &project::ProjectEvent) -> ProjectDispatched {
+        async fn drive_with_candidate(
+            &mut self,
+            event: &project::ProjectEvent,
+            candidate: Option<project::EnrolmentCandidate>,
+        ) -> ProjectDispatched {
             let owner_hex = self.owner.public_key().to_hex();
             let agent_hex = self.agent.public_key().to_hex();
             dispatch_and_flush_project_event(
@@ -12305,6 +12417,7 @@ for line in sys.stdin:
                     startup_watermark: 0,
                 },
                 None,
+                candidate,
                 &self.subscriber,
                 event,
                 &mut self.pool,
@@ -12314,6 +12427,10 @@ for line in sys.stdin:
                 true,
             )
             .await
+        }
+
+        async fn drive(&mut self, event: &project::ProjectEvent) -> ProjectDispatched {
+            self.drive_with_candidate(event, None).await
         }
 
         async fn discover(&mut self, repo_id: &str) {
@@ -12506,5 +12623,102 @@ for line in sys.stdin:
             1,
             "it waits for the turn in flight rather than starting a second one"
         );
+    }
+
+    #[tokio::test]
+    async fn approved_human_comment_first_uses_supplied_root_binding_and_queues_comment() {
+        for kind in [
+            buzz_core::kind::KIND_GIT_ISSUE,
+            buzz_core::kind::KIND_GIT_PULL_REQUEST,
+        ] {
+            let recorder = PromptRecorder::new();
+            let mut rt = Runtime::new(&recorder).await;
+            rt.discover("comment-first").await;
+            let root = unaddressed_root(&rt.owner, "comment-first", kind);
+            let verified_root = project::VerifiedProjectEvent::verify(root.clone())
+                .await
+                .expect("root verifies");
+            let candidate = project::validate_enrolment_candidate(&verified_root, &rt.discovered)
+                .expect("known root is a candidate");
+            let comment = addressed_comment(&rt.owner, &rt.agent, "comment-first", &root);
+
+            let dispatched = rt
+                .drive_with_candidate(
+                    &routed(comment, project::ProjectSubscription::Enrolment).await,
+                    Some(candidate),
+                )
+                .await;
+
+            assert!(
+                matches!(dispatched, ProjectDispatched::Queued { queued: true, .. }),
+                "comment-first dispatch was {dispatched:?}"
+            );
+            assert!(rt.enrolments.get(&root.id.to_hex()).is_some());
+            let prompts = recorder.prompts(1).await;
+            assert!(prompts[0].contains("@desktop-agent please take this"));
+            assert!(!prompts[0].contains("binding root\n\nbinding root"));
+        }
+    }
+
+    #[tokio::test]
+    async fn replayed_comment_first_enrols_without_queueing_historical_work() {
+        let recorder = PromptRecorder::new();
+        let mut rt = Runtime::new(&recorder).await;
+        rt.discover("replay-comment-first").await;
+        let root = unaddressed_root(
+            &rt.owner,
+            "replay-comment-first",
+            buzz_core::kind::KIND_GIT_ISSUE,
+        );
+        let verified_root = project::VerifiedProjectEvent::verify(root.clone())
+            .await
+            .expect("root verifies");
+        let candidate = project::validate_enrolment_candidate(&verified_root, &rt.discovered)
+            .expect("known root is a candidate");
+        let comment = addressed_comment(&rt.owner, &rt.agent, "replay-comment-first", &root);
+
+        let dispatched = rt
+            .drive_with_candidate(
+                &routed_mode(
+                    comment,
+                    project::ProjectSubscription::Enrolment,
+                    project::ProcessingMode::Replay,
+                )
+                .await,
+                Some(candidate),
+            )
+            .await;
+
+        assert_eq!(dispatched, ProjectDispatched::Enrolled);
+        assert!(rt.enrolments.get(&root.id.to_hex()).is_some());
+        assert!(recorder.read().is_empty());
+    }
+
+    #[tokio::test]
+    async fn mismatched_comment_first_candidate_is_ignored() {
+        let recorder = PromptRecorder::new();
+        let mut rt = Runtime::new(&recorder).await;
+        rt.discover("expected").await;
+        rt.discover("other").await;
+        let referenced = unaddressed_root(&rt.owner, "expected", buzz_core::kind::KIND_GIT_ISSUE);
+        let other = unaddressed_root(&rt.owner, "other", buzz_core::kind::KIND_GIT_ISSUE);
+        let verified_other = project::VerifiedProjectEvent::verify(other)
+            .await
+            .expect("root verifies");
+        let wrong_candidate =
+            project::validate_enrolment_candidate(&verified_other, &rt.discovered)
+                .expect("other known root is a candidate");
+        let comment = addressed_comment(&rt.owner, &rt.agent, "expected", &referenced);
+
+        let dispatched = rt
+            .drive_with_candidate(
+                &routed(comment, project::ProjectSubscription::Enrolment).await,
+                Some(wrong_candidate),
+            )
+            .await;
+
+        assert_eq!(dispatched, ProjectDispatched::Ignored);
+        assert!(rt.enrolments.get(&referenced.id.to_hex()).is_none());
+        assert!(recorder.read().is_empty());
     }
 }
