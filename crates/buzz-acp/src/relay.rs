@@ -596,6 +596,24 @@ enum RelayCommand {
         replacement: crate::project::ProjectReplacement,
         filters: Vec<Value>,
     },
+    /// Begin — or widen and restart — the walk back through the roots this
+    /// agent is already addressed on.
+    ///
+    /// Separate from the enrolment REQ it accompanies, because the two are
+    /// different questions with different lifetimes: the enrolment REQ is one
+    /// standing tail under a fixed id, and history is a sequence of
+    /// generation-distinct pages that ends. Folding them into one command is
+    /// what produced the request whose fixed identity could not paginate, and
+    /// so could only ever sample thirty days of history and call it complete.
+    ///
+    /// Carries the coordinate set and the agent rather than a filter: the
+    /// cursor derives every page's filter from its own bound, and a
+    /// caller-supplied one could describe a different question from the page it
+    /// is bound to.
+    BeginEnrolmentHistory {
+        coordinates: Vec<String>,
+        agent: String,
+    },
 }
 
 type WsStream = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
@@ -1020,6 +1038,26 @@ impl HarnessRelay {
             .map_err(|_| RelayError::ConnectionClosed)
     }
 
+    /// Ask the background task to walk back through the roots this agent is
+    /// already addressed on.
+    ///
+    /// Sent alongside the enrolment replacement rather than derived from it,
+    /// because the two are different questions: the enrolment REQ is a standing
+    /// tail under a fixed id, and history is a finite sequence of
+    /// generation-distinct pages. Nothing about the pages is decided here —
+    /// not the bound, not the limit, not the id — for the same reason nothing
+    /// about a replacement's generation is.
+    pub async fn submit_enrolment_history(
+        &self,
+        coordinates: Vec<String>,
+        agent: String,
+    ) -> Result<(), RelayError> {
+        self.cmd_tx
+            .send(RelayCommand::BeginEnrolmentHistory { coordinates, agent })
+            .await
+            .map_err(|_| RelayError::ConnectionClosed)
+    }
+
     /// Reconnect after connection loss. Instructs the background task to
     /// re-authenticate and resubscribe to all previously active channels.
     pub async fn reconnect(&mut self) -> Result<(), RelayError> {
@@ -1306,6 +1344,22 @@ struct BgState {
     ///
     /// Empty in production: nothing enrols a root yet.
     reconstructions: crate::project::ProjectReconstructions,
+    /// The walk back through this agent's own roots, if one has begun.
+    ///
+    /// Lives beside the registry for the same reason the per-root
+    /// reconstructions do: a page is bound the moment its REQ reaches the
+    /// socket, so an owner anywhere else could only issue a collector and wait
+    /// for the bound page to be handed back.
+    enrolment_history: Option<crate::project::EnrolmentReconstruction>,
+    /// **The visible fail-closed state.** Set when the walk could not prove it
+    /// reached the end of history, and never cleared by anything short of a
+    /// fresh walk.
+    ///
+    /// Held rather than merely logged because "we do not know which
+    /// conversations we are responsible for" is a state the agent is *in*, not
+    /// an event that happened to it — and the plan requires it be visible
+    /// rather than inferred from a silence.
+    enrolment_history_degraded: Option<String>,
     /// Current position in the exponential backoff ladder.
     ///
     /// Persisted across calls to `wait_for_reconnect` so a flapping link stays at
@@ -1343,6 +1397,8 @@ impl BgState {
             project_seen_ids: TwoGenDedup::new(SEEN_ID_LIMIT),
             project_requests: crate::project::ProjectRequests::new(),
             reconstructions: crate::project::ProjectReconstructions::new(),
+            enrolment_history: None,
+            enrolment_history_degraded: None,
             backoff_step: 0,
         }
     }
@@ -1484,6 +1540,9 @@ impl BgState {
     fn retire_project_connection(&mut self) {
         self.project_requests.clear_connection();
         self.reconstructions.disconnected();
+        if let Some(history) = self.enrolment_history.as_mut() {
+            history.disconnected();
+        }
     }
 
     fn track_observer_in_flight(&mut self, event: Box<Event>) {
@@ -1581,6 +1640,12 @@ fn apply_command_to_state(state: &mut BgState, cmd: RelayCommand) {
                 crate::project::IntentAdmission::Recorded
                 | crate::project::IntentAdmission::AlreadyIntended => {}
             }
+        }
+        RelayCommand::BeginEnrolmentHistory { coordinates, agent } => {
+            // Offline: remember the question. No page can be written with no
+            // socket, and the walk must not be marked degraded for that — the
+            // reconnect path drives it as soon as there is one.
+            begin_enrolment_history(state, coordinates, agent);
         }
         RelayCommand::ReplaceProject {
             replacement,
@@ -1818,6 +1883,14 @@ async fn execute_connected_command(
                 ProjectSendOutcome::InvariantViolation => true,
                 ProjectSendOutcome::WriteFailed => false,
             }
+        }
+        RelayCommand::BeginEnrolmentHistory { coordinates, agent } => {
+            begin_enrolment_history(state, coordinates, agent);
+            drive_enrolment_history(ws, state).await;
+            // The socket is untouched by any outcome here. A walk that cannot
+            // be opened degrades visibly and every other subscription keeps
+            // working; tearing the connection down would take them with it.
+            true
         }
         RelayCommand::ReplaceProject {
             replacement,
@@ -3131,51 +3204,47 @@ async fn handle_ws_message(
                             route_catch_up_frame(state, admission, expected, *event).await;
                             return true;
                         }
-                        // Replay or live, decided **here** — before the event
-                        // enters the bounded queue, because a backlog frame can
-                        // still be sitting in that queue when the boundary
-                        // arrives, and a flag read later would call it live.
+                        // The enrolment walk's pages take the same path and for
+                        // the same reason: they count what the relay returned.
+                        if matches!(
+                            admission.subscription(),
+                            crate::project::ProjectSubscription::EnrolmentHistory { .. }
+                        ) {
+                            route_enrolment_history_frame(state, admission, *event).await;
+                            return true;
+                        }
+                        // Replay or live is **the class of the request that
+                        // delivered this frame**, read from what this agent
+                        // recorded when it sent the REQ. Nothing here decides
+                        // it, so there is nothing here to get wrong.
                         //
-                        // **A property of the event, not of the subscription.**
+                        // Two earlier rules lived here and both were defects
+                        // of the same shape — a second producer of an answer
+                        // that already had one.
                         //
-                        // This used to also require that the enrolment backlog
-                        // had not drained, and that condition was a defect: the
+                        // The first read the enrolment REQ's drain flag. The
                         // enrolment id is fixed, so a *predecessor's* EOSE
                         // arriving after its successor was registered certified
-                        // a backlog it knew nothing about. The successor's
-                        // remaining stored frames were then stamped live and
-                        // four historical roots were answered on a real relay.
+                        // a backlog it knew nothing about; the successor's
+                        // remaining stored frames were stamped live and four
+                        // historical roots were re-answered on a real relay.
                         //
-                        // An event created before this process started is
-                        // history, whatever carried it and whenever it arrives.
-                        // That cannot be corrupted by a stale boundary, because
-                        // it does not consult one. A root published during an
-                        // enrolment replacement is newer than startup, so it
-                        // stays live and is answered exactly once — the shared
-                        // dedup slot stops the watched REQ answering it again.
+                        // The second read `created_at < startup_watermark`.
+                        // That is the author's clock, which the relay bounds at
+                        // ±15 minutes on ingest: a root published live by a
+                        // slightly slow clock looked historical, so it enrolled
+                        // silently and was never answered. It also could not
+                        // tell a genuinely historical root from one this agent
+                        // had already handled.
                         //
-                        // The honest limit: `created_at` is the author's clock.
-                        // The relay bounds drift at ±15 minutes on ingest, so an
-                        // event can look up to that far "before" startup while
-                        // being live. It would enrol silently and be answered by
-                        // its next comment rather than immediately. That is the
-                        // conservative direction, and it is the reason the EOSE
-                        // boundary is still worth binding to a generation-
-                        // distinct identity as a second signal — which this
-                        // commit does not yet do.
-                        let source = {
-                            let class = admission.subscription().clone();
-                            let is_history =
-                                matches!(class, crate::project::ProjectSubscription::Enrolment)
-                                    && state
-                                        .startup_watermark
-                                        .is_some_and(|w| event.created_at.as_secs() < w);
-                            if is_history {
-                                crate::project::ProjectSubscription::EnrolmentReplay
-                            } else {
-                                class
-                            }
-                        };
+                        // Now the two questions have two requests. The
+                        // enrolment REQ is a live tail floored at startup, and
+                        // `EnrolmentHistory` pages walk backwards on their own
+                        // generation-distinct identities. A skewed root on the
+                        // tail is live because the tail delivered it, and it is
+                        // answered exactly once — the shared dedup slot stops
+                        // any other path answering it again.
+                        let source = admission.subscription().clone();
 
                         // Project dispatch. The step order below is the whole
                         // security property, so it is written out rather than
@@ -3463,6 +3532,60 @@ async fn handle_ws_message(
                         if let Some(advance) = state.reconstructions.complete(&witness) {
                             debug!(sub_id = %subscription_id, ?advance, "history page completed");
                         }
+
+                        // The enrolment walk's own boundary, and **only** its
+                        // own: `complete` compares the page in flight against
+                        // this witness's registration, so a boundary from the
+                        // live enrolment tail, from a predecessor page, or from
+                        // a request opened on a connection that has since died
+                        // certifies nothing here. That is the defect that
+                        // re-answered four historical roots on a real relay,
+                        // closed at the structure rather than by a flag.
+                        let generation = match witness.subscription() {
+                            crate::project::ProjectSubscription::EnrolmentHistory {
+                                generation,
+                            } => *generation,
+                            _ => 0,
+                        };
+                        let advance = state
+                            .enrolment_history
+                            .as_mut()
+                            .and_then(|walk| walk.complete(&witness));
+                        match advance {
+                            Some(crate::project::EnrolmentAdvance::Continue { until, limit }) => {
+                                debug!(
+                                    sub_id = %subscription_id, until, limit,
+                                    "enrolment history page saturated — asking further back"
+                                );
+                                drive_enrolment_history(ws, state).await;
+                            }
+                            Some(crate::project::EnrolmentAdvance::Finished { roots }) => {
+                                let found = roots.len();
+                                let restored =
+                                    deliver_reconstructed_roots(state, event_tx, generation, roots)
+                                        .await;
+                                // Discovered, restored and dropped, as the plan
+                                // requires — at `info`, because "reconstruction
+                                // finished and here is what it covered" is the
+                                // one line an operator needs to trust the run.
+                                info!(
+                                    discovered = found,
+                                    restored,
+                                    dropped = found - restored,
+                                    "enrolment history reconstruction complete"
+                                );
+                            }
+                            Some(crate::project::EnrolmentAdvance::Stale) => {
+                                debug!(
+                                    sub_id = %subscription_id,
+                                    "boundary from a superseded enrolment history page — ignored"
+                                );
+                            }
+                            Some(crate::project::EnrolmentAdvance::Degraded { reason }) => {
+                                degrade_enrolment_history(state, reason);
+                            }
+                            None => {}
+                        }
                     } else {
                         debug!("EOSE for subscription {subscription_id}");
                     }
@@ -3510,6 +3633,7 @@ async fn handle_ws_message(
                             matches!(
                                 a.subscription(),
                                 crate::project::ProjectSubscription::RootCatchUp { .. }
+                                    | crate::project::ProjectSubscription::EnrolmentHistory { .. }
                             )
                         });
                     if state
@@ -3518,16 +3642,37 @@ async fn handle_ws_message(
                         .is_some()
                     {
                         if let Some(lost) = lost {
-                            let routing = state.reconstructions.observe(lost.catch_up(
-                                crate::project::CatchUpOutcome::RequestLost(
-                                    "relay closed the request",
-                                ),
-                            ));
-                            debug!(
-                                sub_id = %subscription_id,
-                                ?routing,
-                                "history page released by a closed request"
+                            let is_enrolment_history = matches!(
+                                lost.subscription(),
+                                crate::project::ProjectSubscription::EnrolmentHistory { .. }
                             );
+                            let frame = lost.catch_up(crate::project::CatchUpOutcome::RequestLost(
+                                "relay closed the request",
+                            ));
+                            if is_enrolment_history {
+                                // Released, not completed. A CLOSED is never a
+                                // boundary, so the walk keeps its cursor and
+                                // re-asks the same bound under a fresh
+                                // registration — a page left attached would
+                                // stall the walk in silence, since no boundary
+                                // can ever follow a CLOSED.
+                                if let Some(walk) = state.enrolment_history.as_mut() {
+                                    let routing = walk.observe(frame);
+                                    debug!(
+                                        sub_id = %subscription_id,
+                                        ?routing,
+                                        "enrolment history page released by a closed request"
+                                    );
+                                }
+                                drive_enrolment_history(ws, state).await;
+                            } else {
+                                let routing = state.reconstructions.observe(frame);
+                                debug!(
+                                    sub_id = %subscription_id,
+                                    ?routing,
+                                    "history page released by a closed request"
+                                );
+                            }
                         }
                         // Registration closed; durable intent kept. An earlier
                         // version dropped the intent too, on the reasoning that
@@ -3937,6 +4082,16 @@ async fn resubscribe_after_reconnect(
             }
         }
     }
+
+    // The walk survives the connection: its cursor and cutoff are ours, and
+    // only the page that was in flight belonged to the socket that died. It
+    // resumes from the bound it had reached, under a fresh registration.
+    //
+    // It is deliberately *not* replayed from durable intent. A history page's
+    // filter carries a bound that moves, so a recorded one would re-ask for a
+    // page the cursor has already walked past — which is why the registry
+    // refuses to hold this class as intent at all.
+    drive_enrolment_history(ws, state).await;
 
     let mut deferred_commands = VecDeque::new();
     let channels: Vec<Uuid> = state.active_subscriptions.keys().copied().collect();
@@ -5167,24 +5322,6 @@ fn channel_id_from_sub_id(sub_id: &str) -> Option<Uuid> {
         .and_then(|s| s.parse::<Uuid>().ok())
 }
 
-/// Route one frame admitted by a live root catch-up request to its page.
-///
-/// **Every admitted frame reaches the page**, and that is the whole difference
-/// from the live-surface path above. A history page counts what the relay
-/// returned under its `limit` in order to distinguish a saturated page — there
-/// is more history, ask again from further back — from an exhausted one. A
-/// frame this agent refuses and discards here does not cost one event: it makes
-/// the page read short, and a short page is how a reconstruction concludes it
-/// has reached the end of history. So a frame that cannot be a row arrives as a
-/// reason the page is untrustworthy instead.
-///
-/// Nothing crosses the event channel, so nothing here can be lost to
-/// backpressure. That is not a convenience: `try_send` has a `Full` arm, and a
-/// page that never learns a frame arrived is short by exactly that many rows,
-/// with no way to tell afterwards.
-///
-/// Nothing here is deduplicated either. The live surfaces share one
-/// `project_seen_ids` set, and putting page rows through it would suppress
 /// Deliver a project-routed peer-call envelope that arrived on the peer-call
 /// subscription.
 ///
@@ -5266,6 +5403,24 @@ async fn route_project_peer_call(
     }
 }
 
+/// Route one frame admitted by a live root catch-up request to its page.
+///
+/// **Every admitted frame reaches the page**, and that is the whole difference
+/// from the live-surface path above. A history page counts what the relay
+/// returned under its `limit` in order to distinguish a saturated page — there
+/// is more history, ask again from further back — from an exhausted one. A
+/// frame this agent refuses and discards here does not cost one event: it makes
+/// the page read short, and a short page is how a reconstruction concludes it
+/// has reached the end of history. So a frame that cannot be a row arrives as a
+/// reason the page is untrustworthy instead.
+///
+/// Nothing crosses the event channel, so nothing here can be lost to
+/// backpressure. That is not a convenience: `try_send` has a `Full` arm, and a
+/// page that never learns a frame arrived is short by exactly that many rows,
+/// with no way to tell afterwards.
+///
+/// Nothing here is deduplicated either. The live surfaces share one
+/// `project_seen_ids` set, and putting page rows through it would suppress
 /// exactly those events the agent had already been delivered live — shortening
 /// the page for the second time, by the same mechanism, for a different reason.
 async fn route_catch_up_frame(
@@ -5313,6 +5468,261 @@ async fn route_catch_up_frame(
     // counted as an anomaly now.
     let routing = state.reconstructions.observe(admission.catch_up(outcome));
     debug!(sub_id = %sub_id, ?routing, "catch-up frame routed");
+}
+
+/// Open as many enrolment-history pages as the walk currently wants.
+///
+/// A loop rather than a single open, because `page_wanted` is the cursor's own
+/// answer and it stays true across a reconnect that dropped a page in flight.
+/// At most one page is in flight at a time, so this issues one page per call in
+/// the steady state — the loop exists so that resuming after a disconnect does
+/// not need a second entry point.
+///
+/// **The bound is never a caller's choice.** The collector comes from the
+/// walk's own cursor, the filter and class come from the collector, and the id
+/// comes from the registry. Nothing between here and the socket can describe a
+/// different question from the page it binds.
+async fn drive_enrolment_history(ws: &mut WsStream, state: &mut BgState) {
+    loop {
+        let Some(history) = state.enrolment_history.as_mut() else {
+            return;
+        };
+        let Some(collector) = history.begin_page() else {
+            // Either nothing is wanted, or the walk just abandoned itself
+            // because it could no longer distinguish a page from a superseded
+            // one. The second is a fail-closed state and must be visible.
+            if let Some(reason) = state
+                .enrolment_history
+                .as_ref()
+                .and_then(|h| h.abandoned_reason())
+            {
+                let reason = reason.to_string();
+                degrade_enrolment_history(state, reason);
+            }
+            return;
+        };
+        match state
+            .project_requests
+            .open_history_page(ws, collector)
+            .await
+        {
+            crate::project::PageOpen::Opened(page) => {
+                let sub_id = page.sub_id().to_string();
+                let Some(history) = state.enrolment_history.as_mut() else {
+                    return;
+                };
+                if let Err(rejected) = history.attach(page) {
+                    // The page is bound and reachable, so its registration is
+                    // closed rather than left behind: an abandoned registration
+                    // would keep absorbing frames with nobody able to complete
+                    // it.
+                    let orphan = rejected.page.sub_id().to_string();
+                    state
+                        .project_requests
+                        .refuse_live(&orphan, "enrolment history page could not attach");
+                    let error = rejected.error;
+                    degrade_enrolment_history(
+                        state,
+                        format!("enrolment history page could not attach: {error:?}"),
+                    );
+                    return;
+                }
+                debug!(sub_id = %sub_id, "enrolment history page opened");
+            }
+            // Not a completion. A page that could not be sent proves nothing
+            // about how much history exists, so the walk must not be allowed to
+            // look finished — it degrades, visibly.
+            other => {
+                degrade_enrolment_history(
+                    state,
+                    format!("enrolment history page could not be opened: {other:?}"),
+                );
+                return;
+            }
+        }
+    }
+}
+
+/// Begin — or restart, on a widened coordinate set — the walk back through the
+/// roots this agent is addressed on.
+///
+/// A widened set restarts from the current snapshot boundary rather than
+/// widening the walk in place. The bound a cursor has already walked past was
+/// proven exhausted *for the set it was asking about*; carrying it onto a
+/// larger set would assert exhaustion over repositories no page had ever
+/// mentioned. Restarting re-reads rows already seen, which the shared dedup
+/// makes an exact no-op, and that is the cheap direction of the trade.
+///
+/// An identical set is left alone, so a discovery that changed nothing does not
+/// restart a walk in progress.
+fn begin_enrolment_history(state: &mut BgState, coordinates: Vec<String>, agent: String) {
+    let cutoff = state
+        .startup_watermark
+        .unwrap_or_else(|| nostr::Timestamp::now().as_secs());
+    let Some(walk) = crate::project::EnrolmentReconstruction::begin(
+        coordinates,
+        &agent,
+        cutoff,
+        ENROLMENT_HISTORY_PAGE_LIMIT,
+        RELAY_MAX_LIMIT,
+    ) else {
+        // Nothing discovered. There is no question to ask, which is not the
+        // same as an unanswered one — the walk stays absent rather than
+        // degraded.
+        return;
+    };
+    if state
+        .enrolment_history
+        .as_ref()
+        .is_some_and(|live| live.scope() == walk.scope() && live.abandoned_reason().is_none())
+    {
+        return;
+    }
+    // A restart clears the degraded state: it is a claim about a walk, and this
+    // is a different walk.
+    state.enrolment_history_degraded = None;
+    state.enrolment_history = Some(walk);
+}
+
+/// Rows per enrolment history page.
+///
+/// Not a completeness bound — the cursor escalates it on a saturated page and
+/// keeps walking, so this is only how much is asked for at a time. It is small
+/// enough that the common case (an agent with a handful of open issues) costs
+/// one page, and the escalation covers the rest.
+const ENROLMENT_HISTORY_PAGE_LIMIT: usize = 64;
+
+/// The largest `limit` this relay will honour on a REQ.
+///
+/// The escalation ceiling, and the point at which a page that is still
+/// saturated with every row sharing one timestamp can no longer be widened —
+/// which is a degraded walk, not a complete one.
+const RELAY_MAX_LIMIT: usize = 5_000;
+
+/// Hand every reconstructed root to the run loop, as replay.
+///
+/// Returns how many actually reached it. The difference from the input length
+/// is the dropped count, and it is reported rather than smoothed over: a root
+/// lost to backpressure here is a conversation this agent holds no authority
+/// for, and saying "complete" over it would be the same false claim the thirty-
+/// day window used to make.
+///
+/// Every row goes out under [`ProjectSubscription::EnrolmentHistory`], which
+/// `processing_mode_for` maps to `ProcessingMode::Replay` — so these restore
+/// authority and lifecycle and **never create a turn**. Nothing here decides
+/// that; the class the page was registered under does.
+///
+/// They spend the shared `project_seen_ids` slot, so a root that the live tail
+/// has already delivered is not restored a second time — and, in the other
+/// order, a root restored here cannot be re-answered by a later live delivery
+/// of the same event.
+async fn deliver_reconstructed_roots(
+    state: &mut BgState,
+    event_tx: &mpsc::Sender<Option<BuzzEvent>>,
+    generation: u64,
+    roots: Vec<crate::project::VerifiedProjectEvent>,
+) -> usize {
+    let mut restored = 0usize;
+    for verified in roots {
+        let Some(route) = crate::project::ProjectRoute::derive(&verified) else {
+            // The page's own scope already refused rows that resolve to no
+            // root, so this is unreachable rather than routine. Counted as
+            // dropped either way: it is a root the agent did not restore.
+            warn!(
+                event_id = %verified.id(),
+                "reconstructed root resolves to no route — not restored"
+            );
+            continue;
+        };
+        let event_id_hex = verified.id();
+        let ts = verified.event().created_at.as_secs();
+        if !state.project_seen_ids.insert(event_id_hex.clone()) {
+            // Already delivered live. Its authority is already held, so this is
+            // a restored root by every measure that matters.
+            restored += 1;
+            continue;
+        }
+        let project_event = crate::project::ProjectEvent::Routed {
+            source: crate::project::ProjectSubscription::EnrolmentHistory { generation },
+            route,
+            event: verified,
+        };
+        match event_tx.try_send(Some(BuzzEvent::Project(project_event))) {
+            Ok(()) => restored += 1,
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                state.project_seen_ids.remove(&event_id_hex);
+                state.project_dropped_since =
+                    Some(state.project_dropped_since.map_or(ts, |d| d.min(ts)));
+                state.proactive_resubscribe_needed = true;
+                warn!(
+                    event_id = %event_id_hex,
+                    "reconstructed root dropped (backpressure) — proactive resubscribe queued"
+                );
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => break,
+        }
+    }
+    restored
+}
+
+/// Enter the fail-closed degraded state, once.
+///
+/// Recorded on the state and logged at `warn`. It is deliberately not an error
+/// returned upwards: the connection is fine and every other subscription keeps
+/// working — what is not fine is the claim that this agent knows the full set
+/// of conversations it is responsible for.
+fn degrade_enrolment_history(state: &mut BgState, reason: String) {
+    if let Some(history) = state.enrolment_history.as_mut() {
+        history.abandon(reason.clone());
+    }
+    if state.enrolment_history_degraded.is_none() {
+        warn!(
+            reason = %reason,
+            "enrolment history reconstruction DEGRADED — this agent cannot prove it has \
+             found every root it is addressed on, and is fail-closed on that claim"
+        );
+        state.enrolment_history_degraded = Some(reason);
+    }
+}
+
+/// Route one frame admitted by a live enrolment-history request to its page.
+///
+/// The same contract as [`route_catch_up_frame`]: every admitted frame reaches
+/// the page, because the page counts what the relay returned in order to tell a
+/// saturated page from an exhausted one, and a frame silently dropped here
+/// shortens the page by exactly one row — which is how the walk decides it has
+/// reached the end of history.
+///
+/// Which rows *belong* is not decided here. The collector asks its own scope,
+/// so a root naming an undiscovered repository, or not addressing this agent,
+/// is counted and refused rather than counted as a row.
+async fn route_enrolment_history_frame(
+    state: &mut BgState,
+    admission: crate::project::FrameAdmission,
+    event: Event,
+) {
+    use crate::project::CatchUpOutcome;
+
+    let sub_id = admission.sub_id().to_string();
+    let outcome = match crate::project::VerifiedProjectEvent::verify(event).await {
+        Err(e) => {
+            warn!(sub_id = %sub_id, "enrolment history frame failed verification: {e}");
+            CatchUpOutcome::Unusable("frame failed verification")
+        }
+        Ok(verified) => CatchUpOutcome::Row(Box::new(verified)),
+    };
+
+    let Some(history) = state.enrolment_history.as_mut() else {
+        debug!(sub_id = %sub_id, "enrolment history frame with no walk in progress");
+        return;
+    };
+    let routing = history.observe(admission.catch_up(outcome));
+    if let crate::project::EnrolmentRouting::Contradiction { reason } = &routing {
+        let reason = reason.clone();
+        degrade_enrolment_history(state, reason);
+        return;
+    }
+    debug!(sub_id = %sub_id, ?routing, "enrolment history frame routed");
 }
 
 /// Per-channel CLOSED denials: the channel is forbidden but the connection is
@@ -7078,78 +7488,497 @@ mod tests {
             .expect("a watched generation is installed")
     }
 
-    /// Install the enrolment subscription over `coordinates`, through the
-    /// registry's own replacement, and return its fixed id.
-    /// The stamp a frame receives on the enrolment subscription.
+    // ── Enrolment history reconstruction ─────────────────────────────────────
+
+    /// A relay peer whose socket survives across several frames.
     ///
-    /// The line these cover is the one that published four historical replies
-    /// on a real relay: it used to require that the enrolment backlog had not
-    /// drained, and the enrolment id is fixed, so a *predecessor's* EOSE
-    /// certified a successor's backlog it knew nothing about. Replay is now a
-    /// property of the event — created before this process, therefore history —
-    /// which no boundary, stale or otherwise, can corrupt.
-    #[tokio::test]
-    async fn an_enrolment_frame_older_than_startup_is_stamped_replay() {
-        let owner = nostr::Keys::generate();
-        let coord = format!("30617:{}:demo", owner.public_key().to_hex());
-        let mut state = BgState::new();
-        state.startup_watermark = Some(1_000);
-        let enrol_id = open_enrolment_for(&mut state, std::slice::from_ref(&coord)).await;
+    /// `dispatch_over_fresh_connection` builds a new pair per frame, which is
+    /// right for frame-level tests and useless here: the page the driver opens
+    /// in response to a boundary is written to the socket, and a test that
+    /// cannot read that socket cannot see whether the walk continued.
+    struct WalkHarness {
+        state: BgState,
+        ws: WsStream,
+        server: WebSocketStream<tokio::net::TcpStream>,
+        owner: nostr::Keys,
+        coordinate: String,
+        tx: mpsc::Sender<Option<BuzzEvent>>,
+        rx: mpsc::Receiver<Option<BuzzEvent>>,
+    }
 
-        let historical = project_root_frame(&owner, &coord, 900);
-        let (tx, mut rx) = mpsc::channel(16);
-        deliver_frame(&mut state, &enrol_id, &historical, &tx).await;
-
-        match drain(&mut rx).into_iter().next() {
-            Some(BuzzEvent::Project(crate::project::ProjectEvent::Routed { source, .. })) => {
-                assert_eq!(
-                    source,
-                    crate::project::ProjectSubscription::EnrolmentReplay,
-                    "a root predating startup is history and must not wake anyone"
-                );
+    impl WalkHarness {
+        async fn new() -> Self {
+            let (ws, server) = test_ws_pair().await;
+            let owner = nostr::Keys::generate();
+            let coordinate = format!("30617:{}:demo", owner.public_key().to_hex());
+            let (tx, rx) = mpsc::channel(64);
+            Self {
+                state: BgState::new(),
+                ws,
+                server,
+                owner,
+                coordinate,
+                tx,
+                rx,
             }
-            other => panic!("expected a project delivery, got {other:?}"),
+        }
+
+        /// Begin the walk through the production command path.
+        async fn begin(&mut self) {
+            self.state.startup_watermark = Some(10_000);
+            execute_connected_command(
+                &mut self.ws,
+                &mut self.state,
+                &test_agent_hex(),
+                RelayCommand::BeginEnrolmentHistory {
+                    coordinates: vec![self.coordinate.clone()],
+                    agent: test_agent_hex(),
+                },
+            )
+            .await;
+        }
+
+        /// The next REQ the driver wrote, or `None` if it wrote nothing.
+        async fn next_req(&mut self) -> Option<Value> {
+            let message = timeout(Duration::from_millis(250), self.server.next())
+                .await
+                .ok()??
+                .ok()?;
+            serde_json::from_str(message.to_text().ok()?).ok()
+        }
+
+        async fn req(&mut self) -> Value {
+            self.next_req().await.expect("a REQ must reach the socket")
+        }
+
+        /// Feed one frame through the production ingress seam, on this socket.
+        async fn feed(&mut self, frame: Value) {
+            use futures_util::SinkExt;
+            let (observer_tx, _observer_rx) = mpsc::channel(8);
+            let keys = nostr::Keys::generate();
+            let text = serde_json::to_string(&frame).expect("encode");
+            self.server
+                .send(Message::Text(text.into()))
+                .await
+                .expect("the peer writes the frame");
+            let frame = match ingress::read_frame(&mut self.ws).await {
+                ingress::FrameRead::Frame(frame) => frame,
+                ingress::FrameRead::Lost => panic!("the connection dropped the frame"),
+            };
+            assert_ne!(
+                ingress::dispatch_frame(
+                    frame,
+                    &mut self.ws,
+                    &self.tx,
+                    &observer_tx,
+                    &mut self.state,
+                    &keys,
+                    "ws://test",
+                    &test_agent_hex(),
+                    None,
+                )
+                .await,
+                ingress::FrameDispatch::Lost,
+                "dispatch must not signal connection loss"
+            );
+        }
+
+        /// Fill a page with `count` roots, then close it with its own boundary.
+        async fn fill_and_close(&mut self, sub_id: &str, stamps: &[u64]) {
+            for created_at in stamps {
+                let root = project_root_frame(&self.owner, &self.coordinate, *created_at);
+                self.feed(json!(["EVENT", sub_id, root])).await;
+            }
+            self.feed(json!(["EOSE", sub_id])).await;
+        }
+
+        /// Fill `req`'s page to exactly its own limit, with orderable
+        /// timestamps, and close it with its own boundary.
+        ///
+        /// Saturation is relative to the limit the page actually asked for, not
+        /// to a number the test picked: a page is saturated when the relay
+        /// returns as many rows as it was allowed to, and hard-coding a count
+        /// would pass or fail on the page limit rather than on the rule.
+        async fn saturate(&mut self, req: &Value) {
+            let limit = req[2]["limit"].as_u64().expect("a page limit");
+            let id = req[1].as_str().expect("an id").to_string();
+            let stamps: Vec<u64> = (0..limit).map(|i| 9_000 - i * 10).collect();
+            self.fill_and_close(&id, &stamps).await;
+        }
+
+        fn degraded(&self) -> Option<&str> {
+            self.state.enrolment_history_degraded.as_deref()
         }
     }
 
-    /// A root published after startup stays live, even while the enrolment
-    /// backlog is still draining.
+    /// The walk opens its first page, and the live tail is untouched by it.
     ///
-    /// This is the half that keeps replay safety from becoming "quietly miss
-    /// concurrent work": a root created during an enrolment replacement is
-    /// news, and must be answered exactly once.
+    /// The two requests are the whole shape of this correction. The tail is one
+    /// standing REQ under a fixed id; the walk is a sequence of pages. Paging
+    /// through the tail's identity is what made the restart case unfixable,
+    /// because a fixed identity cannot carry a bound that moves.
     #[tokio::test]
-    async fn an_enrolment_frame_newer_than_startup_stays_live() {
+    async fn the_walk_pages_without_disturbing_the_live_tail() {
+        let mut h = WalkHarness::new().await;
+        let tail_id = open_enrolment_for(&mut h.state, std::slice::from_ref(&h.coordinate)).await;
+        // Drain the tail's own REQ, written by the replacement above onto its
+        // own throwaway socket — nothing of it reaches this one.
+        assert!(h.next_req().await.is_none());
+
+        h.begin().await;
+        let first = h.req().await;
+        let first_id = first[1].as_str().expect("an id").to_string();
+        assert_ne!(
+            first_id, tail_id,
+            "a history page must not wear the tail's identity"
+        );
+        assert!(
+            h.state.project_requests.match_frame(&tail_id).is_some(),
+            "the tail must still be live after a page is opened"
+        );
+
+        // A second page, after the first proves saturated.
+        h.saturate(&first).await;
+        let second = h.req().await;
+        let second_id = second[1].as_str().expect("an id").to_string();
+        assert_ne!(
+            second_id, first_id,
+            "each page takes a fresh identity, so a delayed frame from page one \
+             cannot be handed page two's authority"
+        );
+        assert_ne!(second_id, tail_id);
+        assert!(
+            h.state.project_requests.match_frame(&tail_id).is_some(),
+            "and the tail is still live after paging — it is never replaced by \
+             a history request"
+        );
+        assert!(h.degraded().is_none(), "a healthy walk is not degraded");
+    }
+
+    /// A history page is never durable intent.
+    ///
+    /// Its filter carries a bound that moves, so a recorded one would re-ask,
+    /// after a reconnect, for a page the cursor has already walked past — and
+    /// the walk would never terminate. The registry refuses the class outright
+    /// rather than checking its key.
+    #[tokio::test]
+    async fn a_history_page_is_never_recorded_as_durable_intent() {
+        let mut h = WalkHarness::new().await;
+        open_enrolment_for(&mut h.state, std::slice::from_ref(&h.coordinate)).await;
+        let _ = h.next_req().await;
+        h.begin().await;
+        let page_id = h.req().await[1].as_str().expect("an id").to_string();
+
+        let replayable = h
+            .state
+            .project_requests
+            .replayable()
+            .expect("durable intent resolves");
+        assert!(
+            !replayable.iter().any(|r| r.sub_id() == page_id),
+            "a page bound to a moving cursor must not be replayed from a record"
+        );
+        assert!(
+            !replayable
+                .iter()
+                .any(|r| r.sub_id().contains("enrol-history")),
+            "no history identity at all belongs in durable intent"
+        );
+    }
+
+    /// A predecessor page's boundary cannot certify its successor.
+    ///
+    /// This is the defect that re-answered four historical roots on a real
+    /// relay, reproduced at the page level: an EOSE from a request that is no
+    /// longer the one in flight must leave the walk exactly as it found it.
+    #[tokio::test]
+    async fn a_predecessors_boundary_cannot_certify_its_successor() {
+        let mut h = WalkHarness::new().await;
+        open_enrolment_for(&mut h.state, std::slice::from_ref(&h.coordinate)).await;
+        let _ = h.next_req().await;
+        h.begin().await;
+        let first = h.req().await;
+        let first_id = first[1].as_str().expect("an id").to_string();
+
+        h.saturate(&first).await;
+        let second_id = h.req().await[1].as_str().expect("an id").to_string();
+
+        // The predecessor speaks again, after its successor is in flight.
+        h.feed(json!(["EOSE", first_id])).await;
+
+        assert!(
+            h.next_req().await.is_none(),
+            "a stale boundary must not advance the walk"
+        );
+        assert!(
+            h.state.project_requests.match_frame(&second_id).is_some(),
+            "and the page actually in flight is untouched"
+        );
+        assert!(
+            h.state
+                .enrolment_history
+                .as_ref()
+                .is_some_and(|w| !w.has_proven_exhaustion()),
+            "nor may it certify that history is exhausted"
+        );
+    }
+
+    /// A saturated page asks further back; it does not conclude.
+    ///
+    /// The removed 500-row ceiling made exactly this mistake: a page that came
+    /// back full is evidence there is *more*, and treating it as the end is how
+    /// an agent reports complete authority over a truncated set.
+    #[tokio::test]
+    async fn a_saturated_page_asks_further_back_rather_than_finishing() {
+        let mut h = WalkHarness::new().await;
+        open_enrolment_for(&mut h.state, std::slice::from_ref(&h.coordinate)).await;
+        let _ = h.next_req().await;
+        h.begin().await;
+        let first = h.req().await;
+        let limit = first[2]["limit"].as_u64().expect("a page limit") as usize;
+        let first_id = first[1].as_str().expect("an id").to_string();
+
+        // Exactly `limit` rows, distinct timestamps: saturated, and orderable.
+        let stamps: Vec<u64> = (0..limit as u64).map(|i| 9_000 - i * 10).collect();
+        h.fill_and_close(&first_id, &stamps).await;
+
+        let second = h.req().await;
+        assert_eq!(
+            second[2]["until"],
+            json!(stamps.last().copied().expect("a stamp")),
+            "the next page resumes at the oldest row seen, so no root between \
+             the two bounds can be skipped: {second:?}"
+        );
+        assert_eq!(
+            second[2]["limit"],
+            json!(limit),
+            "an orderable saturated page does not need a wider one: {second:?}"
+        );
+    }
+
+    /// A page filled by one timestamp widens instead of stepping past it.
+    ///
+    /// Walking backwards by `until` cannot separate rows that share a second.
+    /// Stepping past them would skip roots silently; asking again from the same
+    /// bound would spin. The page widens until the cohort fits.
+    #[tokio::test]
+    async fn a_same_timestamp_cohort_widens_the_page_instead_of_skipping_roots() {
+        let mut h = WalkHarness::new().await;
+        open_enrolment_for(&mut h.state, std::slice::from_ref(&h.coordinate)).await;
+        let _ = h.next_req().await;
+        h.begin().await;
+        let first = h.req().await;
+        let limit = first[2]["limit"].as_u64().expect("a page limit") as usize;
+        let until = first[2]["until"].as_u64().expect("a bound");
+        let first_id = first[1].as_str().expect("an id").to_string();
+
+        let stamps: Vec<u64> = std::iter::repeat_n(9_000u64, limit).collect();
+        h.fill_and_close(&first_id, &stamps).await;
+
+        let second = h.req().await;
+        assert!(
+            second[2]["limit"].as_u64().expect("a limit") > limit as u64,
+            "the page must widen to fit the cohort: {second:?}"
+        );
+        assert!(
+            second[2]["until"].as_u64().expect("a bound") <= until,
+            "and must not step past a bound it cannot order within: {second:?}"
+        );
+        assert!(
+            h.degraded().is_none(),
+            "widening is progress, not a failure: {:?}",
+            h.degraded()
+        );
+    }
+
+    /// An unsaturated page proves exhaustion, and the roots restore silently.
+    ///
+    /// Both halves matter. The walk ends because the relay returned fewer rows
+    /// than it was allowed to — nothing else may end it — and the roots it
+    /// found arrive as `EnrolmentHistory`, which folds every effect through
+    /// `ProcessingMode::Replay`. A restart that answered them would re-reply to
+    /// every issue the agent had ever been addressed on.
+    #[tokio::test]
+    async fn a_short_page_completes_the_walk_and_restores_without_a_turn() {
+        let mut h = WalkHarness::new().await;
+        open_enrolment_for(&mut h.state, std::slice::from_ref(&h.coordinate)).await;
+        let _ = h.next_req().await;
+        h.begin().await;
+        let first_id = h.req().await[1].as_str().expect("an id").to_string();
+
+        // Two rows against a page that asked for many: unsaturated, and the
+        // only thing that may end a walk.
+        h.fill_and_close(&first_id, &[9_000, 8_500]).await;
+
+        assert!(
+            h.next_req().await.is_none(),
+            "an unsaturated page is the end of history — nothing more is asked"
+        );
+        assert!(
+            h.state
+                .enrolment_history
+                .as_ref()
+                .is_some_and(|w| w.has_proven_exhaustion()),
+            "and the walk says so"
+        );
+        assert!(h.degraded().is_none());
+
+        let restored: Vec<_> = drain(&mut h.rx)
+            .into_iter()
+            .filter_map(|e| match e {
+                BuzzEvent::Project(crate::project::ProjectEvent::Routed { source, .. }) => {
+                    Some(source)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(restored.len(), 2, "both roots restore: {restored:?}");
+        for source in &restored {
+            assert!(
+                matches!(
+                    source,
+                    crate::project::ProjectSubscription::EnrolmentHistory { .. }
+                ),
+                "a reconstructed root must carry its page's class: {source:?}"
+            );
+            assert_eq!(
+                crate::project::processing_mode_for(source),
+                crate::project::ProcessingMode::Replay,
+                "history restores authority and lifecycle; it never runs a turn"
+            );
+        }
+    }
+
+    /// A walk that cannot prove completeness is **visibly** degraded.
+    ///
+    /// The fail-closed state the plan requires. A cohort that still fills the
+    /// page at the relay's ceiling cannot be walked past without skipping
+    /// roots, so there is no honest answer left except "I do not know how much
+    /// history there is" — and that has to be a state the agent is in, not a
+    /// silence an operator has to infer.
+    #[tokio::test]
+    async fn a_walk_that_cannot_prove_completeness_degrades_visibly() {
+        let mut h = WalkHarness::new().await;
+        open_enrolment_for(&mut h.state, std::slice::from_ref(&h.coordinate)).await;
+        let _ = h.next_req().await;
+        h.begin().await;
+
+        // Widen until the ceiling, always with one indivisible cohort.
+        let mut asked = h.req().await;
+        for _ in 0..8 {
+            let limit = asked[2]["limit"].as_u64().expect("a limit") as usize;
+            let id = asked[1].as_str().expect("an id").to_string();
+            let stamps: Vec<u64> = std::iter::repeat_n(9_000u64, limit).collect();
+            h.fill_and_close(&id, &stamps).await;
+            match h.next_req().await {
+                Some(next) => asked = next,
+                None => break,
+            }
+        }
+
+        let reason = h
+            .degraded()
+            .expect("a walk that cannot prove exhaustion must say so");
+        assert!(
+            reason.contains("enrolment history"),
+            "the degraded state must name what is unproven: {reason}"
+        );
+        assert!(
+            h.state
+                .enrolment_history
+                .as_ref()
+                .is_some_and(|w| !w.has_proven_exhaustion()),
+            "and must never read as complete"
+        );
+        assert!(
+            h.next_req().await.is_none(),
+            "a degraded walk stops asking rather than spinning"
+        );
+    }
+
+    /// Replay or live is the **request path**, never the author's clock.
+    ///
+    /// Two rules used to live on this line and both re-answered old work. The
+    /// first required that the enrolment backlog had not drained: the enrolment
+    /// id is fixed, so a predecessor's EOSE certified a successor's backlog it
+    /// knew nothing about, and four historical roots were replied to on a real
+    /// relay. The second read `created_at < startup_watermark`.
+    ///
+    /// These cover the second, which fails in *both* directions — and neither
+    /// failure is visible from the event alone, which is the point.
+    #[tokio::test]
+    async fn a_frame_on_the_live_tail_is_live_however_old_it_claims_to_be() {
         let owner = nostr::Keys::generate();
         let coord = format!("30617:{}:demo", owner.public_key().to_hex());
         let mut state = BgState::new();
         state.startup_watermark = Some(1_000);
         let enrol_id = open_enrolment_for(&mut state, std::slice::from_ref(&coord)).await;
 
-        let fresh = project_root_frame(&owner, &coord, 1_500);
+        // The relay bounds author clock drift at ±15 minutes on ingest, so a
+        // root published *now* by a slow clock can carry a `created_at` before
+        // this process started. The tail's `since` is the relay's ingest
+        // decision, so the tail delivered it — and it is live work.
+        let skewed = project_root_frame(&owner, &coord, 900);
         let (tx, mut rx) = mpsc::channel(16);
-        deliver_frame(&mut state, &enrol_id, &fresh, &tx).await;
+        deliver_frame(&mut state, &enrol_id, &skewed, &tx).await;
 
         match drain(&mut rx).into_iter().next() {
             Some(BuzzEvent::Project(crate::project::ProjectEvent::Routed { source, .. })) => {
                 assert_eq!(
                     source,
                     crate::project::ProjectSubscription::Enrolment,
-                    "a root published after startup is live work"
+                    "the timestamp rule made this history, so it enrolled silently and \
+                     was never answered"
+                );
+                assert_eq!(
+                    crate::project::processing_mode_for(&source),
+                    crate::project::ProcessingMode::Live,
+                    "a live root must still be able to invoke the agent"
                 );
             }
             other => panic!("expected a project delivery, got {other:?}"),
         }
     }
 
-    /// An EOSE cannot change how a later historical frame is stamped.
+    /// …and it is answered exactly **once**.
     ///
-    /// The reported failure in one test: predecessor boundary, successor
-    /// frames, historical roots answered. The boundary no longer participates
-    /// in this decision, so delivering one — under the enrolment id, at any
-    /// point — leaves the stamp exactly where it was.
+    /// The other half of the skew case. Being live is only correct if the
+    /// second delivery — from the watched REQ that this very enrolment
+    /// installs, or from a peer call naming the same root — is an exact no-op.
+    /// The shared `project_seen_ids` slot is what makes it one.
     #[tokio::test]
-    async fn a_boundary_cannot_make_a_historical_frame_live() {
+    async fn a_clock_skewed_root_on_the_live_tail_invokes_exactly_once() {
+        let owner = nostr::Keys::generate();
+        let coord = format!("30617:{}:demo", owner.public_key().to_hex());
+        let mut state = BgState::new();
+        state.startup_watermark = Some(1_000);
+        let enrol_id = open_enrolment_for(&mut state, std::slice::from_ref(&coord)).await;
+
+        let skewed = project_root_frame(&owner, &coord, 900);
+        let (tx, mut rx) = mpsc::channel(16);
+        deliver_frame(&mut state, &enrol_id, &skewed, &tx).await;
+        // The same signed event again, on the same path.
+        deliver_frame(&mut state, &enrol_id, &skewed, &tx).await;
+
+        let deliveries: Vec<_> = drain(&mut rx)
+            .into_iter()
+            .filter(|e| matches!(e, BuzzEvent::Project(_)))
+            .collect();
+        assert_eq!(
+            deliveries.len(),
+            1,
+            "one root, one delivery — got {deliveries:?}"
+        );
+    }
+
+    /// A boundary on the live tail classifies nothing.
+    ///
+    /// The reported failure was: predecessor boundary, successor frames,
+    /// historical roots answered. The boundary is out of this decision
+    /// entirely now — an EOSE under the enrolment id, at any point, leaves
+    /// every later frame exactly as live as it was.
+    #[tokio::test]
+    async fn a_boundary_on_the_live_tail_does_not_classify_later_frames() {
         let owner = nostr::Keys::generate();
         let coord = format!("30617:{}:demo", owner.public_key().to_hex());
         let mut state = BgState::new();
@@ -7159,8 +7988,8 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(16);
         deliver_control_frame_to(&mut state, json!(["EOSE", enrol_id.clone()]), &tx).await;
 
-        let historical = project_root_frame(&owner, &coord, 900);
-        deliver_frame(&mut state, &enrol_id, &historical, &tx).await;
+        let later = project_root_frame(&owner, &coord, 900);
+        deliver_frame(&mut state, &enrol_id, &later, &tx).await;
 
         match drain(&mut rx)
             .into_iter()
@@ -7169,8 +7998,8 @@ mod tests {
             Some(BuzzEvent::Project(crate::project::ProjectEvent::Routed { source, .. })) => {
                 assert_eq!(
                     source,
-                    crate::project::ProjectSubscription::EnrolmentReplay,
-                    "a boundary must not be able to promote history to live work"
+                    crate::project::ProjectSubscription::Enrolment,
+                    "a boundary must not be able to reclassify the tail it bounds"
                 );
             }
             other => panic!("expected a project delivery, got {other:?}"),
@@ -7192,6 +8021,8 @@ mod tests {
         .expect("sign")
     }
 
+    /// Install the enrolment subscription over `coordinates`, through the
+    /// registry's own replacement, and return its fixed id.
     async fn open_enrolment_for(state: &mut BgState, coordinates: &[String]) -> String {
         let discovered = crate::project::DiscoveredRepositories::for_test(coordinates.to_vec());
         let filter = crate::project::enrolment_filter(&discovered, &test_agent_hex(), 0)
@@ -7247,8 +8078,10 @@ mod tests {
         let filter = crate::project::catch_up_filter(&root, HistoryStream::Comments, cutoff, limit);
 
         let mut cursor = crate::project::HistoryCursor::new(
-            &root,
-            HistoryStream::Comments,
+            crate::project::HistoryScope::Root {
+                root: root.clone(),
+                stream: HistoryStream::Comments,
+            },
             cutoff,
             limit,
             1_000,
@@ -8349,8 +9182,15 @@ mod tests {
         let (mut ws, mut server) = test_ws_pair().await;
         let mut state = BgState::new();
 
-        let mut cursor =
-            crate::project::HistoryCursor::new(&root, HistoryStream::Comments, 1_000, 4, 1_000);
+        let mut cursor = crate::project::HistoryCursor::new(
+            crate::project::HistoryScope::Root {
+                root: root.clone(),
+                stream: HistoryStream::Comments,
+            },
+            1_000,
+            4,
+            1_000,
+        );
         let mut used = cursor.begin_request();
         used.observe_malformed("a row that arrived before any registration existed");
         assert!(
@@ -10172,6 +11012,26 @@ mod tests {
             // frames on the wire.
             Ok(())
         }
+
+        /// Same seam, same reason: the walk is begun by the production command
+        /// handler, which is where the first page's REQ is written.
+        async fn submit_enrolment_history(
+            &self,
+            coordinates: Vec<String>,
+            agent: String,
+        ) -> Result<(), RelayError> {
+            let mut guard = self.inner.lock().await;
+            let (state, ws) = &mut *guard;
+            let kept = execute_connected_command(
+                ws,
+                state,
+                "0".repeat(64).as_str(),
+                RelayCommand::BeginEnrolmentHistory { coordinates, agent },
+            )
+            .await;
+            *self.kept.lock().await = kept;
+            Ok(())
+        }
     }
 
     /// The libtest filter that selects [`project_comment_cli_helper`].
@@ -10747,10 +11607,44 @@ mod tests {
             deliver!(announcement);
             assert_eq!(drive_all!(), crate::ProjectDispatched::DiscoveryChanged);
 
+            // Two REQs, because discovery raises two different questions.
+            //
+            // The tail under the fixed id — floored, unlimited, open-ended
+            // forwards — and the first history page on its own
+            // generation-distinct id, walking backwards from a snapshot bound.
+            // A single REQ answering both is what made the restart case
+            // unfixable: a fixed identity cannot paginate, so any reach-back it
+            // carried could only sample.
             let seen = readable_frames(&mut server_rx).await;
-            assert_eq!(seen.len(), 1, "one enrolment REQ: {seen:?}");
+            assert_eq!(
+                seen.len(),
+                2,
+                "the enrolment tail and its first history page: {seen:?}"
+            );
+            let history = seen
+                .iter()
+                .find(|f| f[1].as_str().is_some_and(|id| id.contains("enrol-history")))
+                .expect("a history page REQ");
+            assert!(
+                history[2]["until"].as_u64().is_some(),
+                "a history page walks backwards from a bound: {history:?}"
+            );
+            assert!(
+                history[2]["since"].is_null(),
+                "a floor would make exhaustion a statement about the floor: {history:?}"
+            );
+            assert_eq!(
+                history[2]["kinds"],
+                json!([1621, 1618]),
+                "roots only — comments reach an enrolled root through its watched \
+                 REQ: {history:?}"
+            );
+            let seen: Vec<Value> = seen
+                .into_iter()
+                .filter(|f| f[1].as_str() == Some(crate::project::PROJECT_ENROL_SUB_ID))
+                .collect();
+            assert_eq!(seen.len(), 1, "one enrolment tail: {seen:?}");
             assert_eq!(seen[0][0], "REQ");
-            assert_eq!(seen[0][1], crate::project::PROJECT_ENROL_SUB_ID);
             assert_eq!(
                 req_tag_set(&seen[0], &["#p"]),
                 vec![agent_hex.clone()],
@@ -10786,14 +11680,36 @@ mod tests {
             deliver!(other_announcement);
             assert_eq!(drive_all!(), crate::ProjectDispatched::DiscoveryChanged);
 
+            // The tail widens in place; the walk restarts.
+            //
+            // Two different correct answers to the same discovery, because the
+            // two requests mean different things. The tail's id is fixed, so
+            // widening it is a replacement. The walk's proven-exhausted bound
+            // was proven *for the narrower set*: carrying it onto a wider one
+            // would assert exhaustion over a repository no page had mentioned,
+            // so the walk starts again from the snapshot boundary under a fresh
+            // identity — which is what `enrol-history-4` is.
             let seen = readable_frames(&mut server_rx).await;
-            assert_eq!(seen.len(), 1, "the widened enrolment REQ: {seen:?}");
-            assert_eq!(seen[0][0], "REQ");
             assert_eq!(
-                seen[0][1],
-                crate::project::PROJECT_ENROL_SUB_ID,
-                "widening reuses the enrolment id"
+                seen.len(),
+                2,
+                "the widened tail and a restarted history walk: {seen:?}"
             );
+            let restarted = seen
+                .iter()
+                .find(|f| f[1].as_str().is_some_and(|id| id.contains("enrol-history")))
+                .expect("a restarted history page REQ");
+            assert_eq!(
+                req_coordinate_set(restarted).len(),
+                2,
+                "the restarted walk must cover both repositories: {restarted:?}"
+            );
+            let seen: Vec<Value> = seen
+                .into_iter()
+                .filter(|f| f[1].as_str() == Some(crate::project::PROJECT_ENROL_SUB_ID))
+                .collect();
+            assert_eq!(seen.len(), 1, "one widened tail: {seen:?}");
+            assert_eq!(seen[0][0], "REQ");
             let widened = seen[0].to_string();
             assert_ne!(
                 widened, first_enrolment,
@@ -10954,6 +11870,25 @@ mod tests {
             // Exactly the three current intents, and generation 0 is not among
             // them. A retired generation coming back here is the defect this
             // whole iteration exists for, arriving by a different door.
+            //
+            // Plus the history walk resuming — which is *not* a fourth intent.
+            // The registry refuses to hold a history page as durable intent at
+            // all, because its filter carries a bound that moves and a recorded
+            // one would re-ask for a page the cursor has already walked past.
+            // It comes back because the walk re-derives it from its own cursor.
+            let history_ids: Vec<&String> = replayed_ids
+                .iter()
+                .filter(|id| id.contains("enrol-history"))
+                .collect();
+            assert_eq!(
+                history_ids.len(),
+                1,
+                "the walk resumes under exactly one fresh identity: {replayed:?}"
+            );
+            let replayed_ids: Vec<String> = replayed_ids
+                .into_iter()
+                .filter(|id| !id.contains("enrol-history"))
+                .collect();
             assert_eq!(
                 replayed_ids.len(),
                 3,

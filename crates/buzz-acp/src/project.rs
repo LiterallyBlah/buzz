@@ -73,23 +73,15 @@ pub(crate) enum ProjectSubscription {
     /// [`ProjectRoute::derive`] to be quietly dropped.
     Discovery,
     /// `#a` + `#p`: events that tag this agent on a known project.
+    ///
+    /// **The live tail.** Its filter floors at startup and asks for no history,
+    /// so a frame arriving under this class is news by construction — which is
+    /// why nothing reclassifies it after the fact. The class of the request
+    /// that delivered a frame *is* the answer to "replay or live", and there is
+    /// exactly one producer of each answer.
     Enrolment,
     /// `#e` / `#E` over enrolled roots, one generation per REQ replacement.
     Watched { generation: u64 },
-    /// The enrolment REQ, carrying a frame from its **stored backlog** —
-    /// history, not news.
-    ///
-    /// A per-frame stamp rather than a request class: the enrolment REQ is one
-    /// subscription that delivers its backlog and then keeps delivering, so
-    /// "replay or live" is a property of the frame and must be decided before
-    /// it enters the bounded event queue. A boolean read later cannot answer
-    /// it — a backlog frame can still be sitting in that queue when the EOSE
-    /// arrives, and would then be processed as live and re-answered.
-    ///
-    /// Carries the same authority as `Enrolment` and less permission: every
-    /// effect is folded through `ProcessingMode::Replay`, so a historical root
-    /// enrols without waking anyone.
-    EnrolmentReplay,
     /// The NIP-PC peer-call REQ, carrying a project-routed envelope.
     ///
     /// A transport source, not a grant. It exists so a call that arrives before
@@ -102,6 +94,20 @@ pub(crate) enum ProjectSubscription {
     /// never had would put a false provenance into the record that decides
     /// which REQ to retire.
     PeerCall,
+    /// A generated, exhaustible **historical page of the enrolment question**.
+    ///
+    /// Frames on it are always replay: the request exists only to reconstruct
+    /// roots that predate this process, and it retires when its own page proves
+    /// exhausted. One generation per page, so a predecessor's boundary names a
+    /// retired id and can neither certify nor retire its successor.
+    ///
+    /// This is what replaces classifying enrolment frames by the author's
+    /// clock. Author time is evidence, not provenance: the relay admits ±15
+    /// minutes of drift, so a genuinely live root could carry a `created_at`
+    /// before startup and be enrolled without ever being answered. A request
+    /// that only ever carries history cannot make that mistake, because the
+    /// question it asked was a historical one.
+    EnrolmentHistory { generation: u64 },
     /// Historical reconstruction for one newly enrolled root.
     ///
     /// The full root id is carried in the id, not a prefix, so the arriving
@@ -252,8 +258,8 @@ const PROJECT_REQ_SEND_TIMEOUT_SECS: u64 = 10;
 /// `open_request` writing its REQ and *then* installing it.
 mod requests {
     use super::{
-        catch_up_filter, HistoryPageCollector, HistoryStream, ProjectReqSink, ProjectSubscription,
-        ProposalDomain, VerifiedProjectEvent,
+        HistoryPageCollector, HistoryStream, ProjectReqSink, ProjectSubscription, ProposalDomain,
+        VerifiedProjectEvent,
     };
     use serde_json::{json, Value};
     use std::collections::hash_map::Entry;
@@ -564,12 +570,8 @@ mod requests {
         /// to rather than be told: an `attach(stream, page)` signature would put
         /// the caller back in the position of asserting a fact about authority
         /// it does not establish.
-        pub(crate) fn root(&self) -> &str {
-            self.collector.root()
-        }
-
-        pub(crate) fn stream(&self) -> HistoryStream {
-            self.collector.stream()
+        pub(crate) fn scope(&self) -> &super::HistoryScope {
+            self.collector.scope()
         }
 
         pub(crate) fn effective_limit(&self) -> usize {
@@ -640,11 +642,14 @@ mod requests {
         /// Is that request asking this page's own question — same root, same
         /// stream — whichever attempt it was?
         fn asks_the_same_as(&self, subscription: &ProjectSubscription) -> bool {
-            matches!(
-                subscription,
-                ProjectSubscription::RootCatchUp { root, stream }
-                    if root == self.collector.root() && *stream == self.collector.stream()
-            )
+            // Compared against what this page's own scope *would* register as,
+            // so a scope added later cannot silently match a class it does not
+            // belong to. The generation is the page's own, for the same reason.
+            &self
+                .collector
+                .scope()
+                .subscription(self.collector.generation())
+                == subscription
         }
     }
 
@@ -1442,14 +1447,15 @@ mod requests {
                          their own cursor and are never durable"
                     ));
                 }
-                super::ProjectSubscription::EnrolmentReplay => {
-                    // A per-frame stamp, not a request. The enrolment request
-                    // is persisted as `Enrolment`; a record naming the replay
-                    // stamp was written by something that mistook provenance
-                    // for identity.
+                super::ProjectSubscription::EnrolmentHistory { generation } => {
+                    // Exhaustible, like a root catch-up: opened for one
+                    // transport attempt and re-derived from its cursor if the
+                    // connection ends. There is no id under which it is a
+                    // correct durable record.
                     return Err(format!(
-                        "durable intent holds an enrolment-replay stamp under id {id}; \
-                         replay is a property of a frame, not a request"
+                        "durable intent holds an enrolment history page under id {id} \
+                         (generation {generation}); history pages are re-derived from \
+                         their cursor and are never durable"
                     ));
                 }
                 super::ProjectSubscription::PeerCall => {
@@ -2012,9 +2018,15 @@ mod requests {
             // Every live entry is a sent entry: `open_request` inserts only
             // after its write returned, so there is no unsent state to reject.
             let live = self.live.get(sub_id)?;
+            // An enrolment history page is one-shot for exactly the same
+            // reason a root catch-up is: it asked for one page bound and has
+            // now been answered. Leaving it live would let a later EVENT be
+            // admitted into a completed page and a second EOSE mint a second
+            // boundary for it.
             let one_shot = matches!(
                 live.identity.subscription(),
                 ProjectSubscription::RootCatchUp { .. }
+                    | ProjectSubscription::EnrolmentHistory { .. }
             );
             let witness = EndOfStoredEvents {
                 sub_id: sub_id.to_string(),
@@ -2104,16 +2116,10 @@ mod requests {
             // and a page whose own filter would ask the relay for everything
             // must cost the incarnation space nothing.
             let identity = ProjectRequestIdentity::new(
-                ProjectSubscription::RootCatchUp {
-                    root: collector.root().to_string(),
-                    stream: collector.stream(),
-                },
-                catch_up_filter(
-                    collector.root(),
-                    collector.stream(),
-                    collector.until(),
-                    collector.effective_limit(),
-                ),
+                collector.scope().subscription(collector.generation()),
+                collector
+                    .scope()
+                    .filter(collector.until(), collector.effective_limit()),
             );
             if let plan::Decision::Refuse(outcome) = plan::history_page(
                 self.checked_current().map(|_| ()),
@@ -2139,7 +2145,7 @@ mod requests {
                 // Unreachable: the plan refused a spent space above.
                 return PageOpen::Exhausted;
             };
-            let sub_id = Self::catch_up_wire_id(collector.root(), collector.stream(), incarnation);
+            let sub_id = Self::history_wire_id(collector.scope(), incarnation);
             let text = match serde_json::to_string(&identity.req_frame(&sub_id)) {
                 Ok(text) => text,
                 Err(e) => return PageOpen::WriteFailed(format!("serialize: {e}")),
@@ -2185,20 +2191,29 @@ mod requests {
         /// sent the REQ. At 79 characters plus the incarnation it stays well
         /// inside the 256 this relay advertises
         /// (`buzz-relay/src/protocol.rs:9`).
-        fn catch_up_wire_id(
-            root: &str,
-            stream: HistoryStream,
-            incarnation: RequestIncarnation,
-        ) -> String {
-            let marker = match stream {
-                HistoryStream::Comments => "c",
-                HistoryStream::PullRequestUpdates => "u",
-            };
-            format!(
-                "{}catchup-{marker}-{root}-{}",
-                super::PROJECT_SUB_ID_PREFIX,
-                incarnation.0
-            )
+        fn history_wire_id(scope: &super::HistoryScope, incarnation: RequestIncarnation) -> String {
+            match scope {
+                super::HistoryScope::Root { root, stream } => {
+                    let marker = match stream {
+                        HistoryStream::Comments => "c",
+                        HistoryStream::PullRequestUpdates => "u",
+                    };
+                    format!(
+                        "{}catchup-{marker}-{root}-{}",
+                        super::PROJECT_SUB_ID_PREFIX,
+                        incarnation.0
+                    )
+                }
+                // No coordinate in the id. The set can be long and changes as
+                // discovery widens, and an id is a lookup key rather than a
+                // description — the incarnation is what makes it unique, and
+                // the registry holds the question it was opened with.
+                super::HistoryScope::Enrolment { .. } => format!(
+                    "{}enrol-history-{}",
+                    super::PROJECT_SUB_ID_PREFIX,
+                    incarnation.0
+                ),
+            }
         }
 
         /// Take the next incarnation, or `None` once the space is spent.
@@ -4062,6 +4077,14 @@ impl ProjectEnrolments {
 /// Returns `None` when there are no known coordinates: a filter with an empty
 /// `#a` list matches nothing at some relays and *everything* at others, and
 /// "accidentally subscribe to all of kind 1" is not a failure worth risking.
+///
+/// **A live tail, and nothing else.** It floors at `since` and carries no row
+/// limit, so it is open-ended forwards and asks for no history at all. It used
+/// to reach back thirty days for up to five hundred rows, which was the restart
+/// case being answered by the wrong request: a fixed-identity standing REQ
+/// cannot page, so the reach-back could only ever sample. History is
+/// [`EnrolmentReconstruction`]'s question now, on its own generation-distinct
+/// requests, and this one keeps running unreplaced while that walk paginates.
 pub(crate) fn enrolment_filter(
     discovered: &DiscoveredRepositories,
     agent_pubkey_hex: &str,
@@ -4075,31 +4098,9 @@ pub(crate) fn enrolment_filter(
         "kinds": [KIND_GIT_ISSUE, KIND_GIT_PULL_REQUEST, KIND_TEXT_NOTE],
         "#a": coords,
         "#p": [agent_pubkey_hex],
-        "since": since.saturating_sub(ENROLMENT_RECONSTRUCTION_WINDOW_SECS),
-        "limit": ENROLMENT_RECONSTRUCTION_LIMIT,
+        "since": since,
     }))
 }
-
-/// How far back the enrolment REQ reaches for roots that predate this process.
-///
-/// The filter used to floor at the startup watermark, which made enrolment a
-/// live tail: an issue addressed to this agent yesterday was outside the window,
-/// so after a restart the agent held no authority for its own conversations and
-/// correctly refused everything that referred to them.
-///
-/// Thirty days rather than "everything". An unbounded reach is a full-history
-/// scan on every reconnect for a set that is bounded anyway by
-/// `ENROLMENT_RECONSTRUCTION_LIMIT`, and a root nobody has touched in a month is
-/// not the restart case this exists for. It is a retention choice, and it is
-/// stated here so it can be argued with rather than discovered.
-pub(crate) const ENROLMENT_RECONSTRUCTION_WINDOW_SECS: u64 = 30 * 24 * 60 * 60;
-
-/// The row ceiling on one enrolment backlog.
-///
-/// Bounded because the backlog is replayed through the ordinary gate: every row
-/// costs a signature check. The reach above decides *how far*, this decides
-/// *how much*, and neither is left to the relay's discretion.
-pub(crate) const ENROLMENT_RECONSTRUCTION_LIMIT: u64 = 500;
 
 /// NIP-01 filters for the watched-root REQ.
 ///
@@ -4487,6 +4488,134 @@ pub(crate) enum PageOutcome {
     },
 }
 
+/// Which history question a page belongs to.
+///
+/// One cursor paginates both, because saturation, timestamp ties and the
+/// fail-closed exhaustion proof are the same problem whatever is being walked
+/// backwards — and a second cursor beside this one would be a second place for
+/// those rules to drift. What differs is only the question: which rows the REQ
+/// asks for, and which rows the collector will admit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum HistoryScope {
+    /// One root's comments or PR revisions.
+    Root { root: String, stream: HistoryStream },
+    /// The roots on a discovered repository set that address this agent.
+    ///
+    /// **Roots only.** Comments reach an enrolled root through its watched REQ,
+    /// so asking for them here would let a busy repository's chatter consume
+    /// the page budget and crowd out the roots the budget exists to find —
+    /// while the run reported complete authority over fewer of them.
+    Enrolment {
+        coordinates: Vec<String>,
+        agent: String,
+    },
+}
+
+impl HistoryScope {
+    /// The REQ this scope's page sends.
+    ///
+    /// Single-sourced for the reason `catch_up_filter` was: the registered
+    /// filter and the live admission check must be the same question, or the
+    /// check decays into "both sides produced something filter-shaped".
+    ///
+    /// Neither arm carries `since`. A history page walks backwards until an
+    /// unsaturated page proves exhaustion; a floor would make the proof a
+    /// statement about the floor instead.
+    pub(crate) fn filter(&self, until: u64, effective_limit: usize) -> Value {
+        match self {
+            HistoryScope::Root { root, stream } => {
+                catch_up_filter(root, *stream, until, effective_limit)
+            }
+            HistoryScope::Enrolment { coordinates, agent } => json!({
+                "kinds": [KIND_GIT_ISSUE, KIND_GIT_PULL_REQUEST],
+                "#a": coordinates,
+                "#p": [agent],
+                "until": until,
+                "limit": effective_limit,
+            }),
+        }
+    }
+
+    /// Which request class a page of this scope is registered as.
+    ///
+    /// Both are replay-only and neither is ever durable intent: a page is
+    /// re-derived from its own cursor, so a record claiming one was written by
+    /// something that mistook a transport attempt for a standing question.
+    pub(crate) fn subscription(&self, generation: u64) -> ProjectSubscription {
+        match self {
+            HistoryScope::Root { root, stream } => ProjectSubscription::RootCatchUp {
+                root: root.clone(),
+                stream: *stream,
+            },
+            HistoryScope::Enrolment { .. } => ProjectSubscription::EnrolmentHistory { generation },
+        }
+    }
+
+    /// Which stream of one root this scope walks, if it walks a root at all.
+    ///
+    /// `None` is not "unknown" — it is the enrolment scope, which walks roots
+    /// across a coordinate set and belongs to no single one of them.
+    pub(crate) fn stream(&self) -> Option<HistoryStream> {
+        match self {
+            HistoryScope::Root { stream, .. } => Some(*stream),
+            HistoryScope::Enrolment { .. } => None,
+        }
+    }
+
+    /// Admit one verified row, or say why it does not belong to this page.
+    fn admit(&self, verified: &VerifiedProjectEvent) -> Result<(), String> {
+        match self {
+            HistoryScope::Root { root, stream } => {
+                if !stream.admits(verified.kind()) {
+                    let kind = verified.kind();
+                    return Err(format!("kind {kind} does not belong to {stream:?}"));
+                }
+                match root_event_id(verified.kind(), &verified.id(), &verified.tag_vecs()) {
+                    Some(found) if &found == root => Ok(()),
+                    Some(other) => Err(format!("event belongs to root {other}, not this one")),
+                    None => Err("event resolves to no root".to_string()),
+                }
+            }
+            HistoryScope::Enrolment { coordinates, agent } => {
+                let kind = verified.kind();
+                if !matches!(kind, KIND_GIT_ISSUE | KIND_GIT_PULL_REQUEST) {
+                    return Err(format!("kind {kind} is not a project root"));
+                }
+                // The root's *own* `a`, against the discovered set. A root that
+                // claims a repository this agent never discovered is not a row
+                // of this question, whoever delivered it.
+                //
+                // Read here rather than through `sole_reference`, which
+                // canonicalises a 64-hex *event id* — a coordinate is
+                // `30617:<owner>:<name>` and never satisfies it, so every root
+                // would be refused and the page would read as an unusable
+                // cohort. Exactly one, for the same reason `sole_reference`
+                // insists on one: a root naming two repositories belongs to
+                // neither, and picking either is choosing on its behalf.
+                let tags = verified.tag_vecs();
+                let mut named = tags
+                    .iter()
+                    .filter(|t| t.len() > 1 && t[0] == "a")
+                    .map(|t| t[1].as_str());
+                let (Some(coordinate), None) = (named.next(), named.next()) else {
+                    return Err("root names no single repository coordinate".to_string());
+                };
+                if !coordinates.iter().any(|known| known == coordinate) {
+                    return Err(format!("root names undiscovered repository {coordinate}"));
+                }
+                if !verified
+                    .tag_vecs()
+                    .iter()
+                    .any(|t| t.len() > 1 && t[0] == "p" && &t[1] == agent)
+                {
+                    return Err("root does not address this agent".to_string());
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
 /// The one shape a root catch-up REQ filter may take.
 ///
 /// Single-sourced because [`ProjectRequests::open_history_page`] builds the
@@ -4545,8 +4674,7 @@ mod history {
     #[derive(Debug, Clone, PartialEq, Eq)]
     struct HistoryPageRequest {
         generation: u64,
-        root: String,
-        stream: HistoryStream,
+        scope: super::HistoryScope,
         until: u64,
         effective_limit: usize,
     }
@@ -4597,8 +4725,7 @@ mod history {
     /// completed stream and route them past the merge's checks.
     #[derive(Debug)]
     pub(crate) struct RetainedStream {
-        root: String,
-        stream: HistoryStream,
+        scope: super::HistoryScope,
         /// The immutable snapshot boundary this stream was paginated from.
         ///
         /// Separate from the cursor's moving `until`, which is where pagination
@@ -4610,12 +4737,30 @@ mod history {
     }
 
     impl RetainedStream {
+        /// The root this stream paginated, for the per-root merge.
+        ///
+        /// Empty for an enrolment scope, which paginates a repository set
+        /// rather than a root — the merge that reads this only ever sees
+        /// root-scoped streams, because it is reached from a bound root.
         pub(crate) fn root(&self) -> &str {
-            &self.root
+            match &self.scope {
+                super::HistoryScope::Root { root, .. } => root,
+                super::HistoryScope::Enrolment { .. } => "",
+            }
         }
 
         pub(crate) fn stream(&self) -> HistoryStream {
-            self.stream
+            match &self.scope {
+                super::HistoryScope::Root { stream, .. } => *stream,
+                // Unreachable from the per-root merge, which is the only
+                // caller: it is reached from a `VerifiedBoundRoot`, and an
+                // enrolment page has no root to be bound to.
+                super::HistoryScope::Enrolment { .. } => HistoryStream::Comments,
+            }
+        }
+
+        pub(crate) fn scope(&self) -> &super::HistoryScope {
+            &self.scope
         }
 
         pub(crate) fn cutoff(&self) -> u64 {
@@ -4630,10 +4775,20 @@ mod history {
             self.events.is_empty()
         }
 
+        /// Take the retained rows, oldest first.
+        ///
+        /// **Consuming.** A retained stream is a completed proof, and a reader
+        /// that could take it twice would let two owners each believe they hold
+        /// the reconstruction. The enrolment walk is the one production reader;
+        /// the per-root merge reads its own streams by reference.
+        pub(crate) fn into_events(self) -> Vec<VerifiedProjectEvent> {
+            self.events
+        }
+
         /// Test-only row access, for asserting retention and ordering.
         ///
-        /// Not available in production builds, where the only reader is the
-        /// merge — which is the whole point of the type.
+        /// Not available in production builds, where the only readers are the
+        /// merge and the enrolment walk — which is the whole point of the type.
         #[cfg(test)]
         pub(crate) fn events(&self) -> &[VerifiedProjectEvent] {
             &self.events
@@ -4741,12 +4896,8 @@ mod history {
         /// from them. Reading a request's own parameters is not the forgery
         /// risk — *constructing* authority is, and that stays inside the
         /// registry.
-        pub(crate) fn root(&self) -> &str {
-            &self.request.root
-        }
-
-        pub(crate) fn stream(&self) -> HistoryStream {
-            self.request.stream
+        pub(crate) fn scope(&self) -> &super::HistoryScope {
+            &self.request.scope
         }
 
         pub(crate) fn until(&self) -> u64 {
@@ -4791,19 +4942,17 @@ mod history {
         pub(crate) fn observe(&mut self, verified: VerifiedProjectEvent) {
             self.raw_count += 1;
 
-            if !self.request.stream.admits(verified.kind()) {
-                let kind = verified.kind();
-                let stream = self.request.stream;
-                return self.poison(format!("kind {kind} does not belong to {stream:?}"));
-            }
             if verified.event().created_at.as_secs() > self.request.until {
                 let until = self.request.until;
                 return self.poison(format!("event newer than the requested until={until}"));
             }
-            match super::root_event_id(verified.kind(), &verified.id(), &verified.tag_vecs()) {
-                Some(root) if root == self.request.root => self.events.push(verified),
-                Some(other) => self.poison(format!("event belongs to root {other}, not this one")),
-                None => self.poison("event resolves to no root".to_string()),
+            // Scope-specific: which rows this question asked for. Both arms
+            // poison rather than skip, because a row the page did not ask for
+            // means the relay answered a different question and the count this
+            // page's exhaustion proof rests on is no longer trustworthy.
+            match self.request.scope.admit(&verified) {
+                Ok(()) => self.events.push(verified),
+                Err(reason) => self.poison(reason),
             }
         }
 
@@ -4875,8 +5024,7 @@ mod history {
     /// a different costume.
     #[derive(Debug)]
     pub(crate) struct HistoryCursor {
-        root: String,
-        stream: HistoryStream,
+        scope: super::HistoryScope,
         /// The snapshot boundary this cursor was opened against. Immutable.
         ///
         /// Kept apart from `until` because they answer different questions:
@@ -4910,16 +5058,14 @@ mod history {
 
     impl HistoryCursor {
         pub(crate) fn new(
-            root: &str,
-            stream: HistoryStream,
+            scope: super::HistoryScope,
             cutoff: u64,
             initial_limit: usize,
             relay_max_limit: usize,
         ) -> Self {
             let relay_max_limit = relay_max_limit.max(1);
             Self {
-                root: root.to_string(),
-                stream,
+                scope,
                 cutoff,
                 until: cutoff,
                 limit: initial_limit.clamp(1, relay_max_limit),
@@ -4932,8 +5078,10 @@ mod history {
             }
         }
 
-        pub(crate) fn stream(&self) -> HistoryStream {
-            self.stream
+        /// The question this cursor walks. Every page it opens asks it again,
+        /// one `until` further back.
+        pub(crate) fn scope(&self) -> &super::HistoryScope {
+            &self.scope
         }
 
         pub(crate) fn cutoff(&self) -> u64 {
@@ -5035,8 +5183,7 @@ mod history {
             HistoryPageCollector {
                 request: HistoryPageRequest {
                     generation,
-                    root: self.root.clone(),
-                    stream: self.stream,
+                    scope: self.scope.clone(),
                     until: self.until,
                     effective_limit: self.limit,
                 },
@@ -5144,8 +5291,7 @@ mod history {
             } = page;
 
             if r.generation != self.generation
-                || r.root != self.root
-                || r.stream != self.stream
+                || r.scope != self.scope
                 || r.until != self.until
                 || r.effective_limit != self.limit
             {
@@ -5237,8 +5383,7 @@ mod history {
         fn finish(&mut self) -> PageOutcome {
             self.state = CursorState::Finished;
             PageOutcome::Complete(RetainedStream {
-                root: self.root.clone(),
-                stream: self.stream,
+                scope: self.scope.clone(),
                 cutoff: self.cutoff,
                 events: std::mem::take(&mut self.retained).into_values().collect(),
             })
@@ -5376,16 +5521,18 @@ mod history {
 
             let root_id = root.binding().root();
             for stream in &streams {
-                if stream.root != root_id {
+                if stream.root() != root_id {
                     return Err(format!(
                         "{:?} was paginated for root {}, not {root_id}",
-                        stream.stream, stream.root
+                        stream.stream(),
+                        stream.root()
                     ));
                 }
                 if stream.cutoff != expected_cutoff {
                     return Err(format!(
                         "{:?} was paginated from cutoff {}, not the reconstruction's {expected_cutoff}",
-                        stream.stream, stream.cutoff
+                        stream.stream(),
+                        stream.cutoff
                     ));
                 }
             }
@@ -5475,6 +5622,10 @@ pub(crate) struct AttachRejected {
 pub(crate) enum AttachError {
     /// The page collects for a different root.
     WrongRoot,
+    /// The page collects for a different question entirely — a root page
+    /// offered to an enrolment walk, or an enrolment page opened over a
+    /// coordinate set this walk is not proving exhaustion over.
+    WrongScope,
     /// This root does not require that stream — a PR update page offered to an
     /// issue reconstruction, for instance.
     StreamNotRequired,
@@ -5571,7 +5722,15 @@ impl RootReconstruction {
             .iter()
             .map(|stream| StreamProgress {
                 stream: *stream,
-                cursor: HistoryCursor::new(&root_id, *stream, cutoff, page_limit, relay_max),
+                cursor: HistoryCursor::new(
+                    crate::project::HistoryScope::Root {
+                        root: root_id.clone(),
+                        stream: *stream,
+                    },
+                    cutoff,
+                    page_limit,
+                    relay_max,
+                ),
                 open: None,
                 retained: None,
             })
@@ -5679,10 +5838,13 @@ impl RootReconstruction {
         if self.abandoned.is_some() {
             refuse!(AttachError::Closed);
         }
-        if page.root() != self.root {
+        let crate::project::HistoryScope::Root { root, stream } = page.scope().clone() else {
+            // An enrolment page has no root to attach to a root's progress.
+            refuse!(AttachError::WrongRoot);
+        };
+        if root != self.root {
             refuse!(AttachError::WrongRoot);
         }
-        let stream = page.stream();
         let Some(progress) = self.streams.iter_mut().find(|s| s.stream == stream) else {
             refuse!(AttachError::StreamNotRequired);
         };
@@ -5989,6 +6151,296 @@ impl ProjectReconstructions {
     #[cfg(test)]
     pub(crate) fn get(&mut self, root: &str) -> Option<&mut RootReconstruction> {
         self.find(root)
+    }
+}
+
+// ── Enrolment reconstruction ──────────────────────────────────────────────────
+
+/// Walking the roots this agent is addressed on, backwards, to exhaustion.
+///
+/// The question a restarted agent has to answer is "which conversations am I
+/// already responsible for?", and until this existed the enrolment REQ answered
+/// it with a live tail plus a 30-day, 500-row reach-back. Both halves of that
+/// reach-back were false completeness: the window silently excluded older
+/// roots, and the row cap silently truncated the newer ones — and *neither*
+/// announced itself, so the agent reported full authority over a set it had
+/// only sampled.
+///
+/// So this is not a bigger window. It is a cursor: page backwards from a fixed
+/// snapshot boundary until an unsaturated page proves there is nothing older,
+/// and if that proof cannot be reached, say so — see [`EnrolmentAdvance`].
+///
+/// **Roots only, and a strict replay.** The rows it retains reconstruct
+/// authority and lifecycle; they never become turns, because every page is
+/// registered as [`ProjectSubscription::EnrolmentHistory`], which
+/// [`processing_mode_for`] maps to [`ProcessingMode::Replay`].
+///
+/// Structurally the same as [`RootReconstruction`] with one stream, and it
+/// shares that stream's [`HistoryCursor`] rather than reimplementing it —
+/// saturation escalation, same-timestamp cohorts, the predecessor/contradiction
+/// verdict and the exhaustion proof are the same rules whatever is being walked
+/// backwards, and a second copy of them is a second place for them to drift.
+#[derive(Debug)]
+pub(crate) struct EnrolmentReconstruction {
+    scope: HistoryScope,
+    /// Immutable for the life of the reconstruction.
+    cutoff: u64,
+    cursor: HistoryCursor,
+    /// At most one page in flight. A second would produce two boundaries the
+    /// cursor could not order.
+    open: Option<OpenedHistoryPage>,
+    /// Set once, terminal.
+    abandoned: Option<String>,
+    /// Set when the walk reached proven exhaustion. Pages stop being wanted.
+    complete: bool,
+}
+
+/// What attaching a boundary to an enrolment reconstruction produced.
+#[derive(Debug)]
+pub(crate) enum EnrolmentAdvance {
+    /// Another page is wanted, from `until` with `limit`.
+    Continue { until: u64, limit: usize },
+    /// Exhaustion is proven. These are every root the walk found, oldest first.
+    Finished { roots: Vec<VerifiedProjectEvent> },
+    /// An authentic boundary from an earlier instance of the same request. The
+    /// page stays in flight; only its own boundary may finish it.
+    Stale,
+    /// Completeness could not be established. **This is the fail-closed state**
+    /// the plan requires be visible: the caller reports it rather than
+    /// continuing as though the walk had succeeded.
+    Degraded { reason: String },
+}
+
+/// Where an admitted enrolment-history frame went.
+///
+/// The same five answers [`FrameRouting`] gives, without the stream — an
+/// enrolment walk has one.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum EnrolmentRouting {
+    Absorbed,
+    Released,
+    Predecessor,
+    NotOurs,
+    Contradiction { reason: String },
+}
+
+impl EnrolmentReconstruction {
+    /// Begin a walk over the discovered coordinate set.
+    ///
+    /// `None` when nothing has been discovered: the filter would carry an empty
+    /// `#a`, which matches nothing at some relays and everything at others.
+    pub(crate) fn begin(
+        coordinates: Vec<String>,
+        agent_pubkey_hex: &str,
+        cutoff: u64,
+        page_limit: usize,
+        relay_max: usize,
+    ) -> Option<Self> {
+        if coordinates.is_empty() {
+            return None;
+        }
+        let scope = HistoryScope::Enrolment {
+            coordinates,
+            agent: agent_pubkey_hex.to_string(),
+        };
+        Some(Self {
+            cursor: HistoryCursor::new(scope.clone(), cutoff, page_limit, relay_max),
+            scope,
+            cutoff,
+            open: None,
+            abandoned: None,
+            complete: false,
+        })
+    }
+
+    pub(crate) fn scope(&self) -> &HistoryScope {
+        &self.scope
+    }
+
+    pub(crate) fn cutoff(&self) -> u64 {
+        self.cutoff
+    }
+
+    pub(crate) fn abandoned_reason(&self) -> Option<&str> {
+        self.abandoned.as_deref()
+    }
+
+    /// Has this walk **proven** it reached the end of history?
+    ///
+    /// Named for the proof rather than for a readiness state, because that is
+    /// all it is: an unsaturated page came back, so there is nothing older.
+    /// Whether the agent is *ready* additionally depends on what happened to
+    /// the rows, which is the caller's question and not this type's.
+    pub(crate) fn has_proven_exhaustion(&self) -> bool {
+        self.complete
+    }
+
+    /// Does this walk want a page, and on what bound?
+    ///
+    /// The `until` is the cursor's, never a caller's choice.
+    pub(crate) fn page_wanted(&self) -> Option<(u64, usize)> {
+        if self.abandoned.is_some()
+            || self.complete
+            || self.open.is_some()
+            || self.cursor.degraded_reason().is_some()
+        {
+            return None;
+        }
+        Some((self.cursor.until(), self.cursor.limit()))
+    }
+
+    /// Issue a collector from **this reconstruction's own cursor**.
+    pub(crate) fn begin_page(&mut self) -> Option<HistoryPageCollector> {
+        self.page_wanted()?;
+        match self.cursor.propose_request() {
+            Some(collector) => Some(collector),
+            None => {
+                // Same reasoning as the per-root walk: a walk that can never
+                // issue another page while it keeps advertising one is a spin.
+                self.abandon(
+                    "enrolment history: page generation space exhausted; no further page \
+                     can be distinguished from a superseded one",
+                );
+                None
+            }
+        }
+    }
+
+    /// Take ownership of a page opened for this walk.
+    pub(crate) fn attach(&mut self, page: OpenedHistoryPage) -> Result<(), Box<AttachRejected>> {
+        macro_rules! refuse {
+            ($e:expr) => {
+                return Err(Box::new(AttachRejected { error: $e, page }))
+            };
+        }
+        if self.abandoned.is_some() || self.complete || self.cursor.degraded_reason().is_some() {
+            refuse!(AttachError::Closed);
+        }
+        // The whole question, not the variant: a page opened for a narrower
+        // coordinate set than the one this walk is proving exhaustion over
+        // would finish it early over a set it never asked about.
+        if page.scope() != &self.scope {
+            refuse!(AttachError::WrongScope);
+        }
+        if self.open.is_some() {
+            refuse!(AttachError::AlreadyInFlight);
+        }
+        let expected_until = self.cursor.until();
+        if page.until() != expected_until {
+            refuse!(AttachError::WrongUntil {
+                expected: expected_until,
+                found: page.until(),
+            });
+        }
+        let expected_limit = self.cursor.limit();
+        if page.effective_limit() != expected_limit {
+            refuse!(AttachError::WrongLimit {
+                expected: expected_limit,
+                found: page.effective_limit(),
+            });
+        }
+        if !self
+            .cursor
+            .commit_request(page.generation(), page.proposal_domain())
+        {
+            refuse!(AttachError::Superseded);
+        }
+        self.open = Some(page);
+        Ok(())
+    }
+
+    /// Is the page in flight the one **that registration** opened?
+    fn awaits(&self, sub_id: &str) -> bool {
+        self.open.as_ref().is_some_and(|p| p.sub_id() == sub_id)
+    }
+
+    /// Route one admitted enrolment-history frame to the page that opened it.
+    pub(crate) fn observe(&mut self, frame: CatchUpFrame) -> EnrolmentRouting {
+        let (admission, outcome) = frame.into_parts();
+        if self.abandoned.is_some() || !self.awaits(admission.sub_id()) {
+            return EnrolmentRouting::NotOurs;
+        }
+        let Some(page) = self.open.as_mut() else {
+            return EnrolmentRouting::NotOurs;
+        };
+        match page.verdict_for_frame(&admission) {
+            AuthorityVerdict::SameRegistration => match outcome {
+                CatchUpOutcome::Row(verified) => {
+                    page.observe(*verified);
+                    EnrolmentRouting::Absorbed
+                }
+                CatchUpOutcome::Unusable(reason) => {
+                    page.observe_unusable(reason);
+                    EnrolmentRouting::Absorbed
+                }
+                CatchUpOutcome::RequestLost(_) => {
+                    self.open = None;
+                    EnrolmentRouting::Released
+                }
+            },
+            AuthorityVerdict::Predecessor => EnrolmentRouting::Predecessor,
+            AuthorityVerdict::Contradiction => {
+                let reason =
+                    "enrolment history: frame from a registration this page is not".to_string();
+                self.abandon(reason.clone());
+                EnrolmentRouting::Contradiction { reason }
+            }
+        }
+    }
+
+    /// Complete the page this boundary belongs to.
+    ///
+    /// `None` when no page in flight was opened under that id — which is the
+    /// ordinary answer for the live enrolment tail's own boundary, and the
+    /// reason a predecessor's EOSE can no longer certify anything here.
+    pub(crate) fn complete(&mut self, witness: &EndOfStoredEvents) -> Option<EnrolmentAdvance> {
+        if self.abandoned.is_some() || !self.awaits(witness.sub_id()) {
+            return None;
+        }
+        let page = self.open.take()?;
+        match self.cursor.complete(witness, page) {
+            PageOutcome::Continue { until, limit } => {
+                Some(EnrolmentAdvance::Continue { until, limit })
+            }
+            PageOutcome::Complete(retained) => {
+                self.complete = true;
+                Some(EnrolmentAdvance::Finished {
+                    roots: retained.into_events(),
+                })
+            }
+            PageOutcome::Stale { page } => {
+                self.open = Some(page);
+                Some(EnrolmentAdvance::Stale)
+            }
+            PageOutcome::Degraded { reason, .. } => {
+                let reason = format!("enrolment history: {reason}");
+                self.abandon(reason.clone());
+                Some(EnrolmentAdvance::Degraded { reason })
+            }
+        }
+    }
+
+    /// The connection died: the page in flight belonged to it. The cursor and
+    /// the cutoff survive, so the walk resumes from where it got to.
+    pub(crate) fn disconnected(&mut self) {
+        self.open = None;
+    }
+
+    pub(crate) fn abandon(&mut self, reason: impl Into<String>) {
+        if self.abandoned.is_none() {
+            self.abandoned = Some(reason.into());
+        }
+        self.disconnected();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn in_flight(&self) -> bool {
+        self.open.is_some()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn force_generation(&mut self, generation: u64) {
+        self.cursor.force_generation(generation);
     }
 }
 
@@ -6321,7 +6773,7 @@ pub(crate) fn resolve_addressing(
     if !evidence.p_tag_present {
         if matches!(
             source,
-            ProjectSubscription::Enrolment | ProjectSubscription::EnrolmentReplay
+            ProjectSubscription::Enrolment | ProjectSubscription::EnrolmentHistory { .. }
         ) {
             return None;
         }
@@ -6386,7 +6838,13 @@ pub(crate) fn resolve_addressing(
 /// received the frame.
 pub(crate) fn processing_mode_for(source: &ProjectSubscription) -> ProcessingMode {
     match source {
-        ProjectSubscription::EnrolmentReplay => ProcessingMode::Replay,
+        // The one producer of `Replay`, and it is a *request class* rather than
+        // a stamp applied to a frame after it arrived. An earlier version
+        // derived this from `created_at < startup`, which read the author's
+        // clock: the relay bounds drift at ±15 minutes on ingest, so a root
+        // published live by a slightly slow clock was classified as history and
+        // enrolled without ever being answered.
+        ProjectSubscription::EnrolmentHistory { .. } => ProcessingMode::Replay,
         _ => ProcessingMode::Live,
     }
 }
@@ -9161,7 +9619,15 @@ mod tests {
     // ── History pagination ───────────────────────────────────────────────────
 
     fn cursor(cutoff: u64, limit: usize, relay_max: usize) -> HistoryCursor {
-        HistoryCursor::new(ROOT, HistoryStream::Comments, cutoff, limit, relay_max)
+        HistoryCursor::new(
+            HistoryScope::Root {
+                root: ROOT.to_string(),
+                stream: HistoryStream::Comments,
+            },
+            cutoff,
+            limit,
+            relay_max,
+        )
     }
 
     fn comment_on(root: &str, ts: u64, marker: &str) -> nostr::Event {
@@ -9359,7 +9825,15 @@ mod tests {
     async fn witness_for_another_request_degrades() {
         let mut h = PageHarness::new();
         let mut c = cursor(1_000, 4, 1_000);
-        let mut other = HistoryCursor::new(OTHER_ROOT, HistoryStream::Comments, 1_000, 4, 1_000);
+        let mut other = HistoryCursor::new(
+            HistoryScope::Root {
+                root: OTHER_ROOT.to_string(),
+                stream: HistoryStream::Comments,
+            },
+            1_000,
+            4,
+            1_000,
+        );
 
         let other_page = h.open(&mut other).await;
         let other_witness = h.witness(other_page.sub_id());
@@ -9386,7 +9860,15 @@ mod tests {
     async fn cross_request_witness_cannot_unfinish_a_cursor() {
         let mut h = PageHarness::new();
         let mut c = cursor(1_000, 4, 1_000);
-        let mut other = HistoryCursor::new(OTHER_ROOT, HistoryStream::Comments, 1_000, 4, 1_000);
+        let mut other = HistoryCursor::new(
+            HistoryScope::Root {
+                root: OTHER_ROOT.to_string(),
+                stream: HistoryStream::Comments,
+            },
+            1_000,
+            4,
+            1_000,
+        );
 
         // Short page -> the cursor finishes.
         expect_complete(run_page(&mut c, &[(900, "a")]).await);
@@ -9416,7 +9898,15 @@ mod tests {
     async fn cross_request_witness_does_not_overwrite_degradation_cause() {
         let mut h = PageHarness::new();
         let mut c = cursor(1_000, 4, 1_000);
-        let mut other = HistoryCursor::new(OTHER_ROOT, HistoryStream::Comments, 1_000, 4, 1_000);
+        let mut other = HistoryCursor::new(
+            HistoryScope::Root {
+                root: OTHER_ROOT.to_string(),
+                stream: HistoryStream::Comments,
+            },
+            1_000,
+            4,
+            1_000,
+        );
 
         let mut poisoned = h.open(&mut c).await;
         poisoned.observe_unusable("frame was not parseable as an event");
@@ -10017,7 +10507,15 @@ mod tests {
 
     #[tokio::test]
     async fn the_collector_poisons_a_page_containing_a_wrong_kind() {
-        let mut c = HistoryCursor::new(ROOT, HistoryStream::PullRequestUpdates, 1_000, 4, 1_000);
+        let mut c = HistoryCursor::new(
+            HistoryScope::Root {
+                root: ROOT.to_string(),
+                stream: HistoryStream::PullRequestUpdates,
+            },
+            1_000,
+            4,
+            1_000,
+        );
         let mut h = PageHarness::new();
         let mut page = h.open(&mut c).await;
         // A comment on a PR-update stream: wrong filter class.
@@ -10225,9 +10723,24 @@ mod tests {
         // One cursor per exact filter means one accumulator per exact filter.
         // Sharing them would let a complete Comments stream carry rows the PR
         // stream never proved exhausted, and vice versa.
-        let mut comments = HistoryCursor::new(ROOT, HistoryStream::Comments, 1_000, 4, 1_000);
-        let mut updates =
-            HistoryCursor::new(ROOT, HistoryStream::PullRequestUpdates, 1_000, 4, 1_000);
+        let mut comments = HistoryCursor::new(
+            HistoryScope::Root {
+                root: ROOT.to_string(),
+                stream: HistoryStream::Comments,
+            },
+            1_000,
+            4,
+            1_000,
+        );
+        let mut updates = HistoryCursor::new(
+            HistoryScope::Root {
+                root: ROOT.to_string(),
+                stream: HistoryStream::PullRequestUpdates,
+            },
+            1_000,
+            4,
+            1_000,
+        );
 
         let comment_rows =
             expect_complete(run_page(&mut comments, &[(900, "c1"), (890, "c2")]).await);
@@ -10314,7 +10827,15 @@ mod tests {
         root: &str,
         stream: HistoryStream,
     ) -> OpenedHistoryPage {
-        let mut cursor = HistoryCursor::new(root, stream, 1_000, 4, 1_000);
+        let mut cursor = HistoryCursor::new(
+            HistoryScope::Root {
+                root: root.to_string(),
+                stream,
+            },
+            1_000,
+            4,
+            1_000,
+        );
         h.open_with(cursor.begin_request()).await
     }
 
@@ -10455,7 +10976,15 @@ mod tests {
         let mut h = PageHarness::new();
 
         // Genuine root, stream and `until`; a different page limit.
-        let mut odd = HistoryCursor::new(recon.root(), HistoryStream::Comments, 1_000, 9, 1_000);
+        let mut odd = HistoryCursor::new(
+            HistoryScope::Root {
+                root: recon.root().to_string(),
+                stream: HistoryStream::Comments,
+            },
+            1_000,
+            9,
+            1_000,
+        );
         let page = h.open_with(odd.begin_request()).await;
 
         let rejected = recon.attach(page).unwrap_err();
@@ -10613,7 +11142,15 @@ mod tests {
         recon: &RootReconstruction,
         stream: HistoryStream,
     ) -> OpenedHistoryPage {
-        let mut successor = HistoryCursor::new(recon.root(), stream, 1_000, 4, 1_000);
+        let mut successor = HistoryCursor::new(
+            HistoryScope::Root {
+                root: recon.root().to_string(),
+                stream,
+            },
+            1_000,
+            4,
+            1_000,
+        );
         h.open_with(successor.begin_request()).await
     }
 
@@ -10875,7 +11412,13 @@ mod tests {
         let mut h = PageHarness::new();
 
         let page = open_for(&mut h, &mut recon, HistoryStream::PullRequestUpdates).await;
-        assert_eq!(page.stream(), HistoryStream::PullRequestUpdates);
+        assert_eq!(
+            page.scope(),
+            &HistoryScope::Root {
+                root: pr.binding().root().to_string(),
+                stream: HistoryStream::PullRequestUpdates,
+            }
+        );
         recon.attach(page).expect("attaches to its own stream");
 
         assert!(recon.in_flight(HistoryStream::PullRequestUpdates));
@@ -10920,8 +11463,8 @@ mod tests {
             "two boundaries on one stream could not be ordered by its cursor"
         );
         assert_eq!(
-            rejected.page.stream(),
-            HistoryStream::Comments,
+            rejected.page.scope().stream(),
+            Some(HistoryStream::Comments),
             "and the page comes back, so its registration is still reachable"
         );
 
@@ -10982,8 +11525,15 @@ mod tests {
         let mut h = PageHarness::new();
 
         // Never call `recon.begin_page()`.
-        let mut outsider =
-            HistoryCursor::new(recon.root(), HistoryStream::Comments, 1_000, 4, 1_000);
+        let mut outsider = HistoryCursor::new(
+            HistoryScope::Root {
+                root: recon.root().to_string(),
+                stream: HistoryStream::Comments,
+            },
+            1_000,
+            4,
+            1_000,
+        );
         let collector = outsider.begin_request();
         assert_eq!(
             collector.generation(),
@@ -11335,7 +11885,15 @@ mod tests {
         cutoff: u64,
         entries: &[(u64, &str)],
     ) -> RetainedStream {
-        let mut c = HistoryCursor::new(root, HistoryStream::Comments, cutoff, 100, 1_000);
+        let mut c = HistoryCursor::new(
+            HistoryScope::Root {
+                root: root.to_string(),
+                stream: HistoryStream::Comments,
+            },
+            cutoff,
+            100,
+            1_000,
+        );
         let mut h = PageHarness::new();
         let mut page = h.open(&mut c).await;
         for (ts, marker) in entries {
@@ -11349,7 +11907,15 @@ mod tests {
         cutoff: u64,
         entries: &[(u64, &str)],
     ) -> RetainedStream {
-        let mut c = HistoryCursor::new(root, HistoryStream::PullRequestUpdates, cutoff, 100, 1_000);
+        let mut c = HistoryCursor::new(
+            HistoryScope::Root {
+                root: root.to_string(),
+                stream: HistoryStream::PullRequestUpdates,
+            },
+            cutoff,
+            100,
+            1_000,
+        );
         let mut h = PageHarness::new();
         let mut page = h.open(&mut c).await;
         for (ts, marker) in entries {
@@ -11449,7 +12015,15 @@ mod tests {
         // `PageOutcome::Complete`. A degraded or still-paginating cursor
         // therefore has nothing to pass to `merge_completed_streams`.
         let (bound, root_id) = bound_root(KIND_GIT_ISSUE).await;
-        let mut c = HistoryCursor::new(&root_id, HistoryStream::Comments, 1_000, 2, 1_000);
+        let mut c = HistoryCursor::new(
+            HistoryScope::Root {
+                root: root_id.to_string(),
+                stream: HistoryStream::Comments,
+            },
+            1_000,
+            2,
+            1_000,
+        );
         let mut h = PageHarness::new();
         let mut page = h.open(&mut c).await;
         page.observe_unusable("frame was not parseable as an event");
@@ -11518,7 +12092,15 @@ mod tests {
     async fn a_completed_stream_remembers_the_cutoff_it_was_opened_against() {
         // `until` moves as pages are consumed; `cutoff` must not, or there is
         // nothing left for the merge to check by the time a stream completes.
-        let mut c = HistoryCursor::new(ROOT, HistoryStream::Comments, 1_000, 2, 1_000);
+        let mut c = HistoryCursor::new(
+            HistoryScope::Root {
+                root: ROOT.to_string(),
+                stream: HistoryStream::Comments,
+            },
+            1_000,
+            2,
+            1_000,
+        );
         assert_eq!(c.cutoff(), 1_000);
         assert_eq!(
             expect_continue(run_page(&mut c, &[(900, "a"), (880, "b")]).await),
@@ -11583,8 +12165,16 @@ mod tests {
 
     #[test]
     fn a_cursor_knows_which_stream_it_proves() {
-        let c = HistoryCursor::new(ROOT, HistoryStream::PullRequestUpdates, 1_000, 10, 1_000);
-        assert_eq!(c.stream(), HistoryStream::PullRequestUpdates);
+        let c = HistoryCursor::new(
+            HistoryScope::Root {
+                root: ROOT.to_string(),
+                stream: HistoryStream::PullRequestUpdates,
+            },
+            1_000,
+            10,
+            1_000,
+        );
+        assert_eq!(c.scope().stream(), Some(HistoryStream::PullRequestUpdates));
     }
 
     // ── Addressing resolution ────────────────────────────────────────────────
@@ -12091,37 +12681,38 @@ mod tests {
 
     #[test]
     fn enrolment_filter_scopes_by_project_and_agent() {
-        let now = 2 * ENROLMENT_RECONSTRUCTION_WINDOW_SECS;
-        let f = enrolment_filter(&known(&[&coord()]), AGENT, now).expect("filter");
+        let f = enrolment_filter(&known(&[&coord()]), AGENT, 2_000).expect("filter");
         assert_eq!(f["kinds"], json!([1621, 1618, 1]));
         assert_eq!(f["#a"], json!([coord()]));
         assert_eq!(f["#p"], json!([AGENT]));
-        assert_eq!(f["limit"], json!(ENROLMENT_RECONSTRUCTION_LIMIT));
     }
 
-    /// Enrolment reaches **behind** the caller's floor, and is bounded.
+    /// The enrolment REQ is a live tail: it takes the caller's floor literally
+    /// and asks for no history at all.
     ///
-    /// The floor used to be taken literally, which made this a live tail: a
-    /// root addressed to the agent before it started was outside the window, so
-    /// after a restart it held no authority for its own conversations and
-    /// correctly refused everything referring to them. Reaching back is what
-    /// makes reconstruction possible; the `limit` is what stops it becoming a
-    /// full-history scan on every reconnect.
+    /// It used to reach thirty days behind that floor for up to five hundred
+    /// rows. Both bounds were false completeness — a root older than the window,
+    /// or beyond the five hundredth, was silently absent while the agent
+    /// reported full authority — and neither could be fixed by widening, because
+    /// this REQ's identity is fixed and a fixed identity cannot paginate. The
+    /// walk that can is [`EnrolmentReconstruction`], on its own requests, and it
+    /// runs *beside* this one rather than replacing it.
     #[test]
-    fn enrolment_filter_reaches_back_past_the_callers_floor() {
-        let now = 10 * ENROLMENT_RECONSTRUCTION_WINDOW_SECS;
-        let f = enrolment_filter(&known(&[&coord()]), AGENT, now).expect("filter");
+    fn the_enrolment_filter_asks_for_no_history() {
+        let f = enrolment_filter(&known(&[&coord()]), AGENT, 9_000).expect("filter");
         assert_eq!(
             f["since"],
-            json!(now - ENROLMENT_RECONSTRUCTION_WINDOW_SECS),
-            "a root published before startup must be inside the window"
+            json!(9_000),
+            "the tail must start exactly at the caller's floor, not behind it"
         );
-        assert!(f["limit"].as_u64().is_some_and(|l| l > 0));
-
-        // A floor inside the window saturates at zero rather than wrapping to
-        // the end of time and matching nothing.
-        let early = enrolment_filter(&known(&[&coord()]), AGENT, 5).expect("filter");
-        assert_eq!(early["since"], json!(0));
+        assert!(
+            f.get("limit").is_none(),
+            "a row cap on a standing tail can only ever truncate it: {f}"
+        );
+        assert!(
+            f.get("until").is_none(),
+            "the tail is open-ended forwards: {f}"
+        );
     }
 
     #[test]
@@ -13965,7 +14556,15 @@ mod tests {
         let route = ProjectRoute::derive(&verified).expect("routes");
 
         let mut h = PageHarness::new();
-        let mut c = HistoryCursor::new(ROOT, HistoryStream::Comments, 1_000, 4, 1_000);
+        let mut c = HistoryCursor::new(
+            HistoryScope::Root {
+                root: ROOT.to_string(),
+                stream: HistoryStream::Comments,
+            },
+            1_000,
+            4,
+            1_000,
+        );
         let page = h.open_with(c.begin_request()).await;
         let Some(ProjectSubscription::RootCatchUp { root: expected, .. }) =
             h.requests.match_frame(page.sub_id())
@@ -13992,10 +14591,24 @@ mod tests {
         // registry must be able to hold both. The incarnation is what stops two
         // *attempts* colliding, which is the same argument one level down.
         let mut h = PageHarness::new();
-        let mut comments_cursor =
-            HistoryCursor::new(ROOT, HistoryStream::Comments, 1_000, 4, 1_000);
-        let mut updates_cursor =
-            HistoryCursor::new(ROOT, HistoryStream::PullRequestUpdates, 1_000, 4, 1_000);
+        let mut comments_cursor = HistoryCursor::new(
+            HistoryScope::Root {
+                root: ROOT.to_string(),
+                stream: HistoryStream::Comments,
+            },
+            1_000,
+            4,
+            1_000,
+        );
+        let mut updates_cursor = HistoryCursor::new(
+            HistoryScope::Root {
+                root: ROOT.to_string(),
+                stream: HistoryStream::PullRequestUpdates,
+            },
+            1_000,
+            4,
+            1_000,
+        );
         let comments = h.open_with(comments_cursor.begin_request()).await;
         let updates = h.open_with(updates_cursor.begin_request()).await;
 

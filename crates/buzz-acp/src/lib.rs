@@ -3391,6 +3391,14 @@ pub(crate) trait ProjectSubscriber {
         replacement: project::ProjectReplacement,
         filters: Vec<serde_json::Value>,
     ) -> impl std::future::Future<Output = Result<(), relay::RelayError>>;
+
+    /// Begin the walk back through the roots this agent is already addressed
+    /// on, over the coordinate set discovery has reached.
+    fn submit_enrolment_history(
+        &self,
+        coordinates: Vec<String>,
+        agent: String,
+    ) -> impl std::future::Future<Output = Result<(), relay::RelayError>>;
 }
 
 impl ProjectSubscriber for relay::HarnessRelay {
@@ -3400,6 +3408,14 @@ impl ProjectSubscriber for relay::HarnessRelay {
         filters: Vec<serde_json::Value>,
     ) -> Result<(), relay::RelayError> {
         relay::HarnessRelay::submit_project_replacement(self, replacement, filters).await
+    }
+
+    async fn submit_enrolment_history(
+        &self,
+        coordinates: Vec<String>,
+        agent: String,
+    ) -> Result<(), relay::RelayError> {
+        relay::HarnessRelay::submit_enrolment_history(self, coordinates, agent).await
     }
 }
 
@@ -3574,6 +3590,24 @@ pub(crate) async fn dispatch_project_event(
                     .await
                 {
                     tracing::warn!("enrolment replacement submission error: {e}");
+                }
+            }
+            // …and the history behind it, as a separate walk.
+            //
+            // Both, on every discovery change. The tail alone was the restart
+            // defect: an issue addressed to this agent before it started is
+            // outside a tail's `since` by definition, so the agent held no
+            // authority for its own conversations and correctly refused
+            // everything referring to them. Widening the tail could not fix it
+            // — a fixed-identity REQ cannot paginate, so any reach-back it
+            // carried could only sample and call the sample complete.
+            let coordinates: Vec<String> = dispatch.discovered.iter().cloned().collect();
+            if !coordinates.is_empty() {
+                if let Err(e) = subscriber
+                    .submit_enrolment_history(coordinates, agent_pubkey_hex.to_string())
+                    .await
+                {
+                    tracing::warn!("enrolment history submission error: {e}");
                 }
             }
         }
@@ -5476,7 +5510,7 @@ mod project_discovery_ingestion_tests {
             &owner,
             &agent,
             "demo",
-            project::ProjectSubscription::EnrolmentReplay,
+            project::ProjectSubscription::EnrolmentHistory { generation: 0 },
             None,
             root,
         )
@@ -5513,7 +5547,7 @@ mod project_discovery_ingestion_tests {
             &owner,
             &agent,
             "demo",
-            project::ProjectSubscription::EnrolmentReplay,
+            project::ProjectSubscription::EnrolmentHistory { generation: 0 },
             Some(root),
             comment,
         )
@@ -5524,22 +5558,34 @@ mod project_discovery_ingestion_tests {
         );
     }
 
-    /// The mode is a property of the frame's stamp and of nothing else.
+    /// The mode is a property of the **request class** and of nothing else.
     ///
     /// Pinned so that adding a subscription class cannot silently make its
-    /// frames replay — or, worse, make replay frames live.
+    /// frames replay — or, worse, make replay frames live. `EnrolmentHistory`
+    /// is the one producer of `Replay`, and every generation of it is one:
+    /// a class whose replay-ness depended on its generation would be a second
+    /// place to get this wrong.
     #[test]
-    fn only_the_replay_stamp_carries_replay_mode() {
+    fn only_a_history_page_carries_replay_mode() {
         use project::{processing_mode_for, ProcessingMode, ProjectSubscription};
-        assert!(matches!(
-            processing_mode_for(&ProjectSubscription::EnrolmentReplay),
-            ProcessingMode::Replay
-        ));
+        for generation in [0u64, 1, u64::MAX] {
+            assert!(matches!(
+                processing_mode_for(&ProjectSubscription::EnrolmentHistory { generation }),
+                ProcessingMode::Replay
+            ));
+        }
         for live in [
+            // The enrolment tail included, and deliberately: it floors at
+            // startup, so a frame it delivers is news by construction. This is
+            // the assertion the removed `created_at < startup` rule broke.
             ProjectSubscription::Enrolment,
             ProjectSubscription::Discovery,
             ProjectSubscription::PeerCall,
             ProjectSubscription::Watched { generation: 3 },
+            ProjectSubscription::RootCatchUp {
+                root: "a".repeat(64),
+                stream: project::HistoryStream::Comments,
+            },
         ] {
             assert!(
                 matches!(processing_mode_for(&live), ProcessingMode::Live),
@@ -6201,6 +6247,8 @@ mod project_discovery_ingestion_tests {
     #[derive(Default)]
     struct RecordingSubscriber {
         calls: std::sync::Mutex<Vec<(project::ProjectReplacement, String)>>,
+        /// Every enrolment-history walk asked for, in order.
+        history: std::sync::Mutex<Vec<(Vec<String>, String)>>,
     }
 
     impl ProjectSubscriber for RecordingSubscriber {
@@ -6213,6 +6261,15 @@ mod project_discovery_ingestion_tests {
                 .lock()
                 .unwrap()
                 .push((replacement, serde_json::to_string(&filters).unwrap()));
+            Ok(())
+        }
+
+        async fn submit_enrolment_history(
+            &self,
+            coordinates: Vec<String>,
+            agent: String,
+        ) -> Result<(), relay::RelayError> {
+            self.history.lock().unwrap().push((coordinates, agent));
             Ok(())
         }
     }
@@ -11040,6 +11097,14 @@ for line in sys.stdin:
             &self,
             _replacement: project::ProjectReplacement,
             _filters: Vec<serde_json::Value>,
+        ) -> Result<(), relay::RelayError> {
+            Ok(())
+        }
+
+        async fn submit_enrolment_history(
+            &self,
+            _coordinates: Vec<String>,
+            _agent: String,
         ) -> Result<(), relay::RelayError> {
             Ok(())
         }
