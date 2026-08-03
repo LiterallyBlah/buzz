@@ -4696,6 +4696,20 @@ impl HistoryStream {
         }
     }
 
+    /// Which stream carried a row of this kind.
+    ///
+    /// The merge folds both streams into one ordered history, so a row that has
+    /// left pagination behind no longer knows which page fetched it — and the
+    /// class it is replayed under must still name one. Deriving it from the
+    /// row's own kind keeps that honest: the two streams partition the kinds,
+    /// so there is exactly one answer, and `None` for a kind neither admits
+    /// rather than a plausible default.
+    pub(crate) fn carrying(kind: u32) -> Option<Self> {
+        [HistoryStream::Comments, HistoryStream::PullRequestUpdates]
+            .into_iter()
+            .find(|stream| stream.admits(kind))
+    }
+
     fn admits(self, kind: u32) -> bool {
         match self {
             HistoryStream::Comments => matches!(
@@ -4909,13 +4923,20 @@ pub(crate) fn catch_up_filter(
     })
 }
 
-// Consumed by the reconstruction driver, which is the next change.
-#[allow(unused_imports)]
+// Consumed by the reconstruction driver in `relay.rs`. The blanket
+// `allow(unused_imports)` this carried while the driver was still unwritten is
+// gone with it: every name below has a caller, so a future one that loses its
+// last caller is a warning rather than a silence.
 pub(crate) use history::{
     merge::{merge_completed_streams, OrderedRetainedRows},
-    DiagnosticRow, DiagnosticRows, EoseHistoryPage, HistoryCursor, HistoryPageCollector,
-    ProposalDomain, RetainedStream,
+    DiagnosticRows, HistoryCursor, HistoryPageCollector, ProposalDomain, RetainedStream,
 };
+
+/// Only tests name a single row. Production reads them through
+/// [`DiagnosticRows`], which is the whole point of that type: a failure is
+/// describable without the witnesses being reachable.
+#[cfg(test)]
+pub(crate) use history::DiagnosticRow;
 
 /// Pagination internals, in a private module so the proof types are genuinely
 /// exclusive rather than merely documented as such.
@@ -5855,8 +5876,16 @@ mod history {
 /// says the reconstruction as a whole is trustworthy.
 #[derive(Debug)]
 pub(crate) struct RootReconstruction {
-    root: String,
-    is_pull_request: bool,
+    /// The proof this reconstruction is *of*, kept rather than reduced to a
+    /// root id.
+    ///
+    /// [`merge_completed_streams`] needs it to check that the streams present
+    /// are the ones this root's class requires, and it must be the same proof
+    /// the streams were opened under. Reducing it to a string at construction
+    /// and asking a caller for a root again at completion would be the
+    /// caller-states-a-fact hole the rest of this type closes, arriving at the
+    /// one moment where the fact decides what a whole history means.
+    root: VerifiedBoundRoot,
     /// Immutable for the life of the reconstruction.
     cutoff: u64,
     streams: Vec<StreamProgress>,
@@ -5988,9 +6017,8 @@ impl RootReconstruction {
         page_limit: usize,
         relay_max: usize,
     ) -> Self {
-        let is_pull_request = root.binding().is_pull_request();
         let root_id = root.binding().root().to_string();
-        let streams = HistoryStream::required_for(is_pull_request)
+        let streams = HistoryStream::required_for(root.binding().is_pull_request())
             .iter()
             .map(|stream| StreamProgress {
                 stream: *stream,
@@ -6008,8 +6036,7 @@ impl RootReconstruction {
             })
             .collect();
         Self {
-            root: root_id,
-            is_pull_request,
+            root: root.clone(),
             cutoff,
             streams,
             abandoned: None,
@@ -6017,7 +6044,7 @@ impl RootReconstruction {
     }
 
     pub(crate) fn root(&self) -> &str {
-        &self.root
+        self.root.binding().root()
     }
 
     pub(crate) fn cutoff(&self) -> u64 {
@@ -6025,7 +6052,40 @@ impl RootReconstruction {
     }
 
     pub(crate) fn is_pull_request(&self) -> bool {
-        self.is_pull_request
+        self.root.binding().is_pull_request()
+    }
+
+    /// Has every stream this root's class requires reached proven exhaustion?
+    ///
+    /// Deliberately narrower than "is this trustworthy": an abandoned
+    /// reconstruction answers `false` here and stays abandoned, so completeness
+    /// and degradation cannot both be claimed of one root.
+    pub(crate) fn all_streams_finished(&self) -> bool {
+        if self.abandoned.is_some() {
+            return false;
+        }
+        let required = HistoryStream::required_for(self.is_pull_request()).len();
+        self.streams.iter().filter(|s| s.retained.is_some()).count() == required
+    }
+
+    /// Consume the reconstruction into its merged history.
+    ///
+    /// Consuming rather than borrowing, because a reconstruction that has given
+    /// up its retained streams has nothing left to page and must not be
+    /// advertised for one: `pages_wanted` selects on `retained.is_none()`, so a
+    /// version that took the streams out in place would re-open every page it
+    /// had just finished, forever. The caller drops it from the live set by
+    /// calling this at all.
+    ///
+    /// `Err` when the merge refuses — a stream missing, duplicated, or opened
+    /// against a different cutoff. That is a degraded root, not a partial one.
+    pub(crate) fn into_completed(mut self) -> Result<OrderedRetainedRows, String> {
+        let streams: Vec<RetainedStream> = self
+            .streams
+            .iter_mut()
+            .filter_map(|s| s.retained.take())
+            .collect();
+        merge_completed_streams(&self.root, self.cutoff, streams)
     }
 
     pub(crate) fn abandoned_reason(&self) -> Option<&str> {
@@ -6114,7 +6174,7 @@ impl RootReconstruction {
             // An enrolment page has no root to attach to a root's progress.
             refuse!(AttachError::WrongRoot);
         };
-        if root != self.root {
+        if root != self.root() {
             refuse!(AttachError::WrongRoot);
         }
         let Some(progress) = self.streams.iter_mut().find(|s| s.stream == stream) else {
@@ -6329,6 +6389,20 @@ impl RootReconstruction {
             .iter()
             .any(|s| s.stream == stream && s.open.is_some())
     }
+
+    /// Test-only: the wire id and bound of the page currently in flight.
+    ///
+    /// Reading the page the *production* driver opened, rather than opening one
+    /// and reading that back. A fixture that opens its own page cannot tell
+    /// whether the driver would have.
+    #[cfg(test)]
+    pub(crate) fn in_flight_page(&self, stream: HistoryStream) -> Option<(String, u64)> {
+        self.streams
+            .iter()
+            .find(|s| s.stream == stream)
+            .and_then(|s| s.open.as_ref())
+            .map(|page| (page.sub_id().to_string(), page.until()))
+    }
 }
 
 /// The reconstructions in progress, and the only thing that puts an admitted
@@ -6368,9 +6442,10 @@ impl ProjectReconstructions {
     /// the page would report `NotOurs` while the other absorbed it — a
     /// coin-flip that depends on vector order.
     ///
-    /// No production caller yet. Deciding *which* roots to rebuild is enrolment,
-    /// which is a later piece; until it lands this collection is empty in
-    /// production and every admitted frame routes to `NotOurs`.
+    /// Refusing is also what makes a repeated restore idempotent: a root
+    /// rediscovered by a second enrolment walk asks for its history again, and
+    /// starting a second reconstruction of a root already being rebuilt would
+    /// double every page.
     pub(crate) fn insert(&mut self, reconstruction: RootReconstruction) -> bool {
         if self.find(reconstruction.root()).is_some() {
             return false;
@@ -6381,6 +6456,98 @@ impl ProjectReconstructions {
 
     fn find(&mut self, root: &str) -> Option<&mut RootReconstruction> {
         self.live.iter_mut().find(|r| r.root() == root)
+    }
+
+    /// Every page any live reconstruction currently wants, as `(root, stream)`.
+    ///
+    /// The bound and the limit are deliberately **not** here. They are the
+    /// cursor's, and a driver that carried them from this call to `begin_page`
+    /// would be a second place for them to be stated — the collector already
+    /// carries the only copy that matters.
+    pub(crate) fn pages_wanted(&self) -> Vec<(String, HistoryStream)> {
+        self.live
+            .iter()
+            .flat_map(|r| {
+                r.pages_wanted()
+                    .into_iter()
+                    .map(|(stream, _, _)| (r.root().to_string(), stream))
+            })
+            .collect()
+    }
+
+    /// Issue a collector for one root's stream, from that reconstruction's own
+    /// cursor.
+    pub(crate) fn begin_page(
+        &mut self,
+        root: &str,
+        stream: HistoryStream,
+    ) -> Option<HistoryPageCollector> {
+        self.find(root)?.begin_page(stream)
+    }
+
+    /// Hand a bound page to the reconstruction it was opened for.
+    ///
+    /// The root comes from the page's own scope, never from an argument, so a
+    /// page cannot be attached to a reconstruction it does not describe.
+    /// `WrongRoot` when no reconstruction holds that root — the same refusal a
+    /// mismatched page gets, because "nobody is rebuilding this" and "you
+    /// offered this to the wrong rebuild" are the same failure for the caller:
+    /// close the registration.
+    pub(crate) fn attach(&mut self, page: OpenedHistoryPage) -> Result<(), Box<AttachRejected>> {
+        let HistoryScope::Root { root, .. } = page.scope().clone() else {
+            return Err(Box::new(AttachRejected {
+                error: AttachError::WrongRoot,
+                page,
+            }));
+        };
+        match self.find(&root) {
+            Some(reconstruction) => reconstruction.attach(page),
+            None => Err(Box::new(AttachRejected {
+                error: AttachError::WrongRoot,
+                page,
+            })),
+        }
+    }
+
+    /// Give up on one root permanently.
+    pub(crate) fn abandon(&mut self, root: &str, reason: impl Into<String>) {
+        if let Some(reconstruction) = self.find(root) {
+            reconstruction.abandon(reason);
+        }
+    }
+
+    /// The roots that have given up, and why.
+    ///
+    /// A degraded reconstruction stays in the live set rather than being
+    /// dropped: dropping it would let the next restore of the same root start a
+    /// fresh one and quietly re-enter the healthy path, so the agent would
+    /// oscillate between "cannot prove this root's history" and "complete"
+    /// without either being true.
+    pub(crate) fn abandoned(&self) -> Vec<(String, String)> {
+        self.live
+            .iter()
+            .filter_map(|r| {
+                r.abandoned_reason()
+                    .map(|reason| (r.root().to_string(), reason.to_string()))
+            })
+            .collect()
+    }
+
+    /// Take the merged history of `root`, if every stream it requires has
+    /// reached proven exhaustion.
+    ///
+    /// **Removes the reconstruction.** A root whose history has been handed on
+    /// is finished, and leaving a spent reconstruction in the live set would
+    /// keep offering it pages it has no cursor left to fill.
+    pub(crate) fn take_completed(
+        &mut self,
+        root: &str,
+    ) -> Option<Result<OrderedRetainedRows, String>> {
+        let index = self
+            .live
+            .iter()
+            .position(|r| r.root() == root && r.all_streams_finished())?;
+        Some(self.live.swap_remove(index).into_completed())
     }
 
     /// Route one admitted catch-up frame.

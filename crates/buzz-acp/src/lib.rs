@@ -3399,6 +3399,17 @@ pub(crate) trait ProjectSubscriber {
         coordinates: Vec<String>,
         agent: String,
     ) -> impl std::future::Future<Output = Result<(), relay::RelayError>>;
+
+    /// Rebuild one restored root's own history — comments, revisions and,
+    /// above all, lifecycle.
+    ///
+    /// Takes the proof rather than a root id: only this side holds the
+    /// discovered set a root must be validated against, so minting it here is
+    /// what stops the relay task rebuilding a root nothing vouched for.
+    fn submit_root_catch_up(
+        &self,
+        root: project::VerifiedBoundRoot,
+    ) -> impl std::future::Future<Output = Result<(), relay::RelayError>>;
 }
 
 impl ProjectSubscriber for relay::HarnessRelay {
@@ -3416,6 +3427,13 @@ impl ProjectSubscriber for relay::HarnessRelay {
         agent: String,
     ) -> Result<(), relay::RelayError> {
         relay::HarnessRelay::submit_enrolment_history(self, coordinates, agent).await
+    }
+
+    async fn submit_root_catch_up(
+        &self,
+        root: project::VerifiedBoundRoot,
+    ) -> Result<(), relay::RelayError> {
+        relay::HarnessRelay::submit_root_catch_up(self, root).await
     }
 }
 
@@ -3614,11 +3632,62 @@ pub(crate) async fn dispatch_project_event(
         // A root joined or rejoined the watched set. The watched REQ names every
         // root explicitly, so the successor takes a fresh generation and the
         // predecessor is retired once the successor is installed.
+        //
+        // A newly watched root **that predates this process** additionally asks
+        // for its own history, and it fires *after* the enrolment above, so the
+        // binding the merge and the authority gate read is already in place.
+        //
+        // Keyed on the root's own timestamp rather than on how it arrived. The
+        // processing mode is tempting — `apply_processing_mode` produces a bare
+        // `Enrol` only under `Replay`, so `Enrolled` alone reads as "restored"
+        // — but it is a *proxy* for "this process watched this root happen",
+        // and inside the enrolment tail's clock-skew reach-back that proxy is
+        // wrong. `enrolment_filter` starts the live root tail at
+        // `watermark - ACCEPTED_CLOCK_SKEW_SECS`, while `watched_roots_filters`
+        // starts at the watermark exactly. So a root published in that window
+        // arrives **live**, enrols live, and a status event published between
+        // that root and startup is inside no REQ at all: too late for the
+        // enrolment walk's cutoff, too early for the watched REQ, and never
+        // asked for by a catch-up that only fires on replay. The root's own
+        // `created_at` is the fact the mode was standing in for.
+        //
+        // A root created after the watermark has no history this process did
+        // not see, so it asks for none.
         ProjectDispatched::Enrolled
         | ProjectDispatched::Queued {
             watch_changed: true,
             ..
         } => {
+            if let project::ProjectEvent::Routed { event, .. } = project_event {
+                if event.event().created_at.as_secs() <= since {
+                    match project::VerifiedBoundRoot::prove(
+                        std::slice::from_ref(event),
+                        dispatch.discovered,
+                    ) {
+                        Some(root) => {
+                            if let Err(e) = subscriber.submit_root_catch_up(root).await {
+                                tracing::warn!("root catch-up submission error: {e}");
+                            }
+                        }
+                        // Not a root at all — the ordinary shape of a comment
+                        // that woke a dormant root, which changes the watched
+                        // set without being a root to rebuild.
+                        //
+                        // For `Enrolled` it is a contradiction rather than a
+                        // shape: that arm enrolled *this* event, which required
+                        // a validated candidate. Worth a word, because a root
+                        // watched with no history request is one whose dormancy
+                        // will not survive the next restart, silently.
+                        None if matches!(dispatched, ProjectDispatched::Enrolled) => {
+                            tracing::warn!(
+                                event_id = %event.id(),
+                                "enrolled root cannot be proven for history reconstruction"
+                            )
+                        }
+                        None => {}
+                    }
+                }
+            }
             let filters = project::watched_roots_filters(dispatch.enrolments, since);
             if !filters.is_empty() {
                 // **Nothing about the generation is decided here.**
@@ -6992,6 +7061,8 @@ mod project_discovery_ingestion_tests {
         calls: std::sync::Mutex<Vec<(project::ProjectReplacement, String)>>,
         /// Every enrolment-history walk asked for, in order.
         history: std::sync::Mutex<Vec<(Vec<String>, String)>>,
+        /// Every root whose own history was asked for, in order.
+        catch_ups: std::sync::Mutex<Vec<String>>,
     }
 
     impl ProjectSubscriber for RecordingSubscriber {
@@ -7013,6 +7084,17 @@ mod project_discovery_ingestion_tests {
             agent: String,
         ) -> Result<(), relay::RelayError> {
             self.history.lock().unwrap().push((coordinates, agent));
+            Ok(())
+        }
+
+        async fn submit_root_catch_up(
+            &self,
+            root: project::VerifiedBoundRoot,
+        ) -> Result<(), relay::RelayError> {
+            self.catch_ups
+                .lock()
+                .unwrap()
+                .push(root.binding().root().to_string());
             Ok(())
         }
     }
@@ -7085,6 +7167,146 @@ mod project_discovery_ingestion_tests {
         assert!(
             calls[1].1.contains(&owner_b.public_key().to_hex()),
             "the second repository is absent from the widened filter"
+        );
+    }
+
+    /// A root that predates this process asks for its history — however it
+    /// arrived.
+    ///
+    /// The producer half of the restart defect. The catch-up machinery existed
+    /// complete — exhaustive paging, generation isolation, fail-closed
+    /// degradation, deterministic merge — and nothing in production ever
+    /// started one: `ProjectReconstructions::insert` had no caller, so a
+    /// restart rebuilt every binding as active and no close was ever fetched.
+    ///
+    /// **Which roots ask is as load-bearing as the asking**, and the obvious
+    /// answer is subtly wrong. "Enrolled from replay" reads as "restored", and
+    /// it is nearly right — but it is a proxy for "this process did not watch
+    /// this root happen", and the two REQs do not meet where the proxy assumes.
+    /// `enrolment_filter` reaches the live root tail back by
+    /// [`project::ACCEPTED_CLOCK_SKEW_SECS`] to tolerate drift;
+    /// `watched_roots_filters` starts at the watermark exactly. A root
+    /// published inside that window therefore arrives **live** and enrols live,
+    /// while a close published between it and startup falls into the gap
+    /// between the two: after the enrolment walk's cutoff, before the watched
+    /// REQ's floor. Keyed on the mode, nothing would ever fetch it — the same
+    /// silent dormancy loss, one window narrower.
+    ///
+    /// So the discriminator is the root's own `created_at` against the
+    /// watermark, and this pins all three cases against one watermark: restored
+    /// by replay, arrived live from inside the skew window, and created after
+    /// startup with no history to miss.
+    #[tokio::test]
+    async fn a_root_that_predates_this_process_asks_for_its_history_however_it_arrived() {
+        const WATERMARK: u64 = 1_785_743_469;
+
+        let owner = Keys::generate();
+        let agent = Keys::generate();
+        let agent_identity = project::AgentIdentity::new(&agent.public_key()).unwrap();
+        let owner_hex = owner.public_key().to_hex();
+        let agent_hex = agent.public_key().to_hex();
+        let humans = std::collections::BTreeSet::new();
+        let externals = std::collections::BTreeSet::new();
+        let mut discovered = project::DiscoveredRepositories::new();
+        let mut enrolments = project::ProjectEnrolments::new();
+        let mut queue = EventQueue::new(config::DedupMode::Queue);
+        let mut ledger = peer_call::CallLedger::new();
+        let mut seen = ProjectSeenIds::new();
+        let subscriber = RecordingSubscriber::default();
+
+        macro_rules! drive {
+            ($ev:expr) => {
+                dispatch_project_event(
+                    &mut dispatch_over(
+                        &agent_identity,
+                        Some(&owner_hex),
+                        &humans,
+                        &externals,
+                        &mut discovered,
+                        &mut enrolments,
+                        &mut queue,
+                        &mut ledger,
+                    ),
+                    &mut seen,
+                    &subscriber,
+                    &agent_hex,
+                    WATERMARK,
+                    $ev,
+                )
+                .await
+            };
+        }
+
+        drive!(&project::ProjectEvent::Discovery {
+            announcement: proven_announcement(&owner, "proj").await,
+        });
+
+        // A root at `t`, addressed to the agent on the discovered coordinate.
+        let root_at = |body: &str, at: u64| {
+            let coord = format!("30617:{}:proj", owner.public_key().to_hex());
+            EventBuilder::new(
+                nostr::Kind::Custom(buzz_core::kind::KIND_GIT_ISSUE as u16),
+                body,
+            )
+            .custom_created_at(nostr::Timestamp::from(at))
+            .tags([
+                nostr::Tag::parse(["a", &coord]).unwrap(),
+                nostr::Tag::parse(["p", &agent.public_key().to_hex()]).unwrap(),
+            ])
+            .sign_with_keys(&owner)
+            .expect("sign")
+        };
+
+        // Restored by the enrolment walk: two hours old, far outside any tail.
+        let restored = root_at("opened before we existed", WATERMARK - 7_200);
+        // Inside the skew window the live root tail reaches back over. This one
+        // arrives **live** and is the case a mode-keyed producer misses.
+        let skewed = root_at(
+            "opened just before we started",
+            WATERMARK - project::ACCEPTED_CLOCK_SKEW_SECS / 2,
+        );
+        // Genuinely live: created after this process was already watching, so
+        // there is no history it did not see.
+        let fresh = root_at("opened while we watched", WATERMARK + 60);
+
+        let restored_id = restored.id.to_hex();
+        let skewed_id = skewed.id.to_hex();
+
+        for (event, mode, source) in [
+            (
+                restored,
+                project::ProcessingMode::Replay,
+                project::ProjectSubscription::EnrolmentHistory { generation: 0 },
+            ),
+            (
+                skewed,
+                project::ProcessingMode::Live,
+                project::ProjectSubscription::Enrolment,
+            ),
+            (
+                fresh,
+                project::ProcessingMode::Live,
+                project::ProjectSubscription::Enrolment,
+            ),
+        ] {
+            let verified = project::VerifiedProjectEvent::verify(event)
+                .await
+                .expect("valid");
+            let route = project::ProjectRoute::derive(&verified).expect("routes");
+            drive!(&project::ProjectEvent::Routed {
+                source,
+                route,
+                event: verified,
+                mode,
+            });
+        }
+
+        let catch_ups = subscriber.catch_ups.lock().unwrap().clone();
+        assert_eq!(
+            catch_ups,
+            vec![restored_id, skewed_id],
+            "every root older than the watermark asks for its history, and only \
+             those: {catch_ups:?}"
         );
     }
 
@@ -11855,6 +12077,13 @@ for line in sys.stdin:
             &self,
             _coordinates: Vec<String>,
             _agent: String,
+        ) -> Result<(), relay::RelayError> {
+            Ok(())
+        }
+
+        async fn submit_root_catch_up(
+            &self,
+            _root: project::VerifiedBoundRoot,
         ) -> Result<(), relay::RelayError> {
             Ok(())
         }

@@ -21,7 +21,7 @@
 //! `HarnessRelay` communicates with the background task via a `RelayCommand`
 //! channel. `next_event()` reads from the event receiver.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::time::Duration;
 
 /// Default capacity of the event channel from background task to harness.
@@ -128,6 +128,7 @@ use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use crate::config::ChannelFilter;
+use crate::project::VerifiedProjectEvent;
 
 /// Metadata about a channel, populated at discovery time.
 #[derive(Debug, Clone)]
@@ -614,6 +615,18 @@ enum RelayCommand {
         coordinates: Vec<String>,
         agent: String,
     },
+    /// Rebuild one restored root's own history — its comments, its revisions
+    /// and, the reason this exists, its lifecycle.
+    ///
+    /// Carries a [`crate::project::VerifiedBoundRoot`] rather than a root id
+    /// because the proof can only be minted where the discovered set lives,
+    /// which is the run loop. A command carrying a bare id would let this task
+    /// start rebuilding a root nothing had validated, and the merge's own check
+    /// — that the streams present are the ones this root's *class* requires —
+    /// would then be answered from a class the relay task guessed.
+    BeginRootCatchUp {
+        root: Box<crate::project::VerifiedBoundRoot>,
+    },
 }
 
 type WsStream = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
@@ -1058,6 +1071,25 @@ impl HarnessRelay {
             .map_err(|_| RelayError::ConnectionClosed)
     }
 
+    /// Ask the background task to rebuild one restored root's own history.
+    ///
+    /// Sent per restored root rather than derived from the enrolment walk,
+    /// because the walk asks for roots and this asks about one root's later
+    /// events — different filters, different bounds, and a walk that fetched
+    /// both would let a busy repository's chatter crowd out the roots the page
+    /// budget exists to find.
+    pub async fn submit_root_catch_up(
+        &self,
+        root: crate::project::VerifiedBoundRoot,
+    ) -> Result<(), RelayError> {
+        self.cmd_tx
+            .send(RelayCommand::BeginRootCatchUp {
+                root: Box::new(root),
+            })
+            .await
+            .map_err(|_| RelayError::ConnectionClosed)
+    }
+
     /// Reconnect after connection loss. Instructs the background task to
     /// re-authenticate and resubscribe to all previously active channels.
     pub async fn reconnect(&mut self) -> Result<(), RelayError> {
@@ -1360,12 +1392,36 @@ struct BgState {
     /// an event that happened to it — and the plan requires it be visible
     /// rather than inferred from a silence.
     enrolment_history_degraded: Option<String>,
-    /// Roots the walk discovered and has not yet proven it handed on.
+    /// Ordered batches of reconstructed rows this task has not yet proven it
+    /// handed to the run loop.
     ///
-    /// `Some` is the state "reconstruction is not finished yet", and it is the
-    /// reason the completion line has one producer rather than being a summary
-    /// the caller assembles. See [`PendingRestorations`].
-    enrolment_restore: Option<PendingRestorations>,
+    /// Non-empty is the state "some reconstruction is not finished yet", and it
+    /// is the reason a completion line has one producer rather than being a
+    /// summary the caller assembles. See [`PendingReplay`].
+    replay_deliveries: VecDeque<PendingReplay>,
+    /// Roots whose history could not be proven complete, and why.
+    ///
+    /// **The per-root fail-closed state**, separate from
+    /// [`BgState::enrolment_history_degraded`] because the two claims are
+    /// different: that one says "I may not know every conversation I am
+    /// responsible for", this one says "I know about this conversation and
+    /// cannot prove what state it is in". An agent can be healthy on one and
+    /// degraded on the other.
+    root_catch_up_degraded: BTreeMap<String, String>,
+    /// Roots whose history has been rebuilt and handed on, and how many rows
+    /// each one accounted for.
+    ///
+    /// **Kept after the reconstruction retires**, for two reasons. A root is
+    /// re-restored on every reconnect the enrolment walk survives, and starting
+    /// its whole history again each time would re-page the same events for no
+    /// new fact; and "this root's history is rebuilt" is the state a restart is
+    /// trying to reach, so an agent that holds it should be able to say so.
+    ///
+    /// The rows themselves are **not** kept. They have been folded into the
+    /// enrolment sets by the run loop, and a copy here would be a second model
+    /// of the same lifecycle — the shape that produced the two-producers defect
+    /// this phase already had to remove once.
+    root_catch_up_done: BTreeMap<String, usize>,
     /// Current position in the exponential backoff ladder.
     ///
     /// Persisted across calls to `wait_for_reconnect` so a flapping link stays at
@@ -1405,7 +1461,9 @@ impl BgState {
             reconstructions: crate::project::ProjectReconstructions::new(),
             enrolment_history: None,
             enrolment_history_degraded: None,
-            enrolment_restore: None,
+            replay_deliveries: VecDeque::new(),
+            root_catch_up_degraded: BTreeMap::new(),
+            root_catch_up_done: BTreeMap::new(),
             backoff_step: 0,
         }
     }
@@ -1654,6 +1712,11 @@ fn apply_command_to_state(state: &mut BgState, cmd: RelayCommand) {
             // reconnect path drives it as soon as there is one.
             begin_enrolment_history(state, coordinates, agent);
         }
+        RelayCommand::BeginRootCatchUp { root } => {
+            // Same offline rule: the reconstruction is created and wants its
+            // first page, which the reconnect drive opens.
+            begin_root_catch_up(state, *root);
+        }
         RelayCommand::ReplaceProject {
             replacement,
             filters,
@@ -1890,6 +1953,13 @@ async fn execute_connected_command(
                 ProjectSendOutcome::InvariantViolation => true,
                 ProjectSendOutcome::WriteFailed => false,
             }
+        }
+        RelayCommand::BeginRootCatchUp { root } => {
+            begin_root_catch_up(state, *root);
+            drive_root_reconstructions(ws, state).await;
+            // Same reasoning as the walk below: a root whose history cannot be
+            // paged degrades on its own and takes nothing else with it.
+            true
         }
         RelayCommand::BeginEnrolmentHistory { coordinates, agent } => {
             begin_enrolment_history(state, coordinates, agent);
@@ -2191,14 +2261,14 @@ async fn run_background_task(
     // resets this to `None`, allowing the pre-select drain to run again.
     let mut drain_pacing_next: Option<tokio::time::Instant> = None;
 
-    // Retry timer for reconstructed roots the run loop was too busy to take.
+    // Retry timer for reconstructed rows the run loop was too busy to take.
     // Armed from the state rather than from the delivery site: whichever
-    // attempt leaves roots retained leaves `enrolment_restore` set, and this
-    // loop owns when the next attempt happens.
+    // attempt leaves rows retained leaves a batch in `replay_deliveries`, and
+    // this loop owns when the next attempt happens.
     let mut restore_retry_next: Option<tokio::time::Instant> = None;
 
     loop {
-        restore_retry_next = match (state.enrolment_restore.is_some(), restore_retry_next) {
+        restore_retry_next = match (!state.replay_deliveries.is_empty(), restore_retry_next) {
             (true, Some(t)) => Some(t),
             (true, None) => Some(tokio::time::Instant::now() + ENROLMENT_RESTORE_RETRY_INTERVAL),
             // Nothing retained: disarm, so a later retention starts a fresh
@@ -3608,6 +3678,52 @@ async fn handle_ws_message(
                         // backlog drains, so their boundary retires no page.
                         if let Some(advance) = state.reconstructions.complete(&witness) {
                             debug!(sub_id = %subscription_id, ?advance, "history page completed");
+                            match advance {
+                                // Another page, on the bound the cursor reached.
+                                crate::project::StreamAdvance::Continue { .. } => {
+                                    drive_root_reconstructions(ws, state).await;
+                                }
+                                // One stream is exhausted. The root's history is
+                                // only *finished* when every stream its class
+                                // requires is, and `take_completed` is the one
+                                // thing that answers that — the driver is still
+                                // called because the other stream may want a
+                                // page it has not been given.
+                                crate::project::StreamAdvance::Finished { stream } => {
+                                    let root = match witness.subscription() {
+                                        crate::project::ProjectSubscription::RootCatchUp {
+                                            root,
+                                            ..
+                                        } => root.clone(),
+                                        // Unreachable: `complete` returns `None`
+                                        // for any other class.
+                                        _ => String::new(),
+                                    };
+                                    debug!(root = %root, ?stream, "root history stream exhausted");
+                                    finish_root_catch_up(state, event_tx, &root);
+                                    drive_root_reconstructions(ws, state).await;
+                                }
+                                // Ordinary reconnect traffic. The page in flight
+                                // is untouched and still completable by its own
+                                // boundary, so nothing is asked for here.
+                                crate::project::StreamAdvance::Stale { .. } => {}
+                                crate::project::StreamAdvance::Degraded {
+                                    stream, reason, ..
+                                } => {
+                                    let root = match witness.subscription() {
+                                        crate::project::ProjectSubscription::RootCatchUp {
+                                            root,
+                                            ..
+                                        } => root.clone(),
+                                        _ => String::new(),
+                                    };
+                                    degrade_root_catch_up(
+                                        state,
+                                        &root,
+                                        format!("{stream:?}: {reason}"),
+                                    );
+                                }
+                            }
                         }
 
                         // The enrolment walk's own boundary, and **only** its
@@ -3744,6 +3860,13 @@ async fn handle_ws_message(
                                     ?routing,
                                     "history page released by a closed request"
                                 );
+                                // Released, not completed — the same rule as
+                                // the walk above. The stream re-asks its own
+                                // bound under a fresh registration, because no
+                                // boundary can ever follow a CLOSED and a page
+                                // left attached would stall this root in
+                                // silence.
+                                drive_root_reconstructions(ws, state).await;
                             }
                         }
                         // Registration closed; durable intent kept. An earlier
@@ -4164,6 +4287,12 @@ async fn resubscribe_after_reconnect(
     // page the cursor has already walked past — which is why the registry
     // refuses to hold this class as intent at all.
     drive_enrolment_history(ws, state).await;
+
+    // Every root reconstruction survives for the same reason and resumes the
+    // same way: `disconnected` dropped only the pages the dead socket owned,
+    // and the cursors say where each stream had got to. A root left unresumed
+    // here would sit finished-looking forever with a history it never proved.
+    drive_root_reconstructions(ws, state).await;
 
     let mut deferred_commands = VecDeque::new();
     let channels: Vec<Uuid> = state.active_subscriptions.keys().copied().collect();
@@ -5739,20 +5868,34 @@ const RELAY_MAX_LIMIT: usize = 5_000;
 /// until every root it found is either restored or the retention bound is
 /// spent — at which point the reconstruction is degraded, visibly. Those are
 /// the only three exits, which is what makes the completion line honest.
-struct PendingRestorations {
-    /// The class every retained root goes out under.
-    ///
-    /// Fixed when the walk finished: the generation names the page that proved
-    /// exhaustion, and a retry is the same delivery arriving late, not a new
-    /// one from somewhere else.
-    generation: u64,
-    /// How many roots the walk found. The denominator of every claim made
-    /// about this reconstruction.
+/// Which reconstruction a batch of retained rows belongs to.
+///
+/// Carried rather than inferred, because the two batches make *different*
+/// claims when they finish — "this agent has found every root it is addressed
+/// on" and "this root's history is complete through the cutoff" — and one
+/// completion line covering both would be true of neither.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ReplayBatch {
+    /// The roots the enrolment walk found.
+    EnrolmentHistory,
+    /// One root's comments, revisions and lifecycle, merged and ordered.
+    RootCatchUp { root: String },
+}
+
+struct PendingReplay {
+    kind: ReplayBatch,
+    /// How many rows the batch found. The denominator of every claim made
+    /// about it.
     discovered: usize,
     /// How many have reached the run loop, across every attempt.
     restored: usize,
-    /// Still owed, in discovery order.
-    queue: VecDeque<crate::project::VerifiedProjectEvent>,
+    /// Still owed, **in the order the batch established**.
+    ///
+    /// For a catch-up that order is load-bearing rather than incidental: the
+    /// merge sorts ascending by `created_at` with the root first, and a close
+    /// delivered after the reopen that followed it would leave the watch in
+    /// the state the history says it left three events ago.
+    queue: VecDeque<(crate::project::ProjectSubscription, VerifiedProjectEvent)>,
     /// Consecutive attempts that may deliver nothing before the reconstruction
     /// is declared degraded.
     ///
@@ -5763,7 +5906,7 @@ struct PendingRestorations {
     stalls_left: u32,
 }
 
-/// What one pass over [`PendingRestorations`] settled.
+/// What one pass over [`PendingReplay`] settled.
 ///
 /// **The single producer of "complete".** `Complete` is returned from exactly
 /// one place — the branch where the queue is empty — so there is no path on
@@ -5801,152 +5944,458 @@ fn begin_restoring_roots(
     state: &mut BgState,
     event_tx: &mpsc::Sender<Option<BuzzEvent>>,
     generation: u64,
-    roots: Vec<crate::project::VerifiedProjectEvent>,
+    roots: Vec<VerifiedProjectEvent>,
 ) -> RestoreOutcome {
-    if let Some(superseded) = state.enrolment_restore.take() {
+    let superseded = state
+        .replay_deliveries
+        .iter()
+        .filter(|batch| batch.kind == ReplayBatch::EnrolmentHistory)
+        .map(|batch| batch.queue.len())
+        .sum::<usize>();
+    if superseded > 0 {
         // A restarted walk covers everything the previous one did — it asks
         // again from the current snapshot boundary — so its own roots subsume
         // these, and delivery is idempotent through `project_seen_ids` either
         // way.
         debug!(
-            retained = superseded.queue.len(),
+            retained = superseded,
             "a fresh reconstruction supersedes an earlier one's retained roots"
         );
+        state
+            .replay_deliveries
+            .retain(|batch| batch.kind != ReplayBatch::EnrolmentHistory);
     }
-    state.enrolment_restore = Some(PendingRestorations {
-        generation,
-        discovered: roots.len(),
+    let source = crate::project::ProjectSubscription::EnrolmentHistory { generation };
+    enqueue_replay(
+        state,
+        event_tx,
+        ReplayBatch::EnrolmentHistory,
+        roots.into_iter().map(|row| (source.clone(), row)).collect(),
+    )
+}
+
+/// Queue one ordered batch of replay rows and try to hand it on.
+fn enqueue_replay(
+    state: &mut BgState,
+    event_tx: &mpsc::Sender<Option<BuzzEvent>>,
+    kind: ReplayBatch,
+    rows: Vec<(crate::project::ProjectSubscription, VerifiedProjectEvent)>,
+) -> RestoreOutcome {
+    state.replay_deliveries.push_back(PendingReplay {
+        kind,
+        discovered: rows.len(),
         restored: 0,
-        queue: roots.into(),
+        queue: rows.into(),
         stalls_left: ENROLMENT_RESTORE_STALL_LIMIT,
     });
     drive_pending_restorations(state, event_tx)
 }
 
-/// Hand as many retained roots to the run loop as it will take right now.
+/// Hand as many retained rows to the run loop as it will take right now.
 ///
-/// Every row goes out under [`crate::project::ProjectSubscription::EnrolmentHistory`],
-/// whose class folds every effect through `ProcessingMode::Replay` — so these
-/// restore authority and lifecycle and **never create a turn**. Nothing here
-/// decides that; the class the page was registered under does.
+/// Every row goes out under the class of the page that produced it —
+/// `EnrolmentHistory` or `RootCatchUp` — and both fold every effect through
+/// `ProcessingMode::Replay`, so these restore authority, context and lifecycle
+/// and **never create a turn**. Nothing here decides that; the class the page
+/// was registered under does.
 ///
-/// They spend the shared `project_seen_ids` slot, so a root the live tail has
-/// already delivered is not restored a second time — and, in the other order, a
-/// root restored here cannot be re-answered by a later live delivery of the
-/// same event. A root already holding a slot is counted restored: its authority
-/// is held, which is the whole point of restoring it.
+/// **Batches drain in order, and rows within a batch drain in the order the
+/// batch established.** For a catch-up that order is the merge's — ascending
+/// `created_at`, root first — and it is what makes lifecycle replay mean
+/// anything: a close applied after the reopen that followed it would leave the
+/// watch in a state the history left three events ago.
+///
+/// Rows spend the shared `project_seen_ids` slot, so one the live surfaces have
+/// already delivered is not replayed a second time — and, in the other order, a
+/// row replayed here cannot be re-answered by a later live delivery of the same
+/// event. A row already holding a slot is counted restored: its effect is
+/// already held, which is the whole point of replaying it.
 fn drive_pending_restorations(
     state: &mut BgState,
     event_tx: &mpsc::Sender<Option<BuzzEvent>>,
 ) -> RestoreOutcome {
-    let Some(mut pending) = state.enrolment_restore.take() else {
-        return RestoreOutcome::Idle;
-    };
-
-    let mut delivered = 0usize;
-    // A refusal the retry cannot repair. Held rather than acted on inside the
-    // loop so that the roots already handed on are still counted.
-    let mut unrestorable: Option<String> = None;
-
-    while let Some(verified) = pending.queue.front().cloned() {
-        let event_id_hex = verified.id();
-        let Some(route) = crate::project::ProjectRoute::derive(&verified) else {
-            // The page's own scope already refused rows that resolve to no
-            // root, so this is unreachable rather than routine. If it happens
-            // anyway, no number of retries changes it: it is a root this agent
-            // cannot restore, and the walk must say so rather than wait.
-            unrestorable = Some(format!(
-                "reconstructed root {event_id_hex} resolves to no project route"
-            ));
-            break;
+    let mut outcome = RestoreOutcome::Idle;
+    // Batches, front to back. A batch that completes is retired and the next
+    // one is attempted in the same pass, so a run loop with room takes the
+    // whole backlog rather than one batch per retry tick.
+    loop {
+        let Some(mut pending) = state.replay_deliveries.pop_front() else {
+            return outcome;
         };
-        if !state.project_seen_ids.insert(event_id_hex.clone()) {
-            pending.queue.pop_front();
-            pending.restored += 1;
-            delivered += 1;
-            continue;
-        }
-        let project_event = crate::project::ProjectEvent::Routed {
-            source: crate::project::ProjectSubscription::EnrolmentHistory {
-                generation: pending.generation,
-            },
-            route,
-            event: verified,
-            // Restored history, by the only path that produces it.
-            mode: crate::project::ProcessingMode::Replay,
-        };
-        match event_tx.try_send(Some(BuzzEvent::Project(project_event))) {
-            Ok(()) => {
+
+        let mut delivered = 0usize;
+        // A refusal the retry cannot repair. Held rather than acted on inside
+        // the loop so that the rows already handed on are still counted.
+        let mut unrestorable: Option<String> = None;
+
+        while let Some((source, verified)) = pending.queue.front().cloned() {
+            let event_id_hex = verified.id();
+            let Some(route) = crate::project::ProjectRoute::derive(&verified) else {
+                // The page's own scope already refused rows that resolve to no
+                // root, so this is unreachable rather than routine. If it
+                // happens anyway, no number of retries changes it: it is a row
+                // this agent cannot replay, and the batch must say so rather
+                // than wait.
+                unrestorable = Some(format!(
+                    "replayed row {event_id_hex} resolves to no project route"
+                ));
+                break;
+            };
+            if !state.project_seen_ids.insert(event_id_hex.clone()) {
                 pending.queue.pop_front();
                 pending.restored += 1;
                 delivered += 1;
+                continue;
             }
-            Err(mpsc::error::TrySendError::Full(_)) => {
-                // The slot is released so that a live delivery of the same
-                // root in the meantime is not suppressed by a claim standing
-                // for an event that never arrived. The root stays at the front
-                // of the queue; the retry re-claims it, or finds it already
-                // held and counts it restored.
-                state.project_seen_ids.remove(&event_id_hex);
-                break;
+            let project_event = crate::project::ProjectEvent::Routed {
+                source,
+                route,
+                event: verified,
+                // Reconstructed history, by the only path that produces it.
+                mode: crate::project::ProcessingMode::Replay,
+            };
+            match event_tx.try_send(Some(BuzzEvent::Project(project_event))) {
+                Ok(()) => {
+                    pending.queue.pop_front();
+                    pending.restored += 1;
+                    delivered += 1;
+                }
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    // The slot is released so that a live delivery of the same
+                    // event in the meantime is not suppressed by a claim
+                    // standing for one that never arrived. The row stays at the
+                    // front of the queue; the retry re-claims it, or finds it
+                    // already held and counts it restored.
+                    state.project_seen_ids.remove(&event_id_hex);
+                    break;
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    state.project_seen_ids.remove(&event_id_hex);
+                    unrestorable =
+                        Some("the run loop is gone — no replayed row can reach it".to_string());
+                    break;
+                }
             }
-            Err(mpsc::error::TrySendError::Closed(_)) => {
-                state.project_seen_ids.remove(&event_id_hex);
-                unrestorable =
-                    Some("the run loop is gone — no reconstructed root can reach it".to_string());
-                break;
+        }
+
+        let retained = pending.queue.len();
+        let discovered = pending.discovered;
+        let restored = pending.restored;
+
+        if let Some(reason) = unrestorable {
+            degrade_replay_batch(
+                state,
+                &pending.kind,
+                format!("{reason}; {restored} of {discovered} rows replayed, {retained} retained"),
+            );
+            return RestoreOutcome::Degraded;
+        }
+
+        if retained == 0 {
+            // The one place a completion line is produced, and it is reachable
+            // only with an empty queue — so `dropped` is zero by construction
+            // rather than by an arithmetic that could disagree with it.
+            match &pending.kind {
+                ReplayBatch::EnrolmentHistory => info!(
+                    discovered,
+                    restored,
+                    dropped = 0,
+                    "enrolment history reconstruction complete"
+                ),
+                ReplayBatch::RootCatchUp { root } => info!(
+                    root = %root,
+                    discovered,
+                    restored,
+                    dropped = 0,
+                    "root history reconstruction complete"
+                ),
+            }
+            outcome = RestoreOutcome::Complete;
+            continue;
+        }
+
+        if delivered > 0 {
+            pending.stalls_left = ENROLMENT_RESTORE_STALL_LIMIT;
+        } else {
+            pending.stalls_left = pending.stalls_left.saturating_sub(1);
+        }
+
+        if pending.stalls_left == 0 {
+            degrade_replay_batch(
+                state,
+                &pending.kind,
+                format!(
+                    "{retained} of {discovered} reconstructed rows could not be handed to the \
+                     run loop within {ENROLMENT_RESTORE_STALL_LIMIT} attempts"
+                ),
+            );
+            return RestoreOutcome::Degraded;
+        }
+
+        debug!(
+            ?pending.kind,
+            discovered, restored, retained,
+            "reconstructed rows retained for retry — reconstruction unfinished"
+        );
+        // Back at the front: a batch that could not drain blocks the ones
+        // behind it on purpose. They are later history, and delivering them
+        // past a stalled predecessor would reorder the replay.
+        state.replay_deliveries.push_front(pending);
+        return RestoreOutcome::Retained(retained);
+    }
+}
+
+/// Route a batch's failure to the degraded state that owns the claim it breaks.
+fn degrade_replay_batch(state: &mut BgState, kind: &ReplayBatch, reason: String) {
+    match kind {
+        ReplayBatch::EnrolmentHistory => degrade_enrolment_history(state, reason),
+        ReplayBatch::RootCatchUp { root } => {
+            let root = root.clone();
+            degrade_root_catch_up(state, &root, reason);
+        }
+    }
+}
+
+/// Hand one root's merged history to the run loop, if it is finished.
+///
+/// Does nothing while any required stream is still paging: `take_completed` is
+/// the only thing that answers "finished", and it answers by consuming the
+/// reconstruction, so there is no window in which a root can be both finished
+/// and still asking for pages.
+///
+/// A merge that refuses — a stream missing, duplicated, or paginated from
+/// another cutoff — degrades the root. It is not a partial history to deliver
+/// anyway: rows that do not compose into one ordered snapshot cannot be folded
+/// into a lifecycle state, and folding them regardless is how an agent ends up
+/// confidently wrong about whether a conversation is open.
+fn finish_root_catch_up(
+    state: &mut BgState,
+    event_tx: &mpsc::Sender<Option<BuzzEvent>>,
+    root: &str,
+) {
+    let Some(merged) = state.reconstructions.take_completed(root) else {
+        return;
+    };
+    let rows = match merged {
+        Ok(rows) => rows,
+        Err(reason) => {
+            degrade_root_catch_up(state, root, format!("history merge refused: {reason}"));
+            return;
+        }
+    };
+    // Each row is stamped with the class of the stream that carries its kind,
+    // derived rather than chosen: the merge folded two streams into one order,
+    // so a single class for the batch would file a PR revision under comments.
+    // `RootCatchUp` is also the only history class `resolve_addressing` lets
+    // through without a `p` tag — which a status event routinely has none of,
+    // and which is exactly the row this whole reconstruction exists to replay.
+    let root_id = rows.root().to_string();
+    // The root event leads the merge, so what this reconstruction *found* is
+    // the rows behind it. Recorded before delivery, because it is a fact about
+    // the history that was rebuilt rather than about how fast the run loop
+    // drained it.
+    state
+        .root_catch_up_done
+        .insert(root_id.clone(), rows.len().saturating_sub(1));
+    let mut batch = Vec::with_capacity(rows.len());
+    for row in rows.rows() {
+        // The merge leads with the root itself, and the root is not a row of
+        // either stream — it is the object they hang off. It is also already
+        // enrolled: a catch-up starts *because* the run loop bound this root,
+        // so replaying it would be a dedup no-op at best. Skipped by identity
+        // rather than by kind, so a history row that happens to carry a root
+        // kind is still refused loudly below.
+        if row.id() == root_id {
+            continue;
+        }
+        let Some(stream) = crate::project::HistoryStream::carrying(row.kind()) else {
+            // The page's own filter admitted it, so a kind neither stream
+            // carries means the filter and this mapping disagree. Refuse the
+            // whole root rather than replay a row under a class that does not
+            // describe it.
+            degrade_root_catch_up(
+                state,
+                root,
+                format!("merged row of kind {} belongs to no stream", row.kind()),
+            );
+            return;
+        };
+        batch.push((
+            crate::project::ProjectSubscription::RootCatchUp {
+                root: root_id.clone(),
+                stream,
+            },
+            row.clone(),
+        ));
+    }
+    let rows = batch;
+    let outcome = enqueue_replay(
+        state,
+        event_tx,
+        ReplayBatch::RootCatchUp {
+            root: root.to_string(),
+        },
+        rows,
+    );
+    debug!(root = %root, ?outcome, "root history merged and queued for replay");
+}
+
+/// Begin rebuilding one restored root's history.
+///
+/// **Only a root the run loop has already bound reaches here.** The proof is
+/// minted where the discovered set lives and travels as a proof, so this cannot
+/// start a reconstruction for a root that was never validated against a
+/// discovered repository — and the binding the merge checks its streams against
+/// is the same one the enrolment set holds.
+///
+/// The cutoff is the startup watermark, the same snapshot boundary the
+/// enrolment walk uses. Every stream of one root must end at the same moment or
+/// the merge is comparing histories that stop at different times, and the two
+/// walks agreeing on it is what makes "complete through the cutoff, live after
+/// it" one statement rather than two overlapping guesses.
+///
+/// A second request for a root already being rebuilt is a no-op: `insert`
+/// refuses it, which is what makes a rediscovered root idempotent rather than a
+/// doubled page.
+fn begin_root_catch_up(state: &mut BgState, root: crate::project::VerifiedBoundRoot) {
+    let cutoff = state
+        .startup_watermark
+        .unwrap_or_else(|| nostr::Timestamp::now().as_secs());
+    let root_id = root.binding().root().to_string();
+    if state.root_catch_up_degraded.contains_key(&root_id) {
+        // Already fail-closed on this root. Starting a fresh reconstruction
+        // would let it re-enter the healthy path and quietly withdraw a claim
+        // that was never repaired.
+        debug!(root = %root_id, "root history already degraded — not restarting");
+        return;
+    }
+    if state.root_catch_up_done.contains_key(&root_id) {
+        // Already rebuilt on this connection's process. The enrolment walk
+        // re-restores every root it finds on each reconnect, and re-paging a
+        // history that has already been folded in would cost the same events
+        // again for no new fact.
+        debug!(root = %root_id, "root history already rebuilt — not repeating");
+        return;
+    }
+    let reconstruction = crate::project::RootReconstruction::begin(
+        &root,
+        cutoff,
+        ENROLMENT_HISTORY_PAGE_LIMIT,
+        RELAY_MAX_LIMIT,
+    );
+    if state.reconstructions.insert(reconstruction) {
+        debug!(root = %root_id, cutoff, "root history reconstruction begun");
+    }
+}
+
+/// Open as many root-history pages as the live reconstructions currently want.
+///
+/// The same shape as [`drive_enrolment_history`] and for the same reasons: the
+/// collector comes from the reconstruction's own cursor, the filter and class
+/// come from the collector, and the id comes from the registry, so nothing
+/// between here and the socket can describe a different question from the page
+/// it binds. A page that cannot be opened or attached degrades **that root**
+/// rather than being retried into a silence — a reconstruction that stops
+/// asking without saying so is exactly the false completeness this whole phase
+/// exists to remove.
+///
+/// A loop over `pages_wanted` rather than one page per call, because a root
+/// requires up to two streams and a reconnect drops every page in flight at
+/// once.
+async fn drive_root_reconstructions(ws: &mut WsStream, state: &mut BgState) {
+    loop {
+        let Some((root, stream)) = state.reconstructions.pages_wanted().into_iter().next() else {
+            return;
+        };
+        let Some(collector) = state.reconstructions.begin_page(&root, stream) else {
+            // Either the stream stopped wanting a page between the two calls,
+            // or `begin_page` abandoned the reconstruction because its
+            // generation space is spent. The second is fail-closed and must be
+            // visible; the first would spin, so both end the drive.
+            report_abandoned_reconstructions(state);
+            return;
+        };
+        match state
+            .project_requests
+            .open_history_page(ws, collector)
+            .await
+        {
+            crate::project::PageOpen::Opened(page) => {
+                let sub_id = page.sub_id().to_string();
+                if let Err(rejected) = state.reconstructions.attach(page) {
+                    // The page is bound and reachable, so its registration is
+                    // closed rather than left behind: an abandoned registration
+                    // would keep absorbing frames with nobody able to complete
+                    // it.
+                    let orphan = rejected.page.sub_id().to_string();
+                    state
+                        .project_requests
+                        .refuse_live(&orphan, "root history page could not attach");
+                    let error = rejected.error;
+                    degrade_root_catch_up(
+                        state,
+                        &root,
+                        format!("root history page could not attach: {error:?}"),
+                    );
+                    // One root's bookkeeping, not the socket's. The others
+                    // still want pages, and returning here would stall them
+                    // until something unrelated drove the loop again.
+                    continue;
+                }
+                debug!(root = %root, ?stream, sub_id = %sub_id, "root history page opened");
+            }
+            // Not a completion. A page that could not be sent proves nothing
+            // about how much history exists, so this root must not be allowed
+            // to look finished — it degrades, visibly.
+            other => {
+                degrade_root_catch_up(
+                    state,
+                    &root,
+                    format!("root history page could not be opened: {other:?}"),
+                );
+                return;
             }
         }
     }
+}
 
-    let retained = pending.queue.len();
-    let discovered = pending.discovered;
-    let restored = pending.restored;
+/// Surface any reconstruction that abandoned itself without a caller asking.
+///
+/// `begin_page` can abandon on its own — generation space exhausted — and a
+/// reconstruction that has given up while nothing reported it is the silent
+/// half of the failure this phase forbids.
+fn report_abandoned_reconstructions(state: &mut BgState) {
+    for (root, reason) in state.reconstructions.abandoned() {
+        if !state.root_catch_up_degraded.contains_key(&root) {
+            degrade_root_catch_up(state, &root, reason);
+        }
+    }
+}
 
-    if let Some(reason) = unrestorable {
-        degrade_enrolment_history(
-            state,
-            format!("{reason}; {restored} of {discovered} roots restored, {retained} retained"),
+/// Enter the per-root fail-closed state, once.
+///
+/// The root keeps its watch and keeps answering live traffic — what is lost is
+/// the claim to know what state its history left it in, which is exactly the
+/// claim a restart needs and cannot bluff.
+fn degrade_root_catch_up(state: &mut BgState, root: &str, reason: String) {
+    state.reconstructions.abandon(root, reason.clone());
+    state.replay_deliveries.retain(|batch| {
+        batch.kind
+            != ReplayBatch::RootCatchUp {
+                root: root.to_string(),
+            }
+    });
+    if !state.root_catch_up_degraded.contains_key(root) {
+        warn!(
+            root = %root,
+            reason = %reason,
+            "root history reconstruction DEGRADED — this agent cannot prove what state this \
+             conversation was left in, and is fail-closed on that claim"
         );
-        return RestoreOutcome::Degraded;
+        state
+            .root_catch_up_degraded
+            .insert(root.to_string(), reason);
     }
-
-    if retained == 0 {
-        // The one place this line is produced, and it is reachable only with
-        // an empty queue — so `dropped` is zero by construction rather than by
-        // an arithmetic that could disagree with it.
-        info!(
-            discovered,
-            restored,
-            dropped = 0,
-            "enrolment history reconstruction complete"
-        );
-        return RestoreOutcome::Complete;
-    }
-
-    if delivered > 0 {
-        pending.stalls_left = ENROLMENT_RESTORE_STALL_LIMIT;
-    } else {
-        pending.stalls_left = pending.stalls_left.saturating_sub(1);
-    }
-
-    if pending.stalls_left == 0 {
-        degrade_enrolment_history(
-            state,
-            format!(
-                "{retained} of {discovered} reconstructed roots could not be handed to the \
-                 run loop within {ENROLMENT_RESTORE_STALL_LIMIT} attempts"
-            ),
-        );
-        return RestoreOutcome::Degraded;
-    }
-
-    debug!(
-        discovered,
-        restored, retained, "reconstructed roots retained for retry — reconstruction unfinished"
-    );
-    state.enrolment_restore = Some(pending);
-    RestoreOutcome::Retained(retained)
 }
 
 /// Enter the fail-closed degraded state, once.
@@ -8013,10 +8462,13 @@ mod tests {
         /// `None` means nothing is pending, which is the only state in which
         /// the reconstruction may be spoken of as finished.
         fn retained(&self) -> Option<usize> {
-            self.state
-                .enrolment_restore
-                .as_ref()
-                .map(|pending| pending.queue.len())
+            let owed: usize = self
+                .state
+                .replay_deliveries
+                .iter()
+                .map(|batch| batch.queue.len())
+                .sum();
+            (owed > 0).then_some(owed)
         }
 
         /// One more attempt to hand the retained roots on.
@@ -10496,12 +10948,15 @@ mod tests {
         );
         EoseOutcome {
             still_live: state.project_requests.match_frame(sub_id).is_some(),
-            page_finished: !state
-                .reconstructions
-                .get(root)
-                .expect("the root is still tracked")
-                .finished_streams()
-                .is_empty(),
+            // A stream that finished is either still held by a reconstruction
+            // with another stream outstanding, or — for a root whose last
+            // required stream this was — merged, handed on, and recorded as it
+            // retired. Both are "the page finished"; only one of them leaves a
+            // reconstruction to ask.
+            page_finished: match state.reconstructions.get(root) {
+                Some(recon) => !recon.finished_streams().is_empty(),
+                None => state.root_catch_up_done.contains_key(root),
+            },
         }
     }
 
@@ -11960,6 +12415,28 @@ mod tests {
     }
 
     impl crate::ProjectSubscriber for SocketSubscriber {
+        /// Same seam: the proof is turned into the production command and run
+        /// by the production handler, which is where the first page's REQ is
+        /// written.
+        async fn submit_root_catch_up(
+            &self,
+            root: crate::project::VerifiedBoundRoot,
+        ) -> Result<(), RelayError> {
+            let mut guard = self.inner.lock().await;
+            let (state, ws) = &mut *guard;
+            let kept = execute_connected_command(
+                ws,
+                state,
+                "0".repeat(64).as_str(),
+                RelayCommand::BeginRootCatchUp {
+                    root: Box::new(root),
+                },
+            )
+            .await;
+            *self.kept.lock().await = kept;
+            Ok(())
+        }
+
         /// **Drives the production command path**, not the registry directly.
         ///
         /// The submission is turned into the same [`RelayCommand`] the run loop
@@ -13701,6 +14178,486 @@ for line in sys.stdin:
         (bound, keys)
     }
 
+    /// **The restart proof, composed end to end.**
+    ///
+    /// The reported failure: an owner closed a watched root, the agent recorded
+    /// it, the process restarted, reconstruction reported `6 discovered / 6
+    /// restored / 0 dropped`, and the root came back **active** — because the
+    /// enrolment walk fetches root kinds and nothing ever fetched the close.
+    /// The next comment ran a turn on a closed issue. The classifier could read
+    /// a replayed lifecycle event correctly and no production path supplied one.
+    ///
+    /// So this crosses both halves of that gap in one run, on real signed
+    /// events:
+    ///
+    /// 1. the relay task rebuilds the root's history through the production
+    ///    command path, on a real socket, and its REQ is read back off the wire;
+    /// 2. what it hands to the event channel is fed to the production run-loop
+    ///    dispatch, on one enrolment set, in the order it arrived.
+    ///
+    /// **The close is signed an hour before startup** — four times the tail's
+    /// 900-second reach-back. Nothing but a real history walk can find it, so a
+    /// pass here cannot be the live tail happening to be close enough.
+    #[tokio::test]
+    async fn a_close_older_than_the_tails_reach_survives_a_restart() {
+        const STARTUP: u64 = 1_785_743_469;
+        const ROOT_AT: u64 = STARTUP - 7_200;
+        const CLOSE_AT: u64 = STARTUP - 3_600;
+
+        let owner = nostr::Keys::generate();
+        let agent = nostr::Keys::generate();
+        let agent_hex = agent.public_key().to_hex();
+        let coordinate = format!("30617:{}:demo", owner.public_key().to_hex());
+        let discovered = crate::project::DiscoveredRepositories::for_test([coordinate.clone()]);
+
+        let root_event = addressed_root(&owner, &agent, &coordinate, ROOT_AT);
+        let root_id = root_event.id.to_hex();
+        let verified_root = crate::project::VerifiedProjectEvent::verify(root_event.clone())
+            .await
+            .expect("a freshly signed root verifies");
+        let bound = crate::project::VerifiedBoundRoot::prove(
+            std::slice::from_ref(&verified_root),
+            &discovered,
+        )
+        .expect("the root names a discovered coordinate");
+
+        // The owner's close, long before anything live could reach.
+        let close = root_status(
+            &owner,
+            &coordinate,
+            &root_id,
+            buzz_core::kind::KIND_GIT_STATUS_CLOSED,
+            CLOSE_AT,
+        );
+
+        // ── the relay task rebuilds this root's history ──────────────────────
+        let mut state = BgState::new();
+        state.startup_watermark = Some(STARTUP);
+        let (mut ws, mut server) = test_ws_pair().await;
+        let (tx, mut rx) = mpsc::channel(64);
+
+        assert!(
+            execute_connected_command(
+                &mut ws,
+                &mut state,
+                &agent_hex,
+                RelayCommand::BeginRootCatchUp {
+                    root: Box::new(bound)
+                },
+            )
+            .await,
+            "a catch-up command must not take the socket down"
+        );
+
+        let req = readable_frames(&mut server)
+            .await
+            .into_iter()
+            .find(|f| f[0] == "REQ")
+            .expect("the catch-up's REQ reached the socket");
+        let page_id = req[1].as_str().expect("an id").to_string();
+        let filter = &req[2];
+        assert!(
+            filter.get("since").is_none(),
+            "a history walk with a floor is a walk that cannot reach an old close: {req:?}"
+        );
+        assert!(
+            filter["kinds"]
+                .as_array()
+                .expect("kinds")
+                .contains(&json!(buzz_core::kind::KIND_GIT_STATUS_CLOSED)),
+            "and it must actually ask for lifecycle: {req:?}"
+        );
+
+        // The relay answers with the close, then its boundary. One row against
+        // a page that asked for many: unsaturated, so the stream is exhausted
+        // and the reconstruction completes.
+        deliver_frame(&mut state, &page_id, &close, &tx).await;
+        assert!(
+            deliver_control_frame_to(&mut state, json!(["EOSE", page_id]), &tx).await,
+            "dispatch must not signal connection loss"
+        );
+
+        let replayed: Vec<_> = drain(&mut rx)
+            .into_iter()
+            .filter_map(|e| match e {
+                BuzzEvent::Project(crate::project::ProjectEvent::Routed {
+                    source,
+                    event,
+                    mode,
+                    ..
+                }) => Some((source, event, mode)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            replayed.len(),
+            1,
+            "the rebuilt history is handed on: {replayed:?}"
+        );
+        assert_eq!(
+            replayed[0].1.id(),
+            close.id.to_hex(),
+            "and it is the close the walk fetched"
+        );
+        assert_eq!(
+            replayed[0].2,
+            crate::project::ProcessingMode::Replay,
+            "as history, which never runs a turn"
+        );
+
+        // ── the run loop folds it into the watch ─────────────────────────────
+        //
+        // Restart order, on one enrolment set: the enrolment walk restores the
+        // root first — that is what establishes the binding the close is
+        // authorised against — and the catch-up's rows follow it.
+        let mut run_loop = RunLoopState::new(&agent, &owner, discovered);
+        assert!(
+            matches!(
+                run_loop
+                    .deliver(
+                        crate::project::ProjectSubscription::EnrolmentHistory { generation: 0 },
+                        crate::project::ProcessingMode::Replay,
+                        verified_root,
+                    )
+                    .await,
+                crate::ProjectDispatched::Enrolled
+            ),
+            "precondition: the restored root is watched again, with no turn"
+        );
+        assert_eq!(
+            run_loop.state_of(&root_id),
+            crate::project::RootState::Active,
+            "precondition: and a root restored from its own event comes back active — \
+             which is exactly why its lifecycle has to be replayed after it"
+        );
+
+        for (source, event, mode) in replayed {
+            run_loop.deliver(source, mode, event).await;
+        }
+        assert_eq!(
+            run_loop.state_of(&root_id),
+            crate::project::RootState::Dormant,
+            "the close the walk fetched must suspend the watch — this is the \
+             restart the reported failure survived"
+        );
+
+        // ── and the watch behaves ────────────────────────────────────────────
+        let while_closed = run_loop
+            .deliver_live(participant_comment(
+                &owner,
+                &agent,
+                &coordinate,
+                &root_id,
+                STARTUP + 10,
+                "ITER3-AFTER-RESTART-CLOSED-MUST-NOT-WAKE",
+            ))
+            .await;
+        assert!(
+            !matches!(
+                while_closed,
+                crate::ProjectDispatched::Queued { queued: true, .. }
+            ),
+            "a comment on a root closed before the restart must not run a turn — \
+             got {while_closed:?}"
+        );
+
+        let reopened = run_loop
+            .deliver_live(root_status(
+                &owner,
+                &coordinate,
+                &root_id,
+                buzz_core::kind::KIND_GIT_STATUS_OPEN,
+                STARTUP + 20,
+            ))
+            .await;
+        assert_eq!(
+            reopened,
+            crate::ProjectDispatched::LifecycleApplied {
+                root_state: crate::project::RootState::Active
+            },
+            "an authorised reopen restores the watch"
+        );
+
+        let after_reopen = run_loop
+            .deliver_live(participant_comment(
+                &owner,
+                &agent,
+                &coordinate,
+                &root_id,
+                STARTUP + 30,
+                "and now?",
+            ))
+            .await;
+        assert!(
+            matches!(
+                after_reopen,
+                crate::ProjectDispatched::Queued { queued: true, .. }
+            ),
+            "and the next comment invokes exactly once — got {after_reopen:?}"
+        );
+    }
+
+    /// Replayed lifecycle applies in the order it happened, not the order it
+    /// arrived.
+    ///
+    /// A history walk pages **backwards**, so the relay hands a close and the
+    /// reopen that followed it back newest-first. Folding them in arrival order
+    /// would leave the watch in the state the conversation left two events ago
+    /// — closed, silently, on a root its owner reopened. The merge sorts
+    /// ascending by `created_at` and the delivery queue preserves that order;
+    /// this is the test that would notice if either stopped.
+    ///
+    /// Both events predate the tail's reach, so neither could have arrived any
+    /// other way.
+    #[tokio::test]
+    async fn a_replayed_close_and_reopen_leave_the_watch_where_history_left_it() {
+        const STARTUP: u64 = 1_785_743_469;
+        const ROOT_AT: u64 = STARTUP - 9_000;
+        const CLOSE_AT: u64 = STARTUP - 7_200;
+        const REOPEN_AT: u64 = STARTUP - 3_600;
+
+        let owner = nostr::Keys::generate();
+        let agent = nostr::Keys::generate();
+        let agent_hex = agent.public_key().to_hex();
+        let coordinate = format!("30617:{}:demo", owner.public_key().to_hex());
+        let discovered = crate::project::DiscoveredRepositories::for_test([coordinate.clone()]);
+
+        let root_event = addressed_root(&owner, &agent, &coordinate, ROOT_AT);
+        let root_id = root_event.id.to_hex();
+        let verified_root = crate::project::VerifiedProjectEvent::verify(root_event)
+            .await
+            .expect("valid");
+        let bound = crate::project::VerifiedBoundRoot::prove(
+            std::slice::from_ref(&verified_root),
+            &discovered,
+        )
+        .expect("proves");
+
+        let close = root_status(
+            &owner,
+            &coordinate,
+            &root_id,
+            buzz_core::kind::KIND_GIT_STATUS_CLOSED,
+            CLOSE_AT,
+        );
+        let reopen = root_status(
+            &owner,
+            &coordinate,
+            &root_id,
+            buzz_core::kind::KIND_GIT_STATUS_OPEN,
+            REOPEN_AT,
+        );
+
+        let mut state = BgState::new();
+        state.startup_watermark = Some(STARTUP);
+        let (mut ws, mut server) = test_ws_pair().await;
+        let (tx, mut rx) = mpsc::channel(64);
+        assert!(
+            execute_connected_command(
+                &mut ws,
+                &mut state,
+                &agent_hex,
+                RelayCommand::BeginRootCatchUp {
+                    root: Box::new(bound)
+                },
+            )
+            .await
+        );
+        let page_id = readable_frames(&mut server)
+            .await
+            .into_iter()
+            .find(|f| f[0] == "REQ")
+            .expect("a REQ")[1]
+            .as_str()
+            .expect("an id")
+            .to_string();
+
+        // Newest first, the way a backwards walk returns them.
+        deliver_frame(&mut state, &page_id, &reopen, &tx).await;
+        deliver_frame(&mut state, &page_id, &close, &tx).await;
+        assert!(deliver_control_frame_to(&mut state, json!(["EOSE", page_id]), &tx).await);
+
+        let replayed: Vec<_> = drain(&mut rx)
+            .into_iter()
+            .filter_map(|e| match e {
+                BuzzEvent::Project(crate::project::ProjectEvent::Routed {
+                    source,
+                    event,
+                    mode,
+                    ..
+                }) => Some((source, event, mode)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            replayed
+                .iter()
+                .map(|(_, e, _)| e.event().created_at.as_secs())
+                .collect::<Vec<_>>(),
+            vec![CLOSE_AT, REOPEN_AT],
+            "the walk read them newest-first; the replay must hand them on oldest-first"
+        );
+
+        let mut run_loop = RunLoopState::new(&agent, &owner, discovered);
+        run_loop
+            .deliver(
+                crate::project::ProjectSubscription::EnrolmentHistory { generation: 0 },
+                crate::project::ProcessingMode::Replay,
+                verified_root,
+            )
+            .await;
+        for (source, event, mode) in replayed {
+            run_loop.deliver(source, mode, event).await;
+        }
+
+        assert_eq!(
+            run_loop.state_of(&root_id),
+            crate::project::RootState::Active,
+            "the owner reopened this root after closing it; a watch left dormant is \
+             an agent silent on a conversation that is open"
+        );
+    }
+
+    /// The run loop's project state, kept across a sequence of events.
+    ///
+    /// Holds what `tokio_main` holds and hands every event to
+    /// [`crate::handle_project_event`], the production entry. It classifies
+    /// nothing: "the root is dormant" read from here is a fact the production
+    /// dispatch produced.
+    struct RunLoopState {
+        agent: crate::project::AgentIdentity,
+        owner_hex: String,
+        humans: std::collections::BTreeSet<String>,
+        externals: std::collections::BTreeSet<String>,
+        discovered: crate::project::DiscoveredRepositories,
+        enrolments: crate::project::ProjectEnrolments,
+        queue: crate::queue::EventQueue,
+        ledger: crate::peer_call::CallLedger,
+    }
+
+    impl RunLoopState {
+        fn new(
+            agent: &nostr::Keys,
+            owner: &nostr::Keys,
+            discovered: crate::project::DiscoveredRepositories,
+        ) -> Self {
+            Self {
+                agent: crate::project::AgentIdentity::new(&agent.public_key()).unwrap(),
+                owner_hex: owner.public_key().to_hex(),
+                humans: std::collections::BTreeSet::new(),
+                externals: std::collections::BTreeSet::new(),
+                discovered,
+                enrolments: crate::project::ProjectEnrolments::new(),
+                queue: crate::queue::EventQueue::new(crate::config::DedupMode::Queue),
+                ledger: crate::peer_call::CallLedger::new(),
+            }
+        }
+
+        async fn deliver(
+            &mut self,
+            source: crate::project::ProjectSubscription,
+            mode: crate::project::ProcessingMode,
+            verified: crate::project::VerifiedProjectEvent,
+        ) -> crate::ProjectDispatched {
+            let route = crate::project::ProjectRoute::derive(&verified).expect("routes");
+            crate::handle_project_event(
+                &mut crate::ProjectDispatch {
+                    identity: crate::project::ProjectIdentity {
+                        agent: &self.agent,
+                        agent_owner: Some(&self.owner_hex),
+                        approved_humans: &self.humans,
+                        approved_external_agents: &self.externals,
+                    },
+                    discovered: &mut self.discovered,
+                    enrolments: &mut self.enrolments,
+                    queue: &mut self.queue,
+                    sibling: None,
+                    ledger: &mut self.ledger,
+                },
+                &crate::project::ProjectEvent::Routed {
+                    source,
+                    route,
+                    event: verified,
+                    mode,
+                },
+            )
+        }
+
+        /// One live event on the watched-root REQ this agent's enrolment
+        /// installed.
+        async fn deliver_live(&mut self, event: Event) -> crate::ProjectDispatched {
+            let verified = crate::project::VerifiedProjectEvent::verify(event)
+                .await
+                .expect("valid");
+            self.deliver(
+                crate::project::ProjectSubscription::Watched { generation: 0 },
+                crate::project::ProcessingMode::Live,
+                verified,
+            )
+            .await
+        }
+
+        fn state_of(&self, root: &str) -> crate::project::RootState {
+            self.enrolments.state_of(root)
+        }
+    }
+
+    /// A `1621` root on `coordinate`, addressed to `agent`, signed by `owner`.
+    fn addressed_root(
+        owner: &nostr::Keys,
+        agent: &nostr::Keys,
+        coordinate: &str,
+        ts: u64,
+    ) -> Event {
+        EventBuilder::new(
+            nostr::Kind::Custom(buzz_core::kind::KIND_GIT_ISSUE as u16),
+            "please look",
+        )
+        .custom_created_at(nostr::Timestamp::from(ts))
+        .tags([
+            nostr::Tag::parse(["a", coordinate]).unwrap(),
+            nostr::Tag::parse(["p", &agent.public_key().to_hex()]).unwrap(),
+        ])
+        .sign_with_keys(owner)
+        .expect("sign")
+    }
+
+    /// A signed status event on `root`.
+    fn root_status(actor: &nostr::Keys, coordinate: &str, root: &str, kind: u32, ts: u64) -> Event {
+        EventBuilder::new(nostr::Kind::Custom(kind as u16), "")
+            .custom_created_at(nostr::Timestamp::from(ts))
+            .tags([
+                nostr::Tag::parse(["a", coordinate]).unwrap(),
+                nostr::Tag::parse(["e", root, "", "root"]).unwrap(),
+            ])
+            .sign_with_keys(actor)
+            .expect("sign")
+    }
+
+    /// A follow-up comment carrying the agent's inherited `p` tag.
+    ///
+    /// Not a fresh explicit mention: Desktop copies prior participants into
+    /// every later comment, so this is the shape an ordinary reply has, and the
+    /// shape a closed root must not answer.
+    fn participant_comment(
+        author: &nostr::Keys,
+        agent: &nostr::Keys,
+        coordinate: &str,
+        root: &str,
+        ts: u64,
+        body: &str,
+    ) -> Event {
+        EventBuilder::new(nostr::Kind::TextNote, body)
+            .custom_created_at(nostr::Timestamp::from(ts))
+            .tags([
+                nostr::Tag::parse(["a", coordinate]).unwrap(),
+                nostr::Tag::parse(["e", root, "", "root"]).unwrap(),
+                nostr::Tag::parse(["p", &agent.public_key().to_hex()]).unwrap(),
+            ])
+            .sign_with_keys(author)
+            .expect("sign")
+    }
+
     /// A comment on `root`, signed for real.
     fn comment_on_root(keys: &nostr::Keys, root: &str, ts: u64, body: &str) -> Event {
         EventBuilder::new(nostr::Kind::TextNote, body)
@@ -14150,13 +15107,23 @@ for line in sys.stdin:
             deliver_control_frame_to(state, json!(["EOSE", sub_id]), tx).await,
             "dispatch must not signal connection loss"
         );
-        let recon = state
-            .reconstructions
-            .get(root)
-            .expect("the root is still tracked");
-        match recon.abandoned_reason() {
-            Some(reason) => Err(reason.to_string()),
-            None => Ok(recon.finished_streams().iter().map(|s| s.len()).sum()),
+        if let Some(reason) = state.root_catch_up_degraded.get(root) {
+            return Err(reason.clone());
+        }
+        match state.reconstructions.get(root) {
+            Some(recon) => match recon.abandoned_reason() {
+                Some(reason) => Err(reason.to_string()),
+                None => Ok(recon.finished_streams().iter().map(|s| s.len()).sum()),
+            },
+            // Not tracked means *finished*: the last stream this root requires
+            // completed on this boundary, its streams were merged and handed to
+            // the run loop, and the reconstruction retired. The count comes from
+            // the record that retirement leaves, and it is the same number — the
+            // merge carries every retained row plus the root that leads it.
+            None => Ok(*state
+                .root_catch_up_done
+                .get(root)
+                .expect("a retired reconstruction records what it rebuilt")),
         }
     }
 
@@ -14185,12 +15152,36 @@ for line in sys.stdin:
             Ok(1),
             "the row that arrived on the wire is the row it retained"
         );
+        // The row does escape now — that is the point of rebuilding a history —
+        // but only as replay. The claim this replaces ("it never escaped") was
+        // true of a phase where completion had no consumer; the claim that
+        // survives is that nothing a page retained can wake a turn.
+        let escaped: Vec<_> = drain(&mut rx)
+            .into_iter()
+            .filter_map(|e| match e {
+                BuzzEvent::Project(crate::project::ProjectEvent::Routed {
+                    source, mode, ..
+                }) => Some((source, mode)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            escaped.len(),
+            1,
+            "the retained row is handed on: {escaped:?}"
+        );
         assert!(
-            drain(&mut rx).iter().all(|e| !matches!(
-                e,
-                BuzzEvent::Project(crate::project::ProjectEvent::Routed { .. })
-            )),
-            "and it never escaped as an ordinary routed event"
+            matches!(
+                escaped[0].0,
+                crate::project::ProjectSubscription::RootCatchUp { .. }
+            ),
+            "under the class of the page that fetched it: {:?}",
+            escaped[0].0
+        );
+        assert_eq!(
+            escaped[0].1,
+            crate::project::ProcessingMode::Replay,
+            "and as history, which never runs a turn"
         );
     }
 
@@ -14205,7 +15196,7 @@ for line in sys.stdin:
     #[tokio::test]
     async fn an_unverifiable_frame_poisons_the_page_instead_of_shortening_it() {
         let mut state = BgState::new();
-        let (tx, _rx) = mpsc::channel(16);
+        let (tx, mut rx) = mpsc::channel(16);
         let (bound, keys) = proven_issue_root().await;
         let root = bound.binding().root().to_string();
         let sub_id = bind_page_under(&mut state, &bound).await;
@@ -14232,6 +15223,20 @@ for line in sys.stdin:
                 .finished_streams()
                 .is_empty(),
             "and must claim no exhausted history"
+        );
+        // **And it hands nothing on.** Now that a completed reconstruction has
+        // a consumer, "claims no exhausted history" and "replays no history"
+        // are separate facts, and only the second one protects the watch: a
+        // poisoned page that delivered the rows it did receive would fold a
+        // *partial* lifecycle into the enrolment set — the close without the
+        // reopen that followed it is a permanently silent conversation, and it
+        // would look exactly like a healthy replay.
+        assert!(
+            drain(&mut rx).iter().all(|e| !matches!(
+                e,
+                BuzzEvent::Project(crate::project::ProjectEvent::Routed { .. })
+            )),
+            "a degraded root replays nothing at all"
         );
     }
 
@@ -14311,11 +15316,15 @@ for line in sys.stdin:
             recon.abandoned_reason().is_none(),
             "a closed request is not a corrupt page — nothing is wrong with what it received"
         );
-        assert_eq!(
-            recon.pages_wanted(),
-            vec![(crate::project::HistoryStream::Comments, 1_000, 4)],
-            "the stream asks again, from the bound it already had"
-        );
+        // Released *and re-asked*. The earlier version of this test stopped at
+        // `pages_wanted`, which was as far as production went; the driver now
+        // opens the replacement itself, so the observable is the page in
+        // flight rather than the appetite for one.
+        let (reopened, until) = recon
+            .in_flight_page(crate::project::HistoryStream::Comments)
+            .expect("the stream asks again rather than stalling");
+        assert_ne!(reopened, sub_id, "under a fresh registration");
+        assert_eq!(until, 1_000, "from the bound it already had");
     }
 
     /// A reconnect releases the pages the dead connection opened.
@@ -14349,11 +15358,15 @@ for line in sys.stdin:
             recon.abandoned_reason().is_none(),
             "a reconnect is not a corrupt page"
         );
-        assert_eq!(
-            recon.pages_wanted(),
-            vec![(crate::project::HistoryStream::Comments, 1_000, 4)],
-            "the stream asks again, from the bound it already had"
-        );
+        // Released *and re-asked*, by the reconnect itself. Stopping at
+        // `pages_wanted` was as far as production went when this was written;
+        // the resubscribe now opens the replacement, so a root that stayed
+        // silent here would be a root that stopped reconstructing.
+        let (reopened, until) = recon
+            .in_flight_page(crate::project::HistoryStream::Comments)
+            .expect("the stream asks again rather than stalling");
+        assert_ne!(reopened, sub_id, "under a fresh registration");
+        assert_eq!(until, 1_000, "from the bound it already had");
         assert!(
             state.project_requests.match_frame(&sub_id).is_none(),
             "and the registration that opened it is gone, so nothing can complete it"
@@ -14411,25 +15424,22 @@ for line in sys.stdin:
             "a duplicate EOSE changes nothing — there is no request left to answer"
         );
 
+        // The completed reconstruction handed its history on; that is a
+        // separate fact, asserted above. Drained here so the emptiness checked
+        // below is about the late frame and nothing else.
+        let _ = drain(&mut rx);
+
         // A late row on the same id.
         let late = comment_on_root(&keys, &root, 899, "after the end");
         deliver_frame(&mut state, &sub_id, &late, &tx).await;
-        let recon = state
-            .reconstructions
-            .get(&root)
-            .expect("the root is still tracked");
         assert!(
-            recon.abandoned_reason().is_none(),
+            !state.root_catch_up_degraded.contains_key(&root),
             "an unadmitted frame is not a contradiction — it never reached the owner"
         );
         assert_eq!(
-            recon
-                .finished_streams()
-                .iter()
-                .map(|s| s.len())
-                .sum::<usize>(),
-            1,
-            "and it is not in the history the completed page retained"
+            state.root_catch_up_done.get(&root),
+            Some(&1),
+            "and it is not in the history the completed page rebuilt"
         );
         assert!(
             !state.project_seen_ids.contains(&late.id.to_hex()),
@@ -14481,11 +15491,17 @@ for line in sys.stdin:
         }
         assert!(deliver_control_frame_to(&mut state, json!(["EOSE", page_a]), &tx).await);
 
-        // Page B. Under a name of its own — but that is asserted at the *end*,
-        // deliberately. Two attempts sharing one name is the mechanism of the
-        // defect, so checking it here would make this test report "the ids are
-        // equal" and stop, in place of the outcome the ids exist to prevent.
-        let page_b = open_page_under(&mut state, &root).await;
+        // Page B, opened by A's own boundary. Under a name of its own — but
+        // that is asserted at the *end*, deliberately. Two attempts sharing one
+        // name is the mechanism of the defect, so checking it here would make
+        // this test report "the ids are equal" and stop, in place of the
+        // outcome the ids exist to prevent.
+        let (page_b, _) = state
+            .reconstructions
+            .get(&root)
+            .expect("tracked")
+            .in_flight_page(crate::project::HistoryStream::Comments)
+            .expect("the saturated stream asks again");
         let _ = drain(&mut rx);
 
         // Now A's stragglers, all three kinds, all naming A.
@@ -14574,21 +15590,21 @@ for line in sys.stdin:
             "the boundary retired page one's registration"
         );
 
-        let wanted = state
+        // Page two is already in flight: the boundary that retired page one
+        // drove it, which is the step this test used to perform for production.
+        let (second, next_until) = state
             .reconstructions
             .get(&root)
             .expect("tracked")
-            .pages_wanted();
-        assert_eq!(wanted.len(), 1, "the stream wants another page: {wanted:?}");
-        let (_, next_until, _) = wanted[0];
+            .in_flight_page(crate::project::HistoryStream::Comments)
+            .expect("the saturated stream asks again");
         assert!(
             next_until < 1_000,
             "and from an advanced bound: {next_until}"
         );
 
-        // No `close_active` anywhere in here, and page two gets a name of its
+        // No `close_active` anywhere in here, and page two got a name of its
         // own rather than inheriting page one's.
-        let second = open_page_under(&mut state, &root).await;
         assert_ne!(second, sub_id, "one page, one wire id");
         let row = comment_on_root(&keys, &root, next_until, "page two row");
         deliver_frame(&mut state, &second, &row, &tx).await;
