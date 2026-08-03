@@ -1909,6 +1909,9 @@ async fn execute_connected_command(
             };
             match outcome {
                 crate::project::ReplaceOutcome::Replaced { retired } => {
+                    if matches!(replacement, crate::project::ProjectReplacement::Enrolment) {
+                        claim_enrolment_backlog(state);
+                    }
                     debug!(?replacement, ?retired, "project subscription replaced");
                     true
                 }
@@ -3237,14 +3240,35 @@ async fn handle_ws_message(
                         // tell a genuinely historical root from one this agent
                         // had already handled.
                         //
-                        // Now the two questions have two requests. The
-                        // enrolment REQ is a live tail floored at startup, and
+                        // Now the two questions have two requests, and neither
+                        // answer is recomputed anywhere downstream.
+                        //
                         // `EnrolmentHistory` pages walk backwards on their own
-                        // generation-distinct identities. A skewed root on the
-                        // tail is live because the tail delivered it, and it is
-                        // answered exactly once — the shared dedup slot stops
-                        // any other path answering it again.
+                        // generation-distinct identities and are always replay.
+                        // The enrolment REQ is a live tail — floored a full
+                        // accepted-skew interval below startup, because a relay
+                        // filters `since` on the author's signed `created_at`
+                        // and would otherwise never hand over an accepted
+                        // slow-clock root at all. That floor pulls a stored
+                        // prefix in behind it, so the tail is asked which
+                        // registration admitted this frame and whether that
+                        // registration's own backlog is still draining. A
+                        // predecessor's boundary cannot answer for it, and no
+                        // timestamp is consulted: a skewed root arriving after
+                        // the boundary is live because *this* request was past
+                        // its stored events when it delivered it.
                         let source = admission.subscription().clone();
+                        let mode =
+                            if matches!(source, crate::project::ProjectSubscription::Enrolment) {
+                                state.project_requests.enrolment_frame_mode(&admission)
+                            } else if matches!(
+                                source,
+                                crate::project::ProjectSubscription::EnrolmentHistory { .. }
+                            ) {
+                                crate::project::ProcessingMode::Replay
+                            } else {
+                                crate::project::ProcessingMode::Live
+                            };
 
                         // Project dispatch. The step order below is the whole
                         // security property, so it is written out rather than
@@ -3384,6 +3408,7 @@ async fn handle_ws_message(
                                     source: other.clone(),
                                     route,
                                     event: verified,
+                                    mode,
                                 }
                             }
                         };
@@ -3525,6 +3550,24 @@ async fn handle_ws_message(
                         .witness_end_of_stored_events(&subscription_id)
                     {
                         debug!(sub_id = %subscription_id, "project EOSE");
+
+                        // The enrolment tail's own boundary, and only its own.
+                        //
+                        // The tail keeps delivering after this, so nothing is
+                        // retired — what ends is the claim that its remaining
+                        // frames are the window the history walk covers. The
+                        // check is by allocation, so a boundary from the
+                        // predecessor that wore this same fixed id, or from a
+                        // registration on a connection that has since died,
+                        // closes nothing. That precise substitution is what
+                        // stamped a successor's stored frames live and
+                        // re-answered four historical roots on a real relay.
+                        if state.project_requests.close_enrolment_backlog(&witness) {
+                            debug!(
+                                sub_id = %subscription_id,
+                                "enrolment tail backlog drained — later frames are live"
+                            );
+                        }
 
                         // `None` is the ordinary case for discovery, enrolment
                         // and watched requests: they keep delivering after their
@@ -4896,8 +4939,18 @@ async fn send_project_replay(
     request: crate::project::ReplayableRequest,
 ) -> ProjectSendOutcome {
     let sub_id = request.sub_id().to_string();
+    let is_enrolment = sub_id == crate::project::PROJECT_ENROL_SUB_ID;
     let outcome = state.project_requests.open_replayed(ws, request).await;
-    report_project_open(&sub_id, outcome)
+    let reported = report_project_open(&sub_id, outcome);
+    // A replayed tail is a *new* registration asking the same question, so it
+    // has its own stored-events prefix and its own boundary. Claiming it here
+    // is what makes reconnect symmetric with the first open; without it the
+    // replacement tail would inherit no backlog, and every frame the relay
+    // handed back on reconnect would count as live.
+    if is_enrolment && matches!(reported, ProjectSendOutcome::Sent) {
+        claim_enrolment_backlog(state);
+    }
+    reported
 }
 
 /// The registry's outcome as this module's outcome. Nothing else.
@@ -5382,6 +5435,10 @@ async fn route_project_peer_call(
         source: crate::project::ProjectSubscription::PeerCall,
         route,
         event: verified,
+        // A peer call is delivered on the standing peer REQ, which carries no
+        // reconstruction of its own. There is no backlog here to be the history
+        // of, so the only honest answer is live.
+        mode: crate::project::ProcessingMode::Live,
     };
 
     match event_tx.try_send(Some(BuzzEvent::Project(project_event))) {
@@ -5543,6 +5600,41 @@ async fn drive_enrolment_history(ws: &mut WsStream, state: &mut BgState) {
     }
 }
 
+/// Claim the stored-events prefix of the enrolment tail that was just opened.
+///
+/// Everything the relay had already stored when it answered this REQ is
+/// context: it restores authority and lifecycle and creates no turn. Everything
+/// after this registration's own boundary is work.
+///
+/// **The boundary is the discriminator, and the walk's progress is not.** An
+/// earlier version asked whether the enrolment history walk had proven
+/// exhaustion yet, reasoning that the walk owns the overlap window. It is the
+/// wrong question about the wrong thing: a frame that arrives while the walk
+/// happens to be mid-page is not thereby history — a real issue opened by a
+/// real owner one second after startup arrives exactly then, and that version
+/// enrolled it silently instead of answering it. What the walk covers is a fact
+/// about the walk. What is stored versus what is new is a fact about this
+/// request, and only its own EOSE states it.
+///
+/// **Nor is a timestamp the discriminator.** Comparing a backlog row's
+/// `created_at` against the startup watermark would separate the overlap the
+/// walk covers from rows published after startup — and would misfile exactly
+/// the accepted slow-clock root this whole correction exists for, in the narrow
+/// window where one can still land in a backlog. The rule that survives is the
+/// one that never reads the author's clock.
+///
+/// The cost is stated rather than hidden: an issue published while this agent
+/// is disconnected arrives in the reconnect backlog, so it enrols and refreshes
+/// context without creating a turn, and is answered on its next comment.
+/// Comments on already-enrolled roots are unaffected — they arrive on the
+/// watched REQ, which has no such prefix. That is the conservative direction,
+/// and it is the direction three iterations of re-answered history argue for.
+fn claim_enrolment_backlog(state: &mut BgState) {
+    if state.project_requests.bind_enrolment_backlog() {
+        debug!("enrolment tail backlog claimed — its stored rows are context");
+    }
+}
+
 /// Begin — or restart, on a widened coordinate set — the walk back through the
 /// roots this agent is addressed on.
 ///
@@ -5646,6 +5738,8 @@ async fn deliver_reconstructed_roots(
             source: crate::project::ProjectSubscription::EnrolmentHistory { generation },
             route,
             event: verified,
+            // Restored history, by the only path that produces it.
+            mode: crate::project::ProcessingMode::Replay,
         };
         match event_tx.try_send(Some(BuzzEvent::Project(project_event))) {
             Ok(()) => restored += 1,
@@ -7179,6 +7273,15 @@ mod tests {
             spec: InboundSpec,
             reply: tokio::sync::oneshot::Sender<nostr::EventId>,
         },
+        /// End of stored events for one subscription — the frame a relay sends
+        /// when it has finished answering a REQ from its store and everything
+        /// after it is new. The peer writes it because the peer *is* the relay
+        /// here; a scenario that synthesised it locally would be asserting
+        /// about its own fixture.
+        EndOfStoredEvents {
+            sub_id: String,
+            reply: tokio::sync::oneshot::Sender<()>,
+        },
         /// After a reconnect, the peer writes to the replacement socket.
         Rebind {
             sink: PeerSink,
@@ -7231,6 +7334,22 @@ mod tests {
                 .await
                 .expect("timed out waiting for the relay peer to publish")
                 .expect("the relay peer answered")
+        }
+
+        /// Finish the stored-events prefix of `sub_id`.
+        async fn end_of_stored_events(&self, sub_id: &str) {
+            let (reply, wait) = tokio::sync::oneshot::channel();
+            self.tx
+                .send(PeerCommand::EndOfStoredEvents {
+                    sub_id: sub_id.to_string(),
+                    reply,
+                })
+                .await
+                .expect("the relay peer accepts the boundary");
+            timeout(Duration::from_secs(5), wait)
+                .await
+                .expect("timed out waiting for the relay peer's EOSE")
+                .expect("the relay peer answered");
         }
 
         /// Point the peer at the replacement connection after a reconnect.
@@ -7296,6 +7415,20 @@ mod tests {
                             .expect("the relay peer writes the sentinel");
                         let _ = reply.send(event.id);
                     }
+                    PeerCommand::EndOfStoredEvents { sub_id, reply } => {
+                        let text = serde_json::to_string(&json!(["EOSE", sub_id]))
+                            .expect("encode boundary");
+                        let sentinel =
+                            serde_json::to_string(&json!(["NOTICE", boundary_sentinel(&sub_id)]))
+                                .expect("encode sentinel");
+                        sink.send(Message::Text(text.into()))
+                            .await
+                            .expect("the relay peer writes the EOSE");
+                        sink.send(Message::Text(sentinel.into()))
+                            .await
+                            .expect("the relay peer writes the sentinel");
+                        let _ = reply.send(());
+                    }
                     PeerCommand::Rebind {
                         sink: replacement,
                         reply,
@@ -7315,6 +7448,11 @@ mod tests {
     /// about the event's contents.
     fn sentinel_text(id: nostr::EventId) -> String {
         format!("delivered:{id}")
+    }
+
+    /// The sentinel behind an EOSE, for the same ordering reason.
+    fn boundary_sentinel(sub_id: &str) -> String {
+        format!("drained:{sub_id}")
     }
 
     /// Let the production reader take the next EVENT off the retained
@@ -7391,6 +7529,65 @@ mod tests {
             "the EVENT was not consumed from the connection — it was still \
              queued when the sentinel was read, so the frame handled above did \
              not come off this socket"
+        );
+    }
+
+    /// Let the production reader take the next EOSE off the retained connection
+    /// and dispatch it.
+    ///
+    /// The same contract as [`deliver_over_connection`], for the frame that
+    /// ends a request's stored-events prefix. It matters that this goes through
+    /// [`ingress::dispatch_frame`] rather than calling the registry directly:
+    /// the boundary's whole job is to be attributed to the exact registration
+    /// that received it, and a scenario that reached past the reader could
+    /// attribute it to whatever it liked.
+    async fn drain_backlog_over_connection(
+        state: &mut BgState,
+        ws: &mut WsStream,
+        sub_id: &str,
+        event_tx: &mpsc::Sender<Option<BuzzEvent>>,
+        keys: &nostr::Keys,
+    ) {
+        let (observer_tx, _observer_rx) = mpsc::channel(8);
+        let read = timeout(Duration::from_secs(2), ingress::read_frame(ws))
+            .await
+            .expect("timed out reading the EOSE off the connection");
+        let frame = match read {
+            ingress::FrameRead::Frame(frame) => frame,
+            ingress::FrameRead::Lost => {
+                panic!("the connection closed before the EOSE arrived")
+            }
+        };
+        let outcome = ingress::dispatch_frame(
+            frame,
+            ws,
+            event_tx,
+            &observer_tx,
+            state,
+            keys,
+            "ws://test",
+            &keys.public_key().to_hex(),
+            None,
+        )
+        .await;
+        assert_eq!(
+            outcome,
+            ingress::FrameDispatch::Handled,
+            "dispatch must not signal connection loss"
+        );
+
+        let echoed = timeout(Duration::from_secs(2), ws.next())
+            .await
+            .expect("timed out reading the sentinel")
+            .expect("the connection closed before the sentinel arrived")
+            .expect("read the sentinel frame");
+        let echoed: serde_json::Value =
+            serde_json::from_str(echoed.to_text().expect("sentinel is text"))
+                .expect("the sentinel is JSON");
+        assert_eq!(
+            echoed,
+            json!(["NOTICE", boundary_sentinel(sub_id)]),
+            "the EOSE was not consumed from the connection"
         );
     }
 
@@ -7826,14 +8023,14 @@ mod tests {
         let restored: Vec<_> = drain(&mut h.rx)
             .into_iter()
             .filter_map(|e| match e {
-                BuzzEvent::Project(crate::project::ProjectEvent::Routed { source, .. }) => {
-                    Some(source)
-                }
+                BuzzEvent::Project(crate::project::ProjectEvent::Routed {
+                    source, mode, ..
+                }) => Some((source, mode)),
                 _ => None,
             })
             .collect();
         assert_eq!(restored.len(), 2, "both roots restore: {restored:?}");
-        for source in &restored {
+        for (source, mode) in &restored {
             assert!(
                 matches!(
                     source,
@@ -7842,7 +8039,7 @@ mod tests {
                 "a reconstructed root must carry its page's class: {source:?}"
             );
             assert_eq!(
-                crate::project::processing_mode_for(source),
+                *mode,
                 crate::project::ProcessingMode::Replay,
                 "history restores authority and lifecycle; it never runs a turn"
             );
@@ -7898,54 +8095,333 @@ mod tests {
 
     /// Replay or live is the **request path**, never the author's clock.
     ///
-    /// Two rules used to live on this line and both re-answered old work. The
-    /// first required that the enrolment backlog had not drained: the enrolment
-    /// id is fixed, so a predecessor's EOSE certified a successor's backlog it
-    /// knew nothing about, and four historical roots were replied to on a real
-    /// relay. The second read `created_at < startup_watermark`.
+    /// Three rules have stood on this line and all three re-answered old work
+    /// or lost new work. The first required that the enrolment backlog had not
+    /// drained, keyed by subscription id: the enrolment id is fixed, so a
+    /// predecessor's EOSE certified a successor's backlog it knew nothing
+    /// about, and four historical roots were replied to on a real relay. The
+    /// second read `created_at < startup_watermark`, the author's clock, which
+    /// fails in both directions and is invisible from the event alone.
     ///
-    /// These cover the second, which fails in *both* directions — and neither
-    /// failure is visible from the event alone, which is the point.
+    /// The third was "the tail is live, always". It is the one this test now
+    /// pins the replacement for: the tail has to reach behind startup to be
+    /// gapless at all (see `the_enrolment_tail_covers_the_relays_accepted_skew`),
+    /// and the rows that reach-back pulls in are stored, not new.
+    ///
+    /// So the same signed root, on the same request, means different things on
+    /// either side of *that request's own* boundary — and nothing about the
+    /// event decides which.
     #[tokio::test]
-    async fn a_frame_on_the_live_tail_is_live_however_old_it_claims_to_be() {
+    async fn the_tails_own_boundary_separates_its_backlog_from_live_work() {
+        let owner = nostr::Keys::generate();
+        let coord = format!("30617:{}:demo", owner.public_key().to_hex());
+        let root = project_root_frame(&owner, &coord, 900);
+
+        // Before the boundary: stored rows, restoring context.
+        let mut state = BgState::new();
+        state.startup_watermark = Some(1_000);
+        let enrol_id = open_enrolment_for(&mut state, std::slice::from_ref(&coord)).await;
+        let (tx, mut rx) = mpsc::channel(16);
+        deliver_frame(&mut state, &enrol_id, &root, &tx).await;
+        assert_eq!(
+            routed_mode(&mut rx),
+            crate::project::ProcessingMode::Replay,
+            "the tail's stored prefix is context — answering it re-answers history"
+        );
+
+        // After it: live work, and the timestamp never changed.
+        let mut state = BgState::new();
+        state.startup_watermark = Some(1_000);
+        let enrol_id = open_enrolment_for(&mut state, std::slice::from_ref(&coord)).await;
+        drain_enrolment_backlog(&mut state, &enrol_id).await;
+        let (tx, mut rx) = mpsc::channel(16);
+        deliver_frame(&mut state, &enrol_id, &root, &tx).await;
+        assert_eq!(
+            routed_mode(&mut rx),
+            crate::project::ProcessingMode::Live,
+            "a root published after the tail finished answering from store is news, \
+             however old its author's clock claims it is"
+        );
+    }
+
+    /// A predecessor's boundary cannot drain its successor's backlog.
+    ///
+    /// This is the original reported defect, in the shape the fix has to keep
+    /// closed. The enrolment id is *fixed*, so a stale EOSE is spelled exactly
+    /// like the current one — id comparison cannot tell them apart, and the
+    /// version that compared ids stamped a successor's stored frames live and
+    /// replied to four historical roots.
+    ///
+    /// The replacement is opened first and the predecessor's boundary arrives
+    /// afterwards, which is the real interleaving: an EOSE already in flight
+    /// when the tail widens.
+    #[tokio::test]
+    async fn a_predecessors_boundary_cannot_drain_the_successors_backlog() {
+        let owner = nostr::Keys::generate();
+        let coord = format!("30617:{}:demo", owner.public_key().to_hex());
+        let second = format!("30617:{}:second", owner.public_key().to_hex());
+        let mut state = BgState::new();
+        state.startup_watermark = Some(1_000);
+
+        let enrol_id = open_enrolment_for(&mut state, std::slice::from_ref(&coord)).await;
+        // The tail widens onto a second repository: a new registration, the
+        // same wire id, and the predecessor's boundary still unaccounted for.
+        let widened = open_enrolment_for(&mut state, &[coord.clone(), second]).await;
+        assert_eq!(
+            widened, enrol_id,
+            "the enrolment id is fixed — that is what makes this substitution possible"
+        );
+
+        // The EOSE the *predecessor* earned, arriving now.
+        drain_enrolment_backlog(&mut state, &enrol_id).await;
+
+        let root = project_root_frame(&owner, &coord, 900);
+        let (tx, mut rx) = mpsc::channel(16);
+        deliver_frame(&mut state, &enrol_id, &root, &tx).await;
+        assert_eq!(
+            routed_mode(&mut rx),
+            crate::project::ProcessingMode::Replay,
+            "a boundary belonging to a request that no longer exists must certify \
+             nothing about the one that replaced it"
+        );
+    }
+
+    /// Two replacements before any boundary owe two boundaries.
+    ///
+    /// The debt is a count, not a flag. A flag would let the second stale
+    /// boundary through — and the successor's stored rows behind it would be
+    /// answered as live work, which is the whole defect wearing one more
+    /// replacement.
+    #[tokio::test]
+    async fn every_undrained_predecessor_owes_its_own_boundary() {
+        let owner = nostr::Keys::generate();
+        let a = format!("30617:{}:a", owner.public_key().to_hex());
+        let b = format!("30617:{}:b", owner.public_key().to_hex());
+        let c = format!("30617:{}:c", owner.public_key().to_hex());
+        let mut state = BgState::new();
+        state.startup_watermark = Some(1_000);
+
+        // Three registrations, no boundary consumed between them.
+        let enrol_id = open_enrolment_for(&mut state, std::slice::from_ref(&a)).await;
+        let _ = open_enrolment_for(&mut state, &[a.clone(), b.clone()]).await;
+        let _ = open_enrolment_for(&mut state, &[a.clone(), b, c]).await;
+
+        let root = project_root_frame(&owner, &a, 900);
+        for owed in 1..=2 {
+            drain_enrolment_backlog(&mut state, &enrol_id).await;
+            let (tx, mut rx) = mpsc::channel(16);
+            deliver_frame(&mut state, &enrol_id, &root, &tx).await;
+            assert_eq!(
+                routed_mode(&mut rx),
+                crate::project::ProcessingMode::Replay,
+                "boundary {owed} of 2 is owed to a predecessor and settles nothing"
+            );
+            // Release the slot so the next round delivers rather than dedups.
+            state.project_seen_ids.remove(&root.id.to_hex());
+        }
+
+        // The third boundary is the live registration's own.
+        drain_enrolment_backlog(&mut state, &enrol_id).await;
+        let (tx, mut rx) = mpsc::channel(16);
+        deliver_frame(&mut state, &enrol_id, &root, &tx).await;
+        assert_eq!(
+            routed_mode(&mut rx),
+            crate::project::ProcessingMode::Live,
+            "the tail must eventually go live, or the agent is deaf by construction"
+        );
+    }
+
+    /// A boundary from a dead connection cannot drain the replacement's
+    /// backlog.
+    ///
+    /// The same substitution across a reconnect rather than a replacement.
+    /// `clear_connection` drops the claim with the connection that earned it,
+    /// so the replayed tail starts its own prefix from scratch.
+    #[tokio::test]
+    async fn a_reconnect_starts_the_tails_backlog_again() {
         let owner = nostr::Keys::generate();
         let coord = format!("30617:{}:demo", owner.public_key().to_hex());
         let mut state = BgState::new();
         state.startup_watermark = Some(1_000);
+
         let enrol_id = open_enrolment_for(&mut state, std::slice::from_ref(&coord)).await;
+        drain_enrolment_backlog(&mut state, &enrol_id).await;
 
-        // The relay bounds author clock drift at ±15 minutes on ingest, so a
-        // root published *now* by a slow clock can carry a `created_at` before
-        // this process started. The tail's `since` is the relay's ingest
-        // decision, so the tail delivered it — and it is live work.
-        let skewed = project_root_frame(&owner, &coord, 900);
+        // The connection dies and the tail is re-opened on its replacement.
+        state.retire_project_connection();
+        let reopened = open_enrolment_for(&mut state, std::slice::from_ref(&coord)).await;
+
+        let root = project_root_frame(&owner, &coord, 900);
         let (tx, mut rx) = mpsc::channel(16);
-        deliver_frame(&mut state, &enrol_id, &skewed, &tx).await;
-
-        match drain(&mut rx).into_iter().next() {
-            Some(BuzzEvent::Project(crate::project::ProjectEvent::Routed { source, .. })) => {
-                assert_eq!(
-                    source,
-                    crate::project::ProjectSubscription::Enrolment,
-                    "the timestamp rule made this history, so it enrolled silently and \
-                     was never answered"
-                );
-                assert_eq!(
-                    crate::project::processing_mode_for(&source),
-                    crate::project::ProcessingMode::Live,
-                    "a live root must still be able to invoke the agent"
-                );
-            }
-            other => panic!("expected a project delivery, got {other:?}"),
-        }
+        deliver_frame(&mut state, &reopened, &root, &tx).await;
+        assert_eq!(
+            routed_mode(&mut rx),
+            crate::project::ProcessingMode::Replay,
+            "the dead connection's boundary drained a request that no longer exists; \
+             the replacement is answering from store again"
+        );
     }
 
-    /// …and it is answered exactly **once**.
+    /// A dead connection's unsettled debt does not follow the replacement.
     ///
-    /// The other half of the skew case. Being live is only correct if the
-    /// second delivery — from the watched REQ that this very enrolment
-    /// installs, or from a peer call naming the same root — is an exact no-op.
-    /// The shared `project_seen_ids` slot is what makes it one.
+    /// The reconnect case that `a_reconnect_starts_the_tails_backlog_again`
+    /// does not reach: the tail is retired *before* its boundary ever arrives,
+    /// so a registry that kept the claim would carry a debt for an EOSE the
+    /// dead socket will now never send. The replacement's own boundary would be
+    /// spent settling that phantom, and the tail would stay in its stored
+    /// prefix forever — deaf to live work, silently, with no error anywhere.
+    ///
+    /// Fail-deaf is the mirror of the defect this correction fixes, and it is
+    /// harder to notice, so it gets its own test rather than riding on another.
+    #[tokio::test]
+    async fn a_dead_connections_unsettled_boundary_is_not_owed_by_its_replacement() {
+        let owner = nostr::Keys::generate();
+        let coord = format!("30617:{}:demo", owner.public_key().to_hex());
+        let mut state = BgState::new();
+        state.startup_watermark = Some(1_000);
+
+        // Opened and never drained — the boundary was still in flight.
+        let _ = open_enrolment_for(&mut state, std::slice::from_ref(&coord)).await;
+        state.retire_project_connection();
+        let reopened = open_enrolment_for(&mut state, std::slice::from_ref(&coord)).await;
+
+        // One boundary, from the replacement's own registration.
+        drain_enrolment_backlog(&mut state, &reopened).await;
+
+        let root = project_root_frame(&owner, &coord, 900);
+        let (tx, mut rx) = mpsc::channel(16);
+        deliver_frame(&mut state, &reopened, &root, &tx).await;
+        assert_eq!(
+            routed_mode(&mut rx),
+            crate::project::ProcessingMode::Live,
+            "the replacement answered its own boundary; a debt owed by a socket that \
+             no longer exists can never be settled, so carrying it makes the tail deaf"
+        );
+    }
+
+    /// **The real-filter regression.**
+    ///
+    /// The reported miss did not happen inside this agent. A `1621` addressed
+    /// to two agents was accepted by the relay with `200 OK`, stored, and
+    /// readable by `buzz issues get` — and neither agent ever saw it, because
+    /// the standing tail's `since` was the agent's own startup and the relay
+    /// evaluates `since` against the event's **signed** `created_at`. The event
+    /// was filtered out before delivery, so every classification rule
+    /// downstream was arguing about a frame that never arrived.
+    ///
+    /// A test that hands a frame to `deliver_frame` cannot catch that: it
+    /// starts one step past the boundary that failed. So this one asks the
+    /// relay's own matcher — `buzz_core::filter`, the code the relay runs — to
+    /// judge the REQ this agent actually wrote to the socket against a real
+    /// signed root at the reported skew.
+    ///
+    /// The negative control is what makes it a regression rather than a
+    /// restatement: the identical root, against a tail built at the caller's
+    /// floor with no reach-back, is **rejected** by that same matcher. That is
+    /// the shipped behaviour, reproduced, failing.
+    #[tokio::test]
+    async fn the_tails_wire_filter_admits_an_accepted_slow_clock_root() {
+        use buzz_core::event::StoredEvent;
+
+        // A plausible live watermark rather than a small number: `since`
+        // arithmetic that only works near zero is arithmetic that has not been
+        // tested.
+        const STARTUP: u64 = 1_785_743_469;
+        // The reported event's own skew: 387 seconds early, well inside the
+        // ±900 the relay's ingest gate accepts.
+        const SKEW: u64 = 387;
+
+        let owner = nostr::Keys::generate();
+        let coord = format!("30617:{}:phase6-e2e", owner.public_key().to_hex());
+        let discovered = crate::project::DiscoveredRepositories::for_test(vec![coord.clone()]);
+
+        // The REQ this agent writes, read back off the wire it wrote it to.
+        let mut state = BgState::new();
+        state.startup_watermark = Some(STARTUP);
+        let (mut ws, mut server) = test_ws_pair().await;
+        let filter = crate::project::enrolment_filter(&discovered, &test_agent_hex(), STARTUP)
+            .expect("a discovered repository yields a filter");
+        let outcome = state
+            .project_requests
+            .replace_enrolment(&mut ws, vec![filter])
+            .await;
+        assert!(matches!(
+            outcome,
+            crate::project::ReplaceOutcome::Replaced { .. }
+        ));
+        claim_enrolment_backlog(&mut state);
+
+        let req = readable_frames(&mut server)
+            .await
+            .into_iter()
+            .find(|f| f[0] == "REQ")
+            .expect("the tail's REQ reached the socket");
+        assert_eq!(
+            req[1],
+            json!(crate::project::PROJECT_ENROL_SUB_ID),
+            "the frame judged below must be the enrolment tail's own"
+        );
+        let on_the_wire: Vec<nostr::Filter> = req.as_array().expect("a REQ is an array")[2..]
+            .iter()
+            .map(|f| serde_json::from_value(f.clone()).expect("a NIP-01 filter"))
+            .collect();
+
+        // A real signed root, addressed to this agent, on the discovered
+        // repository, stamped the way the reported one was.
+        let root = project_root_frame(&owner, &coord, STARTUP - SKEW);
+        let stored = StoredEvent::new(root.clone(), None);
+
+        assert!(
+            buzz_core::filter::filters_match(&on_the_wire, &stored),
+            "the relay stored this root and would deliver it to anyone whose filter \
+             matched; a tail that does not match it is deaf to an event the relay \
+             accepted, and no downstream classification can recover it: {req:?}"
+        );
+
+        // The negative control: the shipped filter, on the same root.
+        let shipped: Vec<nostr::Filter> = {
+            let mut f = crate::project::enrolment_filter(
+                &discovered,
+                &test_agent_hex(),
+                STARTUP + crate::project::ACCEPTED_CLOCK_SKEW_SECS,
+            )
+            .expect("a filter");
+            f["since"] = json!(STARTUP);
+            vec![serde_json::from_value(f).expect("a NIP-01 filter")]
+        };
+        assert!(
+            !buzz_core::filter::filters_match(&shipped, &stored),
+            "the control must reproduce the miss, or the assertion above proves nothing"
+        );
+
+        // And once it is delivered, past the tail's own boundary, it is one
+        // live invocation rather than restored context.
+        let enrol_id = crate::project::PROJECT_ENROL_SUB_ID.to_string();
+        drain_enrolment_backlog(&mut state, &enrol_id).await;
+        let (tx, mut rx) = mpsc::channel(16);
+        deliver_frame(&mut state, &enrol_id, &root, &tx).await;
+        deliver_frame(&mut state, &enrol_id, &root, &tx).await;
+
+        let deliveries: Vec<_> = drain(&mut rx)
+            .into_iter()
+            .filter_map(|e| match e {
+                BuzzEvent::Project(crate::project::ProjectEvent::Routed { mode, .. }) => Some(mode),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            deliveries,
+            vec![crate::project::ProcessingMode::Live],
+            "exactly once, as live work: {deliveries:?}"
+        );
+    }
+
+    /// …and a skewed root delivered twice is still answered once.
+    ///
+    /// Being live is only correct if the second delivery — from the watched REQ
+    /// this very enrolment installs, or from a peer call naming the same root —
+    /// is an exact no-op. The shared `project_seen_ids` slot is what makes it
+    /// one.
     #[tokio::test]
     async fn a_clock_skewed_root_on_the_live_tail_invokes_exactly_once() {
         let owner = nostr::Keys::generate();
@@ -7953,6 +8429,7 @@ mod tests {
         let mut state = BgState::new();
         state.startup_watermark = Some(1_000);
         let enrol_id = open_enrolment_for(&mut state, std::slice::from_ref(&coord)).await;
+        drain_enrolment_backlog(&mut state, &enrol_id).await;
 
         let skewed = project_root_frame(&owner, &coord, 900);
         let (tx, mut rx) = mpsc::channel(16);
@@ -7971,39 +8448,17 @@ mod tests {
         );
     }
 
-    /// A boundary on the live tail classifies nothing.
-    ///
-    /// The reported failure was: predecessor boundary, successor frames,
-    /// historical roots answered. The boundary is out of this decision
-    /// entirely now — an EOSE under the enrolment id, at any point, leaves
-    /// every later frame exactly as live as it was.
-    #[tokio::test]
-    async fn a_boundary_on_the_live_tail_does_not_classify_later_frames() {
-        let owner = nostr::Keys::generate();
-        let coord = format!("30617:{}:demo", owner.public_key().to_hex());
-        let mut state = BgState::new();
-        state.startup_watermark = Some(1_000);
-        let enrol_id = open_enrolment_for(&mut state, std::slice::from_ref(&coord)).await;
-
-        let (tx, mut rx) = mpsc::channel(16);
-        deliver_control_frame_to(&mut state, json!(["EOSE", enrol_id.clone()]), &tx).await;
-
-        let later = project_root_frame(&owner, &coord, 900);
-        deliver_frame(&mut state, &enrol_id, &later, &tx).await;
-
-        match drain(&mut rx)
+    /// The mode carried by the one routed project delivery in `rx`.
+    fn routed_mode(rx: &mut mpsc::Receiver<Option<BuzzEvent>>) -> crate::project::ProcessingMode {
+        let modes: Vec<_> = drain(rx)
             .into_iter()
-            .find(|e| matches!(e, BuzzEvent::Project(_)))
-        {
-            Some(BuzzEvent::Project(crate::project::ProjectEvent::Routed { source, .. })) => {
-                assert_eq!(
-                    source,
-                    crate::project::ProjectSubscription::Enrolment,
-                    "a boundary must not be able to reclassify the tail it bounds"
-                );
-            }
-            other => panic!("expected a project delivery, got {other:?}"),
-        }
+            .filter_map(|e| match e {
+                BuzzEvent::Project(crate::project::ProjectEvent::Routed { mode, .. }) => Some(mode),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(modes.len(), 1, "expected one routed delivery: {modes:?}");
+        modes[0]
     }
 
     /// A signed, addressed project root at a chosen timestamp.
@@ -8030,6 +8485,19 @@ mod tests {
         open_enrolment_with(state, vec![filter]).await
     }
 
+    /// Drain the enrolment tail's stored-events prefix through the production
+    /// EOSE path.
+    ///
+    /// A tail that has just been opened is still answering from the relay's
+    /// store, so its frames are context. Tests that are about *live* traffic
+    /// have to get past that the way production does — by the boundary — and
+    /// saying so at each call site is the point: a helper that opened a tail
+    /// already drained would hide the very state this correction adds.
+    async fn drain_enrolment_backlog(state: &mut BgState, enrol_id: &str) {
+        let (tx, _rx) = mpsc::channel(16);
+        deliver_control_frame_to(state, json!(["EOSE", enrol_id]), &tx).await;
+    }
+
     /// Install the enrolment subscription over `filters`, through the
     /// registry's own replacement, and return the id it stamped.
     async fn open_enrolment_with(state: &mut BgState, filters: Vec<Value>) -> String {
@@ -8038,6 +8506,10 @@ mod tests {
             .project_requests
             .replace_enrolment(&mut ws, filters)
             .await;
+        // Exactly what the `ReplaceProject` command handler does next. Without
+        // it a fixture would open a tail that had never claimed a backlog, and
+        // every frame on it would read as live for the wrong reason.
+        claim_enrolment_backlog(state);
         assert!(
             matches!(outcome, crate::project::ReplaceOutcome::Replaced { .. }),
             "the enrolment replacement must install, got {outcome:?}"
@@ -10821,6 +11293,9 @@ mod tests {
         let filter =
             crate::project::enrolment_filter(&discovered, &agent_hex, 0).expect("enrolment filter");
         let enrol_id = open_enrolment_with(&mut state, vec![filter]).await;
+        // This scenario is about the authority gate, not the tail's prefix, so
+        // it starts where live traffic starts.
+        drain_enrolment_backlog(&mut state, &enrol_id).await;
 
         let root_named = |signer: &nostr::Keys, coord: &str, p: &str| {
             EventBuilder::new(
@@ -11573,6 +12048,16 @@ mod tests {
                 }};
             }
 
+            /// Finish a request's stored-events prefix, the way a relay does.
+            macro_rules! drain_backlog {
+                ($sub_id:expr) => {{
+                    peer.end_of_stored_events($sub_id).await;
+                    let mut guard = subscriber.inner.lock().await;
+                    let (state, ws) = &mut *guard;
+                    drain_backlog_over_connection(state, ws, $sub_id, &tx, &agent).await;
+                }};
+            }
+
             // ── 1. discovery REQ, written the production way ─────────────────
             let discovery_id = crate::project::discovery_sub_id();
             {
@@ -11742,6 +12227,21 @@ mod tests {
             );
 
             // ── 3. the owner opens an issue naming the agent ─────────────────
+            //
+            // The tail's stored-events prefix is drained first, because that is
+            // what a relay does and because everything after it is what "live"
+            // means. Skipping it would leave the scenario asserting about a
+            // request that had never finished answering — and the issue below
+            // is published *after* this point precisely so that it is news
+            // rather than backlog, which is the shape of the real miss this
+            // fixture now covers.
+            //
+            // Two enrolment REQs have been written — the first discovery's and
+            // the widening — so the relay owes two boundaries, and it sends one
+            // per REQ. Draining only one would leave the tail still answering
+            // from store, which is exactly the state the count exists to track.
+            drain_backlog!(crate::project::PROJECT_ENROL_SUB_ID);
+            drain_backlog!(crate::project::PROJECT_ENROL_SUB_ID);
             let coordinate = format!("30617:{owner_hex}:e2e-repo");
             let body = "the pipeline drops frames after reconnect";
             let enrol_id = crate::project::PROJECT_ENROL_SUB_ID.to_string();

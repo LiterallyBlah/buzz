@@ -1123,6 +1123,57 @@ mod requests {
         /// This registry's own allocation, stamped into every authority it
         /// mints so another registry's proofs can never be mistaken for its.
         epoch: Arc<RegistryEpoch>,
+        /// The enrolment tail's unfinished backlog, if it has one.
+        ///
+        /// See [`EnrolmentBacklog`]. `None` means every frame the tail delivers
+        /// is live — either its backlog has drained, or no registration has
+        /// claimed one.
+        enrolment_backlog: Option<EnrolmentBacklog>,
+    }
+
+    /// The stored-events prefix of one enrolment-tail registration.
+    ///
+    /// The tail's wire id is fixed, so the id cannot say which instance of the
+    /// request a frame or a boundary belongs to. The authority can: it is
+    /// allocation identity, compared by pointer, and a replacement mints a new
+    /// one. That is the whole reason this holds an `Arc<RegistrationAuthority>`
+    /// rather than the id it was opened under, and it is what stops a
+    /// predecessor's — or a dead connection's — EOSE from certifying the
+    /// successor's backlog as drained.
+    ///
+    /// **There is no mode field.** One was tried: the idea was that a
+    /// reconnect's backlog could be live, since nothing else covers work missed
+    /// during an outage. It is wrong in the direction that matters. A backlog
+    /// is whatever the relay had already stored when it answered, and this
+    /// agent cannot tell a root it has already handled from one it has not by
+    /// looking at a stored row — that is precisely what the walk, and the
+    /// shared dedup slot, exist to know. A backlog is context. What follows the
+    /// boundary is work.
+    #[derive(Debug)]
+    struct EnrolmentBacklog {
+        /// The exact registration whose stored events are still arriving.
+        authority: Arc<RegistrationAuthority>,
+        /// Boundaries still owed to registrations that came before this one.
+        ///
+        /// **The fixed wire id makes an arriving EOSE anonymous.** A boundary
+        /// carries only the id it answers, and the tail's id never changes, so
+        /// the registry mints its witness from whatever is live *now* — the
+        /// successor. Authority comparison cannot separate a predecessor's
+        /// boundary from the successor's, because by the time either arrives
+        /// they name the same registration. That is not a flaw in the
+        /// comparison; it is the id carrying no information.
+        ///
+        /// Order does carry it. One connection is one TCP stream, and a relay
+        /// answers `REQ`s in the order it read them, so the boundary owed to a
+        /// request opened earlier arrives before the boundary owed to the one
+        /// that replaced it — always, and exactly once each. Replacing a tail
+        /// that had not yet drained therefore owes one boundary that is not
+        /// this registration's, and counting them is exact rather than
+        /// heuristic.
+        ///
+        /// Reset with the connection: a dead socket owes nothing, and a
+        /// replayed tail starts its own prefix from scratch.
+        pending_predecessors: usize,
     }
 
     /// The durable record a registry derives its current intent from.
@@ -2758,6 +2809,96 @@ mod requests {
         pub(crate) fn clear_connection(&mut self) {
             self.live.clear();
             self.suspended.clear();
+            // The backlog belonged to a registration on the connection that
+            // just died. Keeping it would let the replacement tail's frames be
+            // measured against an authority nothing can ever close, and the
+            // replacement's own `bind_enrolment_backlog` is what re-establishes
+            // it — from the registration that actually exists.
+            self.enrolment_backlog = None;
+        }
+
+        /// Claim the stored-events prefix of whatever enrolment tail is live
+        /// **now**.
+        ///
+        /// Called by the owner immediately after an enrolment REQ reaches the
+        /// socket. It reads the live registration rather than accepting one:
+        /// a caller able to supply the authority would be a caller able to
+        /// supply a stale one, which is the whole failure this type exists to
+        /// prevent.
+        ///
+        /// Returns `false` when no enrolment registration is live, which is the
+        /// honest answer to "whose backlog?" when the open did not happen.
+        pub(crate) fn bind_enrolment_backlog(&mut self) -> bool {
+            let Some(live) = self.live.get(super::PROJECT_ENROL_SUB_ID) else {
+                return false;
+            };
+            // A predecessor that had not finished answering still owes its
+            // boundary, and that boundary is indistinguishable from this
+            // registration's once it arrives. Carry the debt forward, including
+            // anything the predecessor had itself inherited: two replacements
+            // before the first EOSE owe two.
+            let inherited = self
+                .enrolment_backlog
+                .as_ref()
+                .map_or(0, |prior| prior.pending_predecessors + 1);
+            self.enrolment_backlog = Some(EnrolmentBacklog {
+                authority: Arc::clone(&live.authority),
+                pending_predecessors: inherited,
+            });
+            true
+        }
+
+        /// What a frame admitted on the enrolment tail means.
+        ///
+        /// **The single producer of an enrolment frame's processing mode.** It
+        /// answers from the registration that admitted the frame, so there is
+        /// no timestamp, no drain flag and no id spelling anywhere in the
+        /// decision — the three things that have each, in turn, misclassified a
+        /// live root as history.
+        ///
+        /// Anything that is not this registration's own unfinished backlog is
+        /// live: a frame under a *later* registration (its predecessor's
+        /// backlog is over by construction), a frame arriving after this
+        /// registration's own boundary, or a frame on a tail that never claimed
+        /// a backlog at all.
+        pub(crate) fn enrolment_frame_mode(
+            &self,
+            admission: &FrameAdmission,
+        ) -> super::ProcessingMode {
+            match &self.enrolment_backlog {
+                Some(backlog) if Arc::ptr_eq(&backlog.authority, &admission.authority) => {
+                    super::ProcessingMode::Replay
+                }
+                _ => super::ProcessingMode::Live,
+            }
+        }
+
+        /// Close the enrolment backlog, if this boundary is the one that can.
+        ///
+        /// Returns whether it closed anything. A boundary owed to a
+        /// predecessor registration, or minted on a connection that has since
+        /// died, certifies nothing here. Neither refusal rests on the id: the
+        /// fixed enrolment id means a stale EOSE is *always* spelled exactly
+        /// like the current one. A dead connection is caught by allocation
+        /// identity, which a replacement cannot reproduce; a predecessor is
+        /// caught by the debt counted in
+        /// [`EnrolmentBacklog::pending_predecessors`], because allocation
+        /// identity cannot see it.
+        pub(crate) fn close_enrolment_backlog(&mut self, witness: &EndOfStoredEvents) -> bool {
+            let Some(backlog) = self.enrolment_backlog.as_mut() else {
+                return false;
+            };
+            if !Arc::ptr_eq(&backlog.authority, &witness.authority) {
+                return false;
+            }
+            // Owed to something earlier. Consumed, so the successor's own
+            // boundary is still ahead — and refused, so it certifies nothing.
+            if backlog.pending_predecessors > 0 {
+                backlog.pending_predecessors -= 1;
+                return false;
+            }
+            self.enrolment_backlog = None;
+            true
         }
 
         /// What to (re-)send, in deterministic order — or why nothing may be.
@@ -4078,13 +4219,30 @@ impl ProjectEnrolments {
 /// `#a` list matches nothing at some relays and *everything* at others, and
 /// "accidentally subscribe to all of kind 1" is not a failure worth risking.
 ///
-/// **A live tail, and nothing else.** It floors at `since` and carries no row
-/// limit, so it is open-ended forwards and asks for no history at all. It used
-/// to reach back thirty days for up to five hundred rows, which was the restart
-/// case being answered by the wrong request: a fixed-identity standing REQ
-/// cannot page, so the reach-back could only ever sample. History is
+/// **A live tail, and nothing else.** It carries no row limit, so it is
+/// open-ended forwards and asks for no history of its own. It used to reach
+/// back thirty days for up to five hundred rows, which was the restart case
+/// being answered by the wrong request: a fixed-identity standing REQ cannot
+/// page, so the reach-back could only ever sample. History is
 /// [`EnrolmentReconstruction`]'s question now, on its own generation-distinct
 /// requests, and this one keeps running unreplaced while that walk paginates.
+///
+/// **`since` is floored a full accepted-skew interval below the caller's
+/// watermark, and that is not an approximation.** A relay evaluates `since`
+/// against the event's *signed* `created_at`, not against when it arrived. An
+/// event whose author's clock runs slow is accepted for storage — the ingest
+/// gate allows [`ACCEPTED_CLOCK_SKEW_SECS`] in either direction — and then
+/// silently fails a `since` set at this process's own startup. It is dropped at
+/// the relay, so no amount of care about how this agent classifies what it
+/// receives can recover it; it never arrives. That was a real miss on a real
+/// relay: a `1621` addressed to two agents, accepted with `created_at` 387
+/// seconds before their startup, delivered to neither.
+///
+/// Widening the floor pulls stored rows from the overlap into the tail's
+/// backlog. They are not turns: the backlog of a tail registration is
+/// classified by [`ProjectRequests::enrolment_frame_mode`] from the
+/// registration that admitted it, so what the overlap costs is one prefix of
+/// context frames, not a re-answered issue.
 pub(crate) fn enrolment_filter(
     discovered: &DiscoveredRepositories,
     agent_pubkey_hex: &str,
@@ -4098,9 +4256,23 @@ pub(crate) fn enrolment_filter(
         "kinds": [KIND_GIT_ISSUE, KIND_GIT_PULL_REQUEST, KIND_TEXT_NOTE],
         "#a": coords,
         "#p": [agent_pubkey_hex],
-        "since": since,
+        "since": since.saturating_sub(ACCEPTED_CLOCK_SKEW_SECS),
     }))
 }
+
+/// How far from server time the relay will accept an event's `created_at`.
+///
+/// Mirrors `MAX_TIMESTAMP_DRIFT_SECS` in
+/// `crates/buzz-relay/src/handlers/ingest.rs`, which is applied to every kind
+/// after signature verification. It is the exact width of the interval in which
+/// "already stored" and "published just now" are indistinguishable from the
+/// timestamp alone, so it is the exact amount a live tail must reach back to be
+/// gapless.
+///
+/// Deliberately a named constant equal to the relay's, not a margin chosen to
+/// feel safe. Too small silently drops accepted events; too large is a longer
+/// context prefix on every reconnect for no coverage the relay would honour.
+pub(crate) const ACCEPTED_CLOCK_SKEW_SECS: u64 = 900;
 
 /// NIP-01 filters for the watched-root REQ.
 ///
@@ -4255,10 +4427,20 @@ pub(crate) enum ProjectEvent {
     /// effect differ between a live enrolment mention, a watched continuation
     /// and a historical reconstruction, and re-deriving that from the event
     /// shape would be guessing at something already known.
+    ///
+    /// `mode` is carried for a stronger version of the same reason: it is not
+    /// derivable downstream *at all*. A `processing_mode_for(source)` lookup
+    /// stood here and was wrong by construction — the enrolment class covers
+    /// both a tail's stored-events prefix and everything live that follows it,
+    /// and one value cannot answer for both. Only the relay task holds what
+    /// separates them, which is the registration that admitted the frame, so
+    /// the relay task is the only thing that may say. Everything downstream
+    /// reads this field; nothing recomputes it.
     Routed {
         source: ProjectSubscription,
         route: ProjectRoute,
         event: VerifiedProjectEvent,
+        mode: ProcessingMode,
     },
 }
 
@@ -6828,25 +7010,6 @@ pub(crate) fn resolve_addressing(
     }
 
     Some(Addressing::ExplicitMention)
-}
-
-/// Which processing mode a frame carries, from the source it was stamped with.
-///
-/// The stamp is applied in the relay task before the event enters the bounded
-/// queue, so this is a lookup rather than a decision: by the time an effect is
-/// being folded, "was this history?" has already been answered by whoever
-/// received the frame.
-pub(crate) fn processing_mode_for(source: &ProjectSubscription) -> ProcessingMode {
-    match source {
-        // The one producer of `Replay`, and it is a *request class* rather than
-        // a stamp applied to a frame after it arrived. An earlier version
-        // derived this from `created_at < startup`, which read the author's
-        // clock: the relay bounds drift at ±15 minutes on ingest, so a root
-        // published live by a slightly slow clock was classified as history and
-        // enrolled without ever being answered.
-        ProjectSubscription::EnrolmentHistory { .. } => ProcessingMode::Replay,
-        _ => ProcessingMode::Live,
-    }
 }
 
 /// Constrain an effect by processing mode.
@@ -12687,23 +12850,43 @@ mod tests {
         assert_eq!(f["#p"], json!([AGENT]));
     }
 
-    /// The enrolment REQ is a live tail: it takes the caller's floor literally
-    /// and asks for no history at all.
+    /// The enrolment REQ is a live tail that reaches back exactly one accepted
+    /// skew interval, and asks for no history beyond it.
     ///
-    /// It used to reach thirty days behind that floor for up to five hundred
+    /// It used to reach thirty days behind the floor for up to five hundred
     /// rows. Both bounds were false completeness — a root older than the window,
     /// or beyond the five hundredth, was silently absent while the agent
     /// reported full authority — and neither could be fixed by widening, because
     /// this REQ's identity is fixed and a fixed identity cannot paginate. The
     /// walk that can is [`EnrolmentReconstruction`], on its own requests, and it
     /// runs *beside* this one rather than replacing it.
+    ///
+    /// Then it took the caller's floor literally, which was the opposite error
+    /// and a worse one, because it was invisible. A relay matches `since`
+    /// against the author's signed `created_at`; the ingest gate accepts
+    /// [`ACCEPTED_CLOCK_SKEW_SECS`] of drift in either direction. So a root
+    /// accepted with `200 OK`, stored, and readable by `buzz issues get` was
+    /// filtered out of the very subscription that existed to deliver it. On a
+    /// real relay a `1621` addressed to two agents, stamped 387 seconds before
+    /// their startup, reached neither.
+    ///
+    /// The floor is therefore the caller's minus the exact interval the relay
+    /// will accept — not a round number that feels generous. A tail that reaches
+    /// back further than the relay will ever accept an event from is asking for
+    /// context it did not need; one that reaches back less is deaf, silently,
+    /// for the difference.
     #[test]
-    fn the_enrolment_filter_asks_for_no_history() {
+    fn the_enrolment_tail_covers_the_relays_accepted_skew() {
         let f = enrolment_filter(&known(&[&coord()]), AGENT, 9_000).expect("filter");
         assert_eq!(
             f["since"],
-            json!(9_000),
-            "the tail must start exactly at the caller's floor, not behind it"
+            json!(9_000 - ACCEPTED_CLOCK_SKEW_SECS),
+            "a root the relay would accept must not be filtered out before it arrives"
+        );
+        assert_eq!(
+            ACCEPTED_CLOCK_SKEW_SECS, 900,
+            "this is MAX_TIMESTAMP_DRIFT_SECS in buzz-relay's ingest path; if that \
+             moved, this must move with it or the tail goes partly deaf again"
         );
         assert!(
             f.get("limit").is_none(),
@@ -12713,6 +12896,24 @@ mod tests {
             f.get("until").is_none(),
             "the tail is open-ended forwards: {f}"
         );
+    }
+
+    /// The reach-back saturates rather than wrapping.
+    ///
+    /// A watermark inside the skew interval is ordinary on a freshly
+    /// provisioned relay, and `0 - 900` on a `u64` is the largest number there
+    /// is — which would turn the tail's floor into a ceiling and match nothing
+    /// at all.
+    #[test]
+    fn a_startup_inside_the_skew_interval_floors_at_zero() {
+        for watermark in [0u64, 1, ACCEPTED_CLOCK_SKEW_SECS - 1] {
+            let f = enrolment_filter(&known(&[&coord()]), AGENT, watermark).expect("filter");
+            assert_eq!(
+                f["since"],
+                json!(0),
+                "watermark {watermark} must floor at 0"
+            );
+        }
     }
 
     #[test]

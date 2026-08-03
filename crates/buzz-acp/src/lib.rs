@@ -4205,6 +4205,7 @@ fn handle_project_event(
             source,
             route,
             event,
+            mode,
         } => {
             // Phase A holds no reconstructed history, so readiness is `Unknown`
             // and stays honest about it. `resolve_addressing` reads that
@@ -4230,13 +4231,16 @@ fn handle_project_event(
             //
             // Folded here, on the decision this gate just made, rather than at
             // any of the effect sites below: one place to read, and no effect
-            // can be added later that quietly escapes it. The stamp itself was
-            // applied in the relay task before this event entered the queue —
-            // a frame's provenance cannot be recovered afterwards, because a
-            // backlog frame may still be queued when the boundary arrives.
-            let mode = project::processing_mode_for(source);
+            // can be added later that quietly escapes it.
+            //
+            // `mode` is read off the event, never recomputed from `source`. It
+            // was decided in the relay task, against the registration that
+            // admitted the frame, at the moment it arrived — and a frame's
+            // provenance cannot be recovered afterwards, because a backlog
+            // frame may still be sitting in this queue when its boundary
+            // arrives and retires the registration that explains it.
             let decision = project::ProjectDecision {
-                effect: project::apply_processing_mode(decision.effect, mode),
+                effect: project::apply_processing_mode(decision.effect, *mode),
                 ..decision
             };
 
@@ -5393,6 +5397,7 @@ mod project_discovery_ingestion_tests {
         agent: &Keys,
         repo_id: &str,
         source: project::ProjectSubscription,
+        mode: project::ProcessingMode,
         preceding: Option<nostr::Event>,
         event: nostr::Event,
     ) -> ProjectDispatched {
@@ -5445,6 +5450,9 @@ mod project_discovery_ingestion_tests {
                     source: project::ProjectSubscription::Enrolment,
                     route,
                     event: verified,
+                    // The setup event that binds the root. Always live: it is
+                    // standing in for the moment the agent was first addressed.
+                    mode: project::ProcessingMode::Live,
                 },
             );
         }
@@ -5468,6 +5476,7 @@ mod project_discovery_ingestion_tests {
                 source,
                 route,
                 event: verified,
+                mode,
             },
         )
     }
@@ -5497,6 +5506,7 @@ mod project_discovery_ingestion_tests {
             &agent,
             "demo",
             project::ProjectSubscription::Enrolment,
+            project::ProcessingMode::Live,
             None,
             root.clone(),
         )
@@ -5511,6 +5521,7 @@ mod project_discovery_ingestion_tests {
             &agent,
             "demo",
             project::ProjectSubscription::EnrolmentHistory { generation: 0 },
+            project::ProcessingMode::Replay,
             None,
             root,
         )
@@ -5548,6 +5559,7 @@ mod project_discovery_ingestion_tests {
             &agent,
             "demo",
             project::ProjectSubscription::EnrolmentHistory { generation: 0 },
+            project::ProcessingMode::Replay,
             Some(root),
             comment,
         )
@@ -5558,40 +5570,63 @@ mod project_discovery_ingestion_tests {
         );
     }
 
-    /// The mode is a property of the **request class** and of nothing else.
+    /// The mode is carried by the frame, and the dispatcher obeys it.
     ///
-    /// Pinned so that adding a subscription class cannot silently make its
-    /// frames replay — or, worse, make replay frames live. `EnrolmentHistory`
-    /// is the one producer of `Replay`, and every generation of it is one:
-    /// a class whose replay-ness depended on its generation would be a second
-    /// place to get this wrong.
-    #[test]
-    fn only_a_history_page_carries_replay_mode() {
-        use project::{processing_mode_for, ProcessingMode, ProjectSubscription};
-        for generation in [0u64, 1, u64::MAX] {
-            assert!(matches!(
-                processing_mode_for(&ProjectSubscription::EnrolmentHistory { generation }),
-                ProcessingMode::Replay
-            ));
-        }
-        for live in [
-            // The enrolment tail included, and deliberately: it floors at
-            // startup, so a frame it delivers is news by construction. This is
-            // the assertion the removed `created_at < startup` rule broke.
-            ProjectSubscription::Enrolment,
-            ProjectSubscription::Discovery,
-            ProjectSubscription::PeerCall,
-            ProjectSubscription::Watched { generation: 3 },
-            ProjectSubscription::RootCatchUp {
-                root: "a".repeat(64),
-                stream: project::HistoryStream::Comments,
-            },
-        ] {
-            assert!(
-                matches!(processing_mode_for(&live), ProcessingMode::Live),
-                "{live:?} must stay live"
-            );
-        }
+    /// This replaces a `processing_mode_for(source)` table test. That table was
+    /// the defect, not a description of it: the enrolment class covers both a
+    /// tail's stored-events prefix and everything live after its boundary, so
+    /// no function of the class alone can be right about both — and the version
+    /// that existed answered "live" for the whole class, which is how a stored
+    /// root re-answered and, in the other direction, why the fix could not be
+    /// expressed at all.
+    ///
+    /// So the assertion moved to where the value now lives. The *same* class,
+    /// the *same* signed root, dispatched twice against fresh state, differing
+    /// only in the mode the frame carries: one enrols and wakes, the other
+    /// enrols and does not. A mode the dispatcher ignored would make these two
+    /// equal, and that is the whole point of the comparison.
+    #[tokio::test]
+    async fn the_frames_mode_decides_whether_a_root_wakes_anyone() {
+        let owner = Keys::generate();
+        let agent = Keys::generate();
+        let repo = "mode-carried-by-the-frame";
+        let root = root_event(
+            &owner,
+            &agent,
+            repo,
+            buzz_core::kind::KIND_GIT_ISSUE,
+            "please look",
+        );
+
+        let live = dispatch_routed(
+            &owner,
+            &agent,
+            repo,
+            project::ProjectSubscription::Enrolment,
+            project::ProcessingMode::Live,
+            None,
+            root.clone(),
+        )
+        .await;
+        let replayed = dispatch_routed(
+            &owner,
+            &agent,
+            repo,
+            project::ProjectSubscription::Enrolment,
+            project::ProcessingMode::Replay,
+            None,
+            root,
+        )
+        .await;
+
+        assert!(
+            matches!(live, ProjectDispatched::Queued { .. }),
+            "a live root is work: {live:?}"
+        );
+        assert!(
+            matches!(replayed, ProjectDispatched::Enrolled),
+            "the same root as history restores the watch and wakes nobody: {replayed:?}"
+        );
     }
 
     fn root_event(
@@ -5710,6 +5745,7 @@ mod project_discovery_ingestion_tests {
                 source: project::ProjectSubscription::Enrolment,
                 route,
                 event: verified,
+                mode: project::ProcessingMode::Live,
             },
         );
         assert!(
@@ -5763,6 +5799,7 @@ mod project_discovery_ingestion_tests {
                 source: project::ProjectSubscription::Watched { generation: 0 },
                 route,
                 event: verified,
+                mode: project::ProcessingMode::Live,
             },
         );
         match dispatched {
@@ -5801,6 +5838,7 @@ mod project_discovery_ingestion_tests {
                 source: project::ProjectSubscription::Watched { generation: 0 },
                 route,
                 event: verified,
+                mode: project::ProcessingMode::Live,
             },
         );
         assert_eq!(
@@ -5838,6 +5876,7 @@ mod project_discovery_ingestion_tests {
                 source: project::ProjectSubscription::Watched { generation: 0 },
                 route,
                 event: verified,
+                mode: project::ProcessingMode::Live,
             },
         );
         assert_eq!(
@@ -5871,6 +5910,7 @@ mod project_discovery_ingestion_tests {
                 source: project::ProjectSubscription::Watched { generation: 0 },
                 route,
                 event: verified,
+                mode: project::ProcessingMode::Live,
             },
         );
         assert_eq!(
@@ -5954,6 +5994,7 @@ mod project_discovery_ingestion_tests {
                 source: project::ProjectSubscription::Enrolment,
                 route,
                 event: verified,
+                mode: project::ProcessingMode::Live,
             },
         );
 
@@ -6006,6 +6047,7 @@ mod project_discovery_ingestion_tests {
                 source: project::ProjectSubscription::Watched { generation: 0 },
                 route,
                 event: verified,
+                mode: project::ProcessingMode::Live,
             },
         );
         assert_eq!(
@@ -6045,6 +6087,7 @@ mod project_discovery_ingestion_tests {
                     source: project::ProjectSubscription::Watched { generation: 0 },
                     route,
                     event: verified,
+                    mode: project::ProcessingMode::Live,
                 },
             ),
             ProjectDispatched::Ignored,
@@ -6079,6 +6122,7 @@ mod project_discovery_ingestion_tests {
                     source: project::ProjectSubscription::Watched { generation: 0 },
                     route,
                     event: verified,
+                    mode: project::ProcessingMode::Live,
                 },
             ),
             ProjectDispatched::Ignored,
@@ -6112,6 +6156,7 @@ mod project_discovery_ingestion_tests {
                 source: project::ProjectSubscription::Watched { generation: 0 },
                 route,
                 event: verified,
+                mode: project::ProcessingMode::Live,
             },
         );
         match resumed {
@@ -6188,6 +6233,7 @@ mod project_discovery_ingestion_tests {
                 source: project::ProjectSubscription::Enrolment,
                 route,
                 event: verified,
+                mode: project::ProcessingMode::Live,
             },
         );
         assert!(
@@ -6220,6 +6266,7 @@ mod project_discovery_ingestion_tests {
                 source: project::ProjectSubscription::Enrolment,
                 route,
                 event: verified,
+                mode: project::ProcessingMode::Live,
             },
         );
         assert!(
@@ -6406,6 +6453,7 @@ mod project_discovery_ingestion_tests {
                 source: project::ProjectSubscription::Enrolment,
                 route,
                 event: verified,
+                mode: project::ProcessingMode::Live,
             });
         }
 
@@ -6460,6 +6508,7 @@ mod project_discovery_ingestion_tests {
             &agent,
             "proj",
             project::ProjectSubscription::Enrolment,
+            project::ProcessingMode::Live,
             None,
             event,
         )
@@ -6490,6 +6539,7 @@ mod project_discovery_ingestion_tests {
             &agent,
             "proj",
             project::ProjectSubscription::Enrolment,
+            project::ProcessingMode::Live,
             None,
             event,
         )
@@ -6539,6 +6589,7 @@ mod project_discovery_ingestion_tests {
             &agent,
             "proj",
             project::ProjectSubscription::Enrolment,
+            project::ProcessingMode::Live,
             None,
             comment,
         )
@@ -6587,6 +6638,7 @@ mod project_discovery_ingestion_tests {
             &agent,
             "proj",
             project::ProjectSubscription::Enrolment,
+            project::ProcessingMode::Live,
             Some(root),
             comment,
         )
@@ -6618,6 +6670,7 @@ mod project_discovery_ingestion_tests {
             &agent,
             "proj",
             project::ProjectSubscription::Enrolment,
+            project::ProcessingMode::Live,
             None,
             event,
         )
@@ -6782,6 +6835,7 @@ mod project_discovery_ingestion_tests {
                 source: project::ProjectSubscription::Watched { generation: 0 },
                 route,
                 event: verified,
+                mode: project::ProcessingMode::Live,
             },
         );
 
@@ -11259,6 +11313,7 @@ for line in sys.stdin:
             source,
             route,
             event: verified,
+            mode: project::ProcessingMode::Live,
         }
     }
 
