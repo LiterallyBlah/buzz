@@ -14518,6 +14518,233 @@ for line in sys.stdin:
         );
     }
 
+    /// A root whose history carries peer-call traffic rebuilds — and rebuilding
+    /// it invokes nothing.
+    ///
+    /// The reported failure: every real root that had ever carried a NIP-PC
+    /// event degraded on catch-up with `Comments: kind 43004 does not belong to
+    /// Comments`. [`crate::project::HistoryStream::kinds`] asked the relay for
+    /// `43001` and `43004` and `admits` refused them, so the relay returned
+    /// exactly what had been requested and the reconstruction objected to
+    /// receiving it. The root then lost the claim to know its own lifecycle on
+    /// the strength of rows the agent had asked for itself.
+    ///
+    /// Three facts in one run, on one root, over a single page whose rows all
+    /// predate startup:
+    ///
+    /// 1. the catch-up **completes without degrading**, with every row it was
+    ///    sent accounted for;
+    /// 2. nothing it replays **invokes a turn or correlates a result**;
+    /// 3. the **lifecycle and comment ordering** the same page carried still
+    ///    lands, so admitting the call did not cost the close.
+    ///
+    /// The second is a contrast rather than an absence. The identical call
+    /// event, delivered live to the *same* run loop afterwards, queues exactly
+    /// one turn — which also proves the replay did not quietly spend the call
+    /// id in the ledger, because a call id already recorded as admitted is
+    /// refused as a replay and would queue nothing.
+    #[tokio::test]
+    async fn historical_peer_call_traffic_rebuilds_without_degrading_or_invoking() {
+        const STARTUP: u64 = 1_785_743_469;
+        const ROOT_AT: u64 = STARTUP - 9_000;
+        const COMMENT_AT: u64 = STARTUP - 8_000;
+        const CALL_AT: u64 = STARTUP - 7_000;
+        const RESULT_AT: u64 = STARTUP - 6_000;
+        const CLOSE_AT: u64 = STARTUP - 5_000;
+
+        let owner = nostr::Keys::generate();
+        let agent = nostr::Keys::generate();
+        // A second agent the owner has approved. Its calls are ones this agent
+        // answers, which is what makes "replay ran none of them" a claim.
+        let peer = nostr::Keys::generate();
+        let agent_hex = agent.public_key().to_hex();
+        let peer_hex = peer.public_key().to_hex().to_ascii_lowercase();
+        let coordinate = format!("30617:{}:demo", owner.public_key().to_hex());
+        let discovered = crate::project::DiscoveredRepositories::for_test([coordinate.clone()]);
+
+        let root_event = addressed_root(&owner, &agent, &coordinate, ROOT_AT);
+        let root_id = root_event.id.to_hex();
+        let verified_root = crate::project::VerifiedProjectEvent::verify(root_event)
+            .await
+            .expect("valid");
+        let bound = crate::project::VerifiedBoundRoot::prove(
+            std::slice::from_ref(&verified_root),
+            &discovered,
+        )
+        .expect("proves");
+
+        let route = buzz_core::peer_call::PeerCallRoute::Project {
+            coordinate: coordinate.clone(),
+            root: root_id.clone(),
+        };
+        let comment = participant_comment(
+            &owner,
+            &agent,
+            &coordinate,
+            &root_id,
+            COMMENT_AT,
+            "before any of this",
+        );
+        // Inbound: the peer asks this agent to do something, on this root.
+        let call = project_call(&peer, &agent_hex, &route, CALL_AT, "take a look");
+        // Outbound answered: a result for a call *this* agent made, so its `p`
+        // names the agent and `call` derives from the agent as caller.
+        let result = project_call_result(
+            &peer,
+            &agent_hex,
+            &buzz_core::peer_call::derive_call_id(&agent_hex, &peer_hex, &route, CALL_NONCE),
+            &route,
+            RESULT_AT,
+            "done",
+        );
+        let close = root_status(
+            &owner,
+            &coordinate,
+            &root_id,
+            buzz_core::kind::KIND_GIT_STATUS_CLOSED,
+            CLOSE_AT,
+        );
+
+        // ── the relay task rebuilds this root's history ──────────────────────
+        let mut state = BgState::new();
+        state.startup_watermark = Some(STARTUP);
+        let (mut ws, mut server) = test_ws_pair().await;
+        let (tx, mut rx) = mpsc::channel(64);
+        assert!(
+            execute_connected_command(
+                &mut ws,
+                &mut state,
+                &agent_hex,
+                RelayCommand::BeginRootCatchUp {
+                    root: Box::new(bound)
+                },
+            )
+            .await
+        );
+        let req = readable_frames(&mut server)
+            .await
+            .into_iter()
+            .find(|f| f[0] == "REQ")
+            .expect("the catch-up's REQ reached the socket");
+        let page_id = req[1].as_str().expect("an id").to_string();
+        let kinds = req[2]["kinds"].as_array().expect("kinds");
+        assert!(
+            kinds.contains(&json!(KIND_PEER_CALL)) && kinds.contains(&json!(KIND_PEER_CALL_RESULT)),
+            "the walk asks for peer-call traffic, which is the whole reason it \
+             must also admit it: {req:?}"
+        );
+
+        // Newest first, the way a backwards walk returns them.
+        for row in [&close, &result, &call, &comment] {
+            deliver_frame(&mut state, &page_id, row, &tx).await;
+        }
+        assert!(deliver_control_frame_to(&mut state, json!(["EOSE", page_id]), &tx).await);
+
+        assert!(
+            !state.root_catch_up_degraded.contains_key(&root_id),
+            "a root must not lose the claim to its own history over rows it \
+             asked for: {:?}",
+            state.root_catch_up_degraded.get(&root_id)
+        );
+        assert_eq!(
+            state.root_catch_up_done.get(&root_id),
+            Some(&4),
+            "and every row the page carried is in the rebuilt history"
+        );
+
+        let replayed: Vec<_> = drain(&mut rx)
+            .into_iter()
+            .filter_map(|e| match e {
+                BuzzEvent::Project(crate::project::ProjectEvent::Routed {
+                    source,
+                    event,
+                    mode,
+                    ..
+                }) => Some((source, event, mode)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            replayed
+                .iter()
+                .map(|(_, e, _)| e.event().created_at.as_secs())
+                .collect::<Vec<_>>(),
+            vec![COMMENT_AT, CALL_AT, RESULT_AT, CLOSE_AT],
+            "the walk read them newest-first; the replay hands them on oldest-first"
+        );
+        assert!(
+            replayed.iter().all(|(source, _, mode)| matches!(
+                source,
+                crate::project::ProjectSubscription::RootCatchUp { .. }
+            ) && *mode
+                == crate::project::ProcessingMode::Replay),
+            "each under the class of the page that fetched it, as history"
+        );
+
+        // ── the run loop folds it in ─────────────────────────────────────────
+        let mut run_loop = RunLoopState::new(&agent, &owner, discovered).approving(&peer_hex);
+        assert!(
+            matches!(
+                run_loop
+                    .deliver(
+                        crate::project::ProjectSubscription::EnrolmentHistory { generation: 0 },
+                        crate::project::ProcessingMode::Replay,
+                        verified_root,
+                    )
+                    .await,
+                crate::ProjectDispatched::Enrolled
+            ),
+            "precondition: the restored root is watched again"
+        );
+
+        for (source, event, mode) in replayed {
+            let kind = event.kind();
+            let dispatched = run_loop.deliver(source, mode, event).await;
+            assert!(
+                !matches!(
+                    dispatched,
+                    crate::ProjectDispatched::Queued { queued: true, .. }
+                ),
+                "history restores state and answers nobody — kind {kind} queued a \
+                 turn: {dispatched:?}"
+            );
+        }
+        assert_eq!(
+            run_loop.state_of(&root_id),
+            crate::project::RootState::Dormant,
+            "and the close still lands: admitting the call must not cost the lifecycle"
+        );
+
+        // ── the contrast ─────────────────────────────────────────────────────
+        //
+        // The owner reopens, and then the *same* call event arrives live. It
+        // must run exactly one turn: if it does not, "replay invoked nothing"
+        // was a fact about this call rather than about replay — and if replay
+        // had spent the call id, the ledger would refuse this as a duplicate.
+        assert_eq!(
+            run_loop
+                .deliver_live(root_status(
+                    &owner,
+                    &coordinate,
+                    &root_id,
+                    buzz_core::kind::KIND_GIT_STATUS_OPEN,
+                    STARTUP + 10,
+                ))
+                .await,
+            crate::ProjectDispatched::LifecycleApplied {
+                root_state: crate::project::RootState::Active
+            },
+        );
+        assert!(
+            matches!(
+                run_loop.deliver_live(call).await,
+                crate::ProjectDispatched::Queued { queued: true, .. }
+            ),
+            "the identical call invokes when it is live, so the silence above \
+             belongs to replay and the ledger was left unspent"
+        );
+    }
+
     /// The run loop's project state, kept across a sequence of events.
     ///
     /// Holds what `tokio_main` holds and hands every event to
@@ -14551,6 +14778,17 @@ for line in sys.stdin:
                 queue: crate::queue::EventQueue::new(crate::config::DedupMode::Queue),
                 ledger: crate::peer_call::CallLedger::new(),
             }
+        }
+
+        /// Approve one external agent, the way the owner's config does.
+        ///
+        /// A peer call from an unapproved key classifies `Untrusted` and would
+        /// never run a turn anyway, so a test that wants "replay invoked
+        /// nothing" to mean something has to make the caller one whose calls
+        /// this agent *does* answer.
+        fn approving(mut self, agent_hex: &str) -> Self {
+            self.externals.insert(agent_hex.to_ascii_lowercase());
+            self
         }
 
         async fn deliver(
@@ -14620,6 +14858,83 @@ for line in sys.stdin:
         ])
         .sign_with_keys(owner)
         .expect("sign")
+    }
+
+    /// The nonce every peer-call fixture here derives its call id from.
+    const CALL_NONCE: &str = "0123456789abcdef0123456789abcdef";
+
+    /// A NIP-PC invocation on a project root, in the shape the wire specifies.
+    ///
+    /// The call id is derived rather than invented, because
+    /// `CallEnvelope::parse` recomputes it — a hand-written id would be refused
+    /// as a mismatch and the event would classify as "not a call to us", which
+    /// is precisely the reading that would make an invocation test pass by
+    /// never having an invocation in it.
+    fn project_call(
+        caller: &nostr::Keys,
+        callee_hex: &str,
+        route: &buzz_core::peer_call::PeerCallRoute,
+        ts: u64,
+        task: &str,
+    ) -> Event {
+        let caller_hex = caller.public_key().to_hex().to_ascii_lowercase();
+        let call_id = buzz_core::peer_call::derive_call_id(
+            &caller_hex,
+            &callee_hex.to_ascii_lowercase(),
+            route,
+            CALL_NONCE,
+        );
+        EventBuilder::new(nostr::Kind::Custom(KIND_PEER_CALL as u16), task)
+            .custom_created_at(nostr::Timestamp::from(ts))
+            .tags(
+                [
+                    nostr::Tag::parse(["p", callee_hex]).unwrap(),
+                    nostr::Tag::parse(["call", &call_id]).unwrap(),
+                    nostr::Tag::parse(["nonce", CALL_NONCE]).unwrap(),
+                    nostr::Tag::parse(["hop", "1"]).unwrap(),
+                    nostr::Tag::parse(["visited", &caller_hex]).unwrap(),
+                ]
+                .into_iter()
+                .chain(peer_route_tags(route)),
+            )
+            .sign_with_keys(caller)
+            .expect("sign")
+    }
+
+    /// A NIP-PC result on a project root, answering `call_id`.
+    fn project_call_result(
+        callee: &nostr::Keys,
+        caller_hex: &str,
+        call_id: &str,
+        route: &buzz_core::peer_call::PeerCallRoute,
+        ts: u64,
+        body: &str,
+    ) -> Event {
+        EventBuilder::new(nostr::Kind::Custom(KIND_PEER_CALL_RESULT as u16), body)
+            .custom_created_at(nostr::Timestamp::from(ts))
+            .tags(
+                [
+                    nostr::Tag::parse(["p", caller_hex]).unwrap(),
+                    nostr::Tag::parse(["call", call_id]).unwrap(),
+                ]
+                .into_iter()
+                .chain(peer_route_tags(route)),
+            )
+            .sign_with_keys(callee)
+            .expect("sign")
+    }
+
+    /// The route tags a project-routed NIP-PC event carries.
+    fn peer_route_tags(route: &buzz_core::peer_call::PeerCallRoute) -> Vec<nostr::Tag> {
+        match route {
+            buzz_core::peer_call::PeerCallRoute::Project { coordinate, root } => vec![
+                nostr::Tag::parse(["a", coordinate]).unwrap(),
+                nostr::Tag::parse(["e", root, "", "root"]).unwrap(),
+            ],
+            buzz_core::peer_call::PeerCallRoute::Channel { .. } => {
+                unreachable!("these fixtures are project-routed")
+            }
+        }
     }
 
     /// A signed status event on `root`.

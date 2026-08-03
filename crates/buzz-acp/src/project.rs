@@ -4710,18 +4710,22 @@ impl HistoryStream {
             .find(|stream| stream.admits(kind))
     }
 
+    /// Does this stream carry rows of `kind`?
+    ///
+    /// **Answered from [`HistoryStream::kinds`], not from a second list.** The
+    /// two used to be written out separately and they drifted: `kinds` asked
+    /// the relay for [`KIND_PEER_CALL`] and [`KIND_PEER_CALL_RESULT`] and this
+    /// rejected them, so a relay returning exactly what was requested degraded
+    /// every real root that had ever carried peer-call traffic — a root whose
+    /// history the agent then refused to claim, on the strength of rows it had
+    /// asked for itself.
+    ///
+    /// A request list and an admission list are the same fact stated twice, and
+    /// the failure mode of stating it twice is not a rejected row: it is a
+    /// *silently narrower* history when the drift runs the other way. So the
+    /// request is the one statement, and admission reads it.
     fn admits(self, kind: u32) -> bool {
-        match self {
-            HistoryStream::Comments => matches!(
-                kind,
-                KIND_TEXT_NOTE
-                    | KIND_GIT_STATUS_OPEN
-                    | KIND_GIT_STATUS_MERGED
-                    | KIND_GIT_STATUS_CLOSED
-                    | KIND_GIT_STATUS_DRAFT
-            ),
-            HistoryStream::PullRequestUpdates => kind == KIND_GIT_PR_UPDATE,
-        }
+        self.kinds().contains(&kind)
     }
 }
 
