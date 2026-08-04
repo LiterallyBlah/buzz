@@ -1,6 +1,7 @@
 import { Activity, Bot, FolderGit2, Inbox, Zap } from "lucide-react";
 
 import { TopbarSearch } from "@/features/search/ui/TopbarSearch";
+import { ProjectsUnreadBadge } from "@/features/sidebar/ui/ProjectsUnreadBadge";
 import { FeatureGate } from "@/shared/features";
 import type { Channel, SearchHit } from "@/shared/api/types";
 import {
@@ -141,6 +142,7 @@ export function AppSidebarPrimaryMenu({
               <FolderGit2 className="h-4 w-4" />
               <SidebarMenuLabel>Projects</SidebarMenuLabel>
             </SidebarMenuButton>
+            <ProjectsUnreadBadge />
           </SidebarMenuItem>
         </FeatureGate>
         <SidebarMenuItem>

@@ -122,7 +122,19 @@ function sanitizeNotificationSettings(value: unknown): NotificationSettings {
   };
 }
 
-function readStoredNotificationSettings(pubkey: string): NotificationSettings {
+/**
+ * Synchronous read of the persisted settings.
+ *
+ * Exported for notification producers that live outside the AppShell tree and
+ * therefore cannot receive `useNotificationSettings`'s state as a prop. Reading
+ * at delivery time (rather than mounting a second `useNotificationSettings`)
+ * is deliberate: a second instance would snapshot the settings at mount and
+ * keep alerting after the user switched them off in Settings, because that
+ * hook's state is local and has no cross-instance sync.
+ */
+export function readStoredNotificationSettings(
+  pubkey: string,
+): NotificationSettings {
   if (typeof window === "undefined" || pubkey.length === 0) {
     return DEFAULT_NOTIFICATION_SETTINGS;
   }

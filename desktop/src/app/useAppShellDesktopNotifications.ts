@@ -4,6 +4,7 @@ import {
   shouldBounceForChannelNotification,
   toSearchHit,
 } from "@/app/AppShell.helpers";
+import { useAppNavigation } from "@/app/navigation/useAppNavigation";
 import { getThreadReference } from "@/features/messages/lib/threading";
 import { hasMentionForEvent } from "@/features/notifications/lib/shouldNotify";
 import type { NotificationSettings } from "@/features/notifications/hooks";
@@ -42,6 +43,12 @@ export function useAppShellDesktopNotifications({
   ) => Promise<unknown>;
   pubkey?: string;
 }) {
+  // Project routing is resolved here rather than passed in like goChannel /
+  // goHome: `useAppNavigation` is a side-effect-free wrapper over the router's
+  // own hooks (safe to call from more than one place in the tree), and AppShell
+  // is at the repo's 1000-line file ceiling, so it cannot grow another prop.
+  const { goProject } = useAppNavigation();
+
   const handleChannelNotification = React.useEffectEvent(
     (_channelId: string, event: RelayEvent) => {
       if (!enabled) return;
@@ -139,6 +146,14 @@ export function useAppShellDesktopNotifications({
       target: import("@/features/notifications/lib/desktop").DesktopNotificationTarget,
     ) => {
       await revealDesktopAppWindow();
+
+      // Project work-item alerts have no channel. Route them before the
+      // channel branches, or they fall through to Home — the one place the
+      // work item definitively is not.
+      if (target.projectId) {
+        await goProject(target.projectId);
+        return;
+      }
 
       if (!target.channelId) {
         void goHome();

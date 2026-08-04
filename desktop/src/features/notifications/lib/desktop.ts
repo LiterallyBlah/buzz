@@ -30,6 +30,17 @@ export type DesktopNotificationTarget = {
   kind: number | null;
   pubkey?: string;
   threadRootId?: string | null;
+  /**
+   * Set for project work-item alerts, which have no channel to route to.
+   * The action handler navigates to the project screen when present; without
+   * it a project notification would fall through to the "no channel" branch
+   * and dump the user on the Inbox.
+   *
+   * The Tauri side treats the whole target as an opaque `serde_json::Value`
+   * (see `src-tauri/src/commands/notifications.rs`), so extending this shape
+   * does not require a backend change.
+   */
+  projectId?: string | null;
 };
 
 type DesktopNotificationPayload = {
@@ -88,6 +99,8 @@ function parseNotificationTarget(
     typeof candidate.pubkey === "string" ? candidate.pubkey : undefined;
   const threadRootId =
     typeof candidate.threadRootId === "string" ? candidate.threadRootId : null;
+  const projectId =
+    typeof candidate.projectId === "string" ? candidate.projectId : null;
 
   if (!channelId && !eventId) {
     return null;
@@ -102,6 +115,7 @@ function parseNotificationTarget(
     kind,
     pubkey,
     threadRootId,
+    projectId,
   };
 }
 
