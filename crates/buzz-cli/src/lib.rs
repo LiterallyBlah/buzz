@@ -552,6 +552,83 @@ buzz projects history --root <EVENT_ID> --root <OTHER_EVENT_ID> --limit 50")]
         #[arg(long, conflicts_with = "comments_only")]
         revisions_only: bool,
     },
+    /// Verify that the owner approved this exact pull-request revision
+    #[command(
+        name = "release-check",
+        after_help = "The self-hosted mirror of \
+scripts/verify-desktop-release-authorization.sh. That script gates a release on \
+a GitHub approval whose commit_id is the exact head SHA, by a privileged role, \
+on a pull request whose overall review decision is APPROVED. This asks the same \
+question of Buzz's own projects grammar and answers it from events it verifies \
+itself — the relay is a transport here, never an authority.\n\n\
+WHAT IS CHECKED\n  \
+1. The root (kind 1618) exists at --root; its id and signature verify.\n  \
+2. With --repo, the root's `a` tag names that repository.\n  \
+3. --revision is a trusted revision of --root: a kind 1619 whose first `E` tag \
+is the root, signed by the root author or the repo owner named in the root's \
+`a` coordinate (the Desktop's trustedUpdateEvents rule). --revision may also be \
+the root id itself, meaning the pull request's initial revision.\n  \
+4. --owner is a reviewer the Desktop would trust (repo owner, a root `p` \
+recipient, or named by a trusted review-request) and is not the root author — \
+nobody reviews their own pull request.\n  \
+5. The owner's latest decision bound to that revision's commit is an approval, \
+and no owner changes-request on this pull request is newer than it.\n\n\
+Review decisions are kind:1 comments labeled `t:approval` or \
+`t:changes-requested` and bound to a commit by their `c` tag (defaulting to the \
+root's initial commit). Every event the verdict rests on has its id and \
+signature verified locally before it is counted.\n\n\
+OUTPUT (stable; a deployer parses this)\n  \
+One JSON object on stdout with exactly these keys:\n    \
+{\"authorized\": bool, \"reason\": string, \"root\": hex, \"revision\": hex, \
+\"owner\": hex, \"commit\": string|null, \"decided_at\": int|null}\n  \
+`commit` is the revision's tip commit once the revision is established, else \
+null. `decided_at` is the created_at of the decision responsible for the \
+verdict, else null.\n\n\
+REASONS (the full set; each verdict names exactly one)\n  \
+approved                       authorized\n  \
+root-not-found                 no kind 1618 at --root\n  \
+signature-invalid              an event the verdict rests on failed id or \
+BIP-340 verification\n  \
+repo-mismatch                  the root does not belong to --repo\n  \
+revision-not-found             no kind 1619 at --revision\n  \
+untrusted-revision             the revision does not name this root with `E`, \
+or is not signed by the root author or repo owner\n  \
+revision-has-no-commit         the revision carries no `c` tag\n  \
+owner-is-pull-request-author   the owner opened this pull request\n  \
+owner-not-a-trusted-reviewer   the owner's decisions are not trusted on this \
+root\n  \
+no-approval                    the owner has approved no revision of this root\n  \
+approval-on-other-revision     the owner's approval names a different commit\n  \
+superseded-by-changes-request  the owner requested changes after approving\n  \
+decision-history-truncated     the comment page hit the limit, so the newest \
+decision may be missing\n\n\
+EXIT CODES\n  \
+0  authorized — and only then.\n  \
+1  a verdict of not-authorized (the JSON verdict is on stdout), or bad \
+arguments (no JSON on stdout).\n  \
+2/3/4  the question could not be asked: network, relay or auth failure. No \
+verdict is printed. \"Could not determine\" is not \"unauthorized\" and must not \
+be treated as either a pass or a durable failure.\n\n\
+Examples:\n  \
+buzz projects release-check --root <ROOT_ID> --revision <REVISION_ID> --owner <OWNER_PUBKEY>\n  \
+buzz projects release-check --root <ROOT_ID> --revision <ROOT_ID> --owner <OWNER_PUBKEY> \
+--repo 30617:<OWNER>:buzz"
+    )]
+    ReleaseCheck {
+        /// Pull-request root event id (kind 1618, 64-char hex)
+        #[arg(long)]
+        root: String,
+        /// Revision event id (kind 1619, 64-char hex); the root id names the
+        /// pull request's initial revision
+        #[arg(long)]
+        revision: String,
+        /// The pubkey whose approval authorizes a release (64-char hex)
+        #[arg(long)]
+        owner: String,
+        /// Require the root to belong to this repository (30617:<owner>:<identifier>)
+        #[arg(long)]
+        repo: Option<String>,
+    },
     /// Create a new multi-repo project (NIP-MP kind:30621)
     ///
     /// Requires at least one --repo. Fails with Conflict if the project already exists.
@@ -2507,13 +2584,22 @@ mod tests {
         );
         assert_eq!(
             names(&cmd, "projects"),
+            // Both families, in one list: the reads the project-routed agent
+            // runtime needs (`addressed`, `history`, `root`, `roots`), the
+            // NIP-MP kind:30621 writes, and the release-authorization verifier
+            // a deployer gates on (`release-check`).
             vec![
                 "add-repo",
+                "addressed",
                 "create",
                 "delete",
                 "get",
+                "history",
                 "list",
+                "release-check",
                 "remove-repo",
+                "root",
+                "roots",
                 "update"
             ]
         );
@@ -2640,7 +2726,7 @@ mod tests {
             ("pack", 2),
             ("patches", 4),
             ("pr", 6),
-            ("projects", 11),
+            ("projects", 12),
             ("reactions", 3),
             ("repos", 5),
             ("social", 7),

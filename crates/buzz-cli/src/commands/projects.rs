@@ -93,16 +93,21 @@ fn bounded_limit(limit: Option<u32>) -> Result<u32, CliError> {
 ///
 /// Lowercased owner, because `#a` matching is exact and two spellings of one
 /// repository are two filters that each miss half the events.
-fn canonical_coordinate(raw: &str) -> Result<String, CliError> {
+///
+/// `flag` names the argument being refused. It is a parameter because the same
+/// grammar is spelled `--project` by the read family and `--repo` by
+/// `release-check`, and a usage error that names a flag the caller did not type
+/// sends them looking for a bug in the wrong argument.
+fn canonical_coordinate_for(raw: &str, flag: &str) -> Result<String, CliError> {
     let parts: Vec<&str> = raw.split(':').collect();
     let [kind, owner, id] = parts[..] else {
         return Err(CliError::Usage(format!(
-            "--project must be 30617:<owner>:<identifier> (got {raw:?})"
+            "{flag} must be 30617:<owner>:<identifier> (got {raw:?})"
         )));
     };
     if kind.parse::<u32>().ok() != Some(KIND_GIT_REPO_ANNOUNCEMENT) {
         return Err(CliError::Usage(format!(
-            "--project must start with {KIND_GIT_REPO_ANNOUNCEMENT}: (got {raw:?})"
+            "{flag} must start with {KIND_GIT_REPO_ANNOUNCEMENT}: (got {raw:?})"
         )));
     }
     validate_hex64(owner)?;
@@ -111,6 +116,11 @@ fn canonical_coordinate(raw: &str) -> Result<String, CliError> {
         "{KIND_GIT_REPO_ANNOUNCEMENT}:{}:{id}",
         owner.to_ascii_lowercase()
     ))
+}
+
+/// The read family's spelling: its coordinate argument is `--project`.
+fn canonical_coordinate(raw: &str) -> Result<String, CliError> {
+    canonical_coordinate_for(raw, "--project")
 }
 
 fn canonical_roots(roots: &[String]) -> Result<Vec<String>, CliError> {
@@ -244,6 +254,558 @@ pub async fn cmd_history(
     };
     println!("{resp}");
     Ok(())
+}
+
+// ── `buzz projects release-check` — release authorization ────────────────────
+//
+// The self-hosted mirror of `scripts/verify-desktop-release-authorization.sh`.
+// That script asks GitHub one question — does an approving review by a
+// privileged role exist whose `commit_id` is the exact head SHA — and refuses
+// the deployment otherwise. This command asks the same question of Buzz's own
+// projects grammar, over events it verifies itself.
+//
+// The mapping, term by term:
+//
+//   GitHub                          Buzz
+//   ------------------------------  ------------------------------------------
+//   pull request                    kind:1618 root event (`--root`)
+//   head SHA                        the `c` tag of a trusted kind:1619 revision
+//                                   (`--revision` names the revision event)
+//   review with state APPROVED      kind:1 comment labeled `t:approval`
+//   review with REQUEST_CHANGES     kind:1 comment labeled `t:changes-requested`
+//   review.commit_id == head SHA    decision `c` tag == the revision's commit
+//   author_association OWNER/…      the configured `--owner` pubkey
+//   reviewDecision == APPROVED      no owner changes-request newer than the
+//                                   approval
+//
+// The reader rules are not invented here: they are the ones
+// `desktop/src/features/projects/projectPullRequests.mjs` applies when it
+// decides what to show a human as an approval. A verifier that authorized a
+// deployment the Desktop shows as unapproved — or refused one it shows as
+// approved — would make the UI a lie about what is enforced, so every trust
+// rule below cites the function it mirrors.
+
+/// The reason strings this command can print, spelled exactly once each.
+///
+/// A deployer branches on these. They are part of the command's contract in
+/// the same way the exit code is: renaming one is a breaking change, and a
+/// second spelling of the same reason somewhere in this file is how a deployer
+/// ends up with an `else` branch that silently treats an unknown refusal as a
+/// transient error.
+const REASON_APPROVED: &str = "approved";
+const REASON_ROOT_NOT_FOUND: &str = "root-not-found";
+const REASON_SIGNATURE_INVALID: &str = "signature-invalid";
+const REASON_REPO_MISMATCH: &str = "repo-mismatch";
+const REASON_REVISION_NOT_FOUND: &str = "revision-not-found";
+const REASON_UNTRUSTED_REVISION: &str = "untrusted-revision";
+const REASON_REVISION_HAS_NO_COMMIT: &str = "revision-has-no-commit";
+const REASON_OWNER_IS_AUTHOR: &str = "owner-is-pull-request-author";
+const REASON_OWNER_NOT_TRUSTED: &str = "owner-not-a-trusted-reviewer";
+const REASON_NO_APPROVAL: &str = "no-approval";
+const REASON_APPROVAL_ON_OTHER_REVISION: &str = "approval-on-other-revision";
+const REASON_SUPERSEDED: &str = "superseded-by-changes-request";
+const REASON_DECISIONS_TRUNCATED: &str = "decision-history-truncated";
+
+/// The `t` labels a review decision rides on.
+///
+/// NIP-34 has no review kinds, so the Desktop publishes decisions as labeled
+/// kind:1 comments (`projectPullRequests.mjs`, `PR_APPROVAL_LABEL` /
+/// `PR_CHANGES_REQUESTED_LABEL`; written by `pullRequestReviews.ts`,
+/// `submitProjectPullRequestReview`). These three strings are the wire.
+const LABEL_APPROVAL: &str = "approval";
+const LABEL_CHANGES_REQUESTED: &str = "changes-requested";
+const LABEL_REVIEW_REQUEST: &str = "review-request";
+
+/// Bound on the decision history this command will consider.
+///
+/// Reused from the read family's ceiling rather than invented: the same "a
+/// bound, or a refusal" rule applies, and here the refusal matters more than
+/// anywhere else in the file — a page that ended at the limit may be hiding
+/// the owner's newest changes-request, and an authorization answer computed
+/// from a truncated history is a guess wearing a verdict's clothes.
+const RELEASE_DECISION_LIMIT: u32 = MAX_LIMIT;
+
+/// What this command answers, before it is rendered as JSON.
+struct ReleaseVerdict {
+    authorized: bool,
+    reason: &'static str,
+    /// `created_at` of the decision that produced this verdict, when one did.
+    decided_at: Option<u64>,
+    /// The commit the named revision points at, once it is known to be a
+    /// trusted revision of the root.
+    commit: Option<String>,
+}
+
+impl ReleaseVerdict {
+    fn refused(reason: &'static str) -> Self {
+        Self {
+            authorized: false,
+            reason,
+            decided_at: None,
+            commit: None,
+        }
+    }
+
+    /// A refusal that a specific owner decision is responsible for.
+    fn refused_at(reason: &'static str, decided_at: u64, commit: &str) -> Self {
+        Self {
+            authorized: false,
+            reason,
+            decided_at: Some(decided_at),
+            commit: Some(commit.to_string()),
+        }
+    }
+
+    fn authorized(decided_at: u64, commit: &str) -> Self {
+        Self {
+            authorized: true,
+            reason: REASON_APPROVED,
+            decided_at: Some(decided_at),
+            commit: Some(commit.to_string()),
+        }
+    }
+
+    /// Carry the resolved commit onto a refusal that was decided after the
+    /// revision was established, so the caller can see *which* artifact was
+    /// refused rather than only that something was.
+    fn with_commit(mut self, commit: &str) -> Self {
+        if self.commit.is_none() {
+            self.commit = Some(commit.to_string());
+        }
+        self
+    }
+}
+
+/// The value of the *first* tag with this name, when that value is non-empty —
+/// the Rust spelling of `getTag`
+/// (`desktop/src/features/projects/projectIssues.mjs`).
+///
+/// Both halves are load-bearing, and both are places a looser reading would be
+/// more permissive than the client:
+///
+/// - "first tag wins": `trustedUpdateEvents` compares `getTag(event, "E")` to
+///   the root id, so a revision carrying a second `E` tag naming this root is
+///   still a revision of whichever root it named first.
+/// - "and then it is empty or it is nothing": an empty first value yields
+///   `None` rather than falling through to a later tag of the same name.
+///
+/// Search all matching tags instead and a `[["E",""],["E",<root>]]` revision
+/// becomes a revision of this root here while the Desktop reads it as a
+/// revision of nothing.
+fn first_tag<'a>(event: &'a Event, name: &str) -> Option<&'a str> {
+    let tag = event.tags.iter().find(|t| tag_name(t) == Some(name))?;
+    tag_value(tag).filter(|v| !v.is_empty())
+}
+
+/// Every non-empty value of a named tag — the Rust spelling of `getAllTags`.
+fn all_tags<'a>(event: &'a Event, name: &str) -> Vec<&'a str> {
+    event
+        .tags
+        .iter()
+        .filter(|t| tag_name(t) == Some(name))
+        .filter_map(|t| tag_value(t).filter(|v| !v.is_empty()))
+        .collect()
+}
+
+/// Does this event address `root`? Mirrors `referencesProjectRoot` with
+/// `allowUppercase = true`: comments name their root with a lowercase `e`, but
+/// third-party clients have shipped the uppercase spelling, and the Desktop
+/// accepts either for comments. Accepting only `e` here would ignore an
+/// owner's changes-request that the Desktop counts — a strictly more
+/// permissive verdict than the client's.
+fn references_root(event: &Event, root: &str) -> bool {
+    event
+        .tags
+        .iter()
+        .any(|t| matches!(tag_name(t), Some("e") | Some("E")) && tag_value(t) == Some(root))
+}
+
+/// The repo owner named by a `30617:<owner>:<id>` coordinate.
+///
+/// Mirrors `repoOwnerFromAddress`: split on `:`, take the second field, accept
+/// it only as 64 hex characters. Deliberately does not require the `30617`
+/// prefix — the Desktop does not, and a stricter rule here would drop an actor
+/// the client trusts.
+fn repo_owner_from_address(address: Option<&str>) -> Option<String> {
+    let owner = address?.split(':').nth(1)?;
+    if owner.len() == 64 && owner.chars().all(|c| c.is_ascii_hexdigit()) {
+        Some(owner.to_ascii_lowercase())
+    } else {
+        None
+    }
+}
+
+/// Pubkeys allowed to change a root's lifecycle: the root author and the owner
+/// of the repo the root targets (`allowedActorsForProjectRoot`). This is the
+/// set that may publish revisions — an arbitrary relay user must not be able to
+/// re-point a pull request at their own commit.
+fn allowed_actors(root: &Event) -> std::collections::HashSet<String> {
+    let mut actors = std::collections::HashSet::new();
+    actors.insert(root.pubkey.to_hex().to_ascii_lowercase());
+    if let Some(owner) = repo_owner_from_address(first_tag(root, "a")) {
+        actors.insert(owner);
+    }
+    actors
+}
+
+/// An owner review decision, reduced to the four facts the verdict rests on.
+struct OwnerDecision {
+    id: String,
+    created_at: u64,
+    /// The commit this decision speaks about: the decision's own `c` tag, or
+    /// the root's initial commit when it carries none (`reviewDecisionCommit`).
+    commit: String,
+    approved: bool,
+}
+
+impl OwnerDecision {
+    /// The Desktop's per-author "latest wins" order: newer `created_at` wins,
+    /// and a tie is broken by the greater event id
+    /// (`reviewDecisionsForPullRequest`). The id tiebreak is not decoration —
+    /// the write path deliberately publishes consecutive decisions one second
+    /// apart (`nextProjectPullRequestReviewCreatedAt`) precisely because
+    /// whole-second Nostr timestamps collide, and without the same tiebreak a
+    /// verifier and the UI would disagree about which of two same-second
+    /// decisions is current.
+    fn order(&self) -> (u64, &str) {
+        (self.created_at, self.id.as_str())
+    }
+}
+
+/// The decision a labeled comment carries, or `None` when it carries none.
+///
+/// Mirrors `eventToPullRequestComment`: a comment labeled *both* `approval`
+/// and `changes-requested` is not a decision at all. That is not a quirk to
+/// tidy up — it is what stops an approval from being smuggled in under a
+/// second label that a reader ignores.
+fn comment_decision(event: &Event) -> Option<bool> {
+    let labels: Vec<String> = all_tags(event, "t")
+        .iter()
+        .map(|l| l.to_ascii_lowercase())
+        .collect();
+    let approval = labels.iter().any(|l| l == LABEL_APPROVAL);
+    let changes = labels.iter().any(|l| l == LABEL_CHANGES_REQUESTED);
+    if approval == changes {
+        None
+    } else {
+        Some(approval)
+    }
+}
+
+fn is_review_request(event: &Event) -> bool {
+    all_tags(event, "t")
+        .iter()
+        .any(|l| l.eq_ignore_ascii_case(LABEL_REVIEW_REQUEST))
+}
+
+/// Fetch one event by exact id and kind, verifying it locally.
+///
+/// The id filter is not trust: a relay can answer an `ids` query with anything.
+/// So the returned rows are re-selected by id *and* kind here, and every
+/// surviving candidate must pass `Event::verify` (id recomputation plus
+/// BIP-340) before it is looked at. Two verified events cannot share an id —
+/// the id *is* the hash — so the first survivor is the only one.
+async fn fetch_verified_by_id(
+    client: &BuzzClient,
+    id: &str,
+    kind: u32,
+) -> Result<Result<Option<Event>, &'static str>, CliError> {
+    let raw = client
+        .query(&json!({
+            "ids": [id],
+            "kinds": [kind],
+            // Two, for the same reason `projects root` asks for two: a caller
+            // that receives one row cannot tell a unique answer from the first
+            // of several conflicting ones.
+            "limit": 2,
+        }))
+        .await?;
+    let candidates: Vec<Event> = parse_events(&raw)?
+        .into_iter()
+        .filter(|e| e.id.to_hex() == id && e.kind.as_u16() as u32 == kind)
+        .collect();
+    if candidates.is_empty() {
+        return Ok(Ok(None));
+    }
+    for candidate in &candidates {
+        if candidate.verify().is_err() {
+            return Ok(Err(REASON_SIGNATURE_INVALID));
+        }
+    }
+    Ok(Ok(candidates.into_iter().next()))
+}
+
+/// `buzz projects release-check` — is this exact revision authorized to ship?
+///
+/// Prints the verdict as JSON on stdout in every case it reached a verdict, and
+/// exits non-zero unless the verdict is `authorized`. Operational failures
+/// (network, relay, malformed arguments) print no verdict: "could not
+/// determine" and "determined to be unauthorized" are different facts, and a
+/// deployer that treated a missing answer as a `false` would deploy on the day
+/// the relay was unreachable — so the absence of stdout JSON is itself part of
+/// the contract.
+pub async fn cmd_release_check(
+    client: &BuzzClient,
+    root: &str,
+    revision: &str,
+    owner: &str,
+    repo: Option<&str>,
+) -> Result<(), CliError> {
+    validate_hex64(root)?;
+    validate_hex64(revision)?;
+    validate_hex64(owner)?;
+    let root = root.to_ascii_lowercase();
+    let revision = revision.to_ascii_lowercase();
+    let owner = owner.to_ascii_lowercase();
+    let repo = repo
+        .map(|raw| canonical_coordinate_for(raw, "--repo"))
+        .transpose()?;
+
+    let verdict = evaluate_release(client, &root, &revision, &owner, repo.as_deref()).await?;
+
+    println!(
+        "{}",
+        json!({
+            "authorized": verdict.authorized,
+            "reason": verdict.reason,
+            "root": root,
+            "revision": revision,
+            "owner": owner,
+            "commit": verdict.commit,
+            "decided_at": verdict.decided_at,
+        })
+    );
+    if verdict.authorized {
+        Ok(())
+    } else {
+        // The verdict is already on stdout; this carries the same reason to the
+        // exit code and the stderr error envelope, so a caller that only checks
+        // `$?` is never told "ok" about a refusal.
+        Err(CliError::NotFound(format!(
+            "release not authorized: {}",
+            verdict.reason
+        )))
+    }
+}
+
+/// The verifier proper. Returns a verdict for every answerable question and a
+/// `CliError` only when the question could not be asked.
+async fn evaluate_release(
+    client: &BuzzClient,
+    root: &str,
+    revision: &str,
+    owner: &str,
+    repo: Option<&str>,
+) -> Result<ReleaseVerdict, CliError> {
+    // ── 1. The root, verified ────────────────────────────────────────────────
+    let root_event = match fetch_verified_by_id(client, root, KIND_GIT_PULL_REQUEST).await? {
+        Err(reason) => return Ok(ReleaseVerdict::refused(reason)),
+        Ok(None) => return Ok(ReleaseVerdict::refused(REASON_ROOT_NOT_FOUND)),
+        Ok(Some(event)) => event,
+    };
+
+    // ── 2. The repository, when the caller pinned one ────────────────────────
+    //
+    // Optional, and worth having: without it, an approval on a root in *any*
+    // repository authorizes this deployment as long as the ids line up. With
+    // it, the caller states which repository a release of theirs can come from.
+    if let Some(expected) = repo {
+        let actual =
+            first_tag(&root_event, "a").and_then(|a| canonical_coordinate_for(a, "--repo").ok());
+        if actual.as_deref() != Some(expected) {
+            return Ok(ReleaseVerdict::refused(REASON_REPO_MISMATCH));
+        }
+    }
+
+    let actors = allowed_actors(&root_event);
+    let root_author = root_event.pubkey.to_hex().to_ascii_lowercase();
+    let initial_commit = first_tag(&root_event, "c").map(str::to_string);
+
+    // ── 3. The revision, verified and linked to the root ─────────────────────
+    //
+    // `--revision <root id>` names the pull request's initial revision: the
+    // root carries the first tip commit in its own `c` tag, and the Desktop
+    // reads it from there (`initialCommit`). Spelling that case out is what
+    // keeps a release cut before the first `1619` from being unverifiable.
+    let commit = if revision == root {
+        match initial_commit.clone() {
+            Some(commit) => commit,
+            None => return Ok(ReleaseVerdict::refused(REASON_REVISION_HAS_NO_COMMIT)),
+        }
+    } else {
+        let event = match fetch_verified_by_id(client, revision, KIND_GIT_PR_UPDATE).await? {
+            Err(reason) => return Ok(ReleaseVerdict::refused(reason)),
+            Ok(None) => return Ok(ReleaseVerdict::refused(REASON_REVISION_NOT_FOUND)),
+            Ok(Some(event)) => event,
+        };
+        // `trustedUpdateEvents`: signed by an allowed actor *and* addressing
+        // this root with the uppercase `E`. Both halves are checked here rather
+        // than left to the relay's `#E` index, because the index is the relay's
+        // claim about the event and the tag is the signer's.
+        if first_tag(&event, "E") != Some(root) {
+            return Ok(ReleaseVerdict::refused(REASON_UNTRUSTED_REVISION));
+        }
+        if !actors.contains(&event.pubkey.to_hex().to_ascii_lowercase()) {
+            return Ok(ReleaseVerdict::refused(REASON_UNTRUSTED_REVISION));
+        }
+        match first_tag(&event, "c") {
+            Some(commit) => commit.to_string(),
+            None => return Ok(ReleaseVerdict::refused(REASON_REVISION_HAS_NO_COMMIT)),
+        }
+    };
+
+    // ── 4. The comment stream this root's reviews live on ────────────────────
+    let raw = client
+        .query(&json!({
+            "kinds": [KIND_TEXT_NOTE],
+            "#e": [root],
+            "limit": RELEASE_DECISION_LIMIT,
+        }))
+        .await?;
+    let comments = parse_events(&raw)?;
+    if comments.len() as u32 >= RELEASE_DECISION_LIMIT {
+        // A full page is an unfinished answer. Refusing beats paginating into a
+        // verdict here: the thing a truncated page most easily hides is the
+        // newest event, which is exactly the changes-request that would have
+        // invalidated the approval.
+        return Ok(ReleaseVerdict::refused(REASON_DECISIONS_TRUNCATED).with_commit(&commit));
+    }
+    let comments: Vec<&Event> = comments
+        .iter()
+        .filter(|e| e.kind.as_u16() as u32 == KIND_TEXT_NOTE && references_root(e, root))
+        .collect();
+
+    // ── 5. Is the configured owner a reviewer the Desktop would trust? ───────
+    //
+    // `--owner` supplies the privilege (GitHub's MEMBER/OWNER/COLLABORATOR),
+    // but it cannot manufacture it: `trustedReviewActors` is what decides whose
+    // decision counts, and a pubkey outside that set has decisions the Desktop
+    // discards. Authorizing on a decision the client shows as untrusted would
+    // make this verifier the weaker of the two readers.
+    if owner == root_author {
+        // `reviewersForPullRequest` deletes the author, and
+        // `trustedReviewActors` re-adds every allowed actor *except* the
+        // author. An author cannot review their own pull request, so an owner
+        // who opened it cannot self-authorize a release of it.
+        return Ok(ReleaseVerdict::refused(REASON_OWNER_IS_AUTHOR).with_commit(&commit));
+    }
+    let owner_is_recipient = all_tags(&root_event, "p")
+        .iter()
+        .any(|p| p.eq_ignore_ascii_case(owner));
+    // Only the review requests that could make *this* owner a reviewer are
+    // load-bearing, so only those are verified. Verifying every comment on the
+    // root would let one unrelated malformed note refuse a release.
+    let mut owner_review_requested = false;
+    for comment in &comments {
+        if !is_review_request(comment)
+            || !actors.contains(&comment.pubkey.to_hex().to_ascii_lowercase())
+            || !all_tags(comment, "p")
+                .iter()
+                .any(|p| p.eq_ignore_ascii_case(owner))
+        {
+            continue;
+        }
+        if comment.verify().is_err() {
+            return Ok(ReleaseVerdict::refused(REASON_SIGNATURE_INVALID).with_commit(&commit));
+        }
+        owner_review_requested = true;
+    }
+    if !actors.contains(owner) && !owner_is_recipient && !owner_review_requested {
+        return Ok(ReleaseVerdict::refused(REASON_OWNER_NOT_TRUSTED).with_commit(&commit));
+    }
+
+    // ── 6. The owner's decisions, verified ───────────────────────────────────
+    let mut decisions: Vec<OwnerDecision> = Vec::new();
+    for comment in &comments {
+        if comment.pubkey.to_hex().to_ascii_lowercase() != owner {
+            continue;
+        }
+        let Some(approved) = comment_decision(comment) else {
+            continue;
+        };
+        // Every event the verdict rests on is verified before it is counted —
+        // an approval the relay invented, or one whose content was edited after
+        // signing, must not be the thing that ships a release.
+        if comment.verify().is_err() {
+            return Ok(ReleaseVerdict::refused(REASON_SIGNATURE_INVALID).with_commit(&commit));
+        }
+        // `reviewDecisionCommit`: the decision's own `c` tag, falling back to
+        // the root's initial commit. A decision that resolves to no commit at
+        // all speaks about nothing, and the Desktop drops it.
+        let Some(decision_commit) = first_tag(comment, "c")
+            .map(str::to_string)
+            .or_else(|| initial_commit.clone())
+        else {
+            continue;
+        };
+        decisions.push(OwnerDecision {
+            id: comment.id.to_hex(),
+            created_at: comment.created_at.as_secs(),
+            commit: decision_commit,
+            approved,
+        });
+    }
+
+    // ── 7. The verdict ───────────────────────────────────────────────────────
+    //
+    // Commit strings are compared byte-for-byte, as the Desktop compares them.
+    // A case-insensitive comparison would accept decisions the client treats as
+    // being about a different commit.
+    let latest_on_revision = decisions
+        .iter()
+        .filter(|d| d.commit == commit)
+        .max_by_key(|d| d.order());
+    let approval = match latest_on_revision {
+        None => {
+            // Nothing on this revision. Saying *why* is the difference between
+            // a release that was never reviewed and one whose approval names
+            // the previous revision — the second is a rebase away from being
+            // authorized, the first is not.
+            return Ok(
+                match decisions
+                    .iter()
+                    .filter(|d| d.approved)
+                    .max_by_key(|d| d.order())
+                {
+                    Some(elsewhere) => ReleaseVerdict::refused_at(
+                        REASON_APPROVAL_ON_OTHER_REVISION,
+                        elsewhere.created_at,
+                        &commit,
+                    ),
+                    None => ReleaseVerdict::refused(REASON_NO_APPROVAL).with_commit(&commit),
+                },
+            );
+        }
+        Some(decision) if !decision.approved => {
+            return Ok(ReleaseVerdict::refused_at(
+                REASON_SUPERSEDED,
+                decision.created_at,
+                &commit,
+            ))
+        }
+        Some(decision) => decision,
+    };
+
+    // The overall-decision half of the GitHub gate (`reviewDecision ==
+    // APPROVED`, not merely "an approving review exists"). Within one commit
+    // the Desktop already supersedes per author; across revisions it re-dates
+    // every decision against the new tip, so an owner who has since asked for
+    // changes anywhere on this pull request has withdrawn the approval in
+    // substance. A verifier that only looked at the target revision would keep
+    // authorizing a release the owner has visibly moved on from.
+    if let Some(newer) = decisions
+        .iter()
+        .filter(|d| !d.approved && d.order() > approval.order())
+        .max_by_key(|d| d.order())
+    {
+        return Ok(ReleaseVerdict::refused_at(
+            REASON_SUPERSEDED,
+            newer.created_at,
+            &commit,
+        ));
+    }
+
+    Ok(ReleaseVerdict::authorized(approval.created_at, &commit))
 }
 
 // ── Buzz repo-ID grammar (bare --repo shorthand) ─────────────────────────────
@@ -802,6 +1364,12 @@ pub async fn dispatch(command: ProjectsCmd, client: &BuzzClient) -> Result<(), C
             comments_only,
             revisions_only,
         } => cmd_history(client, &roots, limit, until, comments_only, revisions_only).await,
+        ProjectsCmd::ReleaseCheck {
+            root,
+            revision,
+            owner,
+            repo,
+        } => cmd_release_check(client, &root, &revision, &owner, repo.as_deref()).await,
 
         // ── Writes: the NIP-MP kind:30621 path ───────────────────────────────
         ProjectsCmd::Create {
@@ -1172,6 +1740,857 @@ mod filter_tests {
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
+
+/// The release-authorization verdict, proved against a relay that answers every
+/// query with the whole fixture set.
+///
+/// That relay is deliberately dishonest in the one way a relay can be: it
+/// ignores the filter and returns everything. A verifier that trusted `ids`,
+/// `kinds` or `#e` to have been applied would read a comment as a root, or a
+/// stranger's revision as this pull request's — so every test below is also a
+/// test that the selection happens locally.
+#[cfg(test)]
+mod release_check_tests {
+    use std::net::SocketAddr;
+    use std::sync::{Arc, Mutex};
+
+    use axum::extract::State;
+    use axum::routing::post;
+    use axum::{Json, Router};
+    use nostr::{Event, Keys, Kind};
+    use serde_json::Value;
+    use tokio::net::TcpListener;
+
+    use super::*;
+
+    /// Two 40-hex git commits: the initial tip and the revision's tip.
+    const COMMIT_INITIAL: &str = "1111111111111111111111111111111111111111";
+    const COMMIT_REVISED: &str = "2222222222222222222222222222222222222222";
+    const OTHER_ROOT: &str = "9999999999999999999999999999999999999999999999999999999999999999";
+
+    #[derive(Clone)]
+    struct Fixtures {
+        asked: Arc<Mutex<Vec<Value>>>,
+        events: Arc<Vec<Event>>,
+    }
+
+    /// A relay that records the filters it was asked and answers each of them
+    /// with every fixture event it holds.
+    async fn fixture_relay(events: Vec<Event>) -> (String, Arc<Mutex<Vec<Value>>>) {
+        let asked = Arc::new(Mutex::new(Vec::new()));
+        let state = Fixtures {
+            asked: asked.clone(),
+            events: Arc::new(events),
+        };
+        let app = Router::new()
+            .route(
+                "/query",
+                post(|State(s): State<Fixtures>, body: String| async move {
+                    if let Ok(filters) = serde_json::from_str::<Vec<Value>>(&body) {
+                        s.asked.lock().expect("lock").extend(filters);
+                    }
+                    Json(serde_json::to_value(&*s.events).expect("serialize fixtures"))
+                }),
+            )
+            .with_state(state);
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr: SocketAddr = listener.local_addr().expect("addr");
+        tokio::spawn(async move { axum::serve(listener, app).await.expect("serve") });
+        (format!("http://{addr}"), asked)
+    }
+
+    fn client_for(url: String) -> BuzzClient {
+        BuzzClient::new(url, Keys::generate(), None, None).expect("client")
+    }
+
+    fn signed(keys: &Keys, kind: u32, created_at: u64, tags: &[&[&str]], content: &str) -> Event {
+        let tags: Vec<Tag> = tags
+            .iter()
+            .map(|parts| Tag::parse(parts.iter().copied()).expect("tag"))
+            .collect();
+        EventBuilder::new(Kind::Custom(kind as u16), content)
+            .tags(tags)
+            .custom_created_at(Timestamp::from(created_at))
+            .sign_with_keys(keys)
+            .expect("sign")
+    }
+
+    /// The cast: a repo owner who reviews, an author who opens the pull
+    /// request, and a second reviewer who is not the owner.
+    struct Cast {
+        owner: Keys,
+        author: Keys,
+        reviewer: Keys,
+        stranger: Keys,
+    }
+
+    impl Cast {
+        fn new() -> Self {
+            Self {
+                owner: Keys::generate(),
+                author: Keys::generate(),
+                reviewer: Keys::generate(),
+                stranger: Keys::generate(),
+            }
+        }
+
+        fn owner_hex(&self) -> String {
+            self.owner.public_key().to_hex()
+        }
+
+        fn coordinate(&self) -> String {
+            format!("30617:{}:demo", self.owner_hex())
+        }
+
+        /// A kind:1618 root in the owner's repository, opened by the author,
+        /// with the owner and one reviewer `p`-tagged.
+        fn root(&self) -> Event {
+            let coord = self.coordinate();
+            let owner = self.owner_hex();
+            let reviewer = self.reviewer.public_key().to_hex();
+            signed(
+                &self.author,
+                KIND_GIT_PULL_REQUEST,
+                100,
+                &[
+                    &["a", &coord],
+                    &["p", &owner],
+                    &["p", &reviewer],
+                    &["subject", "Release candidate"],
+                    &["c", COMMIT_INITIAL],
+                    &["clone", "https://example.invalid/demo.git"],
+                ],
+                "a release",
+            )
+        }
+
+        /// A kind:1619 revision signed by `signer`, naming the root it claims
+        /// to revise with the uppercase `E`.
+        fn revision(&self, signer: &Keys, names: &str, commit: &str) -> Event {
+            let coord = self.coordinate();
+            let owner = self.owner_hex();
+            let author = self.author.public_key().to_hex();
+            signed(
+                signer,
+                KIND_GIT_PR_UPDATE,
+                200,
+                &[
+                    &["a", &coord],
+                    &["p", &owner],
+                    &["E", names],
+                    &["P", &author],
+                    &["c", commit],
+                    &["clone", "https://example.invalid/demo.git"],
+                ],
+                "revised",
+            )
+        }
+
+        /// A review decision: a kind:1 comment labeled and bound to a commit,
+        /// exactly as `submitProjectPullRequestReview` publishes one.
+        fn decision(
+            &self,
+            signer: &Keys,
+            root: &str,
+            label: &str,
+            commit: &str,
+            created_at: u64,
+        ) -> Event {
+            let coord = self.coordinate();
+            let owner = self.owner_hex();
+            let author = self.author.public_key().to_hex();
+            signed(
+                signer,
+                KIND_TEXT_NOTE,
+                created_at,
+                &[
+                    &["e", root, "", "root"],
+                    &["a", &coord],
+                    &["p", &owner],
+                    &["p", &author],
+                    &["t", label],
+                    &["c", commit],
+                ],
+                "Approved these changes",
+            )
+        }
+    }
+
+    /// Re-sign nothing and change everything: the event keeps its id and
+    /// signature but no longer hashes to them.
+    fn tampered(event: &Event) -> Event {
+        let mut raw = serde_json::to_value(event).expect("serialize");
+        raw["content"] = Value::String("Approved these changes (edited)".into());
+        serde_json::from_value(raw).expect("deserialize")
+    }
+
+    async fn verdict(
+        events: Vec<Event>,
+        root: &str,
+        revision: &str,
+        owner: &str,
+        repo: Option<&str>,
+    ) -> (ReleaseVerdict, Vec<Value>) {
+        let (url, asked) = fixture_relay(events).await;
+        let client = client_for(url);
+        let verdict = evaluate_release(&client, root, revision, owner, repo)
+            .await
+            .expect("the question was askable");
+        let asked = asked.lock().expect("lock").clone();
+        (verdict, asked)
+    }
+
+    // ── Happy path ───────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn an_owner_approval_on_the_exact_revision_authorizes_it() {
+        let cast = Cast::new();
+        let root = cast.root();
+        let root_id = root.id.to_hex();
+        let revision = cast.revision(&cast.author, &root_id, COMMIT_REVISED);
+        let approval = cast.decision(&cast.owner, &root_id, "approval", COMMIT_REVISED, 300);
+
+        let (verdict, asked) = verdict(
+            vec![root, revision.clone(), approval.clone()],
+            &root_id,
+            &revision.id.to_hex(),
+            &cast.owner_hex(),
+            Some(&cast.coordinate()),
+        )
+        .await;
+
+        assert!(verdict.authorized, "reason: {}", verdict.reason);
+        assert_eq!(verdict.reason, "approved");
+        assert_eq!(verdict.decided_at, Some(300));
+        assert_eq!(verdict.commit.as_deref(), Some(COMMIT_REVISED));
+
+        // Three scoped, bounded filters and no fourth: the root by id, the
+        // revision by id, and this root's comment stream.
+        assert_eq!(asked.len(), 3, "{asked:?}");
+        assert_eq!(asked[0]["ids"], json!([root_id]));
+        assert_eq!(asked[0]["kinds"], json!([KIND_GIT_PULL_REQUEST]));
+        assert_eq!(asked[0]["limit"], json!(2));
+        assert_eq!(asked[1]["ids"], json!([revision.id.to_hex()]));
+        assert_eq!(asked[1]["kinds"], json!([KIND_GIT_PR_UPDATE]));
+        assert_eq!(asked[2]["kinds"], json!([KIND_TEXT_NOTE]));
+        assert_eq!(asked[2]["#e"], json!([root_id]));
+        assert_eq!(asked[2]["limit"], json!(MAX_LIMIT));
+    }
+
+    /// `--revision <root id>` is the pull request's initial revision: the root
+    /// carries the first tip commit itself, and a release cut before any
+    /// kind:1619 exists must still be verifiable.
+    #[tokio::test]
+    async fn the_root_id_names_the_initial_revision() {
+        let cast = Cast::new();
+        let root = cast.root();
+        let root_id = root.id.to_hex();
+        let approval = cast.decision(&cast.owner, &root_id, "approval", COMMIT_INITIAL, 300);
+
+        let (verdict, asked) = verdict(
+            vec![root, approval],
+            &root_id,
+            &root_id,
+            &cast.owner_hex(),
+            None,
+        )
+        .await;
+
+        assert!(verdict.authorized, "reason: {}", verdict.reason);
+        assert_eq!(verdict.commit.as_deref(), Some(COMMIT_INITIAL));
+        assert_eq!(asked.len(), 2, "no revision fetch is needed: {asked:?}");
+    }
+
+    /// A decision with no `c` tag speaks about the root's initial commit
+    /// (`reviewDecisionCommit`), so it authorizes the initial revision and
+    /// nothing later.
+    #[tokio::test]
+    async fn a_decision_without_a_commit_tag_speaks_about_the_initial_commit() {
+        let cast = Cast::new();
+        let root = cast.root();
+        let root_id = root.id.to_hex();
+        let coord = cast.coordinate();
+        let untagged = signed(
+            &cast.owner,
+            KIND_TEXT_NOTE,
+            300,
+            &[
+                &["e", &root_id, "", "root"],
+                &["a", &coord],
+                &["t", "approval"],
+            ],
+            "Approved these changes",
+        );
+        let revision = cast.revision(&cast.author, &root_id, COMMIT_REVISED);
+
+        let (initial, _) = verdict(
+            vec![root.clone(), untagged.clone()],
+            &root_id,
+            &root_id,
+            &cast.owner_hex(),
+            None,
+        )
+        .await;
+        assert!(initial.authorized, "reason: {}", initial.reason);
+
+        let (revised, _) = verdict(
+            vec![root, revision.clone(), untagged],
+            &root_id,
+            &revision.id.to_hex(),
+            &cast.owner_hex(),
+            None,
+        )
+        .await;
+        assert_eq!(revised.reason, "approval-on-other-revision");
+    }
+
+    // ── Exact-revision binding ───────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn an_approval_of_another_revision_does_not_authorize_this_one() {
+        let cast = Cast::new();
+        let root = cast.root();
+        let root_id = root.id.to_hex();
+        let revision = cast.revision(&cast.author, &root_id, COMMIT_REVISED);
+        // The owner approved the tip the pull request opened with, then the
+        // author pushed a new one.
+        let stale = cast.decision(&cast.owner, &root_id, "approval", COMMIT_INITIAL, 150);
+
+        let (verdict, _) = verdict(
+            vec![root, revision.clone(), stale],
+            &root_id,
+            &revision.id.to_hex(),
+            &cast.owner_hex(),
+            None,
+        )
+        .await;
+
+        assert!(!verdict.authorized);
+        assert_eq!(verdict.reason, "approval-on-other-revision");
+        assert_eq!(verdict.decided_at, Some(150));
+        assert_eq!(verdict.commit.as_deref(), Some(COMMIT_REVISED));
+    }
+
+    // ── Supersession ─────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn an_owner_changes_request_after_the_approval_withdraws_it() {
+        let cast = Cast::new();
+        let root = cast.root();
+        let root_id = root.id.to_hex();
+        let revision = cast.revision(&cast.author, &root_id, COMMIT_REVISED);
+        let approval = cast.decision(&cast.owner, &root_id, "approval", COMMIT_REVISED, 300);
+        let changes = cast.decision(
+            &cast.owner,
+            &root_id,
+            "changes-requested",
+            COMMIT_REVISED,
+            400,
+        );
+
+        let (verdict, _) = verdict(
+            vec![root, revision.clone(), approval, changes],
+            &root_id,
+            &revision.id.to_hex(),
+            &cast.owner_hex(),
+            None,
+        )
+        .await;
+
+        assert!(!verdict.authorized);
+        assert_eq!(verdict.reason, "superseded-by-changes-request");
+        assert_eq!(verdict.decided_at, Some(400));
+    }
+
+    /// The overall-decision half of the GitHub gate: an owner who asks for
+    /// changes anywhere on this pull request after approving has withdrawn the
+    /// approval, even when the request names a later revision.
+    #[tokio::test]
+    async fn a_later_changes_request_on_another_revision_also_withdraws_it() {
+        let cast = Cast::new();
+        let root = cast.root();
+        let root_id = root.id.to_hex();
+        let revision = cast.revision(&cast.author, &root_id, COMMIT_REVISED);
+        let approval = cast.decision(&cast.owner, &root_id, "approval", COMMIT_REVISED, 300);
+        let later = cast.decision(
+            &cast.owner,
+            &root_id,
+            "changes-requested",
+            "3333333333333333333333333333333333333333",
+            500,
+        );
+
+        let (verdict, _) = verdict(
+            vec![root, revision.clone(), approval, later],
+            &root_id,
+            &revision.id.to_hex(),
+            &cast.owner_hex(),
+            None,
+        )
+        .await;
+
+        assert_eq!(verdict.reason, "superseded-by-changes-request");
+        assert_eq!(verdict.decided_at, Some(500));
+    }
+
+    /// The mirror image: changes requested first, then approved. The latest
+    /// decision per author wins, so the release is authorized.
+    #[tokio::test]
+    async fn an_approval_after_a_changes_request_supersedes_it() {
+        let cast = Cast::new();
+        let root = cast.root();
+        let root_id = root.id.to_hex();
+        let revision = cast.revision(&cast.author, &root_id, COMMIT_REVISED);
+        let changes = cast.decision(
+            &cast.owner,
+            &root_id,
+            "changes-requested",
+            COMMIT_REVISED,
+            300,
+        );
+        let approval = cast.decision(&cast.owner, &root_id, "approval", COMMIT_REVISED, 400);
+
+        let (verdict, _) = verdict(
+            vec![root, revision.clone(), changes, approval],
+            &root_id,
+            &revision.id.to_hex(),
+            &cast.owner_hex(),
+            None,
+        )
+        .await;
+
+        assert!(verdict.authorized, "reason: {}", verdict.reason);
+        assert_eq!(verdict.decided_at, Some(400));
+    }
+
+    // ── Who may approve ──────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn an_approval_by_someone_other_than_the_owner_is_not_an_approval() {
+        let cast = Cast::new();
+        let root = cast.root();
+        let root_id = root.id.to_hex();
+        let revision = cast.revision(&cast.author, &root_id, COMMIT_REVISED);
+        // A trusted reviewer — `p`-tagged on the root — but not the configured
+        // owner. The Desktop counts this approval; a release must not.
+        let reviewer_approval =
+            cast.decision(&cast.reviewer, &root_id, "approval", COMMIT_REVISED, 300);
+
+        let (verdict, _) = verdict(
+            vec![root, revision.clone(), reviewer_approval],
+            &root_id,
+            &revision.id.to_hex(),
+            &cast.owner_hex(),
+            None,
+        )
+        .await;
+
+        assert!(!verdict.authorized);
+        assert_eq!(verdict.reason, "no-approval");
+        assert_eq!(verdict.decided_at, None);
+    }
+
+    /// `reviewersForPullRequest` deletes the root author, and
+    /// `trustedReviewActors` re-adds every allowed actor except the author — so
+    /// an owner who opened the pull request cannot approve it, and cannot
+    /// self-authorize a release of it.
+    #[tokio::test]
+    async fn an_owner_who_opened_the_pull_request_cannot_approve_it() {
+        let cast = Cast::new();
+        let coord = cast.coordinate();
+        let owner_hex = cast.owner_hex();
+        // The owner is the author this time.
+        let root = signed(
+            &cast.owner,
+            KIND_GIT_PULL_REQUEST,
+            100,
+            &[
+                &["a", &coord],
+                &["p", &owner_hex],
+                &["subject", "Self-opened"],
+                &["c", COMMIT_INITIAL],
+            ],
+            "mine",
+        );
+        let root_id = root.id.to_hex();
+        let approval = cast.decision(&cast.owner, &root_id, "approval", COMMIT_INITIAL, 300);
+
+        let (verdict, _) =
+            verdict(vec![root, approval], &root_id, &root_id, &owner_hex, None).await;
+
+        assert_eq!(verdict.reason, "owner-is-pull-request-author");
+    }
+
+    /// A pubkey that is neither the repo owner, nor a root recipient, nor
+    /// named by a trusted review request has decisions the Desktop discards.
+    #[tokio::test]
+    async fn an_approval_by_an_untrusted_pubkey_is_refused_by_name() {
+        let cast = Cast::new();
+        let root = cast.root();
+        let root_id = root.id.to_hex();
+        let stranger = cast.stranger.public_key().to_hex();
+        let approval = cast.decision(&cast.stranger, &root_id, "approval", COMMIT_INITIAL, 300);
+
+        let (verdict, _) = verdict(vec![root, approval], &root_id, &root_id, &stranger, None).await;
+
+        assert_eq!(verdict.reason, "owner-not-a-trusted-reviewer");
+    }
+
+    /// The review-request path into trust: a stranger the *author* asked to
+    /// review becomes a trusted reviewer (`reviewersForPullRequest`), and their
+    /// approval then counts — but only when the request itself is signed by an
+    /// allowed actor.
+    #[tokio::test]
+    async fn a_trusted_review_request_can_confer_reviewer_trust() {
+        let cast = Cast::new();
+        let root = cast.root();
+        let root_id = root.id.to_hex();
+        let coord = cast.coordinate();
+        let stranger = cast.stranger.public_key().to_hex();
+        let request = |signer: &Keys| {
+            signed(
+                signer,
+                KIND_TEXT_NOTE,
+                150,
+                &[
+                    &["e", &root_id, "", "root"],
+                    &["a", &coord],
+                    &["p", &stranger],
+                    &["t", "review-request"],
+                ],
+                "Requested a review",
+            )
+        };
+        let approval = cast.decision(&cast.stranger, &root_id, "approval", COMMIT_INITIAL, 300);
+
+        let (trusted, _) = verdict(
+            vec![root.clone(), request(&cast.author), approval.clone()],
+            &root_id,
+            &root_id,
+            &stranger,
+            None,
+        )
+        .await;
+        assert!(trusted.authorized, "reason: {}", trusted.reason);
+
+        // The same request signed by a bystander confers nothing.
+        let (untrusted, _) = verdict(
+            vec![root, request(&cast.reviewer), approval],
+            &root_id,
+            &root_id,
+            &stranger,
+            None,
+        )
+        .await;
+        assert_eq!(untrusted.reason, "owner-not-a-trusted-reviewer");
+    }
+
+    // ── Local verification ───────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn an_approval_whose_signature_does_not_cover_it_is_refused() {
+        let cast = Cast::new();
+        let root = cast.root();
+        let root_id = root.id.to_hex();
+        let approval = cast.decision(&cast.owner, &root_id, "approval", COMMIT_INITIAL, 300);
+
+        let (verdict, _) = verdict(
+            vec![root, tampered(&approval)],
+            &root_id,
+            &root_id,
+            &cast.owner_hex(),
+            None,
+        )
+        .await;
+
+        assert!(!verdict.authorized);
+        assert_eq!(verdict.reason, "signature-invalid");
+    }
+
+    #[tokio::test]
+    async fn a_tampered_root_is_refused_rather_than_read() {
+        let cast = Cast::new();
+        let root = cast.root();
+        let root_id = root.id.to_hex();
+
+        let (verdict, _) = verdict(
+            vec![tampered(&root)],
+            &root_id,
+            &root_id,
+            &cast.owner_hex(),
+            None,
+        )
+        .await;
+
+        assert_eq!(verdict.reason, "signature-invalid");
+    }
+
+    // ── Revision linkage ─────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn a_revision_that_names_another_root_is_not_a_revision_of_this_one() {
+        let cast = Cast::new();
+        let root = cast.root();
+        let root_id = root.id.to_hex();
+        // Signed by the author, valid in every way except the root it names.
+        let foreign = cast.revision(&cast.author, OTHER_ROOT, COMMIT_REVISED);
+        let approval = cast.decision(&cast.owner, &root_id, "approval", COMMIT_REVISED, 300);
+
+        let (verdict, _) = verdict(
+            vec![root, foreign.clone(), approval],
+            &root_id,
+            &foreign.id.to_hex(),
+            &cast.owner_hex(),
+            None,
+        )
+        .await;
+
+        assert!(!verdict.authorized);
+        assert_eq!(verdict.reason, "untrusted-revision");
+        assert_eq!(
+            verdict.commit, None,
+            "an untrusted revision has no commit to report"
+        );
+    }
+
+    /// `getTag` reads the first tag of a name and stops. A revision whose
+    /// first `E` is empty names no root, and a second `E` behind it does not
+    /// rescue it — otherwise a verifier would accept a linkage the Desktop
+    /// reads as absent.
+    #[tokio::test]
+    async fn only_the_first_root_reference_on_a_revision_counts() {
+        let cast = Cast::new();
+        let root = cast.root();
+        let root_id = root.id.to_hex();
+        let coord = cast.coordinate();
+        let author = cast.author.public_key().to_hex();
+        let smuggled = signed(
+            &cast.author,
+            KIND_GIT_PR_UPDATE,
+            200,
+            &[
+                &["a", &coord],
+                &["E", ""],
+                &["E", &root_id],
+                &["P", &author],
+                &["c", COMMIT_REVISED],
+            ],
+            "revised",
+        );
+        let approval = cast.decision(&cast.owner, &root_id, "approval", COMMIT_REVISED, 300);
+
+        let (verdict, _) = verdict(
+            vec![root, smuggled.clone(), approval],
+            &root_id,
+            &smuggled.id.to_hex(),
+            &cast.owner_hex(),
+            None,
+        )
+        .await;
+
+        assert_eq!(verdict.reason, "untrusted-revision");
+    }
+
+    #[tokio::test]
+    async fn a_revision_published_by_a_stranger_is_untrusted() {
+        let cast = Cast::new();
+        let root = cast.root();
+        let root_id = root.id.to_hex();
+        // The stranger re-points the pull request at their own commit and the
+        // owner "approves" that commit. Neither event is forged; the revision
+        // is simply not one an allowed actor published.
+        let hijack = cast.revision(&cast.stranger, &root_id, COMMIT_REVISED);
+        let approval = cast.decision(&cast.owner, &root_id, "approval", COMMIT_REVISED, 300);
+
+        let (verdict, _) = verdict(
+            vec![root, hijack.clone(), approval],
+            &root_id,
+            &hijack.id.to_hex(),
+            &cast.owner_hex(),
+            None,
+        )
+        .await;
+
+        assert_eq!(verdict.reason, "untrusted-revision");
+    }
+
+    #[tokio::test]
+    async fn a_missing_root_and_a_missing_revision_are_named_apart() {
+        let cast = Cast::new();
+        let root = cast.root();
+        let root_id = root.id.to_hex();
+
+        let (no_root, _) = verdict(vec![], &root_id, &root_id, &cast.owner_hex(), None).await;
+        assert_eq!(no_root.reason, "root-not-found");
+
+        let revision = cast.revision(&cast.author, &root_id, COMMIT_REVISED);
+        let (no_revision, _) = verdict(
+            vec![root],
+            &root_id,
+            &revision.id.to_hex(),
+            &cast.owner_hex(),
+            None,
+        )
+        .await;
+        assert_eq!(no_revision.reason, "revision-not-found");
+    }
+
+    /// A revision with no `c` tag names no artifact, so no decision can be
+    /// bound to it — refused by name rather than silently compared against the
+    /// root's initial commit, which would authorize the wrong tree.
+    #[tokio::test]
+    async fn a_revision_without_a_commit_tag_can_never_be_approved() {
+        let cast = Cast::new();
+        let root = cast.root();
+        let root_id = root.id.to_hex();
+        let coord = cast.coordinate();
+        let author = cast.author.public_key().to_hex();
+        let commitless = signed(
+            &cast.author,
+            KIND_GIT_PR_UPDATE,
+            200,
+            &[&["a", &coord], &["E", &root_id], &["P", &author]],
+            "revised",
+        );
+        let approval = cast.decision(&cast.owner, &root_id, "approval", COMMIT_INITIAL, 300);
+
+        let (verdict, _) = verdict(
+            vec![root, commitless.clone(), approval],
+            &root_id,
+            &commitless.id.to_hex(),
+            &cast.owner_hex(),
+            None,
+        )
+        .await;
+
+        assert_eq!(verdict.reason, "revision-has-no-commit");
+    }
+
+    // ── Bounds ───────────────────────────────────────────────────────────────
+
+    /// A comment page that ended at the limit may be missing the owner's
+    /// newest changes-request, so the answer is refused rather than guessed —
+    /// even though this page does contain a valid approval.
+    #[tokio::test]
+    async fn a_full_page_of_comments_refuses_rather_than_guesses() {
+        let cast = Cast::new();
+        let root = cast.root();
+        let root_id = root.id.to_hex();
+        let approval = cast.decision(&cast.owner, &root_id, "approval", COMMIT_INITIAL, 300);
+
+        let mut events = vec![root];
+        events.extend(std::iter::repeat_n(approval, MAX_LIMIT as usize));
+        let (verdict, _) = verdict(events, &root_id, &root_id, &cast.owner_hex(), None).await;
+
+        assert!(!verdict.authorized);
+        assert_eq!(verdict.reason, "decision-history-truncated");
+        assert_eq!(verdict.commit.as_deref(), Some(COMMIT_INITIAL));
+    }
+
+    // ── Repository pinning ───────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn a_root_in_another_repository_cannot_authorize_this_release() {
+        let cast = Cast::new();
+        let root = cast.root();
+        let root_id = root.id.to_hex();
+        let approval = cast.decision(&cast.owner, &root_id, "approval", COMMIT_INITIAL, 300);
+        let elsewhere = format!("30617:{}:other", cast.owner_hex());
+
+        let (verdict, asked) = verdict(
+            vec![root, approval],
+            &root_id,
+            &root_id,
+            &cast.owner_hex(),
+            Some(&elsewhere),
+        )
+        .await;
+
+        assert_eq!(verdict.reason, "repo-mismatch");
+        assert_eq!(asked.len(), 1, "a mismatched repo stops before the reviews");
+    }
+
+    // ── The command surface ──────────────────────────────────────────────────
+
+    /// Exit status is the half of the contract a shell reads. Authorized is
+    /// `Ok`; every refusal is an error, so `set -e` cannot step past one.
+    #[tokio::test]
+    async fn the_command_exits_zero_only_when_authorized() {
+        let cast = Cast::new();
+        let root = cast.root();
+        let root_id = root.id.to_hex();
+        let approval = cast.decision(&cast.owner, &root_id, "approval", COMMIT_INITIAL, 300);
+
+        let (url, _) = fixture_relay(vec![root.clone(), approval]).await;
+        let client = client_for(url);
+        dispatch(
+            ProjectsCmd::ReleaseCheck {
+                root: root_id.clone(),
+                revision: root_id.clone(),
+                owner: cast.owner_hex(),
+                repo: None,
+            },
+            &client,
+        )
+        .await
+        .expect("an owner-approved revision is authorized");
+
+        let (url, _) = fixture_relay(vec![root]).await;
+        let client = client_for(url);
+        let err = dispatch(
+            ProjectsCmd::ReleaseCheck {
+                root: root_id.clone(),
+                revision: root_id,
+                owner: cast.owner_hex(),
+                repo: None,
+            },
+            &client,
+        )
+        .await
+        .expect_err("an unapproved revision is refused");
+        assert!(
+            format!("{err}").contains("no-approval"),
+            "the refusal must name its reason: {err}"
+        );
+        assert_eq!(crate::error::exit_code(&err), 1);
+    }
+
+    /// Malformed arguments are refused before any query: a verdict about a
+    /// release nobody can name is worse than an error.
+    #[tokio::test]
+    async fn malformed_arguments_never_reach_the_relay() {
+        let cast = Cast::new();
+        let root = cast.root();
+        let root_id = root.id.to_hex();
+        let owner = cast.owner_hex();
+
+        for (root_arg, revision, owner_arg, repo) in [
+            ("nope", root_id.as_str(), owner.as_str(), None),
+            (root_id.as_str(), "nope", owner.as_str(), None),
+            (root_id.as_str(), root_id.as_str(), "nope", None),
+            (
+                root_id.as_str(),
+                root_id.as_str(),
+                owner.as_str(),
+                Some("30618:x:y"),
+            ),
+        ] {
+            let (url, asked) = fixture_relay(vec![root.clone()]).await;
+            let client = client_for(url);
+            let err = cmd_release_check(&client, root_arg, revision, owner_arg, repo)
+                .await
+                .expect_err("malformed input must be refused");
+            assert!(
+                matches!(err, CliError::Usage(_)),
+                "expected Usage, got {err:?}"
+            );
+            assert!(
+                asked.lock().expect("lock").is_empty(),
+                "a refused argument must not reach the relay"
+            );
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
