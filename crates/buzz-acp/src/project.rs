@@ -3723,14 +3723,9 @@ pub(crate) fn decide_project_event(
     let kind_effect = classify_kind(event.kind());
     let root_state = state.enrolments.state_of(route.root());
     let evidence = AddressingEvidence::resolve(event, identity.agent);
-    let Some(mut addressing) = resolve_addressing(
-        source,
-        kind_effect,
-        &evidence,
-        state.readiness,
-        None,
-        identity.agent,
-    ) else {
+    let Some(mut addressing) =
+        resolve_addressing(source, &evidence, state.readiness, None, identity.agent)
+    else {
         return ignored;
     };
     let resolved_binding = resolved_candidate.filter(|candidate| {
@@ -7334,11 +7329,19 @@ impl AddressingEvidence {
 /// already a participant, and the agent is not present merely as repository
 /// owner or root author.
 ///
+/// The event's **kind** is deliberately absent too, and for the same reason:
+/// an issue root, a pull-request root and a comment are addressed to this agent
+/// in exactly one way — the agent is named, with its own `p` behind the name.
+/// A root used to be exempt on the grounds that its `p` could not have been
+/// copied forward from a predecessor it does not have. True, and not enough:
+/// Desktop stamps the repository owner onto every root it creates, so on an
+/// agent-owned project that exemption made every issue anybody opened an
+/// address to the agent.
+///
 /// Processing mode is deliberately absent: whether this is replay or live has
 /// no bearing on what the event meant when it was written.
 pub(crate) fn resolve_addressing(
     source: &ProjectSubscription,
-    kind: KindEffect,
     evidence: &AddressingEvidence,
     readiness: &RootHistoryReadiness,
     facts: Option<&PriorRootFacts>,
@@ -7378,30 +7381,35 @@ pub(crate) fn resolve_addressing(
         return Some(Addressing::ExplicitMention);
     }
 
-    // **A root has no predecessor, so its `p` cannot have been inherited.**
+    // **A root's bare `p` is structure, not intent — and nothing below it can
+    // tell the difference, so it is left to fall through as weak evidence.**
     //
-    // `InheritedParticipant` means "this key is here only because an earlier
-    // participant list was copied forward". A `1621`/`1618` root event *is* the
-    // first event on its root — there is no earlier list to copy from, so the
-    // reading is not merely unlikely, it is unavailable. Requiring complete
-    // history before honouring it made the ordinary path — a person opens an
-    // issue and names an agent — unreachable without reconstruction that
-    // proves nothing, because there is no history preceding a root to
-    // reconstruct.
+    // A `1621`/`1618` root really does have no predecessor, so its `p` cannot
+    // have been *copied forward* from an earlier participant list. That was the
+    // whole argument for reading it as explicit, and it is true and beside the
+    // point: propagation is not the only way a `p` arrives without anybody
+    // deciding to address this agent. Desktop stamps the **repository owner**
+    // onto every root it creates — unconditionally, before any mention is
+    // considered (`desktop/src/features/projects/projectIssues.mjs:175-177` for
+    // `1621`, `desktop/src/features/projects/pullRequestMutations.ts:37-42` for
+    // `1618`) — so on a project the agent owns, *every* root, every issue anyone
+    // opens about anything, carries the agent's key. Reading that as an address
+    // woke a turn on roots whose entire content was `test`, before their real
+    // addressee had said a word.
     //
-    // Keyed on `KindEffect`, which the caller derived from the event's own kind
-    // via `classify_kind`, rather than on a boolean a caller could assert. An
-    // unsupported or malformed kind never classifies as `Root` and so gains
-    // nothing here, and everything upstream — signature verification, route
-    // derivation, source admission — has already happened.
+    // So the root shortcut is gone and roots take the same path comments do:
+    // the `named_self` check above is the enrolment route, and it is the one
+    // Desktop actually produces for a mention — the visible `@Name`, plus that
+    // agent's own `p` behind it. What is left here is a root whose only claim
+    // on this agent is a tag the client wrote by itself, which is the same
+    // weak evidence a copied-forward comment tag is and gets the same answer.
     //
-    // Comments are deliberately untouched: a copied-forward `p` on a comment is
-    // exactly the risk this guard exists for, and it still requires complete
-    // history or visible mention syntax.
-    if matches!(kind, KindEffect::Root) {
-        return Some(Addressing::ExplicitMention);
-    }
-
+    // The event's kind is consequently not an input here at all any more, and
+    // the parameter is gone rather than left unread: a kind still in the
+    // signature would read as a route this function takes, and there isn't one.
+    // Kind still decides plenty — `classify_project_event` branches on it for
+    // every effect — but not *whether the agent was addressed*, which is the
+    // one question this function answers.
     if !matches!(readiness, RootHistoryReadiness::Complete) {
         return Some(Addressing::InheritedParticipant);
     }
@@ -7521,8 +7529,15 @@ pub(crate) enum Addressing {
     /// root's existing participant set, or a literal visible `@Agent` in the
     /// content. This is the only form that enrols or reactivates.
     ExplicitMention,
-    /// The agent's pubkey appears only because an earlier participant list was
-    /// copied forward. Never an enrolment signal.
+    /// The agent's pubkey is present as client-written structure rather than as
+    /// an address: copied forward from an earlier participant list, or stamped
+    /// on by Desktop because the agent is the repository's owner or the root's
+    /// author. Never an enrolment signal.
+    ///
+    /// The name is about the *strength* of the evidence, not about one way of
+    /// acquiring it — a root has no participant list to inherit and still lands
+    /// here, because "the client put my key on this by itself" is the same
+    /// nothing whichever rule the client applied.
     InheritedParticipant,
     /// The agent is not named at all — the event reached us through the
     /// watched-root REQ because we are already enrolled.
@@ -12901,16 +12916,7 @@ mod tests {
         readiness: &RootHistoryReadiness,
         facts: Option<&PriorRootFacts>,
     ) -> Option<Addressing> {
-        // Existing addressing tests are about the comment path; `Comment` keeps
-        // their meaning unchanged now that roots take an earlier exit.
-        resolve_addressing(
-            source,
-            KindEffect::Comment,
-            &evidence,
-            readiness,
-            facts,
-            &agent_identity(),
-        )
+        resolve_addressing(source, &evidence, readiness, facts, &agent_identity())
     }
 
     #[test]
@@ -13092,6 +13098,93 @@ mod tests {
             .expect("sign");
         let verified = VerifiedProjectEvent::verify(event).await.expect("valid");
         AddressingEvidence::resolve(&verified, &named_identity())
+    }
+
+    /// The live failure at the layer that produced it, on a real `1621`.
+    ///
+    /// Roots `b1261034…` and `eb1803a2…` on `…:comment-e2e` had body `test`,
+    /// named nobody, and carried exactly one `p` — the repository owner's,
+    /// written by Desktop because the agent owns the coordinate. Each queued a
+    /// turn, because a root took an early exit to `ExplicitMention` on the
+    /// strength of its `p` alone.
+    ///
+    /// The event is signed and verified rather than described, so the `1621`
+    /// kind is really present: this is the case the removed exception was keyed
+    /// on, not a comment standing in for it.
+    #[tokio::test]
+    async fn a_roots_structural_owner_p_tag_is_not_an_address() {
+        let keys = Keys::generate();
+        let root = EventBuilder::new(Kind::Custom(KIND_GIT_ISSUE as u16), "test")
+            .tags([nostr::Tag::parse(tag(&["p", AGENT_PK])).unwrap()])
+            .sign_with_keys(&keys)
+            .expect("sign");
+        let verified = VerifiedProjectEvent::verify(root).await.expect("valid");
+        assert_eq!(
+            classify_kind(verified.kind()),
+            KindEffect::Root,
+            "the fixture has to be a root, or it proves nothing about roots"
+        );
+        let evidence = AddressingEvidence::resolve(&verified, &named_identity());
+
+        assert!(evidence.p_tag_present, "the structural tag is there");
+        assert!(!evidence.named_self, "and nothing in the body names us");
+        assert_eq!(
+            resolve_addressing(
+                &ProjectSubscription::Enrolment,
+                &evidence,
+                // What the process actually holds for a root: nothing. A root
+                // has no history preceding it, so no reconstruction can ever
+                // improve this — which is exactly why the old exception was
+                // reachable and why removing it has to hold here.
+                &RootHistoryReadiness::Unknown,
+                None,
+                &named_identity(),
+            ),
+            Some(Addressing::InheritedParticipant),
+            "a tag Desktop wrote by itself is not somebody addressing this agent"
+        );
+    }
+
+    /// …and the root the same person meant to send, which must still wake.
+    ///
+    /// The pair is the point: the fix is target-only, not deaf. `@Claude` plus
+    /// this agent's own `p` is the ordinary shape Desktop publishes for a
+    /// mention, and it is the only shape that enrols a root now.
+    #[tokio::test]
+    async fn a_root_that_names_this_agent_is_an_explicit_mention() {
+        let keys = Keys::generate();
+        let root = EventBuilder::new(
+            Kind::Custom(KIND_GIT_ISSUE as u16),
+            format!("@{AGENT_DISPLAY_NAME} please take this one"),
+        )
+        .tags([nostr::Tag::parse(tag(&["p", AGENT_PK])).unwrap()])
+        .sign_with_keys(&keys)
+        .expect("sign");
+        let verified = VerifiedProjectEvent::verify(root).await.expect("valid");
+        let evidence = AddressingEvidence::resolve(&verified, &named_identity());
+
+        assert_eq!(
+            resolve_addressing(
+                &ProjectSubscription::Enrolment,
+                &evidence,
+                &RootHistoryReadiness::Unknown,
+                None,
+                &named_identity(),
+            ),
+            Some(Addressing::ExplicitMention),
+        );
+        assert_eq!(
+            classify_project_event(
+                classify_kind(verified.kind()),
+                ProjectAuthor::AuthorisedHuman,
+                CallMarker::None,
+                RootState::Unknown,
+                Addressing::ExplicitMention,
+                false,
+                evidence.directed_at_another_party(),
+            ),
+            ProjectEffect::EnrolAndWake,
+        );
     }
 
     /// The demonstrated live failure: an approved human hands the work to a
@@ -13287,14 +13380,7 @@ mod tests {
         facts: Option<&PriorRootFacts>,
     ) -> Option<Addressing> {
         let evidence = directed_evidence(content, p_tags).await;
-        resolve_addressing(
-            &watched(),
-            KindEffect::Comment,
-            &evidence,
-            readiness,
-            facts,
-            &named_identity(),
-        )
+        resolve_addressing(&watched(), &evidence, readiness, facts, &named_identity())
     }
 
     /// The other half of the addressing failure, and the ordinary case.
@@ -13519,7 +13605,6 @@ mod tests {
         assert_eq!(
             resolve_addressing(
                 &watched(),
-                KindEffect::Comment,
                 &evidence,
                 &RootHistoryReadiness::Complete,
                 Some(&prior(false, THIRD_PARTY, OWNER)),
@@ -14041,6 +14126,23 @@ mod tests {
                 CallMarker::None,
                 RootState::Unknown,
                 Addressing::WatchedRoot,
+                false,
+                false,
+            ),
+            ProjectEffect::Ignore
+        );
+        // Real cases `b1261034…` and `eb1803a2…`: an issue whose only `p` is the
+        // repository owner's, stamped on by Desktop. It reaches this row now
+        // that a root no longer takes an earlier exit to `ExplicitMention`, and
+        // it must answer the same way — the tag is the client's structure, not
+        // a person's request.
+        assert_eq!(
+            classify_project_event(
+                KindEffect::Root,
+                ProjectAuthor::AuthorisedHuman,
+                CallMarker::None,
+                RootState::Unknown,
+                Addressing::InheritedParticipant,
                 false,
                 false,
             ),
@@ -15376,7 +15478,6 @@ mod tests {
         assert_eq!(
             resolve_addressing(
                 &watched(),
-                KindEffect::Comment,
                 &evidence,
                 &RootHistoryReadiness::Complete,
                 Some(&facts),
@@ -15395,7 +15496,6 @@ mod tests {
         assert_eq!(
             resolve_addressing(
                 &watched(),
-                KindEffect::Comment,
                 &later_evidence,
                 &RootHistoryReadiness::Complete,
                 Some(&facts),

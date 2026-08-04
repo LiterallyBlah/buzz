@@ -5985,13 +5985,16 @@ mod project_discovery_ingestion_tests {
         body: &str,
     ) -> nostr::Event {
         let coord = format!("30617:{}:{repo_id}", repo_owner.public_key().to_hex());
-        EventBuilder::new(nostr::Kind::Custom(kind as u16), body)
-            .tags([
-                nostr::Tag::parse(["a", &coord]).unwrap(),
-                nostr::Tag::parse(["p", &agent.public_key().to_hex()]).unwrap(),
-            ])
-            .sign_with_keys(author)
-            .expect("sign")
+        EventBuilder::new(
+            nostr::Kind::Custom(kind as u16),
+            addressed_body(agent, body),
+        )
+        .tags([
+            nostr::Tag::parse(["a", &coord]).unwrap(),
+            nostr::Tag::parse(["p", &agent.public_key().to_hex()]).unwrap(),
+        ])
+        .sign_with_keys(author)
+        .expect("sign")
     }
 
     /// **The reported blocker, as one ordered scenario.**
@@ -6605,6 +6608,15 @@ mod project_discovery_ingestion_tests {
         );
     }
 
+    /// A root that actually addresses `agent`: it names them, and carries their
+    /// `p` behind the name.
+    ///
+    /// The `p` alone is not an address. Desktop stamps the repository owner
+    /// onto every root it creates, so on an agent-owned project a bare `p` says
+    /// only that the client knows who owns the repo. Every fixture built on
+    /// this one is about admission, lifecycle, dedup or subscription
+    /// replacement rather than about addressing, so each says outright who its
+    /// root is for — and [`unaddressed_root_event`] is the other case.
     fn root_event(
         owner: &Keys,
         agent: &Keys,
@@ -6612,8 +6624,42 @@ mod project_discovery_ingestion_tests {
         kind: u32,
         body: &str,
     ) -> nostr::Event {
+        signed_root(owner, agent, repo_id, kind, &addressed_body(agent, body))
+    }
+
+    /// The same root with the agent's `p` tag and **nothing naming them** — the
+    /// shape Buzz Desktop publishes for a root opened on a repository this
+    /// agent owns, and the shape that must now wake nobody.
+    fn unaddressed_root_event(
+        owner: &Keys,
+        agent: &Keys,
+        repo_id: &str,
+        kind: u32,
+        body: &str,
+    ) -> nostr::Event {
+        signed_root(owner, agent, repo_id, kind, body)
+    }
+
+    /// The mention text a person writes when they hand a root to an agent.
+    fn addressed_body(agent: &Keys, body: &str) -> String {
+        use nostr::ToBech32;
+        format!(
+            "nostr:{} {body}",
+            agent.public_key().to_bech32().expect("npub")
+        )
+    }
+
+    /// The tag set both fixtures share: the repository coordinate and the
+    /// agent's `p`. What differs between them is only the content.
+    fn signed_root(
+        owner: &Keys,
+        agent: &Keys,
+        repo_id: &str,
+        kind: u32,
+        content: &str,
+    ) -> nostr::Event {
         let coord = format!("30617:{}:{repo_id}", owner.public_key().to_hex());
-        EventBuilder::new(nostr::Kind::Custom(kind as u16), body)
+        EventBuilder::new(nostr::Kind::Custom(kind as u16), content)
             .tags([
                 nostr::Tag::parse(["a", &coord]).unwrap(),
                 nostr::Tag::parse(["p", &agent.public_key().to_hex()]).unwrap(),
@@ -7457,7 +7503,7 @@ mod project_discovery_ingestion_tests {
             let coord = format!("30617:{}:proj", owner.public_key().to_hex());
             EventBuilder::new(
                 nostr::Kind::Custom(buzz_core::kind::KIND_GIT_ISSUE as u16),
-                body,
+                addressed_body(&agent, body),
             )
             .custom_created_at(nostr::Timestamp::from(at))
             .tags([
@@ -7617,11 +7663,14 @@ mod project_discovery_ingestion_tests {
         );
     }
 
-    /// A root has no predecessor, so its `p` cannot have been copied forward.
-    /// This is the plan's definition of done: a person opens an issue, names an
+    /// The plan's definition of done: a person opens an issue, **names** an
     /// agent, the agent wakes — with no reconstructed history anywhere.
+    ///
+    /// There is no history preceding a root to reconstruct, so if enrolment
+    /// needed one this path would be unreachable rather than merely slow. What
+    /// makes it reachable is the mention, not the `p`: `root_event` writes both.
     #[tokio::test]
-    async fn an_issue_root_p_tag_wakes_without_any_history() {
+    async fn an_issue_root_that_names_the_agent_wakes_without_any_history() {
         let owner = Keys::generate();
         let agent = Keys::generate();
         let event = root_event(
@@ -7649,10 +7698,10 @@ mod project_discovery_ingestion_tests {
         );
     }
 
-    /// Same rule, other root kind. A pull request root is equally first on its
-    /// own root, so the exception must not be spelled for issues alone.
+    /// Same rule, other root kind — the mention must not be spelled for issues
+    /// alone.
     #[tokio::test]
-    async fn a_pull_request_root_p_tag_wakes_without_any_history() {
+    async fn a_pull_request_root_that_names_the_agent_wakes_without_any_history() {
         let owner = Keys::generate();
         let agent = Keys::generate();
         let event = root_event(
@@ -7680,15 +7729,55 @@ mod project_discovery_ingestion_tests {
         );
     }
 
-    /// The protection the root exception must not weaken.
+    /// The other half, and the reported failure: the same root **without** the
+    /// mention.
+    ///
+    /// A `p` and nothing else used to be enough, on the argument that a root
+    /// has no predecessor and so cannot have inherited its tag. Desktop does
+    /// not need a predecessor to write a `p` — it stamps the repository owner
+    /// onto every root it creates — so on an agent-owned project that argument
+    /// turned every issue anybody opened into an address, and the agent
+    /// answered issues whose entire content was `test`.
+    ///
+    /// Both root kinds, because the exception was not spelled for issues alone.
+    #[tokio::test]
+    async fn a_root_carrying_only_a_bare_p_tag_wakes_nobody() {
+        for kind in [
+            buzz_core::kind::KIND_GIT_ISSUE,
+            buzz_core::kind::KIND_GIT_PULL_REQUEST,
+        ] {
+            let owner = Keys::generate();
+            let agent = Keys::generate();
+            let event = unaddressed_root_event(&owner, &agent, "proj", kind, "test");
+
+            let dispatched = dispatch_routed(
+                &owner,
+                &agent,
+                "proj",
+                project::ProjectSubscription::Enrolment,
+                project::ProcessingMode::Live,
+                None,
+                event,
+            )
+            .await;
+
+            assert_eq!(
+                dispatched,
+                ProjectDispatched::Ignored,
+                "kind {kind}: a `p` the client wrote by itself must not enrol \
+                 or wake — got {dispatched:?}"
+            );
+        }
+    }
+
+    /// The comment half of the same rule.
     ///
     /// A comment *can* carry a `p` copied from an earlier participant list, and
     /// without complete history nothing can tell the difference — so it cannot
-    /// bring an unwatched root into the active set. Note the scope: an
-    /// already-active root continues on any comment that is not addressed to a
-    /// different agent (`wake_or_enrol`, `RootState::Active`), because that is
-    /// the follow-up the enrolment `#p` REQ alone could never deliver. What is
-    /// guarded here is *enrolment*, not delivery.
+    /// bring an unwatched root into the active set. Roots now answer the same
+    /// way for the same reason, which is what
+    /// `a_root_carrying_only_a_bare_p_tag_wakes_nobody` above asserts; this one
+    /// is the case that was always true and must stay true.
     #[tokio::test]
     async fn a_comment_p_tag_cannot_enrol_an_unwatched_root() {
         let owner = Keys::generate();
@@ -7732,8 +7821,9 @@ mod project_discovery_ingestion_tests {
         );
     }
 
-    /// Visible mention syntax is evidence the primitive trusts without history,
-    /// and the root exception must not have displaced it for comments.
+    /// Visible mention syntax is the evidence the primitive trusts without any
+    /// history, and it is now the *only* evidence that enrols — on a comment or
+    /// on a root.
     #[tokio::test]
     async fn a_comment_with_a_visible_mention_still_wakes() {
         let owner = Keys::generate();
@@ -7779,9 +7869,9 @@ mod project_discovery_ingestion_tests {
         );
     }
 
-    /// The root exception is about *addressing*. Author classification is a
-    /// separate gate and still suppresses the agent's own root, which is what
-    /// stops an agent that opens an issue from waking itself.
+    /// Addressing is one gate; authorship is another, and it is unchanged.
+    /// A self-authored root is suppressed however well it addresses this agent,
+    /// which is what stops an agent that opens an issue from waking itself.
     #[tokio::test]
     async fn a_self_authored_root_still_does_not_wake() {
         let agent = Keys::generate();
@@ -12732,11 +12822,18 @@ for line in sys.stdin:
         })
     }
 
+    /// An issue root that names the agent, with the agent's `p` behind the
+    /// name. The `p` on its own is structural and addresses nobody — see
+    /// [`desktop_root_on_an_owned_repo`] for that shape.
     fn issue_root(owner: &Keys, agent: &Keys, repo_id: &str) -> nostr::Event {
+        use nostr::ToBech32;
         let coord = format!("30617:{}:{repo_id}", owner.public_key().to_hex());
         EventBuilder::new(
             nostr::Kind::Custom(buzz_core::kind::KIND_GIT_ISSUE as u16),
-            "the test suite is flaky on the second fixture",
+            format!(
+                "nostr:{} the test suite is flaky on the second fixture",
+                agent.public_key().to_bech32().expect("npub"),
+            ),
         )
         .tags([
             nostr::Tag::parse(["a", &coord]).unwrap(),
@@ -12815,9 +12912,24 @@ for line in sys.stdin:
 
     impl Runtime {
         async fn new(recorder: &PromptRecorder) -> Self {
+            Self::known_as(recorder, "").await
+        }
+
+        /// A runtime whose agent knows the name people call it by — what
+        /// `BUZZ_ACP_DISPLAY_NAME` configures, and the only thing that makes
+        /// Desktop's `@Name` mention syntax rather than prose.
+        ///
+        /// Separate from [`Runtime::new`] so the existing scenarios keep
+        /// asserting against a nameless agent: several of them turn on the
+        /// comment-first promotion, and giving those an interpretation of
+        /// `@desktop-agent` would let them pass by a different route than the
+        /// one they were written for.
+        async fn known_as(recorder: &PromptRecorder, display_name: &str) -> Self {
             let owner = Keys::generate();
             let agent = Keys::generate();
-            let identity = project::AgentIdentity::new(&agent.public_key()).unwrap();
+            let identity = project::AgentIdentity::new(&agent.public_key())
+                .unwrap()
+                .with_display_name(display_name);
             let mut humans = BTreeSet::new();
             humans.insert(owner.public_key().to_hex());
             let ctx = test_ctx(&agent, empty_relay().await);
@@ -12879,7 +12991,16 @@ for line in sys.stdin:
         }
 
         async fn discover(&mut self, repo_id: &str) {
-            let announcement = proven_announcement_for(&self.owner, repo_id).await;
+            let announcer = self.owner.clone();
+            self.discover_announced_by(&announcer, repo_id).await;
+        }
+
+        /// Discover a repository somebody other than the human owner announced
+        /// — including this agent, which is the live shape the root-addressing
+        /// failure needed: the agent owns the coordinate, so Desktop's
+        /// repository-owner `p` on every root is *this agent's* key.
+        async fn discover_announced_by(&mut self, announcer: &Keys, repo_id: &str) {
+            let announcement = proven_announcement_for(announcer, repo_id).await;
             self.drive(&project::ProjectEvent::Discovery { announcement })
                 .await;
         }
@@ -13171,5 +13292,174 @@ for line in sys.stdin:
         assert_eq!(dispatched, ProjectDispatched::Ignored);
         assert!(rt.enrolments.get(&referenced.id.to_hex()).is_none());
         assert!(recorder.read().is_empty());
+    }
+
+    /// The display name this agent is configured with, as a live one is.
+    const DISPLAY_NAME: &str = "Claude";
+
+    /// The event Buzz Desktop publishes when a person opens an issue on a
+    /// repository **this agent owns**.
+    ///
+    /// One `p` tag, and it is the repository owner's — so it is the agent's own
+    /// key, on every root, whoever opened it and whatever it says. That is the
+    /// whole of the reported failure: nothing here is an address, and the body
+    /// is the only place an address could have been written.
+    fn desktop_root_on_an_owned_repo(
+        author: &Keys,
+        agent: &Keys,
+        repo_id: &str,
+        body: &str,
+    ) -> nostr::Event {
+        let agent_hex = agent.public_key().to_hex();
+        EventBuilder::new(
+            nostr::Kind::Custom(buzz_core::kind::KIND_GIT_ISSUE as u16),
+            body,
+        )
+        .tags([
+            nostr::Tag::parse(["a", &format!("30617:{agent_hex}:{repo_id}")]).unwrap(),
+            nostr::Tag::parse(["p", &agent_hex]).unwrap(),
+        ])
+        .sign_with_keys(author)
+        .expect("sign")
+    }
+
+    /// A comment on `root`, carrying the same structural `p` set Desktop copies
+    /// forward, plus a body that names somebody.
+    fn desktop_comment(
+        author: &Keys,
+        agent: &Keys,
+        repo_id: &str,
+        root: &nostr::Event,
+        body: &str,
+    ) -> nostr::Event {
+        let agent_hex = agent.public_key().to_hex();
+        EventBuilder::new(nostr::Kind::TextNote, body)
+            .tags([
+                nostr::Tag::parse(["a", &format!("30617:{agent_hex}:{repo_id}")]).unwrap(),
+                nostr::Tag::parse(["e", &root.id.to_hex(), "", "root"]).unwrap(),
+                nostr::Tag::parse(["p", &agent_hex]).unwrap(),
+            ])
+            .sign_with_keys(author)
+            .expect("sign")
+    }
+
+    /// **The reported failure, as the sequence that produced it.**
+    ///
+    /// On `30617:…:comment-e2e`, roots `b1261034…` (queued 10:07:13, answered
+    /// 10:07:27) and `eb1803a2…` (queued 10:09:56, answered 10:10:10) each had
+    /// content `test`, named nobody, and carried the automatic repository-owner
+    /// `p` — this agent's, because this agent owns the coordinate. Each woke a
+    /// turn and produced a canned reply, seventeen and fifteen seconds *before*
+    /// the comment that was actually addressed to somebody arrived. The
+    /// comments were never what woke the agent. The roots were.
+    ///
+    /// Both halves are here because either alone is passable by a wrong build:
+    /// an agent that ignored everything would satisfy the first, and the old
+    /// build satisfied the second. The prompt count is what joins them — under
+    /// the old behaviour the root's turn is in flight and the comment queues
+    /// behind it, so the one prompt the child ever sees carries `test` rather
+    /// than the request.
+    #[tokio::test]
+    async fn a_structurally_tagged_root_wakes_nobody_and_a_later_named_comment_still_enrols() {
+        let recorder = PromptRecorder::new();
+        let mut rt = Runtime::known_as(&recorder, DISPLAY_NAME).await;
+        let agent = rt.agent.clone();
+        rt.discover_announced_by(&agent, "comment-e2e").await;
+
+        let root = desktop_root_on_an_owned_repo(&rt.owner, &agent, "comment-e2e", "test");
+        let dispatched = rt
+            .drive(&routed(root.clone(), project::ProjectSubscription::Enrolment).await)
+            .await;
+
+        assert_eq!(
+            dispatched,
+            ProjectDispatched::Ignored,
+            "an issue saying `test` and naming nobody is not this agent's turn"
+        );
+        assert!(
+            rt.enrolments.get(&root.id.to_hex()).is_none(),
+            "and it must not have quietly enrolled the root either"
+        );
+
+        // The root is separately fetched and verified, which is what
+        // `resolve_comment_first_candidate` does in the run loop for a comment
+        // on a root this process is not watching.
+        let verified_root = project::VerifiedProjectEvent::verify(root.clone())
+            .await
+            .expect("root verifies");
+        let candidate = project::validate_enrolment_candidate(&verified_root, &rt.discovered)
+            .expect("a root on a discovered coordinate is a candidate");
+        let comment = desktop_comment(
+            &rt.owner,
+            &agent,
+            "comment-e2e",
+            &root,
+            &format!("@{DISPLAY_NAME} could you pick this one up"),
+        );
+        let dispatched = rt
+            .drive_with_candidate(
+                &routed(comment, project::ProjectSubscription::Enrolment).await,
+                Some(candidate),
+            )
+            .await;
+
+        assert!(
+            matches!(dispatched, ProjectDispatched::Queued { queued: true, .. }),
+            "ignoring the root must not cost the agent the comment that named \
+             it — got {dispatched:?}"
+        );
+        assert!(
+            rt.enrolments.get(&root.id.to_hex()).is_some(),
+            "comment-first enrolment binds the root it was fetched for"
+        );
+
+        let prompts = recorder.prompts(1).await;
+        assert_eq!(
+            prompts.len(),
+            1,
+            "the root ran a turn of its own: {prompts:?}"
+        );
+        assert!(
+            prompts[0].contains("could you pick this one up"),
+            "the one turn must be the comment's, not the root's: {}",
+            prompts[0]
+        );
+    }
+
+    /// …and the root the same person meant to send.
+    ///
+    /// Same repository, same structural `p`, one difference: the body says who
+    /// it is for. `@Claude` is mention syntax only for an agent that knows its
+    /// own name, which is why this runtime is configured with one.
+    #[tokio::test]
+    async fn a_root_that_names_this_agent_wakes_it_exactly_once() {
+        let recorder = PromptRecorder::new();
+        let mut rt = Runtime::known_as(&recorder, DISPLAY_NAME).await;
+        let agent = rt.agent.clone();
+        rt.discover_announced_by(&agent, "comment-e2e").await;
+
+        let root = desktop_root_on_an_owned_repo(
+            &rt.owner,
+            &agent,
+            "comment-e2e",
+            &format!("@{DISPLAY_NAME} the pipeline drops frames after reconnect"),
+        );
+        let dispatched = rt
+            .drive(&routed(root.clone(), project::ProjectSubscription::Enrolment).await)
+            .await;
+
+        assert!(
+            matches!(dispatched, ProjectDispatched::Queued { queued: true, .. }),
+            "a named root is exactly what enrols and wakes — got {dispatched:?}"
+        );
+        assert!(rt.enrolments.get(&root.id.to_hex()).is_some());
+
+        let prompts = recorder.prompts(1).await;
+        assert_eq!(prompts.len(), 1, "exactly one turn: {prompts:?}");
+        assert!(
+            prompts[0].contains("the pipeline drops frames after reconnect"),
+            "the turn must carry the issue: {}",
+            prompts[0]
+        );
     }
 }

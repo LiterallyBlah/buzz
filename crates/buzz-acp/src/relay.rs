@@ -9418,10 +9418,16 @@ mod tests {
     }
 
     /// A signed, addressed project root at a chosen timestamp.
+    ///
+    /// It names the agent as well as `p`-tagging it. A root's `p` alone is
+    /// structural — Desktop stamps the repository owner onto every root it
+    /// creates — so a fixture that carried only the tag would be admitted by
+    /// the relay and then correctly refused by the gate, which is not what any
+    /// test here is about.
     fn project_root_frame(owner: &nostr::Keys, coord: &str, created_at: u64) -> Event {
         nostr::EventBuilder::new(
             nostr::Kind::Custom(buzz_core::kind::KIND_GIT_ISSUE as u16),
-            "please look",
+            format!("@{} please look", test_agent_hex()),
         )
         .tags([
             nostr::Tag::parse(["a", coord]).unwrap(),
@@ -12088,7 +12094,7 @@ mod tests {
         let coordinate = format!("30617:{owner_hex}:connected-repo");
         let root = EventBuilder::new(
             nostr::Kind::Custom(buzz_core::kind::KIND_GIT_ISSUE as u16),
-            "please take a look",
+            format!("@{agent_hex} please take a look"),
         )
         .tags([
             nostr::Tag::parse(["a", &coordinate]).expect("a tag"),
@@ -12261,7 +12267,7 @@ mod tests {
         let root_named = |signer: &nostr::Keys, coord: &str, p: &str| {
             EventBuilder::new(
                 nostr::Kind::Custom(buzz_core::kind::KIND_GIT_ISSUE as u16),
-                "look at this",
+                format!("@{p} look at this"),
             )
             .tags([
                 nostr::Tag::parse(["a", coord]).expect("a tag"),
@@ -13227,7 +13233,11 @@ mod tests {
             drain_backlog!(crate::project::PROJECT_ENROL_SUB_ID);
             drain_backlog!(crate::project::PROJECT_ENROL_SUB_ID);
             let coordinate = format!("30617:{owner_hex}:e2e-repo");
-            let body = "the pipeline drops frames after reconnect";
+            // Named as well as `p`-tagged. The tag alone is what Desktop puts
+            // on every root it creates; it is not an address, and a fixture
+            // that relied on it would be asserting the relay path against an
+            // event the gate is right to refuse.
+            let body = format!("@{agent_hex} the pipeline drops frames after reconnect");
             let enrol_id = crate::project::PROJECT_ENROL_SUB_ID.to_string();
             let root = peer
                 .publish(
@@ -13235,7 +13245,7 @@ mod tests {
                     InboundSpec {
                         signer: PeerSigner::Owner,
                         kind: buzz_core::kind::KIND_GIT_ISSUE as u16,
-                        content: body.to_string(),
+                        content: body.clone(),
                         tags: vec![
                             vec!["a".to_string(), coordinate.clone()],
                             vec!["p".to_string(), agent_hex.clone()],
@@ -13271,7 +13281,7 @@ mod tests {
                     InboundSpec {
                         signer: PeerSigner::Owner,
                         kind: buzz_core::kind::KIND_GIT_ISSUE as u16,
-                        content: "a second issue on the same repository".to_string(),
+                        content: format!("@{agent_hex} a second issue on the same repository"),
                         tags: vec![
                             vec!["a".to_string(), coordinate.clone()],
                             vec!["p".to_string(), agent_hex.clone()],
@@ -13742,7 +13752,7 @@ for line in sys.stdin:
             assert!(text.contains("issue"), "no issue/PR classification");
             assert!(text.contains("buzz issues comment"), "no reply command");
             assert!(
-                text.contains(body),
+                text.contains(&body),
                 "the triggering event's content is missing"
             );
 
@@ -14855,6 +14865,9 @@ for line in sys.stdin:
     }
 
     /// A `1621` root on `coordinate`, addressed to `agent`, signed by `owner`.
+    ///
+    /// Addressed means named *and* `p`-tagged: the tag alone is structure the
+    /// client writes for itself and does not wake anybody.
     fn addressed_root(
         owner: &nostr::Keys,
         agent: &nostr::Keys,
@@ -14863,7 +14876,7 @@ for line in sys.stdin:
     ) -> Event {
         EventBuilder::new(
             nostr::Kind::Custom(buzz_core::kind::KIND_GIT_ISSUE as u16),
-            "please look",
+            format!("@{} please look", agent.public_key().to_hex()),
         )
         .custom_created_at(nostr::Timestamp::from(ts))
         .tags([
