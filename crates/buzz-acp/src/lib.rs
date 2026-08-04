@@ -12875,6 +12875,14 @@ for line in sys.stdin:
             .expect("sign")
     }
 
+    /// A comment on `root` that names the agent in key syntax.
+    ///
+    /// Key syntax rather than a display name because the runtimes that use this
+    /// are deliberately nameless — what they are about is the comment-first
+    /// *binding*, and an agent with no configured name can still be addressed
+    /// by `@hex`. It used to name `@desktop-agent`, which addressed nobody and
+    /// was carried by the comment-first promotion; that promotion is gone, so
+    /// the fixture now says what it always meant.
     fn addressed_comment(
         owner: &Keys,
         agent: &Keys,
@@ -12882,7 +12890,10 @@ for line in sys.stdin:
         root: &nostr::Event,
     ) -> nostr::Event {
         let coord = format!("30617:{}:{repo_id}", owner.public_key().to_hex());
-        EventBuilder::new(nostr::Kind::TextNote, "@desktop-agent please take this")
+        EventBuilder::new(
+            nostr::Kind::TextNote,
+            format!("@{} please take this", agent.public_key().to_hex()),
+        )
             .tags([
                 nostr::Tag::parse(["a", &coord]).unwrap(),
                 nostr::Tag::parse(["e", &root.id.to_hex(), "", "root"]).unwrap(),
@@ -12919,11 +12930,11 @@ for line in sys.stdin:
         /// `BUZZ_ACP_DISPLAY_NAME` configures, and the only thing that makes
         /// Desktop's `@Name` mention syntax rather than prose.
         ///
-        /// Separate from [`Runtime::new`] so the existing scenarios keep
-        /// asserting against a nameless agent: several of them turn on the
-        /// comment-first promotion, and giving those an interpretation of
-        /// `@desktop-agent` would let them pass by a different route than the
-        /// one they were written for.
+        /// Separate from [`Runtime::new`] so the scenarios that are about the
+        /// comment-first *binding* keep asserting against a nameless agent:
+        /// they address it in key syntax, which needs no configured name, and
+        /// keeping them nameless is what stops a display-name reading standing
+        /// in for the binding they were written to prove.
         async fn known_as(recorder: &PromptRecorder, display_name: &str) -> Self {
             let owner = Keys::generate();
             let agent = Keys::generate();
@@ -13227,7 +13238,7 @@ for line in sys.stdin:
             );
             assert!(rt.enrolments.get(&root.id.to_hex()).is_some());
             let prompts = recorder.prompts(1).await;
-            assert!(prompts[0].contains("@desktop-agent please take this"));
+            assert!(prompts[0].contains("please take this"));
             assert!(!prompts[0].contains("binding root\n\nbinding root"));
         }
     }
@@ -13459,6 +13470,313 @@ for line in sys.stdin:
         assert!(
             prompts[0].contains("the pipeline drops frames after reconnect"),
             "the turn must carry the issue: {}",
+            prompts[0]
+        );
+    }
+
+    /// The handle of the agent the work was actually handed to.
+    ///
+    /// Hyphenated on purpose: this is the shape a Desktop display handle takes,
+    /// and the shape the live comment carried. It is a fixture value and
+    /// nothing in the crate knows it — the grammar is about the hyphen, not
+    /// about this gateway.
+    const OTHER_HANDLE: &str = "hermes-gateway";
+
+    /// The live comment shape: Desktop's copied-forward `p` set with **both**
+    /// parties in it, and a body that hands the work to one of them.
+    ///
+    /// Both tags are the point. The self `p` is what the enrolment
+    /// subscription matched on and what every earlier build read as an address;
+    /// the other party's `p` is what makes the visible handle an address rather
+    /// than prose.
+    fn desktop_comment_to_both(
+        author: &Keys,
+        agent: &Keys,
+        other: &Keys,
+        repo_id: &str,
+        root: &nostr::Event,
+        body: &str,
+    ) -> nostr::Event {
+        let agent_hex = agent.public_key().to_hex();
+        EventBuilder::new(nostr::Kind::TextNote, body)
+            .tags([
+                nostr::Tag::parse(["a", &format!("30617:{agent_hex}:{repo_id}")]).unwrap(),
+                nostr::Tag::parse(["e", &root.id.to_hex(), "", "root"]).unwrap(),
+                nostr::Tag::parse(["p", &agent_hex]).unwrap(),
+                nostr::Tag::parse(["p", &other.public_key().to_hex()]).unwrap(),
+            ])
+            .sign_with_keys(author)
+            .expect("sign")
+    }
+
+    /// The root, separately fetched and verified — what
+    /// `resolve_comment_first_candidate` does in the run loop for a comment on
+    /// a root this process is not watching.
+    async fn fetched_root_candidate(
+        rt: &Runtime,
+        root: &nostr::Event,
+    ) -> project::EnrolmentCandidate {
+        let verified = project::VerifiedProjectEvent::verify(root.clone())
+            .await
+            .expect("root verifies");
+        project::validate_enrolment_candidate(&verified, &rt.discovered)
+            .expect("a root on a discovered coordinate is a candidate")
+    }
+
+    /// The queue key a root's work would be parked under, derived the way
+    /// dispatch derives it.
+    fn route_key_of(root: &nostr::Event) -> uuid::Uuid {
+        project::project_route_key(&root.id.to_hex()).expect("a root id is a route key")
+    }
+
+    /// **The live Phase 3e failure, through the production dispatch path.**
+    ///
+    /// Root `d2986fa7…` was correctly ignored for twenty-five seconds. Then
+    /// comment `74f92354…` arrived, `p`-tagging both this agent and the agent
+    /// it was for, and beginning `@hermes-gateway …` — and this agent woke,
+    /// enrolled, and answered a comment that had told it, in its first word,
+    /// who it was for.
+    ///
+    /// The root is `Unknown` here, which was the whole hole: the separately
+    /// fetched root was being read as *addressing* as well as binding, so an
+    /// unknown root's first comment was explicit by construction whoever it
+    /// named.
+    ///
+    /// The addressed follow-up is in the same test rather than beside it. It
+    /// bounds the negative — if the hyphenated comment had queued, the first
+    /// prompt the child ever saw would carry it — and it holds the fix to
+    /// target-only rather than deaf.
+    #[tokio::test]
+    async fn a_comment_handed_to_another_agent_never_enrols_an_unknown_root() {
+        let recorder = PromptRecorder::new();
+        let mut rt = Runtime::known_as(&recorder, DISPLAY_NAME).await;
+        let agent = rt.agent.clone();
+        let other = Keys::generate();
+        rt.discover_announced_by(&agent, "comment-e2e").await;
+
+        let root = desktop_root_on_an_owned_repo(&rt.owner, &agent, "comment-e2e", "test");
+        assert_eq!(
+            rt.drive(&routed(root.clone(), project::ProjectSubscription::Enrolment).await)
+                .await,
+            ProjectDispatched::Ignored,
+            "precondition: the structural root is not an address"
+        );
+
+        let handed_off = desktop_comment_to_both(
+            &rt.owner,
+            &agent,
+            &other,
+            "comment-e2e",
+            &root,
+            &format!("@{OTHER_HANDLE} could you take the deploy check on this one"),
+        );
+        let dispatched = rt
+            .drive_with_candidate(
+                &routed(handed_off, project::ProjectSubscription::Enrolment).await,
+                Some(fetched_root_candidate(&rt, &root).await),
+            )
+            .await;
+
+        assert_eq!(
+            dispatched,
+            ProjectDispatched::Ignored,
+            "a comment addressed to another agent is not this agent's turn"
+        );
+        assert!(
+            rt.enrolments.get(&root.id.to_hex()).is_none(),
+            "and it must not start a watch on the conversation either"
+        );
+        assert_eq!(
+            rt.queue.queued_event_count(&route_key_of(&root)),
+            0,
+            "nothing may be queued for a turn that is not ours"
+        );
+
+        // The same person, on the same root, addressing this agent.
+        let for_us = desktop_comment_to_both(
+            &rt.owner,
+            &agent,
+            &other,
+            "comment-e2e",
+            &root,
+            &format!("@{DISPLAY_NAME} and could you review the migration after that"),
+        );
+        let dispatched = rt
+            .drive_with_candidate(
+                &routed(for_us, project::ProjectSubscription::Enrolment).await,
+                Some(fetched_root_candidate(&rt, &root).await),
+            )
+            .await;
+
+        assert!(
+            matches!(dispatched, ProjectDispatched::Queued { queued: true, .. }),
+            "target-only is not deaf — got {dispatched:?}"
+        );
+        assert!(
+            rt.enrolments.get(&root.id.to_hex()).is_some(),
+            "the comment that named us enrols the root it was fetched for"
+        );
+
+        let prompts = recorder.prompts(1).await;
+        assert_eq!(
+            prompts.len(),
+            1,
+            "exactly one turn, and only from the comment that named us: {prompts:?}"
+        );
+        assert!(
+            prompts[0].contains("review the migration"),
+            "the turn carried the wrong comment: {}",
+            prompts[0]
+        );
+        assert!(
+            !prompts[0].contains("deploy check"),
+            "the handed-off comment reached the child as work: {}",
+            prompts[0]
+        );
+    }
+
+    /// The same comment on a root this agent is already watching.
+    ///
+    /// Once enrolled, this agent is in every later comment's `p` set for good —
+    /// Desktop copies prior recipients forward — so the inherited tag says
+    /// nothing at all about who the next comment is for. Only the body does.
+    #[tokio::test]
+    async fn an_active_root_ignores_a_comment_handed_to_another_agent() {
+        let recorder = PromptRecorder::new();
+        let mut rt = Runtime::known_as(&recorder, DISPLAY_NAME).await;
+        let agent = rt.agent.clone();
+        let other = Keys::generate();
+        rt.discover_announced_by(&agent, "comment-e2e").await;
+
+        let root = desktop_root_on_an_owned_repo(
+            &rt.owner,
+            &agent,
+            "comment-e2e",
+            &format!("@{DISPLAY_NAME} the deploy check is flaky after a reconnect"),
+        );
+        assert!(
+            matches!(
+                rt.drive(&routed(root.clone(), project::ProjectSubscription::Enrolment).await)
+                    .await,
+                ProjectDispatched::Queued { queued: true, .. }
+            ),
+            "precondition: a named root enrols and wakes"
+        );
+        let opening = recorder.prompts(1).await;
+        assert_eq!(opening.len(), 1, "precondition: one opening turn");
+        assert!(matches!(
+            rt.enrolments.state_of(&root.id.to_hex()),
+            project::RootState::Active
+        ));
+
+        // …and the follow-up is for somebody else, on the watched subscription
+        // the enrolment moved this root to.
+        let handed_off = desktop_comment_to_both(
+            &rt.owner,
+            &agent,
+            &other,
+            "comment-e2e",
+            &root,
+            &format!("@{OTHER_HANDLE} could you take it from here"),
+        );
+        let dispatched = rt
+            .drive(
+                &routed(
+                    handed_off,
+                    project::ProjectSubscription::Watched { generation: 1 },
+                )
+                .await,
+            )
+            .await;
+
+        assert_eq!(
+            dispatched,
+            ProjectDispatched::Ignored,
+            "an inherited `p` is propagation, not this agent's next turn"
+        );
+        assert_eq!(
+            rt.queue.queued_event_count(&route_key_of(&root)),
+            0,
+            "and nothing may be waiting behind the turn in flight either"
+        );
+        assert_eq!(
+            recorder.read().len(),
+            1,
+            "the watched root answered a comment addressed to another agent"
+        );
+    }
+
+    /// A copied-forward `p` and nothing else, with the root in hand.
+    ///
+    /// This is the residual claim the comment-first promotion rested on: that
+    /// the enrolment subscription's `p` transport, plus a separately verified
+    /// root, was proof of address by itself. It is not — Desktop stamps the
+    /// repository owner onto every root and copies it into every comment
+    /// below, so on an agent-owned project that evidence is present on comments
+    /// nobody addressed to the agent, including the very first one. Both the
+    /// root and the comment are driven with the fetched candidate supplied, so
+    /// "with a separately resolved root" is asserted rather than assumed.
+    #[tokio::test]
+    async fn a_bare_structural_p_does_not_wake_an_unknown_root() {
+        let recorder = PromptRecorder::new();
+        let mut rt = Runtime::known_as(&recorder, DISPLAY_NAME).await;
+        let agent = rt.agent.clone();
+        rt.discover_announced_by(&agent, "comment-e2e").await;
+
+        let root = desktop_root_on_an_owned_repo(&rt.owner, &agent, "comment-e2e", "test");
+        let candidate = fetched_root_candidate(&rt, &root).await;
+        assert_eq!(
+            rt.drive_with_candidate(
+                &routed(root.clone(), project::ProjectSubscription::Enrolment).await,
+                Some(candidate.clone()),
+            )
+            .await,
+            ProjectDispatched::Ignored,
+            "a root whose only claim is the tag Desktop wrote is not an address"
+        );
+
+        let follow_up = desktop_comment(
+            &rt.owner,
+            &agent,
+            "comment-e2e",
+            &root,
+            "could someone look at this today",
+        );
+        let dispatched = rt
+            .drive_with_candidate(
+                &routed(follow_up, project::ProjectSubscription::Enrolment).await,
+                Some(candidate),
+            )
+            .await;
+
+        assert_eq!(
+            dispatched,
+            ProjectDispatched::Ignored,
+            "a comment naming nobody addresses nobody, root in hand or not"
+        );
+        assert!(rt.enrolments.get(&root.id.to_hex()).is_none());
+        assert_eq!(rt.queue.queued_event_count(&route_key_of(&root)), 0);
+
+        // Bounded by the addressed comment, as above: if either of the two
+        // events had queued, this would not be the first prompt.
+        let for_us = desktop_comment(
+            &rt.owner,
+            &agent,
+            "comment-e2e",
+            &root,
+            &format!("@{DISPLAY_NAME} could you look at this today"),
+        );
+        rt.drive_with_candidate(
+            &routed(for_us, project::ProjectSubscription::Enrolment).await,
+            Some(fetched_root_candidate(&rt, &root).await),
+        )
+        .await;
+
+        let prompts = recorder.prompts(1).await;
+        assert_eq!(prompts.len(), 1, "exactly one turn: {prompts:?}");
+        assert!(
+            prompts[0].contains("could you look at this today"),
+            "the turn carried the wrong event: {}",
             prompts[0]
         );
     }

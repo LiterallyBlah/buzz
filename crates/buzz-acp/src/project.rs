@@ -3723,31 +3723,40 @@ pub(crate) fn decide_project_event(
     let kind_effect = classify_kind(event.kind());
     let root_state = state.enrolments.state_of(route.root());
     let evidence = AddressingEvidence::resolve(event, identity.agent);
-    let Some(mut addressing) =
+    let Some(addressing) =
         resolve_addressing(source, &evidence, state.readiness, None, identity.agent)
     else {
         return ignored;
     };
+    // **A separately fetched root is a binding, and only a binding.**
+    //
+    // It used to be addressing as well: on an unknown root, a comment on the
+    // enrolment subscription whose exact `p` carried this agent was promoted to
+    // `Addressing::ExplicitMention` outright, on the argument that the `p`
+    // transport plus a verified matching root was the complete comment-first
+    // proof and that Desktop's display-name text could not be read here.
+    //
+    // Both halves have since stopped being true. `named_self` reads the
+    // display name Desktop actually writes, so a real `@Claude` no longer needs
+    // rescuing by a promotion — it resolves explicitly on its own. And the `p`
+    // is not the exact transport the promotion assumed: Desktop stamps the
+    // repository owner onto every root it creates and copies every prior
+    // recipient into every later comment, so on an agent-owned project a
+    // *first* comment on a root the agent was never addressed in still carries
+    // the agent's key. That is the shape the live Phase 3d run failed on —
+    // root `d2986fa7…` content `test`, correctly ignored, then comment
+    // `74f92354…` addressed to `@hermes-gateway` with both parties `p`-tagged,
+    // which the promotion turned into an explicit mention of this agent and a
+    // turn.
+    //
+    // The binding half is kept, and it is the half that was ever load-bearing:
+    // a comment that genuinely names this agent on a root this process has
+    // never seen has no enrolment candidate of its own, and without the fetched
+    // root there is nothing to enrol under.
     let resolved_binding = resolved_candidate.filter(|candidate| {
         candidate.root() == route.root()
             && matches!(route.coordinate_claim(), CoordinateClaim::Unique(value) if value == candidate.coordinate())
     });
-    // On an unknown root, the enrolment subscription's exact `p` transport plus
-    // a separately verified matching root is the complete comment-first proof.
-    // Desktop display-name text is presentation data and cannot be resolved
-    // reliably here. Do not apply this promotion to dormant roots: their copied
-    // participant tags must remain silent unless stronger explicit evidence is
-    // available.
-    if matches!(root_state, RootState::Unknown)
-        && matches!(kind_effect, KindEffect::Comment)
-        && matches!(
-            source,
-            ProjectSubscription::Enrolment | ProjectSubscription::EnrolmentHistory { .. }
-        )
-        && resolved_binding.is_some()
-    {
-        addressing = Addressing::ExplicitMention;
-    }
     let author = classify_project_author(
         event,
         identity.agent,
@@ -7083,12 +7092,27 @@ pub(crate) fn history_order_key(root: &str, event_id: &str, created_at: u64) -> 
 
 // ── Mention syntax ────────────────────────────────────────────────────────────
 
-/// Characters that can appear *inside* an identifier token.
+/// Characters that can appear *inside* a mention token.
 ///
-/// Unicode alphanumeric plus `_`. Deliberately not tied to either key alphabet:
-/// a token ends where the lexer says, not where the key's alphabet runs out.
-/// "Is the next character another hex digit" accepted `@<64-hex>garbage`.
-fn is_identifier_char(c: char) -> bool {
+/// Unicode alphanumeric plus `_` and `-`. Deliberately not tied to either key
+/// alphabet: a token ends where the lexer says, not where the key's alphabet
+/// runs out. "Is the next character another hex digit" accepted
+/// `@<64-hex>garbage`.
+///
+/// The hyphen is here because display handles are written with it, and it is
+/// the difference between reading `@hermes-gateway` as one address and reading
+/// it as `@hermes` followed by noise. That matters in both directions: an agent
+/// called `Claude` must not answer `@claude-bot`, and an agent called
+/// `hermes-gateway` must still be found by its whole name.
+fn is_mention_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
+}
+
+/// Characters a mention token may *begin* with.
+///
+/// A token has to name something. `-` continues a handle but cannot open one,
+/// so a stray `@-` in prose is punctuation rather than an address.
+fn opens_mention_token(c: char) -> bool {
     c.is_alphanumeric() || c == '_'
 }
 
@@ -7101,6 +7125,12 @@ const MENTION_PREFIXES: [&str; 2] = ["nostr:", "@"];
 /// the prefix, the exact identity, and a boundary after it. Every occurrence is
 /// scanned, so prose mentioning an identity followed by a genuine mention still
 /// resolves.
+///
+/// Boundaries are [`is_mention_char`], so a display name that is a *prefix* of
+/// somebody else's handle does not match it: an agent called `Claude` reads
+/// `@claude-bot` as a mention of `claude-bot`, which is not its name. Before
+/// the hyphen was admitted into the token, that comment named this agent and
+/// woke it.
 fn explicit_mention_present(content: &str, identity: &str) -> bool {
     if identity.is_empty() {
         return false;
@@ -7117,11 +7147,11 @@ fn explicit_mention_present(content: &str, identity: &str) -> bool {
             let leading_ok = lower[..start]
                 .chars()
                 .next_back()
-                .is_none_or(|c| !is_identifier_char(c));
+                .is_none_or(|c| !is_mention_char(c));
             let trailing_ok = lower[end..]
                 .chars()
                 .next()
-                .is_none_or(|c| !is_identifier_char(c));
+                .is_none_or(|c| !is_mention_char(c));
             if leading_ok && trailing_ok {
                 return true;
             }
@@ -7139,9 +7169,12 @@ fn explicit_mention_present(content: &str, identity: &str) -> bool {
 /// nobody* — the second is an ordinary continuation and must keep waking an
 /// active root.
 ///
-/// A token is a prefix at a lexical boundary followed by at least one
-/// identifier character, so an email address, a lone `@`, or a decorative
-/// `nostr:` with nothing after it is not a mention.
+/// A token is a prefix at a lexical boundary followed by a character that can
+/// open a handle ([`opens_mention_token`]), so an email address, a lone `@`, or
+/// a decorative `nostr:` with nothing after it is not a mention. What follows
+/// that first character is not inspected: the token's *extent* only matters
+/// when it is being compared against an identity, which is
+/// [`explicit_mention_present`]'s job.
 fn mention_token_present(content: &str) -> bool {
     let lower = content.to_ascii_lowercase();
 
@@ -7153,8 +7186,8 @@ fn mention_token_present(content: &str) -> bool {
             let leading_ok = lower[..start]
                 .chars()
                 .next_back()
-                .is_none_or(|c| !is_identifier_char(c));
-            let names_something = lower[end..].chars().next().is_some_and(is_identifier_char);
+                .is_none_or(|c| !is_mention_char(c));
+            let names_something = lower[end..].chars().next().is_some_and(opens_mention_token);
             if leading_ok && names_something {
                 return true;
             }
@@ -7715,8 +7748,9 @@ pub(crate) fn classify_project_author(
 /// is [`lifecycle_actor_allowed`] for lifecycle events and ignored otherwise.
 ///
 /// `directed_elsewhere` is [`AddressingEvidence::directed_at_another_party`].
-/// It only ever subtracts: it can stop an active root waking on a comment aimed
-/// at a different agent, and it can never create a turn or an enrolment.
+/// It only ever subtracts: it can stop a comment aimed at a different agent
+/// waking or enrolling this one, whatever state the root is in, and it can
+/// never create a turn or an enrolment.
 pub(crate) fn classify_project_event(
     kind_effect: KindEffect,
     author: ProjectAuthor,
@@ -7825,6 +7859,8 @@ pub(crate) fn classify_project_event(
 /// | `Active` | wake | ignore — not addressed to us |
 /// | `Dormant` | reactivate and wake | ignore — stays dormant |
 ///
+/// …and every row is void when the comment names somebody else.
+///
 /// **Target-only.** Every row now requires the comment to address *this* agent.
 /// The active row used to wake on anything an approved human wrote, on the
 /// theory that a continuation needs no re-tag. That is true of a two-party
@@ -7845,15 +7881,26 @@ pub(crate) fn classify_project_event(
 /// is also reachable via a *fresh* `p` tag with complete history, so a comment
 /// can name another agent in prose while still carrying explicit-`p` evidence
 /// for us. Naming somebody else wins.
+///
+/// It guards **every** row, not only the active one. A root this process has
+/// never seen is exactly where an unaddressed comment is most expensive: the
+/// active row at least means somebody once addressed this agent here, whereas
+/// enrolling from `@another-agent, please take this` starts a watch on a
+/// conversation nobody invited the agent into, and answers it. Restricting the
+/// guard to `Active` was the live Phase 3d failure — on a fresh root the very
+/// first comment, handed to another party, still enrolled and woke.
 fn wake_or_enrol(
     root_state: RootState,
     addressing: Addressing,
     directed_elsewhere: bool,
 ) -> ProjectEffect {
+    // A comment handed to a different agent is never ours, whatever else it
+    // carries or whatever state the root is in — checked before addressing for
+    // exactly that reason.
+    if directed_elsewhere {
+        return ProjectEffect::Ignore;
+    }
     match root_state {
-        // A comment handed to a different agent is never ours, whatever else it
-        // carries — checked before addressing for exactly that reason.
-        RootState::Active if directed_elsewhere => ProjectEffect::Ignore,
         RootState::Active => match addressing {
             Addressing::ExplicitMention => ProjectEffect::Wake,
             Addressing::InheritedParticipant | Addressing::WatchedRoot => ProjectEffect::Ignore,
@@ -13331,6 +13378,151 @@ mod tests {
         }
     }
 
+    /// **The live Phase 3d failure, at the layer that produced it.**
+    ///
+    /// Comment `74f92354…` on root `d2986fa7…` was addressed to
+    /// `@hermes-gateway` and carried both parties' `p` tags. The root had been
+    /// correctly ignored twenty-five seconds earlier, so it was `Unknown` — and
+    /// `Unknown` was the one row the guard did not cover. The hyphenated handle
+    /// is the fixture's whole point: it is what a display handle looks like,
+    /// and a token grammar that stopped at the `-` would read the address as
+    /// `@hermes`, which is a different question than the one being asked here.
+    ///
+    /// `Addressing::ExplicitMention` is supplied deliberately — the strongest
+    /// addressing any route could hand this comment, whether from a fresh `p`
+    /// with complete history or, before this change, from the comment-first
+    /// promotion. Naming somebody else has to beat all of it, in every state.
+    #[tokio::test]
+    async fn a_comment_addressed_to_a_hyphenated_handle_is_nobody_elses_turn() {
+        let evidence = directed_evidence(
+            "@hermes-gateway please pick this up",
+            &[AGENT_PK, THIRD_PARTY],
+        )
+        .await;
+
+        assert!(
+            evidence.p_tag_present,
+            "the agent's own `p` is on the comment — that is the whole trap"
+        );
+        assert!(
+            evidence.directed_at_another_party(),
+            "a hyphenated handle is a mention token, and it is not our name"
+        );
+        for state in [RootState::Unknown, RootState::Active, RootState::Dormant] {
+            assert_eq!(
+                classify_project_event(
+                    classify_kind(KIND_TEXT_NOTE),
+                    ProjectAuthor::AuthorisedHuman,
+                    CallMarker::None,
+                    state,
+                    Addressing::ExplicitMention,
+                    false,
+                    evidence.directed_at_another_party(),
+                ),
+                ProjectEffect::Ignore,
+                "{state:?} woke on a comment handed to another agent"
+            );
+        }
+    }
+
+    /// A handle this agent's name is only the *start* of is not this agent.
+    ///
+    /// `@claude-bot` used to match the display name `Claude`: the token grammar
+    /// ended at the hyphen, so the trailing boundary check passed and
+    /// `named_self` was true. The comment then read as *ours*, which is worse
+    /// than the failure it sits beside — it does not merely fail to suppress a
+    /// turn, it manufactures one, and it does so on the comment that names the
+    /// agent the work was actually for.
+    #[tokio::test]
+    async fn a_handle_that_only_starts_with_our_name_is_not_our_mention() {
+        let evidence =
+            directed_evidence("@claude-bot please pick this up", &[AGENT_PK, THIRD_PARTY]).await;
+
+        assert!(
+            !evidence.named_self,
+            "`@claude-bot` names claude-bot, not Claude"
+        );
+        assert!(
+            evidence.directed_at_another_party(),
+            "and it names a p-tagged party that is not us"
+        );
+        assert_eq!(
+            resolve_addressing(
+                &ProjectSubscription::Enrolment,
+                &evidence,
+                &RootHistoryReadiness::Unknown,
+                None,
+                &named_identity(),
+            ),
+            Some(Addressing::InheritedParticipant),
+            "the only claim left on this agent is a tag it was carried along in"
+        );
+    }
+
+    /// …and the agent whose handle it is still finds itself in it.
+    ///
+    /// The negative above is only worth having if the hyphenated handle is a
+    /// real address for somebody: an agent configured as `hermes-gateway` has
+    /// to be addressable by the name people write.
+    #[tokio::test]
+    async fn an_agent_whose_handle_is_hyphenated_is_addressed_by_it() {
+        let keys = Keys::generate();
+        let event = EventBuilder::new(
+            Kind::Custom(KIND_TEXT_NOTE as u16),
+            "@hermes-gateway please pick this up",
+        )
+        .tags([nostr::Tag::parse(tag(&["p", AGENT_PK])).unwrap()])
+        .sign_with_keys(&keys)
+        .expect("sign");
+        let verified = VerifiedProjectEvent::verify(event).await.expect("valid");
+        let hyphenated = agent_identity().with_display_name("hermes-gateway");
+        let evidence = AddressingEvidence::resolve(&verified, &hyphenated);
+
+        assert!(evidence.named_self, "it is written exactly as configured");
+        assert!(
+            !evidence.directed_at_another_party(),
+            "the comment names this agent, so it is not handed elsewhere"
+        );
+        assert_eq!(
+            resolve_addressing(
+                &ProjectSubscription::Enrolment,
+                &evidence,
+                &RootHistoryReadiness::Unknown,
+                None,
+                &hyphenated,
+            ),
+            Some(Addressing::ExplicitMention),
+        );
+    }
+
+    /// A NIP-PC invocation is addressed by its envelope, not by its prose.
+    ///
+    /// The guard widened to every root state, so this is the case that must not
+    /// have widened with it: a caller's covering note may name anybody — the
+    /// human it is doing this on behalf of, the agent it is handing off from —
+    /// and the envelope still names this agent as its callee.
+    #[test]
+    fn a_peer_call_still_enrols_when_its_prose_names_somebody_else() {
+        for state in [RootState::Unknown, RootState::Active, RootState::Dormant] {
+            assert_eq!(
+                classify_project_event(
+                    classify_kind(KIND_TEXT_NOTE),
+                    ProjectAuthor::TrustedAgent,
+                    CallMarker::Invocation,
+                    state,
+                    Addressing::InheritedParticipant,
+                    false,
+                    true,
+                ),
+                match state {
+                    RootState::Active => ProjectEffect::Wake,
+                    _ => ProjectEffect::EnrolAndWake,
+                },
+                "{state:?} refused a call whose envelope named this agent"
+            );
+        }
+    }
+
     /// An agent with no configured name cannot tell "excluded" from "not
     /// mentioned", so it must not read the comment as excluding it — but under
     /// the target-only rule that no longer buys it a turn either. Both halves
@@ -13465,6 +13657,35 @@ mod tests {
         assert!(!mention_token_present("email me at foo@example.com"));
         assert!(!mention_token_present("a bare @ sign"));
         assert!(!mention_token_present("no names at all"));
+        // A handle written with a hyphen is a name somebody was called by.
+        assert!(mention_token_present("@hermes-gateway please"));
+        // A `-` continues a handle but cannot open one.
+        assert!(!mention_token_present("wrapped in @-@ dashes"));
+        // The local part of an address is still not a mention, hyphens or not.
+        assert!(!mention_token_present("write to first-last@example.com"));
+    }
+
+    /// The token grammar, at the boundary the hyphen moved.
+    ///
+    /// Every case here is one identity against one body, so a failure names the
+    /// rule that broke rather than a scenario that happened to depend on it.
+    #[test]
+    fn a_hyphenated_handle_is_one_whole_mention_token() {
+        // The defect: `Claude` matched the front of somebody else's handle,
+        // because the token was taken to end at the `-`.
+        assert!(!explicit_mention_present("@claude-bot please", "Claude"));
+        assert!(!explicit_mention_present("@claude-bot please", "claude-bo"));
+        // …and the whole handle still matches itself, wherever it sits.
+        assert!(explicit_mention_present("@hermes-gateway please", "hermes-gateway"));
+        assert!(explicit_mention_present("ping @hermes-gateway.", "hermes-gateway"));
+        assert!(explicit_mention_present("(@hermes-gateway)", "hermes-gateway"));
+        // A longer handle is a different handle, at either end.
+        assert!(!explicit_mention_present("@hermes-gateway-2 please", "hermes-gateway"));
+        assert!(!explicit_mention_present("@relay-hermes-gateway", "hermes-gateway"));
+        // The leading boundary is unchanged: an `@` inside a word addresses
+        // nobody, which is what keeps an ordinary email address out.
+        assert!(!explicit_mention_present("mail ops@claude-bot.example", "claude-bot"));
+        assert!(!explicit_mention_present("mail hermes@example.com", "example"));
     }
 
     /// This agent's npub. Asserted against the derived form in
