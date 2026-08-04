@@ -162,9 +162,12 @@ harness_schema() {
   harness_compose exec -T postgres psql -U buzz -d buzz -v ON_ERROR_STOP=1 \
     -c "DROP SCHEMA public CASCADE; CREATE SCHEMA public;" >/dev/null || return 1
 
+  # -1 wraps each file in a transaction, matching how sqlx applies these same
+  # files in production — 0007 opens with LOCK TABLE, which is only legal
+  # inside a transaction block, and others may rely on all-or-nothing apply.
   local m
   for m in "${REPO_ROOT}"/migrations/*.sql; do
-    harness_compose exec -T postgres psql -U buzz -d buzz -v ON_ERROR_STOP=1 \
+    harness_compose exec -T postgres psql -U buzz -d buzz -v ON_ERROR_STOP=1 -1 \
       < "${m}" >/dev/null || { err "migration failed: $(basename "${m}")"; return 1; }
   done
 
