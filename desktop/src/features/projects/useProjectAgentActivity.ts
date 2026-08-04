@@ -8,6 +8,7 @@ import {
   type ProjectAgentActivity,
 } from "@/features/projects/projectAgentActivity";
 import { subscribeToProjectActivity } from "@/shared/api/projectActivityRelay";
+import { useLivenessSweep } from "@/shared/lib/useLivenessSweep";
 
 /**
  * How often the hook re-evaluates staleness.
@@ -74,14 +75,9 @@ export function useProjectAgentActivity(
     };
   }, [rootEventId]);
 
-  React.useEffect(() => {
-    if (Object.keys(state).length === 0) return;
-    const timer = window.setInterval(
-      () => setNow(Date.now()),
-      ACTIVITY_TICK_MS,
-    );
-    return () => window.clearInterval(timer);
-  }, [state]);
+  useLivenessSweep(Object.keys(state).length > 0, ACTIVITY_TICK_MS, () =>
+    setNow(Date.now()),
+  );
 
   return React.useMemo(() => liveProjectActivity(state, now), [state, now]);
 }

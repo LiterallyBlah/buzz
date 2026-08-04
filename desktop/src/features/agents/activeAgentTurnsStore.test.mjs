@@ -1002,6 +1002,116 @@ describe("activeAgentTurnsStore", () => {
     });
   });
 
+  /**
+   * The removal bound is derived from the cadence the harness is ACTUALLY
+   * emitting at, not from an assumed 10s. This is a deliberate change to
+   * observable timing: a deployment running BUZZ_ACP_TURN_LIVENESS_SECS=15
+   * previously lost a working badge mid-turn on a single dropped ping (one 30s
+   * hole against a 25s bound); it now keeps it, because three 15s gaps move the
+   * bound to 37.5s. Nothing changes at the 10s default — the observed cadence
+   * is floored there — which the second test pins.
+   *
+   * Both cases keep one sibling turn pinging throughout, so the prune pause
+   * (which engages only when an agent's WHOLE stream goes quiet) cannot be what
+   * decides the outcome. The bound itself is what is under test.
+   */
+  describe("removal bound follows the observed liveness cadence", () => {
+    const EPOCH = Date.parse("2024-01-01T00:00:00Z");
+    const at = (ms) => new Date(EPOCH + ms).toISOString();
+
+    let unsubscribe;
+    let seq;
+
+    beforeEach(() => {
+      mock.timers.enable({ apis: ["setInterval", "Date"], now: EPOCH });
+      unsubscribe = subscribeActiveAgentTurns(() => {});
+      seq = 0;
+    });
+
+    afterEach(() => {
+      unsubscribe();
+      mock.timers.reset();
+    });
+
+    /** Two turns for one agent, both started at t=0. */
+    function startPair() {
+      syncAgentTurnsFromEvents(AGENT, [
+        makeEvent({
+          seq: ++seq,
+          turnId: "t1",
+          channelId: "c1",
+          timestamp: at(0),
+        }),
+        makeEvent({
+          seq: ++seq,
+          turnId: "t2",
+          channelId: "c2",
+          timestamp: at(0),
+        }),
+      ]);
+    }
+
+    /** Advance the clock to `ms` and deliver one liveness frame per turn. */
+    function pingAt(ms, turnIds) {
+      mock.timers.tick(EPOCH + ms - Date.now());
+      syncAgentTurnsFromEvents(
+        AGENT,
+        turnIds.map((turnId) =>
+          makeEvent({
+            seq: ++seq,
+            kind: "turn_liveness",
+            turnId,
+            channelId: turnId.replace("t", "c"),
+            timestamp: at(ms),
+          }),
+        ),
+      );
+    }
+
+    it("keeps a badge through one dropped ping at a 15s harness cadence", () => {
+      startPair();
+      pingAt(15_000, ["t1", "t2"]);
+      pingAt(30_000, ["t1", "t2"]);
+      pingAt(45_000, ["t1", "t2"]);
+      // t2's 60s ping is lost in transit; t1's arrives, so the agent's stream is
+      // demonstrably up and the prune pause stays disengaged.
+      pingAt(60_000, ["t1"]);
+      mock.timers.tick(15_000); // t2 silent for 30s — past the old 25s bound
+
+      assert.ok(
+        channelIdsOf(getActiveTurnsForAgent(AGENT)).has("c2"),
+        "a 15s cadence must tolerate one dropped ping instead of wiping the badge",
+      );
+
+      // The window is wider, not absent: 2.5 × 15s = 37.5s still terminates.
+      mock.timers.tick(10_000); // t2 silent for 40s
+      assert.ok(
+        !channelIdsOf(getActiveTurnsForAgent(AGENT)).has("c2"),
+        "a genuinely dead turn must still prune at 2.5 observed cadences",
+      );
+      assert.ok(
+        channelIdsOf(getActiveTurnsForAgent(AGENT)).has("c1"),
+        "the pinging sibling must be untouched",
+      );
+    });
+
+    it("still prunes at 25s when the harness runs at the 10s default", () => {
+      startPair();
+      pingAt(10_000, ["t1", "t2"]);
+      pingAt(20_000, ["t1", "t2"]);
+      pingAt(30_000, ["t1", "t2"]);
+      pingAt(40_000, ["t1"]);
+      mock.timers.tick(20_000); // t2 silent for 30s
+
+      const channels = channelIdsOf(getActiveTurnsForAgent(AGENT));
+      assert.ok(
+        !channels.has("c2"),
+        "the observed cadence is floored at 10s, so the bound stays at 25s",
+      );
+      assert.ok(channels.has("c1"), "the pinging sibling must survive");
+    });
+  });
+
   describe("skew-corrected elapsed (real-time arrival)", () => {
     // The clock offset estimate (running minimum of Date.now() - event time)
     // is only meaningful when events arrive at distinct real times — exactly

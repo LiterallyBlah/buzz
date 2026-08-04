@@ -1,5 +1,9 @@
 import type { RelayEvent } from "@/shared/api/types";
 import { KIND_PROJECT_ACTIVITY } from "@/shared/constants/kinds";
+import {
+  createLivenessMap,
+  type LivenessState,
+} from "@/shared/lib/livenessStore";
 
 /**
  * NIP-PA: which agents are working on a project root, right now.
@@ -9,6 +13,12 @@ import { KIND_PROJECT_ACTIVITY } from "@/shared/constants/kinds";
  * from a finished turn, a harness that died without sending one at all, an
  * event that belongs to a different issue — are testable without rendering
  * anything.
+ *
+ * The bookkeeping underneath — one entry per scope, refreshed by frames,
+ * removed by a terminal frame, expired by silence, same object back when
+ * nothing changed — is the shared liveness core. What stays here is what is
+ * actually about NIP-PA: which events are believable at all, and which
+ * announcement wins when two disagree.
  */
 
 /** How long an announcement stays believable (NIP-PA §Refresh). */
@@ -42,10 +52,40 @@ export type ProjectAgentActivity = {
   announcedAt: number;
 };
 
-/** Agent pubkey → its latest live announcement on one root. */
-export type ProjectActivityState = Record<string, ProjectAgentActivity>;
+/**
+ * The liveness rules for one root, as data.
+ *
+ * `frameAtMs` on every upsert is the announcement's own `created_at`, so the
+ * 45-second window is measured from when the runtime said it — not from when
+ * the relay got round to delivering it.
+ */
+const activityLiveness = createLivenessMap<ProjectAgentActivity>({
+  ttlMs: PROJECT_ACTIVITY_STALE_MS,
+  supersede: (existing, incoming) =>
+    // An out-of-order announcement from an older frame must not overwrite a
+    // newer one — relays do not promise ordering, and the older frame's stage
+    // would replace the current caption.
+    (existing.turnId === incoming.turnId &&
+      existing.announcedAt >= incoming.announcedAt) ||
+    // `queued` never displaces `working`, and this is not the same rule as the
+    // one above: the two frames belong to *different* turns — a queued frame is
+    // named after the comment that caused it, never after a turn — so the
+    // turn-id check cannot see them as a pair. The runtime already refuses to
+    // announce one over the other, but `created_at` is whole seconds and the
+    // same second routinely carries both, so a reordered pair would arrive as
+    // "working — editing files" then "queued" and walk the indicator backwards
+    // for a full refresh cycle.
+    (incoming.state === "queued" &&
+      existing.state === "working" &&
+      existing.announcedAt >= incoming.announcedAt),
+  compare: (a, b) => a.value.agent.localeCompare(b.value.agent),
+});
 
-export const EMPTY_PROJECT_ACTIVITY: ProjectActivityState = {};
+/** Agent pubkey → its latest live announcement on one root. */
+export type ProjectActivityState = LivenessState<ProjectAgentActivity>;
+
+export const EMPTY_PROJECT_ACTIVITY: ProjectActivityState =
+  activityLiveness.empty;
 
 function tag(event: RelayEvent, key: string): string | null {
   for (const entry of event.tags) {
@@ -134,45 +174,20 @@ export function applyProjectActivity(
   const parsed = parseProjectActivity(event, rootEventId);
   if (!parsed) return current;
 
-  const existing = current[parsed.agent];
-
   if (parsed.state === "idle") {
     // Only the turn being shown may be cleared by its own `idle`. A late
     // terminal frame from the previous turn would otherwise blank the
     // indicator for work that is still running.
-    if (!existing || existing.turnId !== parsed.turnId) return current;
-    const next = { ...current };
-    delete next[parsed.agent];
-    return next;
+    return activityLiveness.drop(
+      current,
+      parsed.agent,
+      (existing) => existing.turnId === parsed.turnId,
+    );
   }
 
-  // An out-of-order announcement from an older frame must not overwrite a newer
-  // one — relays do not promise ordering, and the older frame's stage would
-  // replace the current caption.
-  if (
-    existing &&
-    existing.turnId === parsed.entry.turnId &&
-    existing.announcedAt >= parsed.entry.announcedAt
-  ) {
-    return current;
-  }
-
-  // `queued` never displaces `working`, and this is not the same rule as the
-  // one above: the two frames belong to *different* turns — a queued frame is
-  // named after the comment that caused it, never after a turn — so the turn-id
-  // check cannot see them as a pair. The runtime already refuses to announce
-  // one over the other, but `created_at` is whole seconds and the same second
-  // routinely carries both, so a reordered pair would arrive as
-  // "working — editing files" then "queued" and walk the indicator backwards
-  // for a full refresh cycle.
-  if (
-    parsed.entry.state === "queued" &&
-    existing?.state === "working" &&
-    existing.announcedAt >= parsed.entry.announcedAt
-  ) {
-    return current;
-  }
-  return { ...current, [parsed.agent]: parsed.entry };
+  return activityLiveness.upsert(current, parsed.agent, parsed.entry, {
+    frameAtMs: parsed.entry.announcedAt * 1_000,
+  });
 }
 
 /**
@@ -191,9 +206,5 @@ export function liveProjectActivity(
   state: ProjectActivityState,
   nowMs: number,
 ): ProjectAgentActivity[] {
-  return Object.values(state)
-    .filter(
-      (entry) => nowMs - entry.announcedAt * 1_000 < PROJECT_ACTIVITY_STALE_MS,
-    )
-    .sort((a, b) => a.agent.localeCompare(b.agent));
+  return activityLiveness.live(state, nowMs);
 }

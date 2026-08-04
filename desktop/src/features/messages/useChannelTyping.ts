@@ -12,39 +12,46 @@ import {
   KIND_TYPING_INDICATOR,
 } from "@/shared/constants/kinds";
 import { resolveEventAuthorPubkey } from "@/shared/lib/authors";
+import {
+  createLivenessMap,
+  type LivenessState,
+} from "@/shared/lib/livenessStore";
+import { useLivenessSweep } from "@/shared/lib/useLivenessSweep";
 
 export type TypingIndicatorEntry = {
   pubkey: string;
   threadHeadId: string | null;
 };
 
-type TypingEntry = {
-  expiresAt: number;
-  firstSeenAt: number;
-  pubkey: string;
-  threadHeadId: string | null;
-};
-type TypingState = Record<string, TypingEntry>;
-
 const TYPING_INDICATOR_TTL_MS = 8_000;
 const TYPING_PRUNE_INTERVAL_MS = 1_000;
 const TYPING_POST_MESSAGE_SUPPRESS_MS = 2_000;
 
-function pruneTypingState(state: TypingState, now = Date.now()) {
-  let changed = false;
-  const next: TypingState = {};
+/**
+ * Typing is a liveness signal like any other: a 20002 frame puts one typist on
+ * the channel, the next frame keeps them there, the message they were writing
+ * takes them off, and silence expires them after the TTL. The shared core owns
+ * that; what stays in this hook is what is specific to typing — whose frames
+ * count, which frames the composer's own message should suppress, and the
+ * thread scoping.
+ *
+ * Ordering is by when a typist first appeared, so the list does not reshuffle
+ * under the reader every time somebody's indicator refreshes. `firstSeenAt` is
+ * therefore liveness metadata, not part of the entry: it survives refreshes and
+ * is not something the UI renders.
+ */
+const typingLiveness = createLivenessMap<TypingIndicatorEntry>({
+  ttlMs: TYPING_INDICATOR_TTL_MS,
+  // Consecutive frames from one typist in one thread say exactly the same
+  // thing, so they are pure refreshes: the deadline moves and React does not
+  // re-render.
+  sameValue: (existing, incoming) =>
+    existing.pubkey === incoming.pubkey &&
+    existing.threadHeadId === incoming.threadHeadId,
+  compare: (a, b) => a.firstSeenAt - b.firstSeenAt,
+});
 
-  for (const [pubkey, entry] of Object.entries(state)) {
-    if (entry.expiresAt > now) {
-      next[pubkey] = entry;
-      continue;
-    }
-
-    changed = true;
-  }
-
-  return changed ? next : state;
-}
+type TypingState = LivenessState<TypingIndicatorEntry>;
 
 function isTypingCompletionEvent(event: RelayEvent | null | undefined) {
   if (!event) {
@@ -73,7 +80,9 @@ export function useChannelTyping(
 ) {
   const channelId = channel?.id ?? null;
   const channelType = channel?.channelType ?? null;
-  const [typingByPubkey, setTypingByPubkey] = useState<TypingState>({});
+  const [typingByPubkey, setTypingByPubkey] = useState<TypingState>(
+    typingLiveness.empty,
+  );
   const normalizedCurrentPubkey = currentPubkey?.toLowerCase();
   const typingSuppressUntilByPubkeyRef = useRef<Record<string, number>>({});
   const latestMessageCreatedAtByPubkeyRef = useRef<Record<string, number>>({});
@@ -115,24 +124,22 @@ export function useChannelTyping(
       return;
     }
 
-    setTypingByPubkey((current) => {
-      const pruned = pruneTypingState(current, now);
-      const existing = pruned[typingKey];
-      return {
-        ...pruned,
-        [typingKey]: {
-          expiresAt: Math.min(now + TYPING_INDICATOR_TTL_MS, eventExpiresAt),
-          firstSeenAt: existing?.firstSeenAt ?? now,
-          pubkey: typingPubkey,
-          threadHeadId,
-        },
-      };
-    });
+    setTypingByPubkey((current) =>
+      typingLiveness.upsert(
+        typingLiveness.prune(current, now),
+        typingKey,
+        { pubkey: typingPubkey, threadHeadId },
+        // The frame's own `created_at` caps the deadline: a typist's client
+        // declares how long its claim is good for, and a slow relay must not
+        // extend it past that.
+        { nowMs: now, frameAtMs: event.created_at * 1_000 },
+      ),
+    );
   });
 
   // biome-ignore lint/correctness/useExhaustiveDependencies: channel changes should clear local typing state
   useEffect(() => {
-    setTypingByPubkey({});
+    setTypingByPubkey(typingLiveness.empty);
     typingSuppressUntilByPubkeyRef.current = {};
     latestMessageCreatedAtByPubkeyRef.current = {};
   }, [channelId]);
@@ -164,16 +171,9 @@ export function useChannelTyping(
     );
     typingSuppressUntilByPubkeyRef.current[typingKey] =
       Date.now() + TYPING_POST_MESSAGE_SUPPRESS_MS;
-    setTypingByPubkey((current) => {
-      const next = pruneTypingState(current);
-      if (!(typingKey in next)) {
-        return next;
-      }
-
-      const updated = { ...next };
-      delete updated[typingKey];
-      return updated;
-    });
+    setTypingByPubkey((current) =>
+      typingLiveness.drop(typingLiveness.prune(current), typingKey),
+    );
   }, [channelId, latestMessageEvent, relaySelfPubkey]);
 
   useEffect(() => {
@@ -214,27 +214,11 @@ export function useChannelTyping(
     };
   }, [channelId, channelType]);
 
-  const hasActiveTypers = Object.keys(typingByPubkey).length > 0;
+  const hasActiveTypers = typingLiveness.size(typingByPubkey) > 0;
 
-  useEffect(() => {
-    if (!hasActiveTypers) {
-      return;
-    }
+  useLivenessSweep(hasActiveTypers, TYPING_PRUNE_INTERVAL_MS, () => {
+    setTypingByPubkey((current) => typingLiveness.prune(current));
+  });
 
-    const interval = window.setInterval(() => {
-      setTypingByPubkey((current) => pruneTypingState(current));
-    }, TYPING_PRUNE_INTERVAL_MS);
-
-    return () => {
-      window.clearInterval(interval);
-    };
-  }, [hasActiveTypers]);
-
-  return useMemo(
-    () =>
-      Object.values(typingByPubkey)
-        .sort((left, right) => left.firstSeenAt - right.firstSeenAt)
-        .map(({ pubkey, threadHeadId }) => ({ pubkey, threadHeadId })),
-    [typingByPubkey],
-  );
+  return useMemo(() => typingLiveness.list(typingByPubkey), [typingByPubkey]);
 }
