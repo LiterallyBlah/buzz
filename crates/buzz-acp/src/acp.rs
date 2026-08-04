@@ -5036,4 +5036,50 @@ mod terminal_auth_redaction_tests {
         );
         client.shutdown().await;
     }
+
+    /// The seam: a `session/update` from a real agent process becomes the
+    /// observer frame the project-activity publisher captions a turn from.
+    ///
+    /// That publisher's own tests build the frame by hand, and a hand-built
+    /// frame only ever proves the publisher agrees with the fixture. This one
+    /// spawns a process that speaks ACP, lets the read loop publish whatever it
+    /// really publishes, and asks the production caption function what it makes
+    /// of the result — so a change to the envelope [`AcpClient::publish_inbound`]
+    /// puts on the bus fails here instead of silently blanking every caption on
+    /// every issue.
+    #[tokio::test]
+    async fn a_real_session_update_captions_the_activity_it_produces() {
+        let observer = ObserverHandle::in_process();
+        let notification = r#"{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"tool_call","toolCallId":"c1","title":"Read AGENTS.md","kind":"read","status":"in_progress"}}}"#;
+        let response = r#"{"jsonrpc":"2.0","id":1,"result":{}}"#;
+        let mut client = AcpClient::spawn(
+            "bash",
+            &[
+                "-c".into(),
+                format!("printf '%s\\n' '{notification}' '{response}'; sleep 30"),
+            ],
+            &[],
+            false,
+        )
+        .await
+        .expect("spawn fake adapter");
+        client.set_observer(Some(observer.clone()), 0);
+
+        client
+            .read_until_response(1)
+            .await
+            .expect("the adapter answered its request");
+
+        let captions: Vec<String> = observer
+            .snapshot()
+            .iter()
+            .filter_map(crate::ProjectActivityPublisher::stage_for)
+            .collect();
+        assert_eq!(
+            captions,
+            vec!["Read AGENTS.md".to_string()],
+            "the tool the agent announced did not caption the turn it produced"
+        );
+        client.shutdown().await;
+    }
 }

@@ -1250,6 +1250,36 @@ impl ProjectActivityState {
     }
 }
 
+/// Reduce a stage label to one bounded line, or `None` if nothing is left.
+///
+/// The caption is no longer a word this crate chose: it is whatever the working
+/// agent called what it is doing — an ACP tool-call title, typically — so it
+/// arrives as free text and may hold a newline, a tab or a control character
+/// from a command it is quoting. A `stage` is rendered on one line beside the
+/// agent's name, so every run of whitespace becomes a single space and control
+/// characters are dropped rather than smuggled onto the wire.
+///
+/// Bounded *after* flattening, so the 80 characters are 80 visible ones rather
+/// than a budget an indented multi-line title could spend on leading blanks.
+///
+/// Applied here rather than at the caller because every producer of a 20003 —
+/// this harness, the CLI, anything later — publishes to every reader of the
+/// issue, and a second place that decides what a caption may contain is a place
+/// that can disagree with this one.
+fn flatten_stage_label(stage: Option<&str>) -> Option<String> {
+    // Whitespace becomes a space *before* control characters are dropped: a
+    // newline is both, and dropping it as a control would run the words on
+    // either side of it together into one that was never written.
+    let spaced: String = stage?
+        .chars()
+        .map(|c| if c.is_whitespace() { ' ' } else { c })
+        .filter(|c| !c.is_control())
+        .collect();
+    let flattened: String = spaced.split_whitespace().collect::<Vec<_>>().join(" ");
+    let bounded: String = flattened.chars().take(80).collect();
+    (!bounded.is_empty()).then_some(bounded)
+}
+
 /// Build an agent activity signal for a project root (kind:20003, NIP-PA).
 ///
 /// Ephemeral and unencrypted: it says only that an agent is working on this
@@ -1287,11 +1317,11 @@ pub fn build_project_activity(
         tag(&["state", state.as_tag()])?,
         tag(&["turn", turn_id])?,
     ];
-    // A stage label is presentation. It is trimmed and bounded here rather than
-    // at the consumer because an unbounded one is published to every reader of
-    // the issue, and a blank one would render as a caption with nothing in it.
-    if let Some(stage) = stage.map(str::trim).filter(|s| !s.is_empty()) {
-        let stage: String = stage.chars().take(80).collect();
+    // A stage label is presentation. It is flattened, trimmed and bounded here
+    // rather than at the consumer because an unbounded one is published to
+    // every reader of the issue, and a blank one would render as a caption with
+    // nothing in it.
+    if let Some(stage) = flatten_stage_label(stage) {
         tags.push(tag(&["stage", &stage])?);
     }
 
@@ -3949,6 +3979,45 @@ mod tests {
             .unwrap(),
         );
         assert!(tag_values(&ev, "stage").is_empty());
+    }
+
+    /// A stage is now whatever the working agent called what it is doing, so it
+    /// is free text on its way to every reader of the issue. It leaves here as
+    /// one bounded line: no newline, no tab, no control character, and eighty
+    /// visible characters at most.
+    #[test]
+    fn a_stage_is_flattened_to_one_bounded_line() {
+        let repo = GitRepoCoord {
+            owner: "a".repeat(64),
+            id: "repo".to_string(),
+        };
+        let caption = |stage: &str| {
+            let ev = sign(
+                build_project_activity(
+                    &repo,
+                    &event_id().to_hex(),
+                    &keys().public_key().to_hex(),
+                    ProjectActivityState::Working,
+                    "t",
+                    Some(stage),
+                )
+                .unwrap(),
+            );
+            tag_values(&ev, "stage").first().cloned()
+        };
+
+        assert_eq!(
+            caption("  Running\n\tsh -c   'ls'\u{7}  ").as_deref(),
+            Some("Running sh -c 'ls'"),
+            "a multi-line title must not reach the wire as one"
+        );
+
+        let long = caption(&format!("Reading {}", "x".repeat(200))).expect("no caption");
+        assert_eq!(long.chars().count(), 80, "the caption was not bounded");
+
+        // A title of nothing but whitespace and control characters is not a
+        // caption at all — publishing it would render an empty one.
+        assert_eq!(caption("\n\t \u{7}"), None);
     }
 
     /// A coordinate survives the round trip, and anything that is not one is

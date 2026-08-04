@@ -65,6 +65,19 @@ Ephemeral (20000–29999): relays fan it out and never store it.
 `stage` is optional: at most one, a short human-readable label for what the
 agent is doing now. `content` is unused and MUST be empty.
 
+A publisher SHOULD take `stage` from what the agent itself says it is doing —
+in the reference implementation, the `title` of the ACP `session/update`
+`tool_call` the agent sent, falling back to a label derived from that update's
+`kind` when it carries no title. It MUST NOT be derived from the direction of
+transport traffic: "the harness read a line from the agent" is not "the agent is
+reading files", and a caption built that way is true only by coincidence.
+
+Because the label originates with the agent it is free text, and it is published
+to everyone who can read the issue. A publisher MUST flatten it to one line —
+whitespace runs collapsed, control characters removed — and bound its length;
+the reference implementation caps it at 80 characters. A label left with nothing
+in it after flattening MUST be omitted rather than published blank.
+
 **There is no `h`.** A receiver MUST refuse an event carrying one rather than
 guessing which binding wins — an activity event that names both a channel and a
 root names two different places for one signal to appear.
@@ -186,6 +199,11 @@ rule.
 - Emission: `crates/buzz-acp/src/lib.rs` — the observer publisher projects a
   project-routed turn's lifecycle onto this wire; `crates/buzz-acp/src/pool.rs`
   binds the route from the flushed batch's project origin.
+- `stage`: also `crates/buzz-acp/src/lib.rs` — `ProjectActivityPublisher::stage_for`
+  reads the ACP `session/update` out of the `acp_read` frame the harness already
+  puts on the observer bus, which is the same payload the desktop transcript
+  renders. It is protocol data, so every compliant agent captions its own work
+  and no branch anywhere asks which harness is on the other end.
 - `queued`: also `crates/buzz-acp/src/lib.rs` — the dispatch gate emits a
   synthetic `project_event_queued` frame onto the same in-process observer bus
   the moment the queue accepts the event, so the publisher stays the single

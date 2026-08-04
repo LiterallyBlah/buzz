@@ -583,17 +583,92 @@ impl ProjectActivityPublisher {
     /// A short label for what the agent is doing, or `None` for frames that
     /// say nothing a person would want read aloud.
     ///
-    /// Deliberately a small allowlist rather than the raw observer kind. The
-    /// observer bus carries every ACP JSON-RPC message, and most of them are
-    /// transport noise whose names would read as gibberish on an issue.
-    fn stage_for(kind: &str) -> Option<&'static str> {
-        match kind {
-            "turn_started" => Some("starting"),
-            "session_resolved" => Some("thinking"),
-            "acp_read" => Some("reading files"),
-            "acp_write" => Some("editing files"),
-            "tool_call" => Some("running a tool"),
+    /// **Read from the ACP `session/update` the agent sent, not from the
+    /// observer kind.** The two frames that carry work — `acp_read` and
+    /// `acp_write` — name a *direction on the pipe*: `acp_read` is "the harness
+    /// read a line from the agent" and fires for every message chunk, thought
+    /// and notification, while `acp_write` is "the harness wrote to the agent's
+    /// stdin" and fires for permission answers and keepalives. Captioning them
+    /// "reading files" and "editing files" described the transport and claimed
+    /// it was the work: an agent that had touched no file all turn still
+    /// announced `working — reading files`, and the caption flapped to
+    /// `editing files` whenever the harness answered it. `tool_call` was worse
+    /// than wrong — no observer event is ever emitted under that kind, so the
+    /// arm was dead and the one frame that does name a tool never reached it.
+    ///
+    /// So the caption comes from `params.update` of a `session/update`
+    /// notification, which is the agent's own account of what it is doing and
+    /// is the same payload the desktop transcript already renders. It is ACP
+    /// data, so every compliant agent produces it — nothing here knows which
+    /// harness is on the other end, and nothing needs to.
+    fn stage_for(event: &observer::ObserverEvent) -> Option<String> {
+        match event.kind.as_str() {
+            "turn_started" => Some("starting".to_string()),
+            "session_resolved" => Some("thinking".to_string()),
+            // Inbound JSON-RPC. Only a session/update says anything about the
+            // work; every other method is transport.
+            "acp_read" => {
+                if event.payload.get("method").and_then(|v| v.as_str())? != "session/update" {
+                    return None;
+                }
+                Self::stage_for_session_update(event.payload.pointer("/params/update")?)
+            }
             _ => None,
+        }
+    }
+
+    /// The caption for one ACP `session/update`, or `None` when the update is
+    /// not about work a reader of the issue would want narrated.
+    ///
+    /// `tool_call` carries the agent's own `title` — "Read AGENTS.md",
+    /// "Running rtk git log" — which is exactly the sentence NIP-PA's `stage`
+    /// asks for and is better than anything this file could synthesise. The
+    /// builder trims, collapses and bounds it before it reaches the wire.
+    ///
+    /// `tool_call_update` is folded in for its `title` alone: an agent that
+    /// opens a call with a placeholder and names it on the first update would
+    /// otherwise never have the real title read. Its `status` is deliberately
+    /// ignored — "completed" is not a thing the agent is *doing*, and
+    /// announcing it would blank the caption between tools.
+    fn stage_for_session_update(update: &serde_json::Value) -> Option<String> {
+        let str_field = |key: &str| {
+            update
+                .get(key)
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+        };
+        match update.get("sessionUpdate").and_then(|v| v.as_str())? {
+            "tool_call" => Some(
+                str_field("title")
+                    .map(str::to_string)
+                    .unwrap_or_else(|| Self::stage_for_tool_kind(str_field("kind")).to_string()),
+            ),
+            "tool_call_update" => str_field("title").map(str::to_string),
+            "agent_thought_chunk" => Some("thinking".to_string()),
+            "agent_message_chunk" => Some("writing a reply".to_string()),
+            "plan" => Some("planning".to_string()),
+            _ => None,
+        }
+    }
+
+    /// The fallback caption for a tool call that arrived without a title.
+    ///
+    /// The words are ACP's own `ToolKind` variants. An unknown one is captioned
+    /// honestly rather than guessed at: a kind this build has never heard of is
+    /// still a tool, and "running a tool" is the true sentence about it.
+    fn stage_for_tool_kind(kind: Option<&str>) -> &'static str {
+        match kind.unwrap_or_default() {
+            "read" => "reading files",
+            "edit" => "editing files",
+            "delete" => "deleting files",
+            "move" => "moving files",
+            "search" => "searching",
+            "execute" => "running a command",
+            "think" => "thinking",
+            "fetch" => "fetching",
+            "switch_mode" => "switching mode",
+            _ => "running a tool",
         }
     }
 
@@ -699,7 +774,7 @@ impl ProjectActivityPublisher {
             .collect();
         }
 
-        let stage = Self::stage_for(&event.kind).map(str::to_string);
+        let stage = Self::stage_for(event);
         let announce = match self.live.get(&route.root) {
             // A different turn on the same root: announce immediately, so the
             // stale turn's id stops being the one an `idle` must match.
@@ -13233,6 +13308,39 @@ mod project_activity_tests {
         }
     }
 
+    /// An `acp_read` frame carrying one ACP `session/update`, in the exact
+    /// envelope [`AcpClient::publish_inbound`] puts on the bus: the whole
+    /// JSON-RPC notification, unwrapped by nothing.
+    fn session_update_frame(
+        root: &str,
+        turn: &str,
+        update: serde_json::Value,
+    ) -> observer::ObserverEvent {
+        observer::ObserverEvent {
+            payload: serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "session/update",
+                "params": { "sessionId": "sess", "update": update },
+            }),
+            ..project_frame("acp_read", root, turn)
+        }
+    }
+
+    /// The frame an agent produces when it starts a tool call.
+    fn tool_call_frame(root: &str, turn: &str, title: &str, kind: &str) -> observer::ObserverEvent {
+        session_update_frame(
+            root,
+            turn,
+            serde_json::json!({
+                "sessionUpdate": "tool_call",
+                "toolCallId": "call-1",
+                "title": title,
+                "kind": kind,
+                "status": "in_progress",
+            }),
+        )
+    }
+
     /// The frame the dispatch gate emits when it queues a comment.
     ///
     /// Built through [`observe_project_event_queued`] rather than by hand, so
@@ -13469,15 +13577,15 @@ mod project_activity_tests {
     ///
     /// The root is already announcing something stronger and truer about the
     /// same agent. Announcing `queued` over it would walk the indicator
-    /// backwards from "working — editing files" while it was demonstrably
-    /// editing files, and the comment is going into the same root's queue,
+    /// backwards from "working — Edit lib.rs" while it was demonstrably
+    /// editing that file, and the comment is going into the same root's queue,
     /// which the running turn's own completion will flush.
     #[test]
     fn a_comment_arriving_mid_turn_does_not_walk_the_indicator_back() {
         let (mut state, _keys) = publisher();
         let now = tokio::time::Instant::now();
         state.ingest(&project_frame("turn_started", ROOT, "t1"), now);
-        state.ingest(&project_frame("acp_write", ROOT, "t1"), now);
+        state.ingest(&tool_call_frame(ROOT, "t1", "Edit lib.rs", "edit"), now);
 
         assert!(
             state.ingest(&queued_frame(ROOT, COMMENT), now).is_empty(),
@@ -13602,20 +13710,188 @@ mod project_activity_tests {
 
         let reading = signed(
             &keys,
-            state.ingest(&project_frame("acp_read", ROOT, "t1"), now),
+            state.ingest(&tool_call_frame(ROOT, "t1", "Read AGENTS.md", "read"), now),
         );
         assert_eq!(reading.len(), 1, "a new stage is worth an announcement");
         assert_eq!(
             tag_of(&reading[0], "stage").as_deref(),
-            Some("reading files")
+            Some("Read AGENTS.md")
         );
 
         let refreshed = signed(&keys, state.refresh(now + PROJECT_ACTIVITY_REFRESH));
         assert_eq!(
             tag_of(&refreshed[0], "stage").as_deref(),
-            Some("reading files"),
+            Some("Read AGENTS.md"),
             "the refresh blanked a caption the agent is still working under"
         );
+    }
+
+    /// The caption is the agent's own account of the tool it is running.
+    ///
+    /// This is the whole point of the change: an ACP agent already says what it
+    /// is doing, in `session/update`, and every compliant agent says it the
+    /// same way. Nothing here reads the agent's identity, so an agent that
+    /// used to narrate its work by posting a comment per tool call gets the
+    /// same live caption from the protocol it already speaks.
+    #[test]
+    fn the_caption_is_the_agents_own_tool_title() {
+        let (mut state, keys) = publisher();
+        let now = tokio::time::Instant::now();
+        state.ingest(&project_frame("turn_started", ROOT, "t1"), now);
+
+        for (title, kind, expected) in [
+            (
+                "Running rtk git log --oneline",
+                "execute",
+                "Running rtk git log --oneline",
+            ),
+            (
+                "Searching files for *buzz*",
+                "search",
+                "Searching files for *buzz*",
+            ),
+        ] {
+            let events = signed(
+                &keys,
+                state.ingest(&tool_call_frame(ROOT, "t1", title, kind), now),
+            );
+            assert_eq!(events.len(), 1, "a new tool is a new caption");
+            assert_eq!(tag_of(&events[0], "stage").as_deref(), Some(expected));
+        }
+    }
+
+    /// A titleless tool call is captioned from its ACP `kind`, and an unknown
+    /// kind degrades to the honest generic rather than to silence.
+    #[test]
+    fn a_titleless_tool_call_is_captioned_from_its_acp_kind() {
+        for (kind, expected) in [
+            ("read", "reading files"),
+            ("edit", "editing files"),
+            ("execute", "running a command"),
+            ("search", "searching"),
+            ("a_kind_this_build_has_never_heard_of", "running a tool"),
+        ] {
+            let (mut state, keys) = publisher();
+            let now = tokio::time::Instant::now();
+            state.ingest(&project_frame("turn_started", ROOT, "t1"), now);
+
+            let frame = session_update_frame(
+                ROOT,
+                "t1",
+                serde_json::json!({ "sessionUpdate": "tool_call", "kind": kind }),
+            );
+            let events = signed(&keys, state.ingest(&frame, now));
+            assert_eq!(events.len(), 1, "{kind} announced nothing");
+            assert_eq!(tag_of(&events[0], "stage").as_deref(), Some(expected));
+        }
+    }
+
+    /// Transport is not work.
+    ///
+    /// `acp_read` fires for every line the agent writes and `acp_write` for
+    /// every line the harness writes back — neither says anything about files.
+    /// Captioning them "reading files" and "editing files" put a claim about
+    /// the work on the issue that was true only by coincidence: an agent that
+    /// had opened no file all turn still announced `working — reading files`,
+    /// and the caption flapped to `editing files` whenever the harness answered
+    /// a permission request.
+    #[test]
+    fn transport_frames_do_not_caption_the_turn() {
+        let (mut state, keys) = publisher();
+        let now = tokio::time::Instant::now();
+        let started = signed(
+            &keys,
+            state.ingest(&project_frame("turn_started", ROOT, "t1"), now),
+        );
+        assert_eq!(tag_of(&started[0], "stage").as_deref(), Some("starting"));
+
+        // A JSON-RPC message that is not a session/update, and a write back to
+        // the agent: both are traffic, neither is a caption.
+        let request = observer::ObserverEvent {
+            payload: serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 7,
+                "method": "session/request_permission",
+                "params": {},
+            }),
+            ..project_frame("acp_read", ROOT, "t1")
+        };
+        assert!(
+            state.ingest(&request, now).is_empty(),
+            "a permission request re-captioned the turn"
+        );
+        assert!(
+            state
+                .ingest(&project_frame("acp_write", ROOT, "t1"), now)
+                .is_empty(),
+            "writing to the agent's stdin re-captioned the turn"
+        );
+
+        // And the caption the turn does have was not replaced by either.
+        let refreshed = signed(&keys, state.refresh(now + PROJECT_ACTIVITY_REFRESH));
+        assert_eq!(tag_of(&refreshed[0], "stage").as_deref(), Some("starting"));
+    }
+
+    /// A completed tool call does not blank the caption.
+    ///
+    /// `tool_call_update` carries a `status`, and "completed" is not something
+    /// the agent is doing. It is folded in only for a `title` an agent supplied
+    /// late; a status-only update leaves the caption alone.
+    #[test]
+    fn a_tool_call_update_recaptions_only_when_it_names_the_tool() {
+        let (mut state, keys) = publisher();
+        let now = tokio::time::Instant::now();
+        state.ingest(&project_frame("turn_started", ROOT, "t1"), now);
+        state.ingest(&tool_call_frame(ROOT, "t1", "Read AGENTS.md", "read"), now);
+
+        let status_only = session_update_frame(
+            ROOT,
+            "t1",
+            serde_json::json!({
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "call-1",
+                "status": "completed",
+            }),
+        );
+        assert!(
+            state.ingest(&status_only, now).is_empty(),
+            "a finished tool call announced a caption of its own"
+        );
+
+        let named_late = session_update_frame(
+            ROOT,
+            "t1",
+            serde_json::json!({
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "call-2",
+                "title": "Edit lib.rs",
+            }),
+        );
+        let events = signed(&keys, state.ingest(&named_late, now));
+        assert_eq!(events.len(), 1, "a late title never reached the wire");
+        assert_eq!(tag_of(&events[0], "stage").as_deref(), Some("Edit lib.rs"));
+    }
+
+    /// A title is agent-supplied free text, and it is published to everyone who
+    /// can read the issue. It reaches the wire as one bounded line.
+    #[test]
+    fn an_agent_supplied_title_reaches_the_wire_as_one_bounded_line() {
+        let (mut state, keys) = publisher();
+        let now = tokio::time::Instant::now();
+        state.ingest(&project_frame("turn_started", ROOT, "t1"), now);
+
+        let title = format!("Running\n\tsh -c\u{7} '{}'", "x".repeat(200));
+        let events = signed(
+            &keys,
+            state.ingest(&tool_call_frame(ROOT, "t1", &title, "execute"), now),
+        );
+        let stage = tag_of(&events[0], "stage").expect("no stage on the wire");
+        assert!(
+            !stage.chars().any(char::is_control),
+            "a control character reached the issue: {stage:?}"
+        );
+        assert_eq!(stage.chars().count(), 80, "the caption was not bounded");
+        assert!(stage.starts_with("Running sh -c 'xxx"), "{stage:?}");
     }
 
     /// A frame with no turn id, or an unreadable coordinate, announces nothing
