@@ -13676,16 +13676,37 @@ mod tests {
         assert!(!explicit_mention_present("@claude-bot please", "Claude"));
         assert!(!explicit_mention_present("@claude-bot please", "claude-bo"));
         // …and the whole handle still matches itself, wherever it sits.
-        assert!(explicit_mention_present("@hermes-gateway please", "hermes-gateway"));
-        assert!(explicit_mention_present("ping @hermes-gateway.", "hermes-gateway"));
-        assert!(explicit_mention_present("(@hermes-gateway)", "hermes-gateway"));
+        assert!(explicit_mention_present(
+            "@hermes-gateway please",
+            "hermes-gateway"
+        ));
+        assert!(explicit_mention_present(
+            "ping @hermes-gateway.",
+            "hermes-gateway"
+        ));
+        assert!(explicit_mention_present(
+            "(@hermes-gateway)",
+            "hermes-gateway"
+        ));
         // A longer handle is a different handle, at either end.
-        assert!(!explicit_mention_present("@hermes-gateway-2 please", "hermes-gateway"));
-        assert!(!explicit_mention_present("@relay-hermes-gateway", "hermes-gateway"));
+        assert!(!explicit_mention_present(
+            "@hermes-gateway-2 please",
+            "hermes-gateway"
+        ));
+        assert!(!explicit_mention_present(
+            "@relay-hermes-gateway",
+            "hermes-gateway"
+        ));
         // The leading boundary is unchanged: an `@` inside a word addresses
         // nobody, which is what keeps an ordinary email address out.
-        assert!(!explicit_mention_present("mail ops@claude-bot.example", "claude-bot"));
-        assert!(!explicit_mention_present("mail hermes@example.com", "example"));
+        assert!(!explicit_mention_present(
+            "mail ops@claude-bot.example",
+            "claude-bot"
+        ));
+        assert!(!explicit_mention_present(
+            "mail hermes@example.com",
+            "example"
+        ));
     }
 
     /// This agent's npub. Asserted against the derived form in

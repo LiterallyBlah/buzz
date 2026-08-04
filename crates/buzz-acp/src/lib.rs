@@ -1565,6 +1565,59 @@ impl Drop for RespawnGuard {
 // sync entry point — `std::env::set_var` is only safe before tokio spawns
 // worker threads (Rust 2024 edition safety requirement).
 
+fn inactivity_expired(
+    last_activity: tokio::time::Instant,
+    now: tokio::time::Instant,
+    bound: Duration,
+    turn_in_flight: bool,
+) -> bool {
+    !bound.is_zero() && !turn_in_flight && now.duration_since(last_activity) >= bound
+}
+
+#[cfg(test)]
+mod inactivity_tests {
+    use super::*;
+
+    #[test]
+    fn zero_disables_expiry_and_in_flight_turns_defer_it() {
+        let started = tokio::time::Instant::now();
+        let after_bound = started + Duration::from_secs(61);
+
+        assert!(!inactivity_expired(
+            started,
+            after_bound,
+            Duration::ZERO,
+            false
+        ));
+        assert!(!inactivity_expired(
+            started,
+            after_bound,
+            Duration::from_secs(60),
+            true
+        ));
+        assert!(inactivity_expired(
+            started,
+            after_bound,
+            Duration::from_secs(60),
+            false
+        ));
+    }
+
+    #[test]
+    fn dispatched_activity_restarts_the_inactivity_bound() {
+        let started = tokio::time::Instant::now();
+        let dispatched = started + Duration::from_secs(50);
+        let checked = started + Duration::from_secs(61);
+
+        assert!(!inactivity_expired(
+            dispatched,
+            checked,
+            Duration::from_secs(60),
+            false
+        ));
+    }
+}
+
 pub fn run() -> Result<()> {
     config::propagate_legacy_env_vars();
     tokio_main()
@@ -2010,6 +2063,21 @@ async fn tokio_main() -> Result<()> {
     let mut typing_channels: HashMap<Uuid, ThreadTags> = HashMap::new();
     let mut presence_task: Option<tokio::task::JoinHandle<()>> = None;
 
+    // Independent of pool readiness: a never-mentioned lazy agent must still
+    // self-terminate. The watch interval is capped so small configured bounds
+    // remain reasonably precise without waking long-lived agents frequently.
+    let inactivity_bound = Duration::from_secs(config.exit_after_inactivity_secs);
+    let mut last_activity = tokio::time::Instant::now();
+    let mut inactivity_reaper = if inactivity_bound.is_zero() {
+        None
+    } else {
+        let interval = inactivity_bound.min(Duration::from_secs(30));
+        Some(tokio::time::interval_at(
+            tokio::time::Instant::now() + interval,
+            interval,
+        ))
+    };
+
     // Runs at the TOP of every loop iteration via Instant check — cannot be
     // starved by the biased select. Slot refill spawns background tasks so
     // spawn_and_init never blocks the main loop.
@@ -2252,7 +2320,9 @@ async fn tokio_main() -> Result<()> {
             // called on relay events or pool results, neither of which
             // arrive when the channel is silent.
             if queue.has_flushable_work() {
-                for (channel_id, thread_tags) in dispatch_pending(&mut pool, &mut queue, &ctx) {
+                for (channel_id, thread_tags) in
+                    dispatch_pending(&mut pool, &mut queue, &ctx, &mut last_activity)
+                {
                     typing_channels.insert(channel_id, thread_tags);
                 }
             }
@@ -2288,7 +2358,9 @@ async fn tokio_main() -> Result<()> {
         // this, batches requeued during crash recovery sit idle until the
         // next relay event arrives — which can be minutes on quiet channels.
         if respawn_collected {
-            for (channel_id, thread_tags) in dispatch_pending(&mut pool, &mut queue, &ctx) {
+            for (channel_id, thread_tags) in
+                dispatch_pending(&mut pool, &mut queue, &ctx, &mut last_activity)
+            {
                 typing_channels.insert(channel_id, thread_tags);
             }
         }
@@ -2448,6 +2520,7 @@ async fn tokio_main() -> Result<()> {
                                 &mut pool,
                                 &mut queue,
                                 &ctx,
+                                &mut last_activity,
                                 &mut typing_channels,
                                 pool_ready,
                             )
@@ -2871,7 +2944,7 @@ async fn tokio_main() -> Result<()> {
                             }
                             if pool_ready {
                                 for (channel_id, thread_tags) in
-                                    dispatch_pending(&mut pool, &mut queue, &ctx)
+                                    dispatch_pending(&mut pool, &mut queue, &ctx, &mut last_activity)
                                 {
                                     typing_channels.insert(channel_id, thread_tags);
                                 }
@@ -2889,6 +2962,27 @@ async fn tokio_main() -> Result<()> {
                     None
                 }
                 _ = async {
+                    match inactivity_reaper.as_mut() {
+                        Some(timer) => timer.tick().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    let _ = result_rx;
+                    if inactivity_expired(
+                        last_activity,
+                        tokio::time::Instant::now(),
+                        inactivity_bound,
+                        queue.has_in_flight() || heartbeat_in_flight,
+                    ) {
+                        tracing::info!(
+                            inactivity_seconds = config.exit_after_inactivity_secs,
+                            "inactivity bound reached — exiting gracefully"
+                        );
+                        let _ = shutdown_tx.send(());
+                    }
+                    None
+                }
+                _ = async {
                     match heartbeat.as_mut() {
                         Some(hb) => hb.tick().await,
                         None => std::future::pending().await,
@@ -2900,7 +2994,7 @@ async fn tokio_main() -> Result<()> {
                     } else if queue.has_flushable_work() {
                         tracing::debug!("heartbeat_skipped_events");
                         for (channel_id, thread_tags) in
-                            dispatch_pending(&mut pool, &mut queue, &ctx)
+                            dispatch_pending(&mut pool, &mut queue, &ctx, &mut last_activity)
                         {
                             typing_channels.insert(channel_id, thread_tags);
                         }
@@ -2998,7 +3092,9 @@ async fn tokio_main() -> Result<()> {
                 {
                     break;
                 }
-                for (channel_id, thread_tags) in dispatch_pending(&mut pool, &mut queue, &ctx) {
+                for (channel_id, thread_tags) in
+                    dispatch_pending(&mut pool, &mut queue, &ctx, &mut last_activity)
+                {
                     typing_channels.insert(channel_id, thread_tags);
                 }
             }
@@ -3021,7 +3117,9 @@ async fn tokio_main() -> Result<()> {
                     tracing::error!("all agents dead — exiting");
                     break;
                 }
-                for (channel_id, thread_tags) in dispatch_pending(&mut pool, &mut queue, &ctx) {
+                for (channel_id, thread_tags) in
+                    dispatch_pending(&mut pool, &mut queue, &ctx, &mut last_activity)
+                {
                     typing_channels.insert(channel_id, thread_tags);
                 }
             }
@@ -3163,7 +3261,9 @@ async fn tokio_main() -> Result<()> {
                 // tear down the in-flight task; on its completion the
                 // queue drains. We still try here in case the in-flight
                 // task has already returned.
-                for (channel_id, thread_tags) in dispatch_pending(&mut pool, &mut queue, &ctx) {
+                for (channel_id, thread_tags) in
+                    dispatch_pending(&mut pool, &mut queue, &ctx, &mut last_activity)
+                {
                     typing_channels.insert(channel_id, thread_tags);
                 }
             }
@@ -3228,7 +3328,7 @@ async fn tokio_main() -> Result<()> {
                             None,
                         );
                         for (channel_id, thread_tags) in
-                            dispatch_pending(&mut pool, &mut queue, &ctx)
+                            dispatch_pending(&mut pool, &mut queue, &ctx, &mut last_activity)
                         {
                             typing_channels.insert(channel_id, thread_tags);
                         }
@@ -3619,6 +3719,10 @@ pub(crate) async fn dispatch_and_flush_project_event(
     pool: &mut AgentPool,
     queue: &mut EventQueue,
     ctx: &Arc<PromptContext>,
+    // Threaded through for the `dispatch_pending` call below: a project turn
+    // dispatched from here is work, and the inactivity clock it feeds is what
+    // `exit_after_inactivity_secs` reads.
+    last_activity: &mut tokio::time::Instant,
     typing_channels: &mut HashMap<Uuid, ThreadTags>,
     pool_ready: bool,
 ) -> ProjectDispatched {
@@ -3647,7 +3751,7 @@ pub(crate) async fn dispatch_and_flush_project_event(
     tracing::debug!(?dispatched, "project dispatch");
 
     if pool_ready && matches!(dispatched, ProjectDispatched::Queued { queued: true, .. }) {
-        for (channel_id, thread_tags) in dispatch_pending(pool, queue, ctx) {
+        for (channel_id, thread_tags) in dispatch_pending(pool, queue, ctx, last_activity) {
             typing_channels.insert(channel_id, thread_tags);
         }
     }
@@ -4844,6 +4948,7 @@ fn dispatch_pending(
     pool: &mut AgentPool,
     queue: &mut EventQueue,
     ctx: &Arc<PromptContext>,
+    last_activity: &mut tokio::time::Instant,
 ) -> Vec<(Uuid, ThreadTags)> {
     let mut dispatched_channels = Vec::new();
     loop {
@@ -4937,6 +5042,12 @@ fn dispatch_pending(
         } else {
             dispatched_channels.push((channel_id, typing_scope));
         }
+        // Outside the typing-indicator gate on purpose: this is the inactivity
+        // clock the `exit_after_inactivity_secs` bound reads, and a project
+        // batch is work. Updating it only on the channel path would let a
+        // project-only runtime dispatch turns continuously and still look idle
+        // enough to exit.
+        *last_activity = tokio::time::Instant::now();
     }
     tracing::debug!(
         dispatched = dispatched_channels.len(),
@@ -9575,6 +9686,7 @@ mod build_mcp_servers_tests {
             persona_env_vars: vec![],
             has_generated_codex_config: false,
             relay_observer: false,
+            exit_after_inactivity_secs: 0,
             lazy_pool: false,
             project_routing_enabled: false,
             peer_agents: HashSet::new(),
@@ -9799,6 +9911,7 @@ mod error_outcome_emission_tests {
             persona_env_vars: vec![],
             has_generated_codex_config: false,
             relay_observer: false,
+            exit_after_inactivity_secs: 0,
             lazy_pool: false,
             project_routing_enabled: false,
             peer_agents: HashSet::new(),
@@ -12894,13 +13007,13 @@ for line in sys.stdin:
             nostr::Kind::TextNote,
             format!("@{} please take this", agent.public_key().to_hex()),
         )
-            .tags([
-                nostr::Tag::parse(["a", &coord]).unwrap(),
-                nostr::Tag::parse(["e", &root.id.to_hex(), "", "root"]).unwrap(),
-                nostr::Tag::parse(["p", &agent.public_key().to_hex()]).unwrap(),
-            ])
-            .sign_with_keys(owner)
-            .expect("sign")
+        .tags([
+            nostr::Tag::parse(["a", &coord]).unwrap(),
+            nostr::Tag::parse(["e", &root.id.to_hex(), "", "root"]).unwrap(),
+            nostr::Tag::parse(["p", &agent.public_key().to_hex()]).unwrap(),
+        ])
+        .sign_with_keys(owner)
+        .expect("sign")
     }
 
     /// The whole runtime for one scenario, with **no channels at all**.
@@ -12971,6 +13084,10 @@ for line in sys.stdin:
         ) -> ProjectDispatched {
             let owner_hex = self.owner.public_key().to_hex();
             let agent_hex = self.agent.public_key().to_hex();
+            // These scenarios assert on what was dispatched, not on the
+            // inactivity clock, so the harness owns a local rather than
+            // pretending the test runtime tracks one.
+            let mut last_activity = tokio::time::Instant::now();
             dispatch_and_flush_project_event(
                 &mut ProjectArm {
                     identity: &self.identity,
@@ -12991,6 +13108,7 @@ for line in sys.stdin:
                 &mut self.pool,
                 &mut self.queue,
                 &self.ctx,
+                &mut last_activity,
                 &mut self.typing,
                 true,
             )

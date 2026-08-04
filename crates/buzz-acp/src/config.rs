@@ -507,6 +507,11 @@ pub struct CliArgs {
     #[arg(long, env = "BUZZ_ACP_RELAY_OBSERVER", default_value_t = false)]
     pub relay_observer: bool,
 
+    /// Exit after this many seconds with no dispatched events and no turn in flight.
+    /// 0 disables inactivity self-termination.
+    #[arg(long, env = "BUZZ_ACP_EXIT_AFTER_INACTIVITY", default_value_t = 0)]
+    pub exit_after_inactivity: u64,
+
     /// Connect and subscribe before starting the ACP/LLM subprocess pool.
     #[arg(long, env = "BUZZ_ACP_LAZY_POOL", default_value_t = false)]
     pub lazy_pool: bool,
@@ -612,6 +617,8 @@ pub struct Config {
     pub has_generated_codex_config: bool,
     /// Whether to publish encrypted observer frames through the relay.
     pub relay_observer: bool,
+    /// Seconds without dispatched events before an idle harness exits. 0 = disabled.
+    pub exit_after_inactivity_secs: u64,
     /// Whether ACP/LLM subprocess initialization is deferred until accepted work arrives.
     pub lazy_pool: bool,
     /// Whether project (issue / pull-request) mention routing is enabled.
@@ -1180,6 +1187,7 @@ impl Config {
             persona_env_vars,
             has_generated_codex_config,
             relay_observer: args.relay_observer,
+            exit_after_inactivity_secs: args.exit_after_inactivity,
             lazy_pool: args.lazy_pool,
             project_routing_enabled: args.project_routing_enabled,
             peer_agents,
@@ -1555,6 +1563,7 @@ pub(crate) fn test_config(mode: SubscribeMode) -> Config {
         persona_env_vars: vec![],
         has_generated_codex_config: false,
         relay_observer: false,
+        exit_after_inactivity_secs: 0,
         lazy_pool: false,
         project_routing_enabled: false,
         peer_agents: HashSet::new(),
@@ -2260,6 +2269,22 @@ channels = "ALL"
     fn test_turn_liveness_one_rejected() {
         let err = validate_turn_liveness(1).unwrap_err();
         assert!(err.to_string().contains("turn liveness interval must be 0"));
+    }
+
+    #[test]
+    fn inactivity_exit_defaults_disabled_and_accepts_cli_value() {
+        let key = "0".repeat(64);
+        let default = CliArgs::parse_from(["buzz-acp", "--private-key", &key]);
+        assert_eq!(default.exit_after_inactivity, 0);
+
+        let configured = CliArgs::parse_from([
+            "buzz-acp",
+            "--private-key",
+            &key,
+            "--exit-after-inactivity",
+            "120",
+        ]);
+        assert_eq!(configured.exit_after_inactivity, 120);
     }
 
     #[test]
