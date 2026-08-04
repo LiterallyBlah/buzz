@@ -105,17 +105,29 @@ const REQ_PACING_INTERVAL: Duration = Duration::from_millis(125);
 /// below the relay's 50-frames/5s budget, and ensures the select! loop is never
 /// blocked for more than one REQ's worth of I/O between drain ticks.
 const DRAIN_BUDGET_PER_ITER: usize = 1;
-/// Maximum observer telemetry frames parked while the rate-limit gate is armed
-/// (or the socket is down). The upstream pacer feeds at most ~6 frames/s, so
+/// Maximum durable frames parked while the rate-limit gate is armed (or the
+/// socket is down). The upstream observer pacer feeds at most ~6 frames/s, so
 /// this covers ~40 s of gating; beyond that the oldest frames are dropped with
 /// visible accounting (`gated_observer_dropped`).
 const GATED_OBSERVER_QUEUE_CAP: usize = 256;
+/// Maximum distinct **scopes** parked in the superseding-ephemeral map while
+/// the gate is armed.
+///
+/// Bounds scopes, not frames: a scope holds exactly one frame — its latest —
+/// however long the gate lasts and however fast its publisher re-announces, so
+/// a 50 s gate over 3 s typing costs one entry per channel rather than sixteen.
+/// The live scope count is "channels this agent is typing in" plus "project
+/// roots it is working on" plus one for presence, which is single digits in
+/// practice; 64 is roughly an order of magnitude of headroom at ~1 KB an entry.
+/// Overflow evicts the least-recently-refreshed scope and counts it in
+/// `gated_ephemeral_dropped` so the loss is visible, never silent.
+const GATED_EPHEMERAL_SCOPE_CAP: usize = 64;
 
 use std::time::Instant;
 
 use buzz_core::kind::{
     KIND_AGENT_OBSERVER_FRAME, KIND_MEMBER_ADDED_NOTIFICATION, KIND_MEMBER_REMOVED_NOTIFICATION,
-    KIND_TYPING_INDICATOR,
+    KIND_PRESENCE_UPDATE, KIND_PROJECT_ACTIVITY, KIND_STREAM_MESSAGE, KIND_TYPING_INDICATOR,
 };
 use buzz_core::peer_call::{KIND_PEER_CALL, KIND_PEER_CALL_RESULT};
 use futures_util::{SinkExt, StreamExt};
@@ -1299,12 +1311,31 @@ struct BgState {
     /// or when its REQ could not be written. The main-loop drain re-sends it
     /// once the gate clears.
     peer_call_resub_needed: bool,
-    /// Observer telemetry frames (kind 24200) parked while the rate-limit gate
-    /// is armed. Unlike typing indicators, these frames are durable telemetry:
-    /// dropping them silently loses turn history in the Desktop observer.
+    /// Frames classified [`GatedPublish::Durable`] and parked while the
+    /// rate-limit gate is armed or the socket is down.
+    ///
+    /// Named for its only high-volume tenant — kind 24200 observer telemetry —
+    /// but it holds every durable publish, because the defining property is
+    /// "nobody will say this again": dropping one loses turn history in the
+    /// Desktop observer, or a message a person was waiting for. Order is the
+    /// point, so this is a FIFO and nothing in it is ever superseded.
     /// Bounded at `GATED_OBSERVER_QUEUE_CAP` (drop-oldest); drained by the
     /// main loop one frame per pacing tick once the gate clears.
     gated_observer_pending: VecDeque<Box<Event>>,
+    /// The latest frame each scope is announcing, parked while the rate-limit
+    /// gate is armed — see [`GatedPublish::Superseding`].
+    ///
+    /// One entry per scope, newest wins: a scope's publisher re-announces on a
+    /// cadence (3 s typing, 15 s project activity, 60 s presence), so the frame
+    /// held here is at most one cadence old when the gate clears, and the older
+    /// frame it replaced would have said the same thing later. Ordered by last
+    /// refresh (superseding moves a scope to the back) so the drop-oldest bound
+    /// evicts the scope that has gone quietest, not the one that is busiest.
+    ///
+    /// **Never survives a connection loss** — see
+    /// [`BgState::discard_gated_ephemera`] for why that differs from the
+    /// durable queue above.
+    gated_ephemeral_pending: VecDeque<(EphemeralScope, Box<Event>)>,
     /// Observer frames written to the socket but not yet acknowledged. The
     /// relay's rate-limit NOTICE does not carry an event ID, so all unresolved
     /// observer writes are moved back ahead of the parked FIFO when one arrives.
@@ -1312,6 +1343,10 @@ struct BgState {
     /// Frames evicted from the bounded pending/in-flight observer buffers since
     /// summary log. Makes overflow loss visible instead of silent.
     gated_observer_dropped: u64,
+    /// Scopes evicted from `gated_ephemeral_pending` by the scope cap since the
+    /// last summary log. Superseding is not counted here — replacing a scope's
+    /// frame with a newer one about the same scope is the design, not a loss.
+    gated_ephemeral_dropped: u64,
     /// Channels whose REQ failed during `resubscribe_after_reconnect`.
     ///
     /// A single failed channel REQ is parked here instead of aborting the whole
@@ -1452,8 +1487,10 @@ impl BgState {
             observer_resub_needed: false,
             peer_call_resub_needed: false,
             gated_observer_pending: VecDeque::new(),
+            gated_ephemeral_pending: VecDeque::new(),
             observer_in_flight: VecDeque::new(),
             gated_observer_dropped: 0,
+            gated_ephemeral_dropped: 0,
             resubscribe_retry: HashSet::new(),
             project_dropped_since: None,
             project_seen_ids: TwoGenDedup::new(SEEN_ID_LIMIT),
@@ -1562,7 +1599,7 @@ impl BgState {
         None
     }
 
-    /// Park an observer telemetry frame while the rate-limit gate is armed.
+    /// Park a durable frame while the rate-limit gate is armed.
     ///
     /// Bounded drop-oldest queue: overflow evicts the oldest frame and counts
     /// it in `gated_observer_dropped` so the loss is visible, never silent.
@@ -1576,6 +1613,82 @@ impl BgState {
             );
         }
         self.gated_observer_pending.push_back(event);
+    }
+
+    /// Park the latest frame for one scope while the rate-limit gate is armed.
+    ///
+    /// **Latest wins.** A newer frame about the same scope replaces the parked
+    /// one instead of queueing behind it: the two say the same kind of thing
+    /// about the same subject, so delivering both after the gate clears would
+    /// put a stale claim on the wire ahead of the true one. That replacement is
+    /// not a loss and is not counted — it is what keeps the parked frame at
+    /// most one publisher cadence old, which is the only reason parking
+    /// ephemera is sound at all.
+    ///
+    /// Refreshing a scope moves it to the back, so the drop-oldest bound sheds
+    /// the scope whose publisher has gone quietest — the one whose frame is
+    /// closest to being a lie — rather than whichever happened to park first.
+    fn park_gated_ephemeral_frame(&mut self, scope: EphemeralScope, event: Box<Event>) {
+        if let Some(index) = self
+            .gated_ephemeral_pending
+            .iter()
+            .position(|(parked, _)| *parked == scope)
+        {
+            self.gated_ephemeral_pending.remove(index);
+        }
+        if self.gated_ephemeral_pending.len() >= GATED_EPHEMERAL_SCOPE_CAP {
+            if let Some((evicted, _)) = self.gated_ephemeral_pending.pop_front() {
+                self.gated_ephemeral_dropped += 1;
+                warn!(
+                    kind = evicted.kind,
+                    scope = %evicted.id,
+                    dropped_total = self.gated_ephemeral_dropped,
+                    "gated ephemeral map full — dropped least-recently-refreshed scope"
+                );
+            }
+        }
+        self.gated_ephemeral_pending.push_back((scope, event));
+    }
+
+    /// Whether this scope already has a frame waiting to be drained.
+    ///
+    /// The reason a publish can be parked even with the gate clear: a live send
+    /// would overtake the frame parked behind it, and for a superseding kind
+    /// that is worse than a delay. An `idle` overtaking a parked `working`
+    /// leaves the root announcing work that has finished until the consumer's
+    /// staleness window expires.
+    fn ephemeral_scope_parked(&self, scope: &EphemeralScope) -> bool {
+        self.gated_ephemeral_pending
+            .iter()
+            .any(|(parked, _)| parked == scope)
+    }
+
+    /// Drop every parked ephemeral frame because the socket they were parked on
+    /// is gone.
+    ///
+    /// **Deliberately unlike the durable queue, which survives reconnect.** The
+    /// freshness guarantee for a parked ephemeral frame is "its publisher will
+    /// have re-announced within one cadence", and that holds only while the
+    /// park is live: reconnect has no bounded duration (`wait_for_reconnect`
+    /// retries DNS failures forever), and nothing re-announces during it. A
+    /// frame carried across would say "this agent is typing" or "this root is
+    /// working" as of a socket that died an unknown number of minutes ago.
+    ///
+    /// The cost of dropping is bounded and self-healing, and it is paid at an
+    /// edge where the consumer has already gone blank: no frames flowed during
+    /// the outage, so every client TTL (8 s typing, 45 s project activity) has
+    /// long expired, and the publishers re-announce within one cadence (3 s,
+    /// 15 s, 60 s) of the socket coming back. Logged with a count rather than
+    /// warned because it happens on every reconnect and is the intended path.
+    fn discard_gated_ephemera(&mut self, reason: &str) {
+        if self.gated_ephemeral_pending.is_empty() {
+            return;
+        }
+        debug!(
+            scopes = self.gated_ephemeral_pending.len(),
+            reason, "discarding parked ephemeral frames — they cannot outlive their socket"
+        );
+        self.gated_ephemeral_pending.clear();
     }
 
     /// Restore unresolved observer writes ahead of frames parked after the
@@ -1631,6 +1744,144 @@ impl BgState {
             self.observer_in_flight.remove(index);
         }
     }
+}
+
+/// The subject a superseding ephemeral frame is *about*.
+///
+/// Two frames share a scope exactly when the later one makes the earlier one
+/// untrue, which is the whole condition for replacing rather than queueing.
+/// The kind is part of the key so a scope can never be shared across kinds by
+/// coincidence — and so an entry names, in a log line, which wire it came from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct EphemeralScope {
+    kind: u32,
+    /// The scope value: the channel id for a typing indicator, the root event
+    /// id for project activity, empty for a kind scoped to the agent itself.
+    id: String,
+}
+
+/// What the WS publish path does with one outbound EVENT while the relay's
+/// rate-limit gate is armed.
+///
+/// Both variants park; the difference is what a *second* frame does to the
+/// first. Neither drops.
+#[derive(Debug)]
+enum GatedPublish {
+    /// Nobody will say this again: park it in FIFO order and deliver all of it.
+    ///
+    /// Ordering is load-bearing (NIP-AO turn history is read as a sequence), so
+    /// frames queue behind each other and a frame published after the gate
+    /// clears still queues behind an undrained backlog rather than overtaking
+    /// it.
+    Durable,
+    /// The publisher will say it again on a cadence: park only the latest frame
+    /// per scope.
+    ///
+    /// Sound *because* of that cadence and for no other reason — typing
+    /// re-announces every 3 s, project activity every 15 s, presence every
+    /// 60 s — so the parked frame is at most one interval old when the gate
+    /// clears, and every frame it superseded was a weaker statement of the same
+    /// fact. Take the continuous re-announcement away and this becomes a stale
+    /// claim delivered late; see [`BgState::discard_gated_ephemera`], which is
+    /// the one place that assumption stops holding.
+    Superseding(EphemeralScope),
+}
+
+/// Classify one outbound event for the gated publish path.
+///
+/// **This is the policy, and every kind that can reach
+/// [`RelayCommand::PublishEvent`] must have a row here.** It replaces an
+/// INVARIANT comment that asserted this path carried only observer telemetry
+/// and typing indicators, so everything that was not telemetry could be dropped
+/// while gated. That assertion was true when it was written and false within
+/// two features, silently, because nothing enforced it:
+///
+/// - **kind 20003** (NIP-PA project activity) became a tenant and inherited the
+///   typing indicator's drop by accident. A relay NOTICE throttle lasts 45–53 s
+///   and the consumer's staleness window is 45 s, so every project indicator
+///   blanked for the whole window and flapped back after it — the "status goes
+///   in and out" bug this table exists to prevent recurring.
+/// - **kind 9** (the setup-mode nudge) became a tenant too, and that one is a
+///   real message to a real person: the exact "durable events through this
+///   path" case the old comment warned a future caller about, discarded with no
+///   trace for the length of a gate window.
+///
+/// | kind  | what it is                        | while gated                            |
+/// |-------|-----------------------------------|----------------------------------------|
+/// | 24200 | NIP-AO encrypted owner telemetry  | `Durable` — FIFO, order preserved      |
+/// | 9     | setup-mode nudge (a real message) | `Durable` — FIFO                       |
+/// | 20003 | NIP-PA project activity           | `Superseding` by root (`e` root tag)   |
+/// | 20002 | typing indicator                  | `Superseding` by channel (`h` tag)     |
+/// | 20001 | presence heartbeat                | `Superseding`, one agent-wide scope    |
+/// | *any other* | not yet classified          | `Durable` + `error!` — add a row       |
+///
+/// The fallback is `Durable` rather than a drop because the two failure modes
+/// are not symmetric: parking an ephemeral kind by mistake costs one late frame
+/// that its own publisher will supersede, while dropping a durable one loses
+/// data nothing will ever resend. A new kind on this path therefore arrives
+/// safe and loud instead of quietly wrong, which is the property the comment
+/// this replaced did not have.
+fn gated_publish_policy(event: &Event) -> GatedPublish {
+    let kind = event.kind.as_u16() as u32;
+    match kind {
+        KIND_AGENT_OBSERVER_FRAME | KIND_STREAM_MESSAGE => GatedPublish::Durable,
+        // Channel-scoped: one "someone is typing" per channel.
+        KIND_TYPING_INDICATOR => GatedPublish::Superseding(EphemeralScope {
+            kind,
+            id: tag_value(event, "h").unwrap_or_default(),
+        }),
+        // Root-scoped, and deliberately not channel-scoped: NIP-PA carries no
+        // `h` at all — an issue is not a channel — so the root `e` tag
+        // (`["e", <root>, "", "root"]`, per `build_project_activity`) is the
+        // only identity the frame has, and it is the same key the consumer
+        // subscribes by.
+        KIND_PROJECT_ACTIVITY => GatedPublish::Superseding(EphemeralScope {
+            kind,
+            id: root_e_tag_value(event).unwrap_or_default(),
+        }),
+        // Agent-wide: presence is a property of the pubkey signing it, so every
+        // presence frame shares one scope and the newest is the only true one.
+        KIND_PRESENCE_UPDATE => GatedPublish::Superseding(EphemeralScope {
+            kind,
+            id: String::new(),
+        }),
+        _ => {
+            error!(
+                kind,
+                "unclassified kind on the WS publish path — parking it as durable; \
+                 add a row to gated_publish_policy so its gated behaviour is chosen, not inherited"
+            );
+            GatedPublish::Durable
+        }
+    }
+}
+
+/// The first value of the first tag with this name, if the event carries one.
+///
+/// A superseding frame with no scope tag is not dropped and does not get a
+/// scope of its own: it collapses into its kind's empty-string scope, where the
+/// newest such frame supersedes the last. That keeps a malformed publisher
+/// bounded to one map entry instead of one per frame, and every builder in this
+/// workspace emits the tag, so the case is a defect elsewhere rather than a
+/// shape to design around.
+fn tag_value(event: &Event, name: &str) -> Option<String> {
+    event.tags.iter().find_map(|tag| {
+        let parts = tag.as_slice();
+        (parts.len() >= 2 && parts[0] == name).then(|| parts[1].clone())
+    })
+}
+
+/// The NIP-10 root-marked `e` tag value, falling back to the first `e` tag.
+///
+/// The marker is checked first because a frame may carry several `e` tags and
+/// only the root one identifies the conversation; the fallback covers a
+/// single-`e` frame written without markers.
+fn root_e_tag_value(event: &Event) -> Option<String> {
+    let marked = event.tags.iter().find_map(|tag| {
+        let parts = tag.as_slice();
+        (parts.len() >= 4 && parts[0] == "e" && parts[3] == "root").then(|| parts[1].clone())
+    });
+    marked.or_else(|| tag_value(event, "e"))
 }
 
 /// Record a command's intent in state while disconnected (no WebSocket).
@@ -1782,15 +2033,16 @@ fn apply_command_to_state(state: &mut BgState, cmd: RelayCommand) {
                 state.membership_last_seen = Some(ts);
             }
         }
-        // Observer telemetry frames are durable: park them (bounded, visible
-        // overflow) so they are delivered by the post-reconnect drain. Other
-        // ephemeral publishes (typing indicators) are meaningless while
-        // disconnected and are dropped.
-        RelayCommand::PublishEvent { event } => {
-            if event.kind.as_u16() as u32 == KIND_AGENT_OBSERVER_FRAME {
-                state.park_gated_observer_frame(event);
-            }
-        }
+        // Durable publishes are parked (bounded, visible overflow) so the
+        // post-reconnect drain delivers them. Superseding ephemera are dropped:
+        // a reconnect is unbounded, so nothing parked here could still be true
+        // when it ends, and each one's publisher re-announces within a cadence
+        // of the socket returning. See [`BgState::discard_gated_ephemera`],
+        // which makes the same call for frames parked before the socket died.
+        RelayCommand::PublishEvent { event } => match gated_publish_policy(&event) {
+            GatedPublish::Durable => state.park_gated_observer_frame(event),
+            GatedPublish::Superseding(_) => {}
+        },
         // Already reconnecting — redundant.
         RelayCommand::Reconnect => {}
         // Callers MUST handle Shutdown before calling this function.
@@ -1805,18 +2057,17 @@ fn apply_command_to_state(state: &mut BgState, cmd: RelayCommand) {
 
 /// Retain command intent after a live send failure.
 ///
-/// Subscription state must survive reconnect. Observer telemetry publishes are
-/// parked for post-reconnect drain; other ephemeral publishes are deliberately
-/// discarded because replaying a typing indicator after reconnect is meaningless.
-/// `Shutdown` and `Reconnect` are handled by the caller.
+/// Subscription state must survive reconnect. Durable publishes are parked for
+/// the post-reconnect drain; superseding ephemera are deliberately discarded,
+/// because a send failure means the socket is probably already dead and
+/// replaying a typing indicator across a reconnect states something about a
+/// moment that has passed. `Shutdown` and `Reconnect` are handled by the caller.
 fn retain_failed_command_intent(state: &mut BgState, cmd: RelayCommand) {
     match cmd {
-        RelayCommand::PublishEvent { event }
-            if event.kind.as_u16() as u32 == KIND_AGENT_OBSERVER_FRAME =>
-        {
-            state.park_gated_observer_frame(event);
-        }
-        RelayCommand::PublishEvent { .. } => {}
+        RelayCommand::PublishEvent { event } => match gated_publish_policy(&event) {
+            GatedPublish::Durable => state.park_gated_observer_frame(event),
+            GatedPublish::Superseding(_) => {}
+        },
         cmd => apply_command_to_state(state, cmd),
     }
 }
@@ -2103,43 +2354,57 @@ async fn execute_connected_command(
             }
         }
         RelayCommand::PublishEvent { event } => {
-            // Observer telemetry frames (kind 24200) are durable telemetry, not
-            // droppable ephemera: park them while the rate-limit gate is armed —
-            // and while earlier parked frames are still draining, so relative
-            // order is preserved — then let the main-loop drain deliver them
-            // one per pacing tick once the gate clears.
-            if event.kind.as_u16() as u32 == KIND_AGENT_OBSERVER_FRAME
-                && (state.check_rate_gate().is_some() || !state.gated_observer_pending.is_empty())
-            {
-                debug!(
-                    pending = state.gated_observer_pending.len(),
-                    "rate-gated: parking observer frame for paced drain"
-                );
-                state.park_gated_observer_frame(event);
-                return true;
-            }
-            // Drop remaining ephemeral publishes while rate-gated. Stale typing
-            // indicators are worthless and sending them would consume admission
-            // budget the relay already rejected us on.
-            //
-            // INVARIANT: apart from observer frames (parked above), the WS publish
-            // path carries only ephemeral kinds (typing indicators). The silent
-            // drop-while-gated relies on that invariant. If a future caller
-            // publishes durable events through this path, it must extend the
-            // kind guard above to avoid silently discarding user data.
-            if state.check_rate_gate().is_some() {
-                debug!("rate-gated: dropping ephemeral PublishEvent (typing indicator)");
-                return true;
+            // One policy for everything on this path, parameterised by what the
+            // kind means. [`gated_publish_policy`] carries the table and the
+            // rationale; nothing here may special-case a kind.
+            let policy = gated_publish_policy(&event);
+            let durable = matches!(policy, GatedPublish::Durable);
+            match policy {
+                // Park while the gate is armed *and* while an earlier backlog is
+                // still draining, so relative order is preserved: a frame that
+                // overtook the queue would reorder turn history.
+                GatedPublish::Durable => {
+                    if state.check_rate_gate().is_some() || !state.gated_observer_pending.is_empty()
+                    {
+                        debug!(
+                            kind = event.kind.as_u16(),
+                            pending = state.gated_observer_pending.len(),
+                            "rate-gated: parking durable frame for paced drain"
+                        );
+                        state.park_gated_observer_frame(event);
+                        return true;
+                    }
+                }
+                // Park the latest frame for this scope. The second condition is
+                // the same order rule as above, narrowed to the only ordering
+                // that exists for these kinds — within a scope. A live `idle`
+                // overtaking a parked `working` for the same root would leave
+                // the root announcing finished work for a whole staleness
+                // window; superseding the parked frame is both the fix and the
+                // wire semantics NIP-PA already specifies.
+                GatedPublish::Superseding(scope) => {
+                    if state.check_rate_gate().is_some() || state.ephemeral_scope_parked(&scope) {
+                        debug!(
+                            kind = scope.kind,
+                            scope = %scope.id,
+                            parked_scopes = state.gated_ephemeral_pending.len(),
+                            "rate-gated: parking latest frame for this scope"
+                        );
+                        state.park_gated_ephemeral_frame(scope, event);
+                        return true;
+                    }
+                }
             }
             // Best-effort: log a send failure but don't trigger reconnect — the
-            // next ping or read will detect the dead socket. A failed observer
-            // frame is parked so the post-reconnect drain redelivers it.
+            // next ping or read will detect the dead socket. A failed durable
+            // frame is parked so the post-reconnect drain redelivers it; a
+            // failed ephemeral one is not, because its publisher re-announces.
             let is_observer = event.kind.as_u16() as u32 == KIND_AGENT_OBSERVER_FRAME;
             if send_publish_event_frame(ws, &event).await {
                 if is_observer {
                     state.track_observer_in_flight(event);
                 }
-            } else if is_observer {
+            } else if durable {
                 state.park_gated_observer_frame(event);
             }
             true
@@ -2422,8 +2687,22 @@ async fn run_background_task(
                 }
             }
 
+            // Durable before ephemeral, and both behind the REQ drains above.
+            // The order is a priority, not a preference: the durable queue is
+            // the only one holding frames nobody will send again, and a frame
+            // superseded while it waits its turn costs nothing — the ephemeral
+            // map keeps only the latest per scope, so a delayed drain drains
+            // fresher frames, never more of them.
             if budget > 0 && !state.gated_observer_pending.is_empty() {
                 let sent = drain_gated_observer_pending(&mut ws, &mut state, budget).await;
+                budget = budget.saturating_sub(sent);
+                if sent > 0 {
+                    any_sent = true;
+                }
+            }
+
+            if budget > 0 && !state.gated_ephemeral_pending.is_empty() {
+                let sent = drain_gated_ephemeral_pending(&mut ws, &mut state, budget).await;
                 if sent > 0 {
                     any_sent = true;
                 }
@@ -2431,10 +2710,14 @@ async fn run_background_task(
 
             if any_sent {
                 drain_pacing_next = Some(tokio::time::Instant::now() + REQ_PACING_INTERVAL);
-            } else if !state.gated_observer_pending.is_empty() {
+            } else if !state.gated_observer_pending.is_empty()
+                || !state.gated_ephemeral_pending.is_empty()
+            {
                 // Nothing sent because the gate is still armed. Arm the pacing
-                // timer to the gate deadline so parked observer frames drain
-                // promptly even when no other traffic wakes the select loop.
+                // timer to the gate deadline so parked frames drain promptly
+                // even when no other traffic wakes the select loop — the whole
+                // value of parking a status frame is that it lands at the gate
+                // edge rather than one publisher cadence later.
                 drain_pacing_next = state
                     .check_rate_gate()
                     .or_else(|| Some(tokio::time::Instant::now() + REQ_PACING_INTERVAL));
@@ -4430,7 +4713,7 @@ async fn send_publish_event_frame(ws: &mut WsStream, event: &Event) -> bool {
     true
 }
 
-/// Drain parked observer telemetry frames once the rate-limit gate clears.
+/// Drain parked durable frames once the rate-limit gate clears.
 ///
 /// Called by the main loop pacing timer. Sends at most `budget` frames without
 /// sleeping — pacing is enforced by the caller via `drain_pacing_next`. Stops
@@ -4455,7 +4738,15 @@ async fn drain_gated_observer_pending(
             state.gated_observer_pending.push_front(event);
             break;
         }
-        state.track_observer_in_flight(event);
+        // Only observer frames enter the acknowledgment window. It exists
+        // because a rate-limit NOTICE names no event id, so every unacknowledged
+        // *telemetry* write is re-sent conservatively — and a duplicate 24200 is
+        // free, since the observer stream is deduplicated by event id. A
+        // non-telemetry durable frame is left alone rather than given a retry
+        // policy nothing has asked for.
+        if event.kind.as_u16() as u32 == KIND_AGENT_OBSERVER_FRAME {
+            state.track_observer_in_flight(event);
+        }
         sent += 1;
     }
     if state.gated_observer_pending.is_empty() && state.gated_observer_dropped > 0 {
@@ -4464,6 +4755,49 @@ async fn drain_gated_observer_pending(
             "observer frames lost to gated-queue overflow"
         );
         state.gated_observer_dropped = 0;
+    }
+    sent
+}
+
+/// Drain the parked latest-per-scope ephemeral frames once the gate clears.
+///
+/// Runs after [`drain_gated_observer_pending`] on the same pacing tick and
+/// shares its budget, so a status frame costs the durable queue nothing and
+/// both stay inside the relay's admission window.
+///
+/// A send failure drops the frame instead of re-parking it: the socket is
+/// probably gone, and the publisher behind every kind here re-announces within
+/// one cadence, so retrying would only risk delivering something older than
+/// what is about to be published anyway. Returns the number of frames sent.
+async fn drain_gated_ephemeral_pending(
+    ws: &mut WsStream,
+    state: &mut BgState,
+    budget: usize,
+) -> usize {
+    let mut sent = 0;
+    while sent < budget {
+        if state.check_rate_gate().is_some() {
+            break;
+        }
+        let Some((scope, event)) = state.gated_ephemeral_pending.pop_front() else {
+            break;
+        };
+        if !send_publish_event_frame(ws, &event).await {
+            warn!(
+                kind = scope.kind,
+                scope = %scope.id,
+                "parked ephemeral frame dropped: send failed — its publisher re-announces"
+            );
+            break;
+        }
+        sent += 1;
+    }
+    if state.gated_ephemeral_pending.is_empty() && state.gated_ephemeral_dropped > 0 {
+        warn!(
+            ephemeral_scopes_dropped = state.gated_ephemeral_dropped,
+            "status frames lost to gated ephemeral scope-cap overflow"
+        );
+        state.gated_ephemeral_dropped = 0;
     }
     sent
 }
@@ -4713,6 +5047,7 @@ async fn try_autonomous_reconnect(
     auth_tag: Option<&nostr::Tag>,
 ) -> ReconnectOutcome {
     state.requeue_observer_in_flight();
+    state.discard_gated_ephemera("autonomous reconnect");
     // 5 attempts, up to 16s base backoff. Shares delay values with the
     // initial-connect retry in `HarnessRelay::connect()` (STARTUP_CONNECT_BACKOFFS) —
     // see its doc comment for how the two loops consume the array differently.
@@ -4843,6 +5178,7 @@ async fn wait_for_reconnect(
     auth_tag: Option<&nostr::Tag>,
 ) -> ReconnectOutcome {
     state.requeue_observer_in_flight();
+    state.discard_gated_ephemera("waiting for reconnect");
     if !skip_drain {
         // Drain commands until we get Reconnect (or Shutdown).
         // Other commands update state so reconnect reflects latest intent.
@@ -16923,9 +17259,62 @@ for line in sys.stdin:
         .expect("sign test observer frame")
     }
 
+    /// Build a signed typing indicator (kind 20002) scoped to a channel.
+    fn make_typing_frame(keys: &Keys, channel_id: Uuid) -> Event {
+        make_typing_frame_at(keys, channel_id, nostr::Timestamp::now())
+    }
+
+    /// A typing indicator carries no content, so two frames for one channel are
+    /// the same event unless their timestamps differ — which in production they
+    /// always do, one refresh cadence apart.
+    fn make_typing_frame_at(keys: &Keys, channel_id: Uuid, created_at: nostr::Timestamp) -> Event {
+        EventBuilder::new(Kind::Custom(KIND_TYPING_INDICATOR as u16), "")
+            .tags([Tag::parse(["h", &channel_id.to_string()]).expect("h tag")])
+            .custom_created_at(created_at)
+            .sign_with_keys(keys)
+            .expect("sign typing indicator")
+    }
+
+    /// Build a signed NIP-PA project activity frame (kind 20003) for a root.
+    fn make_project_activity_frame(
+        keys: &Keys,
+        root: &str,
+        activity: buzz_sdk::builders::ProjectActivityState,
+        turn_id: &str,
+    ) -> Event {
+        let agent = keys.public_key().to_hex();
+        let repo = buzz_sdk::GitRepoCoord {
+            owner: agent.clone(),
+            id: "repo".to_string(),
+        };
+        buzz_sdk::builders::build_project_activity(&repo, root, &agent, activity, turn_id, None)
+            .expect("build project activity")
+            .sign_with_keys(keys)
+            .expect("sign project activity")
+    }
+
+    /// Publish one event through the connected command path.
+    async fn publish_through_gate(
+        client: &mut WsStream,
+        state: &mut BgState,
+        event: &Event,
+    ) -> bool {
+        execute_connected_command(
+            client,
+            state,
+            "agent-pubkey",
+            RelayCommand::PublishEvent {
+                event: Box::new(event.clone()),
+            },
+        )
+        .await
+    }
+
     /// While the rate-limit gate is armed, an observer frame (kind 24200) is
-    /// parked — not silently dropped — and delivered by the drain once the
-    /// gate clears. A typing indicator in the same window stays dropped.
+    /// parked in the durable FIFO — not silently dropped — and delivered by the
+    /// drain once the gate clears. A typing indicator in the same window is
+    /// parked too, in the ephemeral map rather than the durable queue: the two
+    /// buffers stay separate because their drain rules are different.
     #[tokio::test]
     async fn gated_observer_frame_is_parked_then_drained_not_dropped() {
         let (mut client, mut server) = test_ws_pair().await;
@@ -16951,11 +17340,9 @@ for line in sys.stdin:
             "observer frame must be parked while gated"
         );
 
-        // Typing indicator while gated: still dropped, not parked.
-        let typing = EventBuilder::new(Kind::Custom(KIND_TYPING_INDICATOR as u16), "")
-            .tags([Tag::parse(["h", &Uuid::new_v4().to_string()]).unwrap()])
-            .sign_with_keys(&keys)
-            .expect("sign typing indicator");
+        // Typing indicator while gated: parked as superseding ephemera, in its
+        // own map — never in the durable queue.
+        let typing = make_typing_frame(&keys, Uuid::new_v4());
         let ok = execute_connected_command(
             &mut client,
             &mut state,
@@ -16969,7 +17356,12 @@ for line in sys.stdin:
         assert_eq!(
             state.gated_observer_pending.len(),
             1,
-            "typing indicators must not be parked"
+            "typing indicators must not enter the durable queue"
+        );
+        assert_eq!(
+            state.gated_ephemeral_pending.len(),
+            1,
+            "typing indicators must be parked, not dropped"
         );
         assert!(
             timeout(Duration::from_millis(50), server.next())
@@ -17108,6 +17500,487 @@ for line in sys.stdin:
             state.gated_observer_pending.back().map(|e| e.id),
             Some(overflow.id),
             "newest frame must be retained"
+        );
+    }
+
+    /// A superseding kind parks one frame per scope: the newer typing frame for
+    /// a channel replaces the parked one instead of queueing behind it, so what
+    /// drains at the gate edge is at most one cadence old.
+    #[tokio::test]
+    async fn gated_ephemera_park_latest_per_scope() {
+        let (mut client, mut server) = test_ws_pair().await;
+        let mut state = BgState::new();
+        let keys = Keys::generate();
+        let channel = Uuid::new_v4();
+        state.rate_limit_gate = Some(tokio::time::Instant::now() + Duration::from_millis(150));
+
+        // One typing cadence apart, as the publisher emits them.
+        let now = nostr::Timestamp::now();
+        let stale = make_typing_frame_at(&keys, channel, now);
+        let fresh = make_typing_frame_at(&keys, channel, now + 3u64);
+        assert_ne!(stale.id, fresh.id, "test needs two distinct frames");
+        assert!(publish_through_gate(&mut client, &mut state, &stale).await);
+        assert!(publish_through_gate(&mut client, &mut state, &fresh).await);
+
+        assert_eq!(
+            state.gated_ephemeral_pending.len(),
+            1,
+            "one channel is one scope however many frames it publishes"
+        );
+        assert_eq!(
+            state.gated_ephemeral_pending[0].1.id, fresh.id,
+            "the newer frame must supersede the parked one"
+        );
+        assert_eq!(
+            state.gated_ephemeral_dropped, 0,
+            "superseding is the design, not a counted loss"
+        );
+
+        tokio::time::sleep(Duration::from_millis(160)).await;
+        assert_eq!(
+            drain_gated_ephemeral_pending(&mut client, &mut state, 4).await,
+            1
+        );
+        let frame = next_test_frame(&mut server).await;
+        assert_eq!(frame[1]["id"], fresh.id.to_hex());
+        assert!(
+            timeout(Duration::from_millis(50), server.next())
+                .await
+                .is_err(),
+            "the superseded frame must never reach the wire"
+        );
+    }
+
+    /// Distinct scopes are independent: two channels and two project roots park
+    /// four frames, and a frame for one scope never displaces another's.
+    #[tokio::test]
+    async fn gated_ephemera_park_distinct_scopes_independently() {
+        let (mut client, _server) = test_ws_pair().await;
+        let mut state = BgState::new();
+        let keys = Keys::generate();
+        state.rate_limit_gate = Some(tokio::time::Instant::now() + Duration::from_secs(5));
+
+        let channel_a = make_typing_frame(&keys, Uuid::new_v4());
+        let channel_b = make_typing_frame(&keys, Uuid::new_v4());
+        let root_a = make_project_activity_frame(
+            &keys,
+            &"a".repeat(64),
+            buzz_sdk::builders::ProjectActivityState::Working,
+            "turn-a",
+        );
+        let root_b = make_project_activity_frame(
+            &keys,
+            &"b".repeat(64),
+            buzz_sdk::builders::ProjectActivityState::Working,
+            "turn-b",
+        );
+        for event in [&channel_a, &channel_b, &root_a, &root_b] {
+            assert!(publish_through_gate(&mut client, &mut state, event).await);
+        }
+
+        assert_eq!(
+            state.gated_ephemeral_pending.len(),
+            4,
+            "two channels and two roots are four scopes"
+        );
+        let parked: Vec<_> = state
+            .gated_ephemeral_pending
+            .iter()
+            .map(|(_, event)| event.id)
+            .collect();
+        for event in [&channel_a, &channel_b, &root_a, &root_b] {
+            assert!(
+                parked.contains(&event.id),
+                "every scope keeps its own frame"
+            );
+        }
+    }
+
+    /// The bug this whole policy exists for: a NIP-PA `queued` frame published
+    /// during a gate window reaches the wire when the gate clears, instead of
+    /// being dropped as if it were a typing indicator.
+    #[tokio::test]
+    async fn gated_project_activity_reaches_the_wire_after_the_gate_clears() {
+        let (mut client, mut server) = test_ws_pair().await;
+        let mut state = BgState::new();
+        let keys = Keys::generate();
+        let root = "c".repeat(64);
+        state.rate_limit_gate = Some(tokio::time::Instant::now() + Duration::from_millis(150));
+
+        let queued = make_project_activity_frame(
+            &keys,
+            &root,
+            buzz_sdk::builders::ProjectActivityState::Queued,
+            "queued:abc",
+        );
+        assert!(publish_through_gate(&mut client, &mut state, &queued).await);
+        assert_eq!(
+            state.gated_ephemeral_pending.len(),
+            1,
+            "project activity must be parked, not dropped"
+        );
+        assert_eq!(
+            state.gated_ephemeral_pending[0].0,
+            EphemeralScope {
+                kind: KIND_PROJECT_ACTIVITY,
+                id: root.clone(),
+            },
+            "a project activity frame is scoped by its root `e` tag"
+        );
+        assert!(
+            timeout(Duration::from_millis(50), server.next())
+                .await
+                .is_err(),
+            "nothing may reach the wire while the gate is armed"
+        );
+
+        tokio::time::sleep(Duration::from_millis(160)).await;
+        assert_eq!(
+            drain_gated_ephemeral_pending(&mut client, &mut state, 1).await,
+            1
+        );
+        let frame = next_test_frame(&mut server).await;
+        assert_eq!(frame[0], "EVENT");
+        assert_eq!(frame[1]["id"], queued.id.to_hex());
+        assert_eq!(frame[1]["kind"], u64::from(KIND_PROJECT_ACTIVITY));
+    }
+
+    /// One pacing tick sends one frame, durable first. Mirrors the main-loop
+    /// drain block's budget arithmetic so the priority is asserted where it is
+    /// decided rather than by whichever drain the test calls first.
+    #[tokio::test]
+    async fn gated_drain_sends_durable_before_ephemera_one_per_tick() {
+        let (mut client, mut server) = test_ws_pair().await;
+        let mut state = BgState::new();
+        let keys = Keys::generate();
+
+        let telemetry = make_observer_frame(&keys);
+        let typing = make_typing_frame(&keys, Uuid::new_v4());
+        state.park_gated_observer_frame(Box::new(telemetry.clone()));
+        state.park_gated_ephemeral_frame(
+            EphemeralScope {
+                kind: KIND_TYPING_INDICATOR,
+                id: "channel".to_string(),
+            },
+            Box::new(typing.clone()),
+        );
+
+        for expected in [&telemetry, &typing] {
+            let mut budget = DRAIN_BUDGET_PER_ITER;
+            if budget > 0 && !state.gated_observer_pending.is_empty() {
+                let sent = drain_gated_observer_pending(&mut client, &mut state, budget).await;
+                budget = budget.saturating_sub(sent);
+            }
+            if budget > 0 && !state.gated_ephemeral_pending.is_empty() {
+                drain_gated_ephemeral_pending(&mut client, &mut state, budget).await;
+            }
+            let frame = next_test_frame(&mut server).await;
+            assert_eq!(
+                frame[1]["id"],
+                expected.id.to_hex(),
+                "durable telemetry drains ahead of status frames, one per tick"
+            );
+        }
+        assert!(state.gated_observer_pending.is_empty());
+        assert!(state.gated_ephemeral_pending.is_empty());
+    }
+
+    /// The ephemeral map is bounded by scopes: overflow evicts the
+    /// least-recently-refreshed scope and counts it, and the drain reports the
+    /// total once the map empties.
+    #[tokio::test]
+    async fn gated_ephemeral_map_drops_least_recently_refreshed_scope() {
+        let (mut client, mut server) = test_ws_pair().await;
+        let mut state = BgState::new();
+        let keys = Keys::generate();
+
+        let first_channel = Uuid::new_v4();
+        let first = make_typing_frame(&keys, first_channel);
+        state.park_gated_ephemeral_frame(
+            EphemeralScope {
+                kind: KIND_TYPING_INDICATOR,
+                id: first_channel.to_string(),
+            },
+            Box::new(first.clone()),
+        );
+        for _ in 1..GATED_EPHEMERAL_SCOPE_CAP {
+            let channel = Uuid::new_v4();
+            state.park_gated_ephemeral_frame(
+                EphemeralScope {
+                    kind: KIND_TYPING_INDICATOR,
+                    id: channel.to_string(),
+                },
+                Box::new(make_typing_frame(&keys, channel)),
+            );
+        }
+        assert_eq!(
+            state.gated_ephemeral_pending.len(),
+            GATED_EPHEMERAL_SCOPE_CAP
+        );
+        assert_eq!(state.gated_ephemeral_dropped, 0);
+
+        // Refreshing the oldest scope moves it out of the eviction slot: the
+        // scope that has gone quiet is the one that should be shed.
+        let refreshed = make_typing_frame(&keys, first_channel);
+        state.park_gated_ephemeral_frame(
+            EphemeralScope {
+                kind: KIND_TYPING_INDICATOR,
+                id: first_channel.to_string(),
+            },
+            Box::new(refreshed.clone()),
+        );
+        assert_eq!(
+            state.gated_ephemeral_pending.len(),
+            GATED_EPHEMERAL_SCOPE_CAP,
+            "a refresh replaces in place, it does not grow the map"
+        );
+        assert_eq!(state.gated_ephemeral_dropped, 0, "a refresh is not a loss");
+
+        let overflow_channel = Uuid::new_v4();
+        state.park_gated_ephemeral_frame(
+            EphemeralScope {
+                kind: KIND_TYPING_INDICATOR,
+                id: overflow_channel.to_string(),
+            },
+            Box::new(make_typing_frame(&keys, overflow_channel)),
+        );
+        assert_eq!(
+            state.gated_ephemeral_pending.len(),
+            GATED_EPHEMERAL_SCOPE_CAP,
+            "map must stay bounded"
+        );
+        assert_eq!(state.gated_ephemeral_dropped, 1, "loss must be counted");
+        assert!(
+            state
+                .gated_ephemeral_pending
+                .iter()
+                .any(|(_, event)| event.id == refreshed.id),
+            "the refreshed scope must survive: eviction takes the quietest"
+        );
+
+        // Draining the map empties the accounting after reporting it.
+        let mut drained = 0;
+        while !state.gated_ephemeral_pending.is_empty() {
+            drained += drain_gated_ephemeral_pending(&mut client, &mut state, 8).await;
+            while timeout(Duration::from_millis(20), server.next())
+                .await
+                .is_ok()
+            {}
+        }
+        assert_eq!(drained, GATED_EPHEMERAL_SCOPE_CAP);
+        assert_eq!(
+            state.gated_ephemeral_dropped, 0,
+            "the counter resets after the summary is logged"
+        );
+    }
+
+    /// Gate expiry mid-park does not let a live publish overtake what is still
+    /// parked for the same scope — but a scope with nothing parked publishes
+    /// straight to the wire.
+    #[tokio::test]
+    async fn ephemeral_publish_after_gate_expiry_supersedes_its_own_parked_scope() {
+        let (mut client, mut server) = test_ws_pair().await;
+        let mut state = BgState::new();
+        let keys = Keys::generate();
+        let root = "d".repeat(64);
+        state.rate_limit_gate = Some(tokio::time::Instant::now() + Duration::from_millis(50));
+
+        let working = make_project_activity_frame(
+            &keys,
+            &root,
+            buzz_sdk::builders::ProjectActivityState::Working,
+            "turn-1",
+        );
+        assert!(publish_through_gate(&mut client, &mut state, &working).await);
+        assert_eq!(state.gated_ephemeral_pending.len(), 1);
+
+        // Gate expires; the parked backlog has not drained yet.
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        assert!(state.check_rate_gate().is_none(), "gate must have expired");
+
+        let idle = make_project_activity_frame(
+            &keys,
+            &root,
+            buzz_sdk::builders::ProjectActivityState::Idle,
+            "turn-1",
+        );
+        assert!(publish_through_gate(&mut client, &mut state, &idle).await);
+        assert_eq!(
+            state.gated_ephemeral_pending.len(),
+            1,
+            "the live frame must supersede the parked one, not overtake it"
+        );
+        assert_eq!(
+            state.gated_ephemeral_pending[0].1.id, idle.id,
+            "the root must end up announcing idle, never working again"
+        );
+
+        // A different scope has nothing parked, so it goes live immediately.
+        let other = make_typing_frame(&keys, Uuid::new_v4());
+        assert!(publish_through_gate(&mut client, &mut state, &other).await);
+        let frame = next_test_frame(&mut server).await;
+        assert_eq!(frame[1]["id"], other.id.to_hex());
+
+        assert_eq!(
+            drain_gated_ephemeral_pending(&mut client, &mut state, 4).await,
+            1
+        );
+        let frame = next_test_frame(&mut server).await;
+        assert_eq!(frame[1]["id"], idle.id.to_hex());
+    }
+
+    /// Parked status frames do not outlive their socket; parked durable frames
+    /// do. Both reconnect entry points call this before backing off.
+    #[test]
+    fn parked_ephemera_are_discarded_on_socket_loss_and_durables_are_not() {
+        let mut state = BgState::new();
+        let keys = Keys::generate();
+        let telemetry = make_observer_frame(&keys);
+        let channel = Uuid::new_v4();
+
+        state.park_gated_observer_frame(Box::new(telemetry.clone()));
+        state.park_gated_ephemeral_frame(
+            EphemeralScope {
+                kind: KIND_TYPING_INDICATOR,
+                id: channel.to_string(),
+            },
+            Box::new(make_typing_frame(&keys, channel)),
+        );
+
+        state.discard_gated_ephemera("test socket loss");
+
+        assert!(
+            state.gated_ephemeral_pending.is_empty(),
+            "a status frame cannot be re-stated on a socket that did not carry it"
+        );
+        assert_eq!(
+            state.gated_observer_pending.len(),
+            1,
+            "durable telemetry must survive the reconnect"
+        );
+
+        // While disconnected the same split holds: durable parks, status drops.
+        apply_command_to_state(
+            &mut state,
+            RelayCommand::PublishEvent {
+                event: Box::new(make_typing_frame(&keys, channel)),
+            },
+        );
+        apply_command_to_state(
+            &mut state,
+            RelayCommand::PublishEvent {
+                event: Box::new(make_observer_frame(&keys)),
+            },
+        );
+        assert!(state.gated_ephemeral_pending.is_empty());
+        assert_eq!(state.gated_observer_pending.len(), 2);
+    }
+
+    /// Every tenant of the publish path gets its policy from the table, not
+    /// from a kind check at the call site — including the two that arrived
+    /// after the invariant this replaced was written.
+    #[test]
+    fn gated_publish_policy_covers_every_tenant_of_the_publish_path() {
+        let keys = Keys::generate();
+        let channel = Uuid::new_v4();
+        let root = "e".repeat(64);
+
+        assert!(matches!(
+            gated_publish_policy(&make_observer_frame(&keys)),
+            GatedPublish::Durable
+        ));
+        assert!(
+            matches!(
+                gated_publish_policy(&make_typing_frame(&keys, channel)),
+                GatedPublish::Superseding(scope) if scope == EphemeralScope {
+                    kind: KIND_TYPING_INDICATOR,
+                    id: channel.to_string(),
+                }
+            ),
+            "a typing indicator is scoped by its channel"
+        );
+        assert!(
+            matches!(
+                gated_publish_policy(&make_project_activity_frame(
+                    &keys,
+                    &root,
+                    buzz_sdk::builders::ProjectActivityState::Working,
+                    "turn-1",
+                )),
+                GatedPublish::Superseding(scope) if scope == EphemeralScope {
+                    kind: KIND_PROJECT_ACTIVITY,
+                    id: root.clone(),
+                }
+            ),
+            "project activity is scoped by its root, not by a channel it does not have"
+        );
+
+        // Presence (20001): one agent-wide scope, so the newest wins outright.
+        let presence = EventBuilder::new(Kind::Custom(KIND_PRESENCE_UPDATE as u16), "online")
+            .tags([])
+            .sign_with_keys(&keys)
+            .expect("sign presence");
+        assert!(matches!(
+            gated_publish_policy(&presence),
+            GatedPublish::Superseding(scope) if scope == EphemeralScope {
+                kind: KIND_PRESENCE_UPDATE,
+                id: String::new(),
+            }
+        ));
+
+        // The setup-mode nudge (kind 9) is a real message to a person: durable,
+        // and the case the replaced INVARIANT comment warned about.
+        let nudge = buzz_sdk::build_message(channel, "setup nudge", None, &[], false, &[])
+            .expect("build nudge")
+            .sign_with_keys(&keys)
+            .expect("sign nudge");
+        assert!(matches!(
+            gated_publish_policy(&nudge),
+            GatedPublish::Durable
+        ));
+
+        // An unclassified kind is parked, loudly, rather than dropped.
+        let unknown = EventBuilder::new(Kind::Custom(31337), "")
+            .tags([])
+            .sign_with_keys(&keys)
+            .expect("sign unknown kind");
+        assert!(matches!(
+            gated_publish_policy(&unknown),
+            GatedPublish::Durable
+        ));
+    }
+
+    /// A durable non-telemetry frame published while gated is parked and
+    /// delivered — but it never joins the observer acknowledgment window, which
+    /// exists only to re-send unacknowledged telemetry after a NOTICE.
+    #[tokio::test]
+    async fn gated_durable_message_is_parked_and_drained_without_in_flight_tracking() {
+        let (mut client, mut server) = test_ws_pair().await;
+        let mut state = BgState::new();
+        let keys = Keys::generate();
+        state.rate_limit_gate = Some(tokio::time::Instant::now() + Duration::from_millis(120));
+
+        let nudge = buzz_sdk::build_message(Uuid::new_v4(), "setup nudge", None, &[], false, &[])
+            .expect("build nudge")
+            .sign_with_keys(&keys)
+            .expect("sign nudge");
+        assert!(publish_through_gate(&mut client, &mut state, &nudge).await);
+        assert_eq!(
+            state.gated_observer_pending.len(),
+            1,
+            "a message must never be dropped by the gate"
+        );
+
+        tokio::time::sleep(Duration::from_millis(130)).await;
+        assert_eq!(
+            drain_gated_observer_pending(&mut client, &mut state, 1).await,
+            1
+        );
+        let frame = next_test_frame(&mut server).await;
+        assert_eq!(frame[1]["id"], nudge.id.to_hex());
+        assert!(
+            state.observer_in_flight.is_empty(),
+            "only telemetry enters the acknowledgment window"
         );
     }
 
