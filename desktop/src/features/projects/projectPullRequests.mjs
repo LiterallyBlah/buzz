@@ -1,50 +1,63 @@
 import {
-  allowedActorsForRoot,
+  allowedActorsForProjectRoot,
   getAllTags,
   getImetaTags,
   getTag,
+  PROJECT_ROOT_STATUS_KINDS,
+  referencesProjectRoot,
 } from "./projectIssues.mjs";
+
+const PROJECT_ROOT_STATUS_KIND_SET = new Set(PROJECT_ROOT_STATUS_KINDS);
+const KIND_COMMENT = 1;
+const KIND_PR_UPDATE = 1619;
+
+/**
+ * The root facts every trust and review rule below is written in terms of.
+ *
+ * A parsed `ProjectPullRequest` already carries exactly these three fields, so
+ * a model can be passed wherever these facts are expected. That is what lets
+ * the live-merge path re-derive review state from a cached pull request with
+ * the rules that built it — the alternative, a second implementation reading
+ * models instead of events, is how a merged view and a refetched view start
+ * disagreeing about who is a reviewer.
+ */
+function rootFactsFromEvent(event) {
+  return {
+    author: event.pubkey,
+    repoAddress: getTag(event, "a") ?? null,
+    recipients: getAllTags(event, "p"),
+  };
+}
 
 // Updates and status changes rewrite the PR's tip commit, clone URLs, and
 // lifecycle state, so they are only honored when signed by the PR author or
 // the repo owner — an arbitrary relay user must not be able to re-point an
 // open PR at their own commit/clone URL or flip its status.
-function trustedUpdatesForPullRequest(pullRequest, updateEvents) {
-  const allowedActors = allowedActorsForRoot(pullRequest);
+//
+// Revisions address their root with an uppercase `E`; a lowercase-only kind
+// 1619 is not a revision of this pull request (NIP-34 reserves `E` for exactly
+// this reference, and the relay's root resolver agrees).
+function trustedUpdateEvents(rootId, allowedActors, updateEvents) {
   return updateEvents.filter(
     (event) =>
       allowedActors.has(event.pubkey.toLowerCase()) &&
-      getTag(event, "E") === pullRequest.id,
+      getTag(event, "E") === rootId,
   );
 }
 
-function latestUpdateForPullRequest(pullRequest, updateEvents) {
-  return trustedUpdatesForPullRequest(pullRequest, updateEvents).sort(
-    (left, right) => right.created_at - left.created_at,
-  )[0];
-}
-
-function latestStatusForPullRequest(pullRequest, statusEvents) {
-  const allowedActors = allowedActorsForRoot(pullRequest);
+function latestStatusEvent(rootId, allowedActors, statusEvents) {
   return statusEvents
     .filter(
       (event) =>
         allowedActors.has(event.pubkey.toLowerCase()) &&
-        event.tags.some(
-          (tag) =>
-            (tag[0] === "e" || tag[0] === "E") && tag[1] === pullRequest.id,
-        ),
+        referencesProjectRoot(event, rootId),
     )
     .sort((left, right) => right.created_at - left.created_at)[0];
 }
 
 function eventsForPullRequest(pullRequestId, events) {
   return events
-    .filter((event) =>
-      event.tags.some(
-        (tag) => (tag[0] === "e" || tag[0] === "E") && tag[1] === pullRequestId,
-      ),
-    )
+    .filter((event) => referencesProjectRoot(event, pullRequestId))
     .sort((left, right) => left.created_at - right.created_at);
 }
 
@@ -55,15 +68,14 @@ function getCloneUrls(event) {
     .filter(Boolean);
 }
 
-function statusFromEvent(pullRequest, statusEvent) {
+function pullRequestStatusFrom(labels, statusEvent) {
   if (statusEvent?.kind === 1630) return "Open";
   if (statusEvent?.kind === 1631) return "Merged";
   if (statusEvent?.kind === 1632) return "Closed";
   if (statusEvent?.kind === 1633) return "Draft";
-  const labels = getAllTags(pullRequest, "t").map((label) =>
-    label.toLowerCase(),
-  );
-  return labels.includes("draft") ? "Draft" : "Open";
+  return labels.some((label) => label.toLowerCase() === "draft")
+    ? "Draft"
+    : "Open";
 }
 
 /** Keep consecutive lifecycle writes ordered even when they happen within the
@@ -224,10 +236,10 @@ function eventToPullRequestComment(event) {
  * review-request comments (signed by the PR author or repo owner). The PR
  * author is never their own reviewer.
  */
-function reviewersForPullRequest(pullRequest, comments) {
-  const allowedActors = allowedActorsForRoot(pullRequest);
+function reviewersForPullRequest(facts, comments) {
+  const allowedActors = allowedActorsForProjectRoot(facts);
   const reviewers = new Set(
-    getAllTags(pullRequest, "p").map((pubkey) => pubkey.toLowerCase()),
+    facts.recipients.map((pubkey) => pubkey.toLowerCase()),
   );
   for (const comment of comments) {
     if (
@@ -239,7 +251,7 @@ function reviewersForPullRequest(pullRequest, comments) {
       }
     }
   }
-  reviewers.delete(pullRequest.pubkey.toLowerCase());
+  reviewers.delete(facts.author.toLowerCase());
   return [...reviewers];
 }
 
@@ -247,10 +259,10 @@ function reviewDecisionCommit(comment, initialCommit) {
   return comment.commit ?? initialCommit;
 }
 
-function trustedReviewActors(pullRequest, reviewers) {
-  const author = pullRequest.pubkey.toLowerCase();
+function trustedReviewActors(facts, reviewers) {
+  const author = facts.author.toLowerCase();
   const trustedActors = new Set(reviewers);
-  for (const actor of allowedActorsForRoot(pullRequest)) {
+  for (const actor of allowedActorsForProjectRoot(facts)) {
     if (actor !== author) trustedActors.add(actor);
   }
   return trustedActors;
@@ -301,27 +313,24 @@ function reviewDecisionsForPullRequest(
   };
 }
 
-export function eventToProjectPullRequest(
-  pullRequest,
-  updateEvents = [],
-  commentEvents = [],
-  statusEvents = [],
+/**
+ * Everything a pull request's review surface is a function of: its comments,
+ * who is trusted, and which commit they speak about.
+ *
+ * Split out of `eventToProjectPullRequest` because the live path re-runs it
+ * with the model's own comments after a merge. Re-decorating already-decorated
+ * comments is intentional and idempotent: a decorated comment is a parsed
+ * comment plus derived fields, and the spread below overwrites exactly those.
+ */
+function projectPullRequestReviewState(
+  facts,
+  parsedComments,
+  initialCommit,
+  latestCommit,
 ) {
-  const latestUpdate = latestUpdateForPullRequest(pullRequest, updateEvents);
-  const latestStatus = latestStatusForPullRequest(pullRequest, statusEvents);
-  const updates = eventsForPullRequest(
-    pullRequest.id,
-    trustedUpdatesForPullRequest(pullRequest, updateEvents),
-  ).map(eventToPullRequestUpdate);
-  const parsedComments = eventsForPullRequest(
-    pullRequest.id,
-    commentEvents,
-  ).map(eventToPullRequestComment);
-  const reviewers = reviewersForPullRequest(pullRequest, parsedComments);
-  const trustedActors = trustedReviewActors(pullRequest, reviewers);
-  const trustedReviewRequestActors = allowedActorsForRoot(pullRequest);
-  const latestCommit = getTag(latestUpdate ?? pullRequest, "c") ?? null;
-  const initialCommit = getTag(pullRequest, "c") ?? null;
+  const reviewers = reviewersForPullRequest(facts, parsedComments);
+  const trustedActors = trustedReviewActors(facts, reviewers);
+  const trustedReviewRequestActors = allowedActorsForProjectRoot(facts);
   const comments = parsedComments.map((comment) => ({
     ...comment,
     inlineCommentStatus: comment.anchor
@@ -344,16 +353,60 @@ export function eventToProjectPullRequest(
       comment.isReviewRequest &&
       trustedReviewRequestActors.has(comment.author.toLowerCase()),
   }));
+
+  return {
+    ...reviewDecisionsForPullRequest(
+      comments,
+      trustedActors,
+      initialCommit,
+      latestCommit,
+    ),
+    comments,
+    reviewers,
+  };
+}
+
+export function eventToProjectPullRequest(
+  pullRequest,
+  updateEvents = [],
+  commentEvents = [],
+  statusEvents = [],
+) {
+  const facts = rootFactsFromEvent(pullRequest);
+  const allowedActors = allowedActorsForProjectRoot(facts);
+  const trustedUpdates = trustedUpdateEvents(
+    pullRequest.id,
+    allowedActors,
+    updateEvents,
+  );
+  const latestUpdate = [...trustedUpdates].sort(
+    (left, right) => right.created_at - left.created_at,
+  )[0];
+  const latestStatus = latestStatusEvent(
+    pullRequest.id,
+    allowedActors,
+    statusEvents,
+  );
+  const updates = eventsForPullRequest(pullRequest.id, trustedUpdates).map(
+    eventToPullRequestUpdate,
+  );
+  const parsedComments = eventsForPullRequest(
+    pullRequest.id,
+    commentEvents,
+  ).map(eventToPullRequestComment);
+  const latestCommit = getTag(latestUpdate ?? pullRequest, "c") ?? null;
+  const initialCommit = getTag(pullRequest, "c") ?? null;
+  const { approvals, changeRequests, comments, reviewers } =
+    projectPullRequestReviewState(
+      facts,
+      parsedComments,
+      initialCommit,
+      latestCommit,
+    );
   const title =
     getTag(pullRequest, "subject") ||
     pullRequest.content.split("\n")[0] ||
     "Untitled pull request";
-  const reviewDecisions = reviewDecisionsForPullRequest(
-    comments,
-    trustedActors,
-    initialCommit,
-    latestCommit,
-  );
 
   return {
     id: pullRequest.id,
@@ -367,9 +420,9 @@ export function eventToProjectPullRequest(
     labels: getAllTags(pullRequest, "t"),
     recipients: getAllTags(pullRequest, "p"),
     reviewers,
-    approvals: reviewDecisions.approvals,
-    changeRequests: reviewDecisions.changeRequests,
-    status: statusFromEvent(pullRequest, latestStatus),
+    approvals,
+    changeRequests,
+    status: pullRequestStatusFrom(getAllTags(pullRequest, "t"), latestStatus),
     statusEventId: latestStatus?.id ?? null,
     statusCreatedAt: latestStatus?.created_at ?? null,
     branchName: getTag(pullRequest, "branch-name") ?? null,
@@ -413,4 +466,139 @@ export function projectPullRequestEventsToPullRequests(
       ),
     )
     .sort((left, right) => right.updatedAt - left.updatedAt);
+}
+
+function pullRequestWithComment(pullRequest, event) {
+  if (!referencesProjectRoot(event, pullRequest.id)) return pullRequest;
+  // Dedupe by event id. The live filter overlaps what the last fetch already
+  // returned and a reconnect replays that overlap, so the identical reference
+  // returned here is what keeps a replay from duplicating a comment row.
+  if (pullRequest.comments.some((comment) => comment.id === event.id)) {
+    return pullRequest;
+  }
+
+  const parsedComments = [
+    ...pullRequest.comments,
+    eventToPullRequestComment(event),
+  ].sort((left, right) => left.createdAt - right.createdAt);
+
+  return {
+    ...pullRequest,
+    ...projectPullRequestReviewState(
+      pullRequest,
+      parsedComments,
+      pullRequest.initialCommit,
+      pullRequest.commit,
+    ),
+    updatedAt: Math.max(pullRequest.updatedAt, event.created_at),
+  };
+}
+
+function pullRequestWithUpdate(pullRequest, event) {
+  if (getTag(event, "E") !== pullRequest.id) return pullRequest;
+  if (
+    !allowedActorsForProjectRoot(pullRequest).has(event.pubkey.toLowerCase())
+  ) {
+    return pullRequest;
+  }
+  if (pullRequest.updates.some((update) => update.id === event.id)) {
+    return pullRequest;
+  }
+
+  const updates = [
+    ...pullRequest.updates,
+    eventToPullRequestUpdate(event),
+  ].sort((left, right) => left.createdAt - right.createdAt);
+  // The newest revision owns the tip commit and clone URLs, exactly as
+  // `eventToProjectPullRequest` reads them off the latest update event. A
+  // late-arriving older revision therefore changes the timeline without
+  // re-pointing the branch.
+  const latestUpdate = updates.reduce(
+    (latest, update) =>
+      !latest || update.createdAt > latest.createdAt ? update : latest,
+    null,
+  );
+  const latestCommit = latestUpdate?.commit ?? null;
+
+  return {
+    ...pullRequest,
+    // Review decisions and inline comments are scoped to the commit they were
+    // written against, so a new tip re-dates every one of them.
+    ...projectPullRequestReviewState(
+      pullRequest,
+      pullRequest.comments,
+      pullRequest.initialCommit,
+      latestCommit,
+    ),
+    cloneUrls: latestUpdate?.cloneUrls ?? pullRequest.cloneUrls,
+    commit: latestCommit,
+    updateCount: updates.length,
+    updatedAt: Math.max(pullRequest.updatedAt, event.created_at),
+    updates,
+  };
+}
+
+function pullRequestWithStatus(pullRequest, event) {
+  if (!referencesProjectRoot(event, pullRequest.id)) return pullRequest;
+  if (
+    !allowedActorsForProjectRoot(pullRequest).has(event.pubkey.toLowerCase())
+  ) {
+    return pullRequest;
+  }
+  // Only a strictly newer status wins, matching `latestStatusEvent`: a replayed
+  // or out-of-order lifecycle event must not reopen a merged pull request.
+  if (
+    pullRequest.statusCreatedAt !== null &&
+    event.created_at <= pullRequest.statusCreatedAt
+  ) {
+    return pullRequest;
+  }
+
+  return {
+    ...pullRequest,
+    status: pullRequestStatusFrom(pullRequest.labels, event),
+    statusEventId: event.id,
+    statusCreatedAt: event.created_at,
+    updatedAt: Math.max(pullRequest.updatedAt, event.created_at),
+  };
+}
+
+/**
+ * Fold one live event into an already-parsed pull request.
+ *
+ * The query cache holds parsed pull requests, not the events they were built
+ * from, so the live path cannot re-run `eventToProjectPullRequest`. It applies
+ * the same rules incrementally instead, and returns the input untouched when
+ * the event says nothing about this pull request — an unrelated root, an
+ * untrusted signer, or a duplicate all take that path.
+ */
+export function mergeProjectPullRequestEvent(pullRequest, event) {
+  if (event.kind === KIND_PR_UPDATE) {
+    return pullRequestWithUpdate(pullRequest, event);
+  }
+  if (event.kind === KIND_COMMENT) {
+    return pullRequestWithComment(pullRequest, event);
+  }
+  if (PROJECT_ROOT_STATUS_KIND_SET.has(event.kind)) {
+    return pullRequestWithStatus(pullRequest, event);
+  }
+  return pullRequest;
+}
+
+/**
+ * The list form. Re-sorts on the key
+ * `projectPullRequestEventsToPullRequests` sorts on so a merged list and a
+ * refetched list agree on order.
+ */
+export function mergeProjectPullRequestsEvent(pullRequests, event) {
+  let changed = false;
+  const merged = pullRequests.map((pullRequest) => {
+    const next = mergeProjectPullRequestEvent(pullRequest, event);
+    if (next !== pullRequest) changed = true;
+    return next;
+  });
+
+  return changed
+    ? merged.sort((left, right) => right.updatedAt - left.updatedAt)
+    : pullRequests;
 }

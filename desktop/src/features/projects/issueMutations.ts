@@ -118,7 +118,7 @@ const ISSUE_STATUS_KIND_BY_LIFECYCLE: Record<
  *
  * Same event shape as `buzz issues status` and as the pull-request path
  * beside it: the root `e`, the repository `a`, and `p` tags for the two
- * pubkeys `allowedActorsForProjectIssue` trusts. The tags come from
+ * pubkeys `allowedActorsForProjectRoot` trusts. The tags come from
  * `buildGitStatusTags`, which existed unused — this is V11's missing caller,
  * not a second way to write the same event.
  *

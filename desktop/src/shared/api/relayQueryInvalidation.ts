@@ -39,6 +39,10 @@ const RELAY_PROJECT_QUERY_PARTS = new Set<string>([
   "activity-summaries",
   "issues",
   "pull-requests",
+  // The cross-project inbox reads issues and pull requests from the relay in
+  // one fan-out. Omitting it left the one view that shows every project's work
+  // stale after a reconnect, while the per-project lists beside it healed.
+  "work-items",
 ]);
 
 const LOCAL_PROJECT_QUERY_PARTS = new Set<string>([

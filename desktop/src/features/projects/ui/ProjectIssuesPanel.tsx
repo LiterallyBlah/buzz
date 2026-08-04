@@ -3,17 +3,18 @@ import * as React from "react";
 import { toast } from "sonner";
 
 import { ForumComposer } from "@/features/forum/ui/ForumComposer";
+import { useCreateProjectIssueCommentMutation } from "@/features/projects/commentMutations";
 import {
   type Project,
   type ProjectIssue,
-  useCreateProjectIssueCommentMutation,
   useProjectIssuesQuery,
 } from "@/features/projects/hooks";
 import {
   type ProjectIssueLifecycleStatus,
   useUpdateProjectIssueStatusMutation,
 } from "@/features/projects/issueMutations";
-import { allowedActorsForProjectIssue } from "@/features/projects/projectIssues.mjs";
+import { allowedActorsForProjectRoot } from "@/features/projects/projectIssues.mjs";
+import { useLiveProjectRoot } from "@/features/projects/useLiveProjectRoot";
 import { useIdentityQuery } from "@/shared/api/hooks";
 import { Button } from "@/shared/ui/button";
 import {
@@ -201,7 +202,7 @@ function issueStatusActions(
  * Issue status controls (V11: the desktop could change PR status and not issue
  * status, so closing an issue was CLI-only).
  *
- * Shown only to the two pubkeys `allowedActorsForProjectIssue` trusts — the issue
+ * Shown only to the two pubkeys `allowedActorsForProjectRoot` trusts — the issue
  * author and the repo owner. Anyone else's status event is discarded by the
  * reader, so offering them the control would produce a published event and a
  * panel that never changes.
@@ -219,7 +220,7 @@ function ProjectIssueStatusControls({
     ? normalizePubkey(identityQuery.data.pubkey)
     : null;
   const canChangeStatus = React.useMemo(
-    () => (self ? allowedActorsForProjectIssue(issue).has(self) : false),
+    () => (self ? allowedActorsForProjectRoot(issue).has(self) : false),
     [issue, self],
   );
 
@@ -282,6 +283,9 @@ export function ProjectIssueDetail({
   stackMetaRail?: boolean;
 }) {
   const commentMutation = useCreateProjectIssueCommentMutation(project);
+  // Mounted on the detail view rather than the panel: the Home inbox renders
+  // this component directly, and an issue open there is just as live.
+  useLiveProjectRoot(project.id, issue.id);
   const authorLabel = resolveUserLabel({ profiles, pubkey: issue.author });
   const members = React.useMemo(
     () => issueMembers(project, issue, profiles),

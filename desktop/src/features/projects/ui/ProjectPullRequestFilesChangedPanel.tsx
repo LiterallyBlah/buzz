@@ -27,11 +27,11 @@ import {
 import * as React from "react";
 import { toast } from "sonner";
 
-import {
-  type Project,
-  type ProjectPullRequest,
-  type ProjectPullRequestCommentAnchor,
-  useCreateProjectPullRequestCommentMutation,
+import { useCreateProjectPullRequestCommentMutation } from "@/features/projects/commentMutations";
+import type {
+  Project,
+  ProjectPullRequest,
+  ProjectPullRequestCommentAnchor,
 } from "@/features/projects/hooks";
 import { canReviewProjectPullRequest } from "@/features/projects/pullRequestReviews";
 import type { ProjectPullRequestComment } from "@/features/projects/projectPullRequests.mjs";

@@ -2,12 +2,15 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
-  allowedActorsForProjectIssue,
+  allowedActorsForProjectRoot,
   allowedActorsForRoot,
   buildGitIssueTags,
   buildGitStatusTags,
   nextProjectIssueStatusCreatedAt,
   eventToProjectIssue,
+  mergeProjectIssueEvent,
+  mergeProjectIssuesEvent,
+  projectIssueEventsToIssues,
   getAllTags,
   getTag,
   PROJECT_ISSUE_STATUS,
@@ -295,10 +298,146 @@ test("the lifecycle actors rule has one implementation", () => {
   };
   const issue = eventToProjectIssue(root, [], []);
   assert.deepEqual(
-    [...allowedActorsForProjectIssue(issue)].sort(),
+    [...allowedActorsForProjectRoot(issue)].sort(),
     [...allowedActorsForRoot(root)].sort(),
   );
-  assert.ok(allowedActorsForProjectIssue(issue).has(AUTHOR.toLowerCase()));
-  assert.ok(allowedActorsForProjectIssue(issue).has(OWNER.toLowerCase()));
-  assert.ok(!allowedActorsForProjectIssue(issue).has(ATTACKER.toLowerCase()));
+  assert.ok(allowedActorsForProjectRoot(issue).has(AUTHOR.toLowerCase()));
+  assert.ok(allowedActorsForProjectRoot(issue).has(OWNER.toLowerCase()));
+  assert.ok(!allowedActorsForProjectRoot(issue).has(ATTACKER.toLowerCase()));
+});
+
+const ISSUE_ID = "e".repeat(64);
+
+function commentEvent({
+  id,
+  createdAt,
+  pubkey = OWNER,
+  rootId = ISSUE_ID,
+  rootTagName = "e",
+  content = "Working on it.",
+}) {
+  return {
+    id,
+    kind: 1,
+    pubkey,
+    created_at: createdAt,
+    content,
+    tags: [
+      [rootTagName, rootId, "", "root"],
+      ["a", REPO_ADDRESS],
+    ],
+  };
+}
+
+test("a live comment lands exactly where a refetch would put it", () => {
+  const first = commentEvent({ id: "comment-1", createdAt: 200 });
+  const second = commentEvent({ id: "comment-2", createdAt: 300 });
+
+  const merged = mergeProjectIssueEvent(
+    eventToProjectIssue(issueEvent(), [], [first]),
+    second,
+  );
+
+  assert.deepEqual(
+    merged,
+    eventToProjectIssue(issueEvent(), [], [first, second]),
+  );
+  assert.deepEqual(
+    merged.comments.map((comment) => comment.id),
+    ["comment-1", "comment-2"],
+  );
+  assert.equal(merged.updatedAt, 300);
+});
+
+test("a replayed comment is the same issue, not a second row", () => {
+  const comment = commentEvent({ id: "comment-1", createdAt: 200 });
+  const issue = eventToProjectIssue(issueEvent(), [], [comment]);
+
+  assert.equal(mergeProjectIssueEvent(issue, comment), issue);
+});
+
+test("a comment on another root leaves this issue untouched", () => {
+  const issue = eventToProjectIssue(issueEvent(), [], []);
+  const otherRoot = commentEvent({
+    id: "comment-1",
+    createdAt: 200,
+    rootId: "f".repeat(64),
+  });
+
+  assert.equal(mergeProjectIssueEvent(issue, otherRoot), issue);
+});
+
+test("a live status change follows the same trust and precedence rules", () => {
+  const issue = eventToProjectIssue(issueEvent(), [
+    statusEvent({ kind: 1631, pubkey: AUTHOR, createdAt: 300 }),
+  ]);
+
+  assert.equal(
+    mergeProjectIssueEvent(
+      issue,
+      statusEvent({ kind: 1632, pubkey: ATTACKER, createdAt: 400 }),
+    ),
+    issue,
+    "an untrusted signer cannot close the issue",
+  );
+  assert.equal(
+    mergeProjectIssueEvent(
+      issue,
+      statusEvent({ kind: 1633, pubkey: OWNER, createdAt: 300 }),
+    ),
+    issue,
+    "an equally-old status does not roll the panel back",
+  );
+
+  const closed = mergeProjectIssueEvent(
+    issue,
+    statusEvent({ kind: 1632, pubkey: OWNER, createdAt: 400 }),
+  );
+  assert.equal(closed.status, PROJECT_ISSUE_STATUS.CLOSED);
+  assert.equal(closed.statusCreatedAt, 400);
+  assert.equal(closed.updatedAt, 400);
+});
+
+test("an issue status must address its root in lowercase", () => {
+  const issue = eventToProjectIssue(issueEvent(), []);
+  const uppercaseRoot = {
+    ...statusEvent({ kind: 1632, pubkey: OWNER, createdAt: 400 }),
+    tags: [
+      ["E", ISSUE_ID, "", "root"],
+      ["a", REPO_ADDRESS],
+    ],
+  };
+
+  assert.equal(mergeProjectIssueEvent(issue, uppercaseRoot), issue);
+});
+
+test("merging a list re-sorts it the way a refetch would order it", () => {
+  const otherRoot = issueEvent({
+    id: "d".repeat(64),
+    created_at: 150,
+    content: "Another issue",
+  });
+  const comment = commentEvent({ id: "comment-1", createdAt: 400 });
+  const issues = projectIssueEventsToIssues([issueEvent(), otherRoot], [], []);
+
+  assert.deepEqual(
+    issues.map((issue) => issue.id),
+    [otherRoot.id, ISSUE_ID],
+  );
+  assert.deepEqual(
+    mergeProjectIssuesEvent(issues, comment),
+    projectIssueEventsToIssues([issueEvent(), otherRoot], [], [comment]),
+  );
+  assert.equal(
+    mergeProjectIssuesEvent(
+      issues,
+      commentEvent({
+        id: "comment-2",
+        createdAt: 400,
+        rootId: "f".repeat(64),
+      }),
+    ),
+    issues,
+    "an event for no cached issue leaves the list identical",
+  );
 });

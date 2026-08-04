@@ -42,8 +42,31 @@ export const PROJECT_ISSUE_STATUS: {
   CLOSED: "Closed";
 };
 
+export const PROJECT_ROOT_STATUS_KINDS: number[];
+
+/** Author + repo coordinate of a parsed issue or pull-request root. */
+export type ProjectRootLifecycleActors = {
+  author: string;
+  repoAddress: string | null;
+};
+
 export function allowedActorsForRoot(rootEvent: RelayEvent): Set<string>;
-export function allowedActorsForProjectIssue(issue: ProjectIssue): Set<string>;
+export function allowedActorsForProjectRoot(
+  root: ProjectRootLifecycleActors,
+): Set<string>;
+export function referencesProjectRoot(
+  event: RelayEvent,
+  rootId: string,
+  allowUppercase?: boolean,
+): boolean;
+export function mergeProjectIssueEvent(
+  issue: ProjectIssue,
+  event: RelayEvent,
+): ProjectIssue;
+export function mergeProjectIssuesEvent(
+  issues: ProjectIssue[],
+  event: RelayEvent,
+): ProjectIssue[];
 export function getTag(event: RelayEvent, name: string): string | undefined;
 export function getAllTags(event: RelayEvent, name: string): string[];
 export function getImetaTags(event: RelayEvent): string[][];

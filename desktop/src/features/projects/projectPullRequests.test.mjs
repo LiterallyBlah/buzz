@@ -3,6 +3,9 @@ import test from "node:test";
 
 import {
   eventToProjectPullRequest,
+  mergeProjectPullRequestEvent,
+  mergeProjectPullRequestsEvent,
+  projectPullRequestEventsToPullRequests,
   nextProjectPullRequestReviewCreatedAt,
   nextProjectPullRequestStatusCreatedAt,
   projectPullRequestCommentTimelineKind,
@@ -825,4 +828,201 @@ test("survives malformed value-less tags", () => {
   assert.equal(pullRequest.status, "Open");
   assert.deepEqual(pullRequest.labels, []);
   assert.deepEqual(pullRequest.recipients, []);
+});
+
+const PR_ID = "f".repeat(64);
+const REVIEWER = "d".repeat(64);
+
+test("a live comment lands exactly where a refetch would put it", () => {
+  const first = commentEvent({ pubkey: OWNER, createdAt: 200 });
+  const second = commentEvent({
+    pubkey: OWNER,
+    createdAt: 300,
+    content: "Pushed a fix.",
+  });
+
+  const merged = mergeProjectPullRequestEvent(
+    eventToProjectPullRequest(pullRequestEvent(), [], [first]),
+    second,
+  );
+
+  assert.deepEqual(
+    merged,
+    eventToProjectPullRequest(pullRequestEvent(), [], [first, second]),
+  );
+  assert.equal(merged.updatedAt, 300);
+});
+
+test("a replayed comment is the same pull request, not a second row", () => {
+  const comment = commentEvent({ pubkey: OWNER, createdAt: 200 });
+  const pullRequest = eventToProjectPullRequest(
+    pullRequestEvent(),
+    [],
+    [comment],
+  );
+
+  assert.equal(mergeProjectPullRequestEvent(pullRequest, comment), pullRequest);
+});
+
+test("a live approval re-derives the review state, not just the row", () => {
+  const root = pullRequestEvent({
+    tags: [
+      ["a", REPO_ADDRESS],
+      ["subject", "Add feature"],
+      ["c", "1111111111111111111111111111111111111111"],
+      ["p", REVIEWER],
+    ],
+  });
+  const approval = commentEvent({
+    pubkey: REVIEWER,
+    createdAt: 300,
+    content: "LGTM",
+    labels: ["approval"],
+    commit: "1111111111111111111111111111111111111111",
+  });
+
+  const merged = mergeProjectPullRequestEvent(
+    eventToProjectPullRequest(root),
+    approval,
+  );
+
+  assert.deepEqual(merged, eventToProjectPullRequest(root, [], [approval]));
+  assert.deepEqual(
+    merged.approvals.map((decision) => decision.author),
+    [REVIEWER],
+  );
+  assert.equal(merged.comments[0].reviewDecisionStatus, "current");
+});
+
+test("a live revision re-points the branch and dates prior reviews", () => {
+  const approval = commentEvent({
+    pubkey: OWNER,
+    createdAt: 200,
+    content: "LGTM",
+    labels: ["approval"],
+    commit: "1111111111111111111111111111111111111111",
+  });
+  const revision = updateEvent({
+    pubkey: AUTHOR,
+    createdAt: 300,
+    commit: "2222222222222222222222222222222222222222",
+    cloneUrl: `https://relay.example/git/${AUTHOR}/demo-fork`,
+  });
+
+  const merged = mergeProjectPullRequestEvent(
+    eventToProjectPullRequest(pullRequestEvent(), [], [approval]),
+    revision,
+  );
+
+  assert.deepEqual(
+    merged,
+    eventToProjectPullRequest(pullRequestEvent(), [revision], [approval]),
+  );
+  assert.equal(merged.commit, "2222222222222222222222222222222222222222");
+  assert.deepEqual(merged.cloneUrls, [
+    `https://relay.example/git/${AUTHOR}/demo-fork`,
+  ]);
+  assert.equal(merged.updateCount, 1);
+  assert.deepEqual(merged.approvals, []);
+  assert.equal(merged.comments[0].reviewDecisionStatus, "historical");
+});
+
+test("a revision is only a revision when it addresses the root uppercase", () => {
+  const pullRequest = eventToProjectPullRequest(pullRequestEvent());
+  const revision = updateEvent({
+    pubkey: AUTHOR,
+    createdAt: 300,
+    commit: "2222222222222222222222222222222222222222",
+  });
+
+  assert.equal(
+    mergeProjectPullRequestEvent(pullRequest, {
+      ...revision,
+      tags: revision.tags.map((tag) =>
+        tag[0] === "E" ? ["e", ...tag.slice(1)] : tag,
+      ),
+    }),
+    pullRequest,
+    "a lowercase-tagged 1619 is not this pull request's revision",
+  );
+  assert.equal(
+    mergeProjectPullRequestEvent(pullRequest, {
+      ...revision,
+      pubkey: ATTACKER,
+    }),
+    pullRequest,
+    "an untrusted signer cannot re-point the branch",
+  );
+  assert.equal(
+    mergeProjectPullRequestEvent(pullRequest, revision).commit,
+    "2222222222222222222222222222222222222222",
+  );
+});
+
+test("a live status change follows the same trust and precedence rules", () => {
+  const pullRequest = eventToProjectPullRequest(
+    pullRequestEvent(),
+    [],
+    [],
+    [statusEvent({ kind: 1631, pubkey: AUTHOR, createdAt: 300 })],
+  );
+
+  assert.equal(
+    mergeProjectPullRequestEvent(
+      pullRequest,
+      statusEvent({ kind: 1632, pubkey: ATTACKER, createdAt: 400 }),
+    ),
+    pullRequest,
+    "an untrusted signer cannot close the pull request",
+  );
+  assert.equal(
+    mergeProjectPullRequestEvent(
+      pullRequest,
+      statusEvent({ kind: 1630, pubkey: OWNER, createdAt: 300 }),
+    ),
+    pullRequest,
+    "an equally-old status does not reopen a merged pull request",
+  );
+  assert.equal(
+    mergeProjectPullRequestEvent(
+      pullRequest,
+      statusEvent({ kind: 1632, pubkey: OWNER, createdAt: 400 }),
+    ).status,
+    "Closed",
+  );
+});
+
+test("merging a list re-sorts it the way a refetch would order it", () => {
+  const otherRoot = pullRequestEvent({
+    id: "0".repeat(64),
+    created_at: 150,
+    content: "Another pull request",
+  });
+  const comment = commentEvent({ pubkey: OWNER, createdAt: 400 });
+  const pullRequests = projectPullRequestEventsToPullRequests([
+    pullRequestEvent(),
+    otherRoot,
+  ]);
+
+  assert.deepEqual(
+    pullRequests.map((pullRequest) => pullRequest.id),
+    [otherRoot.id, PR_ID],
+  );
+  assert.deepEqual(
+    mergeProjectPullRequestsEvent(pullRequests, comment),
+    projectPullRequestEventsToPullRequests(
+      [pullRequestEvent(), otherRoot],
+      [],
+      [comment],
+    ),
+  );
+  assert.equal(
+    mergeProjectPullRequestsEvent(pullRequests, {
+      ...comment,
+      id: "comment-other-root",
+      tags: [["e", "9".repeat(64), "", "root"]],
+    }),
+    pullRequests,
+    "an event for no cached pull request leaves the list identical",
+  );
 });

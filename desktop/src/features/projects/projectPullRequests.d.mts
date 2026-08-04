@@ -145,3 +145,11 @@ export function projectPullRequestEventsToPullRequests(
   commentEvents?: RelayEvent[],
   statusEvents?: RelayEvent[],
 ): ProjectPullRequest[];
+export function mergeProjectPullRequestEvent(
+  pullRequest: ProjectPullRequest,
+  event: RelayEvent,
+): ProjectPullRequest;
+export function mergeProjectPullRequestsEvent(
+  pullRequests: ProjectPullRequest[],
+  event: RelayEvent,
+): ProjectPullRequest[];

@@ -20,11 +20,11 @@ import { useAppNavigation } from "@/app/navigation/useAppNavigation";
 import { useIsManagedAgent } from "@/features/agent-memory/hooks";
 import { useChannelsQuery } from "@/features/channels/hooks";
 import { ForumComposer } from "@/features/forum/ui/ForumComposer";
-import {
-  type Project,
-  type ProjectPullRequest,
-  type ProjectPullRequestCommentAnchor,
-  useCreateProjectPullRequestCommentMutation,
+import { useCreateProjectPullRequestCommentMutation } from "@/features/projects/commentMutations";
+import type {
+  Project,
+  ProjectPullRequest,
+  ProjectPullRequestCommentAnchor,
 } from "@/features/projects/hooks";
 import { projectPullRequestCommentTimelineKind } from "@/features/projects/projectPullRequests.mjs";
 import {
@@ -32,6 +32,7 @@ import {
   relativeTime,
 } from "@/features/projects/lib/projectsViewHelpers";
 import { canReviewProjectPullRequest } from "@/features/projects/pullRequestReviews";
+import { useLiveProjectRoot } from "@/features/projects/useLiveProjectRoot";
 import type { UserProfileLookup } from "@/features/profile/lib/identity";
 import { useIdentityQuery } from "@/shared/api/hooks";
 import type { ChannelMember } from "@/shared/api/types";
@@ -518,6 +519,9 @@ export function ProjectPullRequestDetail({
 }) {
   const identityQuery = useIdentityQuery();
   const commentMutation = useCreateProjectPullRequestCommentMutation(project);
+  // On the detail view, not the panel: the Home inbox renders this component
+  // directly, and a pull request open there is just as live.
+  useLiveProjectRoot(project.id, pullRequest.id);
   const [
     expandedReviewHistoryPullRequestIds,
     setExpandedReviewHistoryPullRequestIds,
