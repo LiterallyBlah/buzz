@@ -4,6 +4,7 @@ import * as React from "react";
 import { createLiveSubscriptionSet } from "@/shared/api/liveSubscriptionSet";
 import { relayClient } from "@/shared/api/relayClient";
 import { createTrailingDebounce } from "@/shared/lib/trailingDebounce";
+import { useClearProjectUnreadWhileOpen } from "./projectUnreadStore";
 import {
   applyProjectRootEvent,
   projectRootEventRole,
@@ -105,4 +106,21 @@ export function useLiveProjectRoot(
       void liveRoot.dispose();
     };
   }, [projectId, queryClient, rootId]);
+}
+
+/**
+ * Everything "this root's detail view is on screen" implies, in one call.
+ *
+ * Two facts follow from a thread being on screen — it must stay live, and its
+ * unread mark has nothing left to say — and the detail views that render one
+ * (the projects panels, and the Home inbox rendering them directly) always
+ * mean both. One hook keeps the pair from drifting apart at a call site that
+ * remembers one fact and not the other.
+ */
+export function useOpenProjectRoot(
+  projectId: string | null | undefined,
+  rootId: string | null | undefined,
+) {
+  useLiveProjectRoot(projectId, rootId);
+  useClearProjectUnreadWhileOpen(rootId);
 }

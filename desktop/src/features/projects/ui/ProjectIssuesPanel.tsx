@@ -14,8 +14,7 @@ import {
   useUpdateProjectIssueStatusMutation,
 } from "@/features/projects/issueMutations";
 import { allowedActorsForProjectRoot } from "@/features/projects/projectIssues.mjs";
-import { useClearProjectUnreadWhileOpen } from "@/features/projects/projectUnreadStore";
-import { useLiveProjectRoot } from "@/features/projects/useLiveProjectRoot";
+import { useOpenProjectRoot } from "@/features/projects/useLiveProjectRoot";
 import { useIdentityQuery } from "@/shared/api/hooks";
 import { Button } from "@/shared/ui/button";
 import {
@@ -285,11 +284,8 @@ export function ProjectIssueDetail({
 }) {
   const commentMutation = useCreateProjectIssueCommentMutation(project);
   // Mounted on the detail view rather than the panel: the Home inbox renders
-  // this component directly, and an issue open there is just as live.
-  useLiveProjectRoot(project.id, issue.id);
-  // Same placement, same reason: whatever surface shows this thread is the
-  // surface reading it, so its unread mark has nothing left to say.
-  useClearProjectUnreadWhileOpen(issue.id);
+  // this component directly, and an issue open there is just as open.
+  useOpenProjectRoot(project.id, issue.id);
   const authorLabel = resolveUserLabel({ profiles, pubkey: issue.author });
   const members = React.useMemo(
     () => issueMembers(project, issue, profiles),
