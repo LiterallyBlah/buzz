@@ -143,24 +143,35 @@ harness_up() {
 # harness_schema — reset + apply schema and partitions. The database belongs
 # solely to our compose project, so a destructive reset every run is correct:
 # stale partitions from an earlier gate run must not colour this verdict.
+#
+# Schema comes from the migrations files, applied in filename order — NOT from
+# schema/schema.sql. Production relays build their schema by running exactly
+# these files (BUZZ_AUTO_MIGRATE=true), and the first live gate runs proved the
+# declarative schema has drifted from them: git_repo_names (0002),
+# parameterized_event_watermarks (0007) and product_feedback (0017) are all
+# absent from schema.sql, so a gate that trusted it judged candidates against
+# a database no production relay has ever run on. The drift itself is an
+# upstream bug worth fixing; until it is, the migrations are the only schema
+# source that provably matches prod. Applied ledger-less via psql, so the gate
+# relays keep auto-migrate OFF — a second applier would collide on migration 1.
 harness_schema() {
-  step "Reset isolated database and apply schema + partitions"
-  preview bin/pgschema apply --file schema/schema.sql --auto-approve
-  note "then: psql < scripts/attach-schema-partitions.sql (via the project's postgres container)"
+  step "Reset isolated database and apply migrations + partitions"
+  preview "psql < migrations/*.sql (in order), then scripts/attach-schema-partitions.sql"
   is_dry && return 0
 
   harness_compose exec -T postgres psql -U buzz -d buzz -v ON_ERROR_STOP=1 \
     -c "DROP SCHEMA public CASCADE; CREATE SCHEMA public;" >/dev/null || return 1
 
-  PGSCHEMA_PLAN_HOST=localhost PGSCHEMA_PLAN_PORT="${GATES_PG_PORT}" \
-  PGSCHEMA_PLAN_DB=buzz PGSCHEMA_PLAN_USER=buzz PGSCHEMA_PLAN_PASSWORD=buzz_dev \
-  PGHOST=localhost PGPORT="${GATES_PG_PORT}" PGUSER=buzz PGDATABASE=buzz PGPASSWORD=buzz_dev \
-    "${REPO_ROOT}/bin/pgschema" apply --file "${REPO_ROOT}/schema/schema.sql" --auto-approve || return 1
+  local m
+  for m in "${REPO_ROOT}"/migrations/*.sql; do
+    harness_compose exec -T postgres psql -U buzz -d buzz -v ON_ERROR_STOP=1 \
+      < "${m}" >/dev/null || { err "migration failed: $(basename "${m}")"; return 1; }
+  done
 
   harness_compose exec -T postgres psql -U buzz -d buzz -v ON_ERROR_STOP=1 \
     < "${REPO_ROOT}/scripts/attach-schema-partitions.sql" >/dev/null || return 1
 
-  ok "Schema applied"
+  ok "Schema applied from $(ls "${REPO_ROOT}"/migrations/*.sql | wc -l) migrations"
 }
 
 # harness_seed — community/channels/members, keyed to OUR relay's host label so
@@ -232,7 +243,6 @@ harness_relay_start() {
     BUZZ_S3_BUCKET=buzz-media \
     BUZZ_REQUIRE_AUTH_TOKEN=false \
     BUZZ_RECONCILE_CHANNELS=true \
-    BUZZ_AUTO_MIGRATE=true \
     "${extra[@]}" \
     "${bin}" >"${logfile}" 2>&1 < /dev/null &
   GATES_RELAY_PID=$!
