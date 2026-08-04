@@ -232,6 +232,7 @@ harness_relay_start() {
     BUZZ_S3_BUCKET=buzz-media \
     BUZZ_REQUIRE_AUTH_TOKEN=false \
     BUZZ_RECONCILE_CHANNELS=true \
+    BUZZ_AUTO_MIGRATE=true \
     "${extra[@]}" \
     "${bin}" >"${logfile}" 2>&1 < /dev/null &
   GATES_RELAY_PID=$!

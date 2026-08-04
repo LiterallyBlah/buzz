@@ -75,6 +75,12 @@ services:
       BUZZ_S3_BUCKET: buzz-media
       BUZZ_REQUIRE_AUTH_TOKEN: "false"
       BUZZ_RECONCILE_CHANNELS: "true"
+      # The relay defaults auto-migrate OFF when the var is unset, and the
+      # harness seed schema predates the git tables — the skew workload's repo
+      # announcement was the first thing to notice (git_repo_names missing on
+      # both pairings, 2026-08-04). Gate relays migrate like prod migrates, so
+      # gate schema is exactly what migrations/ produce.
+      BUZZ_AUTO_MIGRATE: "true"
     ports:
       - "${GATES_RELAY_PORT:-3031}:${GATES_RELAY_PORT:-3031}"
       - "${GATES_RELAY_HEALTH_PORT:-8089}:${GATES_RELAY_HEALTH_PORT:-8089}"
