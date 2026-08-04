@@ -42,6 +42,18 @@ const IN_FLIGHT_DEADLINE_BUFFER_SECS: u64 = 100;
 /// Default in-flight deadline: default max_turn (7200s) + 100s buffer.
 const DEFAULT_IN_FLIGHT_DEADLINE_SECS: u64 = 7300;
 
+/// The in-flight backstop implied by a configured `max_turn_duration`.
+///
+/// One expression of the figure, because it now has two readers. The queue uses
+/// it to declare a dispatched channel orphaned; [`crate::drain`] uses it as the
+/// longest a drain waits for the work it inherited. Those two must not drift:
+/// if the drain gave up first it would abandon a turn the queue still believed
+/// was running, and if the queue gave up first the drain would sit waiting on a
+/// channel that had already been released.
+pub(crate) fn in_flight_deadline_secs(max_turn_duration_secs: u64) -> u64 {
+    max_turn_duration_secs + IN_FLIGHT_DEADLINE_BUFFER_SECS
+}
+
 /// An event waiting in the queue.
 #[derive(Debug, Clone)]
 pub struct QueuedEvent {
@@ -374,8 +386,35 @@ impl EventQueue {
     /// duration, preserving the 100s buffer for cancel-drain grace + respawn.
     pub fn with_in_flight_deadline(mut self, max_turn_duration_secs: u64) -> Self {
         self.in_flight_deadline =
-            Duration::from_secs(max_turn_duration_secs + IN_FLIGHT_DEADLINE_BUFFER_SECS);
+            Duration::from_secs(in_flight_deadline_secs(max_turn_duration_secs));
         self
+    }
+
+    /// Whether the queue is still holding anything at all.
+    ///
+    /// Strictly wider than [`has_flushable_work`](Self::has_flushable_work),
+    /// and the difference is the point. That predicate answers "is there work I
+    /// can dispatch *right now*", so it reports `false` for a batch parked
+    /// behind a `retry_after` backoff and for a channel whose turn is running.
+    /// A drain asking that question would conclude the runtime was empty and
+    /// exit on top of both — abandoning a turn mid-flight, which is the one
+    /// thing the drain exists to prevent.
+    ///
+    /// So this counts every place an event can be: buffered, withheld for an
+    /// in-flight goose-native steer, held back as a cancelled batch awaiting
+    /// merge, or dispatched to a running prompt.
+    ///
+    /// Pure (`&self`) rather than expiring stuck in-flight entries the way
+    /// `has_flushable_work` does. An orphaned in-flight channel therefore keeps
+    /// this `true` until the queue's own backstop releases it — which is
+    /// correct, not a leak: the drain bound is derived from that same backstop
+    /// ([`in_flight_deadline_secs`]), so the two answer together rather than the
+    /// drain silently reaping on the queue's behalf from a `&self` accessor.
+    pub fn has_undrained_work(&self) -> bool {
+        !self.queues.values().all(|q| q.is_empty())
+            || !self.cancelled_batches.is_empty()
+            || !self.withheld_native_steer.values().all(|e| e.is_empty())
+            || !self.in_flight_channels.is_empty()
     }
 
     /// Monotonically extend an existing in-flight deadline for `channel_id`.
@@ -2610,6 +2649,90 @@ mod tests {
             "an in-flight channel's work returns through the result path, not here"
         );
         assert_eq!(pending_count(&queue), 1);
+    }
+
+    /// An empty queue is holding nothing, and a drain on top of it may leave.
+    #[test]
+    fn an_empty_queue_has_no_undrained_work() {
+        let queue = EventQueue::new(DedupMode::Queue);
+        assert!(!queue.has_undrained_work());
+    }
+
+    /// The queued → dispatched → complete arc, watched from the drain's angle.
+    ///
+    /// The middle assertion is the one that matters: `flush_next` empties
+    /// `queues` and moves the events into a running prompt, so a predicate
+    /// reading only the buffers would call the runtime empty at precisely the
+    /// moment it is busiest.
+    #[test]
+    fn work_stays_undrained_from_push_until_mark_complete() {
+        let mut queue = EventQueue::new(DedupMode::Queue);
+        let channel_id = Uuid::new_v4();
+        queue.push(make_queued(channel_id, "hello"));
+        assert!(queue.has_undrained_work(), "buffered");
+
+        let batch = queue.flush_next().expect("batch");
+        assert!(
+            queue.has_undrained_work(),
+            "dispatched is not done — a drain must wait for the turn it started"
+        );
+
+        queue.mark_complete(batch.channel_id);
+        assert!(!queue.has_undrained_work(), "completed");
+    }
+
+    /// A batch parked behind retry backoff is invisible to `has_flushable_work`
+    /// and must not be invisible here: exiting on top of it would drop work the
+    /// queue is still holding.
+    #[test]
+    fn a_retry_throttled_batch_is_still_undrained_work() {
+        let mut queue = EventQueue::new(DedupMode::Queue);
+        let channel_id = Uuid::new_v4();
+        queue.push(make_queued(channel_id, "will fail"));
+        let batch = queue.flush_next().expect("batch");
+        queue.requeue(batch);
+        queue.mark_complete(channel_id);
+
+        assert!(
+            !queue.has_flushable_work(),
+            "precondition: the backoff hides it from dispatch"
+        );
+        assert!(
+            queue.has_undrained_work(),
+            "…but it is still work this runtime is holding"
+        );
+    }
+
+    /// Cancelled batches await merge into the next flush rather than sitting in
+    /// `queues`, so they need their own answer.
+    #[test]
+    fn a_cancelled_batch_awaiting_merge_is_undrained_work() {
+        let mut queue = EventQueue::new(DedupMode::Queue);
+        let channel_id = Uuid::new_v4();
+        queue.push(make_queued(channel_id, "interrupted"));
+        let batch = queue.flush_next().expect("batch");
+        queue.requeue_as_cancelled(batch, CancelReason::Interrupt);
+        queue.mark_complete(channel_id);
+
+        assert!(queue.has_undrained_work());
+    }
+
+    /// An event withheld while a goose-native steer is in flight has left
+    /// `queues` without having been delivered to anybody.
+    #[test]
+    fn an_event_withheld_for_a_native_steer_is_undrained_work() {
+        let mut queue = EventQueue::new(DedupMode::Queue);
+        let channel_id = Uuid::new_v4();
+        let queued = make_queued(channel_id, "steer me");
+        let event_id = queued.event.id.to_hex();
+        queue.push(queued);
+        assert!(queue.mark_native_steer_pending(channel_id, &event_id));
+
+        assert!(
+            !queue.has_flushable_work(),
+            "precondition: the side table is invisible to dispatch"
+        );
+        assert!(queue.has_undrained_work());
     }
 
     fn pending_count(q: &EventQueue) -> usize {

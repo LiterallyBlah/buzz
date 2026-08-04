@@ -2,6 +2,7 @@
 
 mod acp;
 mod config;
+mod drain;
 mod engram_fetch;
 mod filter;
 mod observer;
@@ -862,6 +863,90 @@ fn observe_project_event_queued(
     );
 }
 
+/// Take back the `queued` announcements this process will not honour.
+///
+/// A project event that reached the queue lit an indicator on its issue —
+/// [`observe_project_event_queued`] → NIP-PA `state=queued`. That is a promise,
+/// and a drain that expired with a backlog is a process leaving with the
+/// promise unkept. Emitting a terminal frame per abandoned root clears the
+/// indicator now instead of leaving it to the consumer's staleness window,
+/// which is the difference between "this agent stopped" and "this agent is
+/// still thinking about it" for the 45 seconds after the process is gone.
+///
+/// Emitted as `turn_error` rather than `turn_completed` because it is true:
+/// the work was admitted and never ran. Both are in
+/// [`TURN_TERMINAL_KINDS`], so either would clear the indicator — the
+/// choice is about what the owner's telemetry records, not about what the
+/// issue shows.
+///
+/// The turn tag is the queued pseudo-id ([`queued_turn_id`]) rather than a real
+/// turn id, because no turn ever existed. The publisher's terminal rule clears
+/// a root that is announcing `queued` regardless of which id the frame names,
+/// which is precisely the clause that exists for announcements no turn id could
+/// ever match.
+///
+/// Uses [`EventQueue::drain_all_pending_batches`], so this both enumerates and
+/// empties: after a drain exit there is nothing left to dispatch, and leaving
+/// the batches in place would mean the queue and the wire disagreed about
+/// whether that work was still pending. Batches belonging to an in-flight turn
+/// are deliberately not touched — that turn owns them, its root is announcing
+/// `working`, not `queued`, and its own completion is what clears it.
+///
+/// A clean drain (`DrainExit::Complete`) finds nothing here, because "complete"
+/// is defined as the queue holding nothing. That is the intended common case:
+/// this function exists for the bounded-out one.
+fn clear_queued_project_announcements(
+    queue: &mut EventQueue,
+    observer: Option<&observer::ObserverHandle>,
+) {
+    let abandoned = queue.drain_all_pending_batches();
+    if abandoned.is_empty() {
+        return;
+    }
+    let events: usize = abandoned.iter().map(|batch| batch.events.len()).sum();
+    tracing::warn!(
+        batches = abandoned.len(),
+        events,
+        "drain: abandoning queued work — it stays on the relay for the next process"
+    );
+    let Some(observer) = observer else {
+        return;
+    };
+    for batch in &abandoned {
+        let Some(origin) = batch.project_origin() else {
+            // A channel batch announced nothing to take back: the 👀 reaction
+            // is the only visible mark it left, and removing it would claim the
+            // event was never seen when the successor will see it again.
+            continue;
+        };
+        let Some(first) = batch
+            .events
+            .first()
+            .or_else(|| batch.cancelled_events.first())
+        else {
+            continue;
+        };
+        observer.emit(
+            "turn_error",
+            None,
+            &observer::ObserverContext {
+                channel_id: None,
+                project: Some(observer::ProjectRouteRef {
+                    coordinate: origin.coordinate().to_string(),
+                    root: origin.root().to_string(),
+                }),
+                session_id: None,
+                turn_id: Some(queued_turn_id(&first.event.id.to_hex())),
+                started_at: None,
+            },
+            serde_json::json!({
+                "error": "drained",
+                "detail": "the runtime drained before this work ran; the next process will see it again",
+            }),
+        );
+    }
+}
+
 /// Drive [`ProjectActivityPublisher`] from the observer bus.
 ///
 /// The snapshot is deliberately **not** replayed. It is a buffer of everything
@@ -1327,17 +1412,28 @@ async fn publish_relay_observer_event(
 /// Maximum age (seconds) for an observer control frame to be considered fresh.
 const OBSERVER_CONTROL_FRESHNESS_SECS: i64 = 300;
 
+/// Route one owner-signed observer control frame.
+///
+/// Returns the drain onset when the frame was a drain, and `None` for every
+/// other outcome — refused, unknown, or a different command. The run loop reads
+/// that to emit the runtime lifecycle frame, which it can and this cannot: the
+/// lifecycle identity (start nonce, relay URL) belongs to the loop, and
+/// threading three more strings through here to reach one `emit` would have
+/// coupled every control command to the runtime's identity in order to serve
+/// one of them.
 fn handle_relay_observer_control_event(
     keys: &nostr::Keys,
     event: nostr::Event,
     pool: &mut AgentPool,
     observer: Option<&observer::ObserverHandle>,
     owner_pubkey_hex: &str,
-) {
+    drain: &mut drain::DrainState,
+    drain_bound: Duration,
+) -> Option<drain::DrainOnset> {
     // Defense-in-depth: verify signature even though the relay already checked.
     if let Err(e) = buzz_core::verify_event(&event) {
         tracing::warn!(error = %e, "observer control frame failed signature verification");
-        return;
+        return None;
     }
 
     // Defense-in-depth: verify the sender is the resolved owner.
@@ -1347,10 +1443,16 @@ fn handle_relay_observer_control_event(
             expected = %owner_pubkey_hex,
             "observer control frame from non-owner — dropping"
         );
-        return;
+        return None;
     }
 
     // Freshness: reject stale/replayed frames outside ±5 minute window.
+    //
+    // For drain this is the outer half of the replay answer — it disposes of a
+    // captured frame being re-sent tomorrow. The inner half is that drain is
+    // idempotent, so a replay *inside* the window changes nothing either; see
+    // the `crate::drain` module docs, which spell out why that means no nonce
+    // or seen-set is needed here.
     let now = chrono::Utc::now().timestamp();
     let event_ts = event.created_at.as_secs() as i64;
     if (event_ts - now).unsigned_abs() > OBSERVER_CONTROL_FRESHNESS_SECS as u64 {
@@ -1359,14 +1461,14 @@ fn handle_relay_observer_control_event(
             now,
             "observer control frame outside freshness window — dropping"
         );
-        return;
+        return None;
     }
 
     let payload = match decrypt_observer_payload::<serde_json::Value>(keys, &event) {
         Ok(payload) => payload,
         Err(error) => {
             tracing::warn!("failed to decrypt observer control frame: {error}");
-            return;
+            return None;
         }
     };
 
@@ -1374,14 +1476,141 @@ fn handle_relay_observer_control_event(
     match command_type {
         Some("cancel_turn") => {
             handle_cancel_turn_control(&payload, pool, observer);
+            None
         }
         Some("switch_model") => {
             handle_switch_model_control(&payload, pool, observer);
+            None
         }
+        Some(drain::CONTROL_TYPE_DRAIN) => Some(handle_drain_control(
+            &payload,
+            observer,
+            drain,
+            drain_bound,
+            tokio::time::Instant::now(),
+        )),
+        // Unchanged, and load-bearing for the drain rollout: a binary that
+        // predates a payload type ignores it instead of failing, so a fleet can
+        // be drained mid-rollout with no coordination. Old processes decline
+        // and keep serving; new ones honour it. This arm is the reason drain is
+        // a new `type` rather than a new kind, tag or subscription — each of
+        // which an old binary would have had to be taught to ignore.
         _ => {
             tracing::debug!(payload = %payload, "ignoring unknown observer control frame");
+            None
         }
     }
+}
+
+/// Handle a `drain` control frame: close admission, and say so loudly.
+///
+/// Everything that *waits* — for the in-flight turn, for the queue, for the
+/// bound — happens in the run loop, because the run loop is the thing that has
+/// to keep running while it happens. This function only flips the state and
+/// reports; a handler that blocked here would stop servicing the very prompt
+/// results it was waiting for.
+///
+/// Logged at `warn`, not `info`. A drain is an operator instruction that
+/// silently changes what the process will accept for the rest of its life, and
+/// the one question an operator asks afterwards — "did it get the frame?" — has
+/// to be answerable from a default log level.
+fn handle_drain_control(
+    payload: &serde_json::Value,
+    observer: Option<&observer::ObserverHandle>,
+    drain: &mut drain::DrainState,
+    bound: Duration,
+    now: tokio::time::Instant,
+) -> drain::DrainOnset {
+    let reason = payload
+        .get("reason")
+        .and_then(|value| value.as_str())
+        .map(drain::trim_reason)
+        .unwrap_or_default();
+    let onset = drain.begin(now, bound);
+    match onset {
+        drain::DrainOnset::Started => tracing::warn!(
+            reason = %reason,
+            bound_secs = bound.as_secs(),
+            "drain requested by owner — refusing new work, finishing what is in hand, then exiting 0"
+        ),
+        // Not a warning and not silence. A deployer that retried wants to know
+        // the retry landed; an operator reading logs wants to know the second
+        // frame did nothing.
+        drain::DrainOnset::AlreadyDraining => tracing::info!(
+            reason = %reason,
+            "drain frame received while already draining — no-op (idempotent)"
+        ),
+    }
+    if let Some(observer) = observer {
+        observer.emit(
+            "control_result",
+            None,
+            &observer::ObserverContext::default(),
+            serde_json::json!({
+                "type": drain::CONTROL_TYPE_DRAIN,
+                "status": onset.status(),
+                "reason": reason,
+            }),
+        );
+    }
+    onset
+}
+
+/// Admit one channel event into the queue — unless the runtime is draining.
+///
+/// **Every channel event that can become a turn goes through here.** There are
+/// two such sites in the run loop (an ordinary rule-matched message, and a
+/// NIP-PC peer call routed over a channel) and they used to call
+/// [`EventQueue::push`] directly. Wrapping both is what makes "take nothing
+/// new" a single decision that a test can drive, rather than two `if` statements
+/// buried in a `select!` arm no test can enter.
+///
+/// Returning `push`'s own `bool` is deliberate: a refusal is reported exactly
+/// like the queue's other refusals (`DedupMode::Drop`, a terminal-auth
+/// disposition, a depth cap), so both call sites' existing `if accepted`
+/// handling covers drain without knowing about it. That matters most for the
+/// 👀 reaction — it is added only on acceptance, so a drained runtime makes no
+/// visible promise about an event it declined.
+///
+/// **What refusal means for the event.** Nothing is consumed. The event is
+/// relay history and stays there; this process simply never held it. The
+/// successor resubscribes with `since` derived from its own startup watermark,
+/// so a message posted before the swap is redelivered while a message posted
+/// during the drain window may not be — which is the same exposure the existing
+/// `SIGTERM` grace already has, and strictly smaller than the turn that grace
+/// aborts. Drain does not widen that gap; it exists to close the larger one.
+///
+/// **What is deliberately still admitted while draining.** Owner control
+/// commands (`!shutdown`, `!cancel`, `!rotate`) are handled before this gate and
+/// stay live, because none of them is *work* — they are the levers an operator
+/// needs precisely when a drain is taking longer than expected. Membership
+/// notifications also stay live: a removal drains that channel's queue, which
+/// keeps the drain honest rather than running a turn for a channel this agent
+/// was just removed from.
+///
+/// **A refused NIP-PC call has already touched the call ledger**, because
+/// admission is decided before the queue is offered the event. That leaves an
+/// outstanding-call record nobody will answer — which costs nothing, because the
+/// ledger is process-local and this process is leaving. The caller sees the same
+/// thing it would see if this agent had been killed: no result, and its own
+/// timeout. Moving the gate ahead of the ledger would have meant a second
+/// admission decision living outside [`decide_channel_peer_event`], which is
+/// worse than a record that dies with the process.
+fn admit_channel_event(
+    drain: &drain::DrainState,
+    queue: &mut EventQueue,
+    event: QueuedEvent,
+) -> bool {
+    if !drain.admits_new_work() {
+        tracing::info!(
+            channel_id = %event.channel_id,
+            event_id = %event.event.id.to_hex(),
+            kind = event.event.kind.as_u16(),
+            "draining — refusing new channel event (it stays on the relay for the next process)"
+        );
+        return false;
+    }
+    queue.push(event)
 }
 
 /// Handle a `cancel_turn` control frame: signal the in-flight task to cancel.
@@ -2236,6 +2465,20 @@ async fn tokio_main() -> Result<()> {
         ))
     };
 
+    // ── Drain ─────────────────────────────────────────────────────────────
+    //
+    // Owner-signed "finish what you have, take nothing new, then exit 0" — the
+    // instruction a deployer sends before swapping the binary. Everything about
+    // the frame itself lives in `crate::drain`, including the sender contract.
+    //
+    // Held here rather than inside the control handler because the *waiting* is
+    // the run loop's job: admission gates read it on the way in, and the
+    // top-of-loop exit check reads it on the way out. The bound is the queue's
+    // own in-flight backstop, so a turn running to its configured cap is never
+    // cut short by the drain that is waiting for it.
+    let mut drain = drain::DrainState::open();
+    let drain_bound = drain::drain_bound(config.max_turn_duration_secs);
+
     // Runs at the TOP of every loop iteration via Instant check — cannot be
     // starved by the biased select. Slot refill spawns background tasks so
     // spawn_and_init never blocks the main loop.
@@ -2410,6 +2653,59 @@ async fn tokio_main() -> Result<()> {
     }
 
     loop {
+        // ── Drain: the exit the deployer asked for ────────────────────────
+        //
+        // At the top of the iteration, before anything can add work, and by
+        // the same reasoning the maintenance block above it sits here: a check
+        // living in a `select!` arm can be starved by the biased ordering,
+        // and this one must fire the moment the last turn returns.
+        //
+        // There is no second wait loop. "Finish what you have" is implemented
+        // by *not leaving* — the run loop keeps servicing prompt results until
+        // the queue says it is holding nothing — after which the existing
+        // teardown below runs exactly as it does for `!shutdown`, the
+        // inactivity bound and SIGTERM. Duplicating the teardown's own
+        // "waiting for in-flight prompts" grace here would have meant two
+        // places that both believe they are the last word on when a turn is
+        // allowed to end.
+        if let Some(exit) = drain.should_exit(
+            // The heartbeat turn is tracked separately because it is not
+            // channel-keyed and so leaves no trace in the queue — the same
+            // reason `inactivity_expired` takes it as its own argument.
+            queue.has_undrained_work() || heartbeat_in_flight,
+            tokio::time::Instant::now(),
+        ) {
+            match exit {
+                drain::DrainExit::Complete => {
+                    tracing::warn!("drain complete — nothing left in hand, exiting 0");
+                }
+                drain::DrainExit::BoundExpired => {
+                    tracing::error!(
+                        bound_secs = drain_bound.as_secs(),
+                        "drain bound expired with work still outstanding — exiting 0 and \
+                         leaving the remainder to the next process"
+                    );
+                }
+            }
+            // Before the teardown, while the activity publisher is still
+            // running: anything still queued has been announced on its root as
+            // `state=queued` and is about to become nobody's work.
+            clear_queued_project_announcements(&mut queue, observer.as_ref());
+            emit_runtime_lifecycle(
+                observer.as_ref(),
+                &runtime_start_nonce,
+                &pubkey_hex,
+                &config.relay_url,
+                "drained",
+                None,
+            );
+            break;
+        }
+        // Copied out before the `select!` rather than borrowed into it: an arm
+        // holding `&drain` for the lifetime of the poll collides with the
+        // control arm's `&mut drain`.
+        let drain_deadline = drain.deadline();
+
         // Whether buffered work is waiting on a lazy pool. Also gates the
         // retry-deadline sleep arm below: a `Failed` lifecycle keeps its
         // (possibly past) `retry_at` until the next wake, so sleeping on it
@@ -2566,6 +2862,21 @@ async fn tokio_main() -> Result<()> {
                         _ => std::future::pending().await,
                     }
                 } => None,
+                // Wake the loop when the drain bound expires, so the
+                // top-of-iteration check gets to notice it. Nothing happens
+                // here: firing this arm returns `None`, the loop comes round,
+                // and `should_exit` reports `BoundExpired` — one extra pass,
+                // and one place that decides to leave rather than two.
+                //
+                // Inert until a drain begins (`None` → `pending()` forever), and
+                // it cannot busy-spin afterwards because the very next
+                // iteration breaks out of the loop.
+                _ = async {
+                    match drain_deadline {
+                        Some(deadline) => tokio::time::sleep_until(deadline).await,
+                        None => std::future::pending().await,
+                    }
+                } => None,
                 Some(Err(error)) = wake_tasks.join_next(), if !wake_tasks.is_empty() => {
                     if let Some(attempt) = pool_lifecycle.waking_attempt() {
                         let message = format!("pool wake task failed: {error}");
@@ -2596,7 +2907,45 @@ async fn tokio_main() -> Result<()> {
                     match control_event {
                         Some(event) => {
                             if let Some(ref owner_hex) = owner_cache.pubkey {
-                                handle_relay_observer_control_event(&config.keys, event, &mut pool, observer.as_ref(), owner_hex);
+                                let onset = handle_relay_observer_control_event(
+                                    &config.keys,
+                                    event,
+                                    &mut pool,
+                                    observer.as_ref(),
+                                    owner_hex,
+                                    &mut drain,
+                                    drain_bound,
+                                );
+                                if onset == Some(drain::DrainOnset::Started) {
+                                    // Telemetry first: NIP-AO consumers project
+                                    // this lifecycle already, so `draining`
+                                    // reaches every surface that can currently
+                                    // show `ready` without any of them being
+                                    // taught a new event shape.
+                                    emit_runtime_lifecycle(
+                                        observer.as_ref(),
+                                        &runtime_start_nonce,
+                                        &pubkey_hex,
+                                        &config.relay_url,
+                                        "draining",
+                                        None,
+                                    );
+                                    // Then start the backlog moving. Without
+                                    // this, a runtime whose pool is idle and
+                                    // whose queue is full would sit on that
+                                    // queue until the next inbound event or the
+                                    // 30-second maintenance tick — and inbound
+                                    // events are exactly what a drain has just
+                                    // stopped accepting, so on a project-only
+                                    // runtime "the next event" may never come.
+                                    if pool_ready {
+                                        for (channel_id, thread_tags) in
+                                            dispatch_pending(&mut pool, &mut queue, &ctx, &mut last_activity)
+                                        {
+                                            typing_channels.insert(channel_id, thread_tags);
+                                        }
+                                    }
+                                }
                             } else {
                                 tracing::warn!("observer control frame received but no owner resolved — dropping");
                             }
@@ -2633,6 +2982,22 @@ async fn tokio_main() -> Result<()> {
                             // REQ-widening decision, and then the missing flush
                             // that left a project-only runtime queueing turns
                             // nobody ran.
+                            // Drain short-circuit. The authoritative refusal is
+                            // inside `dispatch_and_flush_project_event`, which
+                            // is where the tests drive it and where refusing is
+                            // provably ahead of the announcement and the REQ.
+                            // This is the same predicate, hoisted, purely so a
+                            // drained runtime does not spend two REST
+                            // round-trips per inbound comment resolving context
+                            // for an event it has already decided to decline —
+                            // latency the drain would otherwise pay on its way
+                            // to the exit check.
+                            if !drain.admits_new_work() {
+                                tracing::info!(
+                                    "draining — refusing new project event (it stays on the relay for the next process)"
+                                );
+                                continue;
+                            }
                             // Resolved before the gate, because the NIP-OA
                             // lookup is async and the gate is not.
                             let project_sibling = attest_project_sibling(
@@ -2671,6 +3036,7 @@ async fn tokio_main() -> Result<()> {
                                     agent_pubkey_hex: &pubkey_hex,
                                     startup_watermark,
                                     observer: observer.as_ref(),
+                                    drain: &drain,
                                 },
                                 project_sibling,
                                 resolved_candidate,
@@ -2842,16 +3208,20 @@ async fn tokio_main() -> Result<()> {
                                         prompt_tag,
                                     } => {
                                         let event_id_hex = buzz_event.event.id.to_hex();
-                                        let accepted = queue.push(QueuedEvent {
-                                            channel_id,
-                                            event: buzz_event.event,
-                                            received_at: std::time::Instant::now(),
-                                            prompt_tag: prompt_tag.into(),
-                                            // A channel call keys on the
-                                            // channel, exactly as an ordinary
-                                            // message does.
-                                            project: None,
-                                        });
+                                        let accepted = admit_channel_event(
+                                            &drain,
+                                            &mut queue,
+                                            QueuedEvent {
+                                                channel_id,
+                                                event: buzz_event.event,
+                                                received_at: std::time::Instant::now(),
+                                                prompt_tag: prompt_tag.into(),
+                                                // A channel call keys on the
+                                                // channel, exactly as an
+                                                // ordinary message does.
+                                                project: None,
+                                            },
+                                        );
                                         if accepted {
                                             let rc = ctx.rest_client.clone();
                                             tokio::spawn(async move {
@@ -3036,15 +3406,19 @@ async fn tokio_main() -> Result<()> {
                             // backed payload) so the cost is negligible.
                             let event_for_steer = buzz_event.event.clone();
                             let prompt_tag_for_steer = prompt_tag.clone();
-                            let accepted = queue.push(QueuedEvent {
-                                channel_id: buzz_event.channel_id,
-                                event: buzz_event.event,
-                                received_at: std::time::Instant::now(),
-                                prompt_tag,
-                                // Channel events are never project-routed; the project
-                                // branch has its own queue insertion.
-                                project: None,
-                            });
+                            let accepted = admit_channel_event(
+                                &drain,
+                                &mut queue,
+                                QueuedEvent {
+                                    channel_id: buzz_event.channel_id,
+                                    event: buzz_event.event,
+                                    received_at: std::time::Instant::now(),
+                                    prompt_tag,
+                                    // Channel events are never project-routed; the
+                                    // project branch has its own queue insertion.
+                                    project: None,
+                                },
+                            );
                             // 👀 — immediate "seen" reaction, only if the event
                             // was actually queued (not dropped by DedupMode::Drop).
                             // Fire-and-forget: on rare fast-failure paths the
@@ -3158,7 +3532,7 @@ async fn tokio_main() -> Result<()> {
                             typing_channels.insert(channel_id, thread_tags);
                         }
                     } else if pool.any_idle() {
-                        dispatch_heartbeat(&mut pool, &ctx, &mut heartbeat_in_flight);
+                        dispatch_heartbeat(&mut pool, &ctx, &mut heartbeat_in_flight, &drain);
                     } else {
                         tracing::debug!("heartbeat_skipped_busy");
                     }
@@ -3810,6 +4184,12 @@ pub(crate) struct ProjectArm<'a> {
     /// [`observe_project_event_queued`]. `None` whenever neither project
     /// routing nor telemetry is on, in which case nobody is listening.
     pub(crate) observer: Option<&'a observer::ObserverHandle>,
+    /// Whether the runtime is still admitting work.
+    ///
+    /// Shared as `&`, never `&mut`, and the asymmetry is the point: the project
+    /// arm is an admission *point*, not somewhere that may decide to drain.
+    /// Only [`handle_relay_observer_control_event`] holds the mutable handle.
+    pub(crate) drain: &'a drain::DrainState,
 }
 
 /// One project event, from arrival to a running turn.
@@ -3891,6 +4271,33 @@ pub(crate) async fn dispatch_and_flush_project_event(
     typing_channels: &mut HashMap<Uuid, ThreadTags>,
     pool_ready: bool,
 ) -> ProjectDispatched {
+    // ── Drain: the project admission point ────────────────────────────────
+    //
+    // Ahead of `dispatch_project_event`, and every word of that ordering is
+    // load-bearing. That function is where a project event id is **spent**,
+    // where the queue insertion happens, where the NIP-PA `state=queued`
+    // announcement is emitted, and where subscription REQs are replaced. A
+    // refusal placed after any of those would have consumed the event in some
+    // way — spent its dedup id, promised work on a public issue, or widened a
+    // subscription — for a process that is about to stop.
+    //
+    // Refused here, nothing is consumed. `ProjectDispatched::Ignored` is
+    // already documented as the disposition that "spends nothing", and that is
+    // exactly true of this one: the event stays relay history, the id stays
+    // unspent, the root stays unannounced. The successor process's enrolment
+    // filter reaches back `ACCEPTED_CLOCK_SKEW_SECS` from its own startup
+    // watermark and its enrolment-history walk paginates the root's whole past,
+    // so a comment declined here is delivered to the next binary rather than
+    // lost with this one.
+    //
+    // This is also the gate the tests drive. The run loop has the same check
+    // hoisted above its two REST round-trips, but that one is a latency
+    // optimisation; this one is the decision.
+    if !arm.drain.admits_new_work() {
+        tracing::info!("draining — project event refused, unspent and still on the relay");
+        return ProjectDispatched::Ignored;
+    }
+
     let dispatched = dispatch_project_event(
         &mut ProjectDispatch {
             identity: project::ProjectIdentity {
@@ -5860,12 +6267,27 @@ fn drain_ready_join_results(
     LoopAction::Continue
 }
 
+/// Run the idle heartbeat prompt, unless something says not to.
+///
+/// The drain check lives here rather than in the `select!` arm that calls it,
+/// for the same reason the `heartbeat_in_flight` check does: this function is
+/// the one place that decides to start a heartbeat turn, and a caller-side
+/// guard would be a second opinion that the next caller could forget to hold.
+/// A heartbeat is unambiguously new work — it is a turn nobody asked for — so a
+/// draining runtime must never begin one. A heartbeat already running when the
+/// drain arrived is *not* refused here; it finishes, and the run loop's exit
+/// check waits for it.
 fn dispatch_heartbeat(
     pool: &mut AgentPool,
     ctx: &Arc<PromptContext>,
     heartbeat_in_flight: &mut bool,
+    drain: &drain::DrainState,
 ) {
     if *heartbeat_in_flight {
+        return;
+    }
+    if !drain.admits_new_work() {
+        tracing::debug!("heartbeat_skipped_draining");
         return;
     }
     let agent = match pool.try_claim(None) {
@@ -9240,6 +9662,267 @@ mod owner_control_command_tests {
             channel_id,
             ControlSignal::Rotate
         ));
+    }
+}
+
+/// The drain control frame, exercised through the real envelope.
+///
+/// Every case here builds a signed `24200` with `buzz_sdk` and hands it to
+/// [`handle_relay_observer_control_event`] — the same function the run loop
+/// calls, with the same signature, owner and freshness checks in front of it.
+/// Nothing is asserted against a hand-rolled payload struct, because the thing
+/// under test is precisely that a frame a deployer can actually build is
+/// accepted, and one an attacker can build is not.
+#[cfg(test)]
+mod drain_control_tests {
+    use buzz_core::observer::{encrypt_observer_payload, OBSERVER_FRAME_CONTROL};
+    use nostr::Keys;
+
+    use super::*;
+
+    /// The bound is irrelevant to acceptance; a short one keeps the assertions
+    /// about deadlines readable.
+    const BOUND: Duration = Duration::from_secs(600);
+
+    /// A control frame as a sender must build it: NIP-44 to the agent, signed
+    /// by the sender's key, `frame=control`, both pubkey tags naming the agent.
+    ///
+    /// `sender` is a parameter rather than "the owner" so the non-owner case
+    /// exercises the identical construction — a refusal that only worked
+    /// because the attacker's frame was malformed would prove nothing.
+    fn control_frame(
+        sender: &Keys,
+        agent: &Keys,
+        payload: serde_json::Value,
+        created_at: Option<nostr::Timestamp>,
+    ) -> nostr::Event {
+        let agent_hex = agent.public_key().to_hex();
+        let encrypted = encrypt_observer_payload(sender, &agent.public_key(), &payload)
+            .expect("encrypt control payload");
+        let builder = buzz_sdk::build_agent_observer_frame(
+            &agent_hex,
+            &agent_hex,
+            OBSERVER_FRAME_CONTROL,
+            &encrypted,
+        )
+        .expect("build control frame");
+        let builder = match created_at {
+            Some(ts) => builder.custom_created_at(ts),
+            None => builder,
+        };
+        builder.sign_with_keys(sender).expect("sign control frame")
+    }
+
+    fn route(
+        agent: &Keys,
+        owner_hex: &str,
+        event: nostr::Event,
+        drain: &mut drain::DrainState,
+    ) -> Option<drain::DrainOnset> {
+        let mut pool = AgentPool::from_slots(vec![]);
+        handle_relay_observer_control_event(agent, event, &mut pool, None, owner_hex, drain, BOUND)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_drain_frame_from_the_owner_closes_admission() {
+        let owner = Keys::generate();
+        let agent = Keys::generate();
+        let mut drain = drain::DrainState::open();
+
+        let onset = route(
+            &agent,
+            &owner.public_key().to_hex(),
+            control_frame(&owner, &agent, serde_json::json!({"type": "drain"}), None),
+            &mut drain,
+        );
+
+        assert_eq!(onset, Some(drain::DrainOnset::Started));
+        assert!(!drain.admits_new_work());
+        assert_eq!(
+            drain.deadline(),
+            Some(tokio::time::Instant::now() + BOUND),
+            "the bound must start when the frame is honoured"
+        );
+    }
+
+    /// The optional `reason` is accepted and changes nothing about the outcome.
+    #[tokio::test(start_paused = true)]
+    async fn a_drain_frame_may_carry_a_reason() {
+        let owner = Keys::generate();
+        let agent = Keys::generate();
+        let mut drain = drain::DrainState::open();
+
+        let onset = route(
+            &agent,
+            &owner.public_key().to_hex(),
+            control_frame(
+                &owner,
+                &agent,
+                serde_json::json!({"type": "drain", "reason": "binary swap"}),
+                None,
+            ),
+            &mut drain,
+        );
+
+        assert_eq!(onset, Some(drain::DrainOnset::Started));
+        assert!(drain.is_draining());
+    }
+
+    /// **Anyone but the owner may not stop this agent.** A correctly built,
+    /// correctly encrypted, perfectly fresh frame from a stranger is refused on
+    /// identity alone — drain is a denial-of-service primitive otherwise.
+    #[tokio::test(start_paused = true)]
+    async fn a_drain_frame_from_a_non_owner_is_dropped() {
+        let owner = Keys::generate();
+        let stranger = Keys::generate();
+        let agent = Keys::generate();
+        let mut drain = drain::DrainState::open();
+
+        let onset = route(
+            &agent,
+            &owner.public_key().to_hex(),
+            control_frame(
+                &stranger,
+                &agent,
+                serde_json::json!({"type": "drain"}),
+                None,
+            ),
+            &mut drain,
+        );
+
+        assert_eq!(onset, None);
+        assert!(
+            drain.admits_new_work(),
+            "a stranger must not be able to take an agent out of service"
+        );
+    }
+
+    /// Outside the freshness window, the owner's own frame is refused too —
+    /// which is what stops a captured drain from being replayed at an
+    /// attacker's chosen moment.
+    #[tokio::test(start_paused = true)]
+    async fn a_stale_drain_frame_is_dropped() {
+        let owner = Keys::generate();
+        let agent = Keys::generate();
+        let mut drain = drain::DrainState::open();
+        let stale = nostr::Timestamp::from(
+            (chrono::Utc::now().timestamp() - OBSERVER_CONTROL_FRESHNESS_SECS - 60) as u64,
+        );
+
+        let onset = route(
+            &agent,
+            &owner.public_key().to_hex(),
+            control_frame(
+                &owner,
+                &agent,
+                serde_json::json!({"type": "drain"}),
+                Some(stale),
+            ),
+            &mut drain,
+        );
+
+        assert_eq!(onset, None);
+        assert!(drain.admits_new_work());
+    }
+
+    /// A frame encrypted to somebody else decrypts to nothing here and is
+    /// logged and dropped — the pre-existing behaviour, asserted because drain
+    /// now depends on it to refuse a frame it cannot read.
+    #[tokio::test(start_paused = true)]
+    async fn an_undecryptable_drain_frame_is_dropped() {
+        let owner = Keys::generate();
+        let agent = Keys::generate();
+        let other = Keys::generate();
+        let mut drain = drain::DrainState::open();
+
+        // Built for `other`, delivered to `agent`.
+        let frame = control_frame(&owner, &other, serde_json::json!({"type": "drain"}), None);
+        let onset = route(&agent, &owner.public_key().to_hex(), frame, &mut drain);
+
+        assert_eq!(onset, None);
+        assert!(drain.admits_new_work());
+    }
+
+    /// **Replay inside the freshness window is harmless because drain is
+    /// idempotent.** The second frame is acknowledged (`AlreadyDraining`) and
+    /// changes nothing — in particular it does not buy the runtime a second
+    /// bound, which is the one way an idempotent-looking operation could still
+    /// be abused into holding a process open forever.
+    #[tokio::test(start_paused = true)]
+    async fn a_replayed_drain_frame_is_idempotent() {
+        let owner = Keys::generate();
+        let agent = Keys::generate();
+        let owner_hex = owner.public_key().to_hex();
+        let mut drain = drain::DrainState::open();
+        let frame = control_frame(&owner, &agent, serde_json::json!({"type": "drain"}), None);
+
+        assert_eq!(
+            route(&agent, &owner_hex, frame.clone(), &mut drain),
+            Some(drain::DrainOnset::Started)
+        );
+        let first_deadline = drain.deadline().expect("draining");
+
+        tokio::time::advance(Duration::from_secs(120)).await;
+        assert_eq!(
+            route(&agent, &owner_hex, frame, &mut drain),
+            Some(drain::DrainOnset::AlreadyDraining),
+            "the very same signed event, delivered twice"
+        );
+        assert_eq!(
+            drain.deadline(),
+            Some(first_deadline),
+            "a replay must not extend the drain"
+        );
+    }
+
+    /// The skew-safety property, from the other side: a payload this binary
+    /// does not know is ignored, and in particular does not drain. A future
+    /// control type must be able to reach an old binary harmlessly, which is
+    /// the same tolerance that lets a drain reach a binary that predates it.
+    #[tokio::test(start_paused = true)]
+    async fn an_unknown_control_type_does_not_drain() {
+        let owner = Keys::generate();
+        let agent = Keys::generate();
+        let mut drain = drain::DrainState::open();
+
+        let onset = route(
+            &agent,
+            &owner.public_key().to_hex(),
+            control_frame(
+                &owner,
+                &agent,
+                serde_json::json!({"type": "quiesce_forever"}),
+                None,
+            ),
+            &mut drain,
+        );
+
+        assert_eq!(onset, None);
+        assert!(drain.admits_new_work());
+    }
+
+    /// The owner is acknowledged on the observer bus, so a deployer can see the
+    /// frame land rather than inferring it from the absence of new turns.
+    #[tokio::test(start_paused = true)]
+    async fn a_drain_is_acknowledged_on_the_observer_bus() {
+        let bus = observer::ObserverHandle::in_process();
+        let mut rx = bus.subscribe();
+        let mut drain = drain::DrainState::open();
+
+        for expected in ["draining", "already_draining"] {
+            handle_drain_control(
+                &serde_json::json!({"type": "drain", "reason": "swap"}),
+                Some(&bus),
+                &mut drain,
+                BOUND,
+                tokio::time::Instant::now(),
+            );
+            let event = rx.try_recv().expect("an acknowledgement per frame");
+            assert_eq!(event.kind, "control_result");
+            assert_eq!(event.payload["type"], "drain");
+            assert_eq!(event.payload["status"], expected);
+            assert_eq!(event.payload["reason"], "swap");
+        }
     }
 }
 
@@ -13421,6 +14104,11 @@ for line in sys.stdin:
         /// routing nor telemetry is on — and nothing here starts depending on a
         /// bus it never asked for.
         observer: Option<observer::ObserverHandle>,
+        /// Whether this runtime is still admitting work.
+        ///
+        /// `Open` by default, so every pre-existing scenario drives the arm
+        /// exactly as it did before drain existed.
+        drain: drain::DrainState,
     }
 
     impl Runtime {
@@ -13464,6 +14152,7 @@ for line in sys.stdin:
                 typing: HashMap::new(),
                 subscriber: NoopSubscriber,
                 observer: None,
+                drain: drain::DrainState::open(),
             }
         }
 
@@ -13491,6 +14180,7 @@ for line in sys.stdin:
                     agent_pubkey_hex: &agent_hex,
                     startup_watermark: 0,
                     observer: self.observer.as_ref(),
+                    drain: &self.drain,
                 },
                 None,
                 candidate,
@@ -13508,6 +14198,60 @@ for line in sys.stdin:
 
         async fn drive(&mut self, event: &project::ProjectEvent) -> ProjectDispatched {
             self.drive_with_candidate(event, None).await
+        }
+
+        /// Honour a drain, as the control handler does.
+        ///
+        /// Goes through [`handle_drain_control`] rather than mutating the state
+        /// directly, so these scenarios inherit the idempotence and the
+        /// acknowledgement rather than testing a shortcut the runtime does not
+        /// take. The frame's own verification is proved in
+        /// [`drain_control_tests`]; what is only visible here is what a drained
+        /// runtime then *does*.
+        fn begin_drain(&mut self, bound: Duration) -> drain::DrainOnset {
+            handle_drain_control(
+                &serde_json::json!({"type": "drain"}),
+                self.observer.as_ref(),
+                &mut self.drain,
+                bound,
+                tokio::time::Instant::now(),
+            )
+        }
+
+        /// Whether the run loop would now leave, and why.
+        ///
+        /// The exact expression the run loop evaluates at the top of every
+        /// iteration, minus the heartbeat flag these project-only scenarios
+        /// never set. Reproduced rather than reached because the loop it lives
+        /// in parses CLI arguments and connects a relay before it is entered;
+        /// this is as directly as the branch can be driven, and the pieces it
+        /// is made of — `has_undrained_work` and `should_exit` — are each
+        /// proved on their own.
+        fn drain_exit(&self) -> Option<drain::DrainExit> {
+            self.drain
+                .should_exit(self.queue.has_undrained_work(), tokio::time::Instant::now())
+        }
+
+        /// Reap one finished turn, the way the run loop's result arm does.
+        ///
+        /// Exactly the two effects that arm has which this scenario depends on:
+        /// the in-flight hold is released and the child goes back in its slot.
+        /// Standing up the real `handle_prompt_result` would need a `Config`, a
+        /// crash-history vector and a respawn channel, none of which say
+        /// anything about drain — and the claim under test is about the queue's
+        /// answer, not about result handling.
+        async fn reap_one_turn(&mut self) {
+            let result = {
+                let (result_rx, _join_set) = self.pool.rx_and_join_set();
+                tokio::time::timeout(Duration::from_secs(20), result_rx.recv())
+                    .await
+                    .expect("a turn must return within 20s")
+                    .expect("pool result channel closed")
+            };
+            if let PromptSource::Channel(key) = result.source {
+                self.queue.mark_complete(key);
+            }
+            self.pool.return_agent(result.agent);
         }
 
         async fn discover(&mut self, repo_id: &str) {
@@ -14366,5 +15110,333 @@ for line in sys.stdin:
             "the turn carried the wrong event: {}",
             prompts[0]
         );
+    }
+
+    // ── Drain ─────────────────────────────────────────────────────────────
+    //
+    // Same harness, same production entry points. What each scenario is about
+    // is what a *drained* runtime does with the very thing the scenarios above
+    // prove it does when open, so the contrast is the assertion.
+
+    /// **Take nothing new — and take nothing away either.**
+    ///
+    /// A project event arriving after the drain is refused, and the refusal
+    /// costs the event nothing: no dedup id spent, no `state=queued` announced
+    /// on the root, no turn. The proof that nothing was spent is the second
+    /// half — the *same signed event*, offered to a runtime that is admitting
+    /// again, is accepted in full. Had the refusal consumed the id, announced
+    /// the root, or half-enrolled it, this second delivery would have been
+    /// refused as a duplicate and the loss would be invisible.
+    ///
+    /// That is what makes the relay-side promise real: the successor process
+    /// starts with an empty `ProjectSeenIds`, its enrolment filter reaches back
+    /// from its own startup watermark, and the event is still relay history —
+    /// so the comment declined here is delivered to the next binary.
+    #[tokio::test]
+    async fn a_project_event_refused_while_draining_is_unspent_and_re_admittable() {
+        let recorder = PromptRecorder::new();
+        let mut rt = Runtime::new(&recorder).await;
+        rt.discover("demo").await;
+
+        let bus = observer::ObserverHandle::in_process();
+        let mut rx = bus.subscribe();
+        rt.observer = Some(bus);
+
+        rt.begin_drain(Duration::from_secs(600));
+        let root = issue_root(&rt.owner, &rt.agent, "demo");
+        let routed_root = routed(root.clone(), project::ProjectSubscription::Enrolment).await;
+
+        assert_eq!(
+            rt.drive(&routed_root).await,
+            ProjectDispatched::Ignored,
+            "a draining runtime must not admit a project event"
+        );
+        assert_eq!(rt.queue.queued_event_count(&route_key_of(&root)), 0);
+        assert!(
+            rt.enrolments.get(&root.id.to_hex()).is_none(),
+            "a refused event must not enrol its root either"
+        );
+        // The acknowledgement of the drain itself is on the bus; nothing after
+        // it may be a queued announcement for work that will not run.
+        while let Ok(event) = rx.try_recv() {
+            assert_ne!(
+                event.kind, OBSERVER_PROJECT_QUEUED,
+                "a refused event must promise nothing on its root"
+            );
+        }
+
+        // …and the same event, to a runtime admitting again.
+        rt.drain = drain::DrainState::open();
+        assert!(
+            matches!(
+                rt.drive(&routed_root).await,
+                ProjectDispatched::Queued { queued: true, .. }
+            ),
+            "the refusal spent nothing: the identical event is still admittable"
+        );
+    }
+
+    /// A channel event meets the same refusal, at the one gate both channel
+    /// admission sites go through.
+    ///
+    /// The `false` is not incidental. It is `queue::push`'s own "not accepted"
+    /// answer, which is what both call sites already branch on to decide
+    /// whether to add the 👀 reaction — so a drained runtime makes no visible
+    /// promise about an event it declined.
+    #[tokio::test]
+    async fn a_channel_event_is_refused_once_the_runtime_is_draining() {
+        let recorder = PromptRecorder::new();
+        let mut rt = Runtime::new(&recorder).await;
+        let channel_id = uuid::Uuid::new_v4();
+        let author = rt.owner.clone();
+        let queued = move |content: &str| QueuedEvent {
+            channel_id,
+            event: EventBuilder::new(nostr::Kind::Custom(9), content)
+                .sign_with_keys(&author)
+                .expect("sign"),
+            received_at: std::time::Instant::now(),
+            prompt_tag: "@mention".into(),
+            project: None,
+        };
+
+        assert!(
+            admit_channel_event(&rt.drain, &mut rt.queue, queued("before")),
+            "precondition: an open runtime admits"
+        );
+
+        rt.begin_drain(Duration::from_secs(600));
+        assert!(
+            !admit_channel_event(&rt.drain, &mut rt.queue, queued("after")),
+            "a draining runtime must refuse a new channel event"
+        );
+        assert_eq!(
+            rt.queue.queued_event_count(&channel_id),
+            1,
+            "only the pre-drain event is held"
+        );
+    }
+
+    /// A heartbeat is a turn nobody asked for, so a draining runtime starts
+    /// none — otherwise the drain would keep manufacturing the very work it is
+    /// waiting to finish, and never converge.
+    #[tokio::test]
+    async fn a_draining_runtime_starts_no_heartbeat() {
+        let recorder = PromptRecorder::new();
+        let mut rt = Runtime::new(&recorder).await;
+        let mut heartbeat_in_flight = false;
+
+        rt.begin_drain(Duration::from_secs(600));
+        dispatch_heartbeat(&mut rt.pool, &rt.ctx, &mut heartbeat_in_flight, &rt.drain);
+
+        assert!(!heartbeat_in_flight, "no heartbeat turn may begin");
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert!(
+            recorder.read().is_empty(),
+            "the child received a prompt a draining runtime never asked for"
+        );
+
+        // The contrast: the same call on an admitting runtime does start one,
+        // so the assertion above is about the drain and not about the harness.
+        rt.drain = drain::DrainState::open();
+        dispatch_heartbeat(&mut rt.pool, &rt.ctx, &mut heartbeat_in_flight, &rt.drain);
+        assert!(heartbeat_in_flight);
+        assert_eq!(recorder.prompts(1).await.len(), 1);
+    }
+
+    /// **Finish what you have.** The whole arc a deployer is buying, end to
+    /// end: a queued root, a drain landing while its turn is in flight, a
+    /// second comment declined, the turn running to completion, and only then
+    /// the run loop's exit condition becoming true.
+    ///
+    /// The middle assertion is the load-bearing one. Between dispatch and the
+    /// result returning, the queue's buffers are empty — the events are inside
+    /// a running prompt — so a drain that asked "is anything queued" would have
+    /// concluded it was done and exited on top of a live turn. `should_exit`
+    /// says no, which is exactly the promise.
+    #[tokio::test]
+    async fn queued_work_runs_dry_before_a_drain_reaches_its_exit() {
+        let recorder = PromptRecorder::new();
+        let mut rt = Runtime::new(&recorder).await;
+        rt.discover("demo").await;
+
+        let root = issue_root(&rt.owner, &rt.agent, "demo");
+        assert!(
+            matches!(
+                rt.drive(&routed(root.clone(), project::ProjectSubscription::Enrolment).await)
+                    .await,
+                ProjectDispatched::Queued { queued: true, .. }
+            ),
+            "precondition: the root queues and dispatches"
+        );
+
+        rt.begin_drain(Duration::from_secs(600));
+        assert_eq!(
+            rt.drain_exit(),
+            None,
+            "a turn is in flight — the drain must wait for it"
+        );
+
+        // Nothing new, even for the root already being worked on.
+        let follow_up = addressed_comment(&rt.owner, &rt.agent, "demo", &root);
+        assert_eq!(
+            rt.drive(&routed(follow_up, project::ProjectSubscription::Enrolment).await)
+                .await,
+            ProjectDispatched::Ignored,
+        );
+
+        // The in-flight turn completes on its own terms.
+        assert_eq!(recorder.prompts(1).await.len(), 1);
+        rt.reap_one_turn().await;
+
+        assert_eq!(
+            rt.drain_exit(),
+            Some(drain::DrainExit::Complete),
+            "hands empty — the run loop leaves, and `tokio_main` returns Ok(())"
+        );
+        assert_eq!(
+            recorder.read().len(),
+            1,
+            "the refused follow-up must never have reached the child"
+        );
+    }
+
+    /// Work queued but not yet dispatched is run dry too, not abandoned.
+    ///
+    /// The pool is empty at admission time, so the root queues without
+    /// dispatching — the shape a busy runtime is always in. The drain then has
+    /// to actually flush it rather than exiting on a queue it can see is
+    /// non-empty, which is why the run loop flushes on drain onset instead of
+    /// waiting for an inbound event that a drain has just stopped accepting.
+    #[tokio::test]
+    async fn a_drain_flushes_work_that_was_queued_but_never_dispatched() {
+        let recorder = PromptRecorder::new();
+        let mut rt = Runtime::new(&recorder).await;
+        rt.discover("demo").await;
+
+        // Take the only child out of its slot, so admission queues and stops.
+        let held = rt.pool.try_claim(None).expect("one idle agent");
+        let root = issue_root(&rt.owner, &rt.agent, "demo");
+        assert!(matches!(
+            rt.drive(&routed(root.clone(), project::ProjectSubscription::Enrolment).await)
+                .await,
+            ProjectDispatched::Queued { queued: true, .. }
+        ));
+        assert_eq!(rt.queue.queued_event_count(&route_key_of(&root)), 1);
+
+        rt.begin_drain(Duration::from_secs(600));
+        assert_eq!(
+            rt.drain_exit(),
+            None,
+            "queued work is work — the drain must not exit over it"
+        );
+
+        // The child comes back, and the drain's flush finds the backlog.
+        rt.pool.return_agent(held);
+        let mut last_activity = tokio::time::Instant::now();
+        dispatch_pending(&mut rt.pool, &mut rt.queue, &rt.ctx, &mut last_activity);
+
+        assert_eq!(recorder.prompts(1).await.len(), 1, "the backlog ran");
+        rt.reap_one_turn().await;
+        assert_eq!(rt.drain_exit(), Some(drain::DrainExit::Complete));
+    }
+
+    /// **A drain cannot hang.** With work still in hand at the bound, the run
+    /// loop leaves anyway — and says so as an error, because abandoning work is
+    /// a fact an operator has to be told rather than a quiet success.
+    #[tokio::test(start_paused = true)]
+    async fn a_drain_with_stuck_work_still_exits_at_its_bound() {
+        let recorder = PromptRecorder::new();
+        let mut rt = Runtime::new(&recorder).await;
+        let channel_id = uuid::Uuid::new_v4();
+        rt.queue.push(QueuedEvent {
+            channel_id,
+            event: EventBuilder::new(nostr::Kind::Custom(9), "never runs")
+                .sign_with_keys(&rt.owner)
+                .expect("sign"),
+            received_at: std::time::Instant::now(),
+            prompt_tag: "@mention".into(),
+            project: None,
+        });
+
+        let bound = Duration::from_secs(600);
+        rt.begin_drain(bound);
+        assert_eq!(rt.drain_exit(), None);
+
+        tokio::time::advance(bound).await;
+        assert_eq!(rt.drain_exit(), Some(drain::DrainExit::BoundExpired));
+    }
+
+    /// The promise the queued announcement made is taken back before the
+    /// process goes.
+    ///
+    /// A queued project event lit `state=queued` on its issue. If the drain
+    /// bounds out on top of it, the indicator would otherwise stay lit until
+    /// the consumer's staleness window closed it — an agent that has already
+    /// exited, still shown as about to start. The abandoned batch produces a
+    /// terminal frame on the same root, and the activity publisher turns that
+    /// into `state=idle`.
+    #[tokio::test]
+    async fn work_abandoned_at_the_bound_clears_the_indicator_it_lit() {
+        let recorder = PromptRecorder::new();
+        let mut rt = Runtime::new(&recorder).await;
+        rt.discover("demo").await;
+
+        let bus = observer::ObserverHandle::in_process();
+        let rx = bus.subscribe();
+        rt.observer = Some(bus);
+        let agent_hex = rt.agent.public_key().to_hex().to_ascii_lowercase();
+        let (publisher, mut published) = relay::RelayEventPublisher::test_pair();
+        let task = tokio::spawn(run_project_activity_publisher(
+            rx,
+            publisher,
+            rt.agent.clone(),
+            agent_hex,
+        ));
+
+        // Queue a root with no child free, so it is announced and then stuck.
+        let _held = rt.pool.try_claim(None).expect("one idle agent");
+        let root = issue_root(&rt.owner, &rt.agent, "demo");
+        let root_id = root.id.to_hex();
+        assert!(matches!(
+            rt.drive(&routed(root, project::ProjectSubscription::Enrolment).await)
+                .await,
+            ProjectDispatched::Queued { queued: true, .. }
+        ));
+
+        let queued_frame = tokio::time::timeout(Duration::from_secs(5), published.recv())
+            .await
+            .expect("the queued announcement must reach the relay")
+            .expect("publisher channel closed");
+        assert_eq!(tag_value(&queued_frame, "state").as_deref(), Some("queued"));
+
+        // The drain gives up on it, and takes the announcement back.
+        clear_queued_project_announcements(&mut rt.queue, rt.observer.as_ref());
+
+        let cleared = tokio::time::timeout(Duration::from_secs(5), published.recv())
+            .await
+            .expect("the indicator must be cleared, not left to expire")
+            .expect("publisher channel closed");
+        task.abort();
+
+        assert_eq!(tag_value(&cleared, "state").as_deref(), Some("idle"));
+        assert_eq!(
+            tag_value(&cleared, "e").as_deref(),
+            Some(root_id.as_str()),
+            "the clearing frame must land on the root that was promised"
+        );
+        assert!(
+            !rt.queue.has_undrained_work(),
+            "the batch is disposed of, so the queue and the wire agree"
+        );
+    }
+
+    /// First tag value for `key`, or `None`.
+    fn tag_value(event: &nostr::Event, key: &str) -> Option<String> {
+        event.tags.iter().find_map(|t| {
+            let s = t.as_slice();
+            (s.first().map(String::as_str) == Some(key))
+                .then(|| s.get(1).cloned())
+                .flatten()
+        })
     }
 }
