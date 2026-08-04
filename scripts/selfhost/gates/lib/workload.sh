@@ -50,14 +50,20 @@ workload_generate_key() {
 # Registers the pid with the harness so teardown reaps it even on a mid-gate
 # abort. Returns after the connect marker appears (or fails on timeout).
 workload_start_acp() {
-  local acp_bin="$1" logfile="$2" seckey="$3" state_dir="$4"
+  local acp_bin="$1" logfile="$2" seckey="$3" state_dir="$4" owner_pub="${5:-}"
   mkdir -p "${state_dir}"
 
   [[ -x "${acp_bin}" ]] || { err "acp binary not executable: ${acp_bin}"; return 1; }
 
+  # The driver keypair is this run's human: BUZZ_ACP_AGENT_OWNER is what gives
+  # its issues enrolment authority, exactly as the production agents carry
+  # their operator's pubkey. Without it the runtime is working as designed —
+  # a stranger's issue on an agent-owned repository enrols nothing, silently —
+  # which run 5 of the first live gate day demonstrated end to end.
   setsid env \
     BUZZ_PRIVATE_KEY="${seckey}" \
     BUZZ_RELAY_URL="$(harness_relay_ws)" \
+    ${owner_pub:+BUZZ_ACP_AGENT_OWNER="${owner_pub}"} \
     BUZZ_ACP_AGENT_COMMAND="node" \
     BUZZ_ACP_AGENT_ARGS="${GATES_STUB_AGENT}" \
     BUZZ_ACP_DISPLAY_NAME="${GATES_AGENT_DISPLAY_NAME}" \

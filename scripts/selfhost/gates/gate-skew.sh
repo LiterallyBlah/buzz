@@ -196,7 +196,7 @@ run_pairing() {
     workload_announce_repo "${cli}" "${agent_sec}" "${repo_id}" \
       > "${dir}/repo-create.log" 2>&1 || failures+=("repo-announce")
 
-    acp_pid="$(workload_start_acp "${acp_bin}" "${acp_log}" "${agent_sec}" "${dir}/state")" \
+    acp_pid="$(workload_start_acp "${acp_bin}" "${acp_log}" "${agent_sec}" "${dir}/state" "${driver_pub}")" \
       || failures+=("acp-start")
 
     wait_for_marker "${acp_log}" "connected to relay at" 90 \
