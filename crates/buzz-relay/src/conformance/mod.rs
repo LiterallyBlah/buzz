@@ -43,7 +43,7 @@ pub use buzz_conformance::{
 };
 
 mod tracers;
-pub use tracers::{JsonlTracer, NoopTracer};
+pub use tracers::{tracer_for_trace_path, JsonlTracer, NoopTracer};
 
 /// Build the [`AbstractState`] for a request from its resolved tenant
 /// context and authenticated public key.

@@ -26,7 +26,12 @@
 #   refused                   — artifacts or source moved mid-run; the evidence
 #                               does not describe the current bytes. NEVER deploy
 #                               a refused stamp, regardless of gate results.
-#   incomplete                — a gate never produced a result.json (crash, kill)
+#   incomplete                — a gate never produced a result.json (crash, kill),
+#                               was dry-run only, or reported `blocked`: it could
+#                               not run for an environmental reason. A gate that
+#                               did not run is not evidence, and the one thing
+#                               this stamp must never do is let "we could not
+#                               check" read as "we checked".
 # =============================================================================
 set -euo pipefail
 
@@ -110,6 +115,12 @@ done
 
 FAILED="$(echo "${GATES_JSON}"  | jq '[.[] | select(.result == "fail")] | length')"
 DRYRUN="$(echo "${GATES_JSON}"  | jq '[.[] | select(.result == "dry-run")] | length')"
+# Anything that is not an outright pass and not one of the states handled
+# explicitly below. `blocked` is the one that exists today (a gate whose
+# environment denied it a run), but the selector is deliberately open-ended: an
+# unrecognised result string must NEVER fall through to `promotable`.
+UNPROVEN="$(echo "${GATES_JSON}" | jq '[.[] | select(.result | IN("pass","fail","dry-run","missing","skipped") | not)] | length')"
+UNPROVEN_NAMES="$(echo "${GATES_JSON}" | jq -r '[.[] | select(.result | IN("pass","fail","dry-run","missing","skipped") | not) | "\(.name)=\(.result)"] | join(", ")')"
 WAIVED="$(echo "${GATES_JSON}"  | jq '[.[] | .details.waivers.applied // [] | length] | add // 0')"
 
 # ---- verdict ----------------------------------------------------------------
@@ -126,6 +137,9 @@ elif [[ ${#MISSING[@]} -gt 0 ]]; then
 elif [[ "${FAILED}" -gt 0 ]]; then
   VERDICT=blocked
   REASON="${FAILED} gate(s) failed"
+elif [[ "${UNPROVEN}" -gt 0 ]]; then
+  VERDICT=incomplete
+  REASON="${UNPROVEN} gate(s) did not run to a verdict: ${UNPROVEN_NAMES} — a gate that could not run is not evidence"
 elif [[ "${DRYRUN}" -gt 0 ]]; then
   VERDICT=incomplete
   REASON="${DRYRUN} gate(s) were dry-run only — a plan is not evidence"

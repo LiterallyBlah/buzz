@@ -98,14 +98,80 @@ workload_open_issue() {
   echo "${out}" | grep -oE '\b[0-9a-f]{64}\b' | head -1
 }
 
+# workload_read_history <cli_bin> <seckey> <root_event_id>
+# ONE read of a root's history through the relay's REQ path, printed on stdout.
+#
+# Deliberately never fails the caller: an empty history is a legitimate answer,
+# and the callers below want the *read* to have happened, not a particular row
+# count. Extracted so the read half of the scenario has exactly one
+# implementation — gate-skew/gate-soak poll it looking for the agent's reply
+# (workload_wait_reply, below), and gate-conformance drives it to make the relay
+# serve a REQ, which is where the trace's read_message_rows / read_by_id_rows
+# actions come from.
+workload_read_history() {
+  local cli="$1" seckey="$2" root="$3"
+  BUZZ_PRIVATE_KEY="${seckey}" BUZZ_RELAY_URL="$(harness_relay_ws)" \
+    "${cli}" projects history --root "${root}" 2>/dev/null || true
+}
+
+# workload_comment_on_root <cli_bin> <seckey> <repo_owner_hex> <repo_id> <root>
+# A kind:1 comment that `e`-tags the root. Emits the comment's event id.
+#
+# Two jobs. It is a third write through the ingest seam, and — because it
+# e-tags the root — it is the one event a `#e=<root>` subscription can actually
+# match. Without it every read comes back empty, and a read observation with
+# zero rows satisfies Inv_NonInterference vacuously: the row-label confinement
+# check has nothing to confine. A conformance trace whose only read steps carry
+# `row_communities: []` proves the emit site fires and nothing else.
+workload_comment_on_root() {
+  local cli="$1" seckey="$2" owner="$3" repo_id="$4" root="$5" out
+  out="$(BUZZ_PRIVATE_KEY="${seckey}" BUZZ_RELAY_URL="$(harness_relay_ws)" \
+    "${cli}" issues comment \
+      --repo-owner "${owner}" \
+      --repo-id "${repo_id}" \
+      --root "${root}" \
+      --content "gates workload comment — gives the read seam a row to confine" \
+      --to "${owner}" 2>&1)" || { echo "${out}" >&2; return 1; }
+  echo "${out}" | grep -oE '\b[0-9a-f]{64}\b' | head -1
+}
+
+# workload_read_subscription <test_cli_bin> <seckey> <kind> <e_tag> <logfile> [timeout_s]
+# ONE WebSocket REQ against the relay: NIP-42 AUTH, subscribe, wait for EOSE.
+#
+# WHY THIS EXISTS ALONGSIDE workload_read_history. The `buzz` CLI reads through
+# the relay's HTTP bridge (`POST /query`, crates/buzz-relay/src/api/bridge.rs) —
+# a SEPARATE read path from the WebSocket REQ handler
+# (crates/buzz-relay/src/handlers/req.rs:43 `handle_req`). The bridge borrows
+# req.rs's query builders but has its own delivery loop, and the conformance
+# trace's read observations (read_message_rows / read_by_id_rows / auth_check)
+# are emitted only INSIDE handle_req. So a workload that reads exclusively over
+# the bridge produces a trace with no read observations at all — which is not a
+# hypothetical: gate-conformance's first live run captured exactly that, two
+# writes and zero reads, and its coverage requirement caught it.
+#
+# buzz-test-cli (crates/buzz-test-client) is the repo's own WS instrument and
+# does the NIP-42 handshake REQ requires. It is a PROBE, not a candidate
+# artifact: it is never staged or hash-bound, because nothing ships it.
+#
+# Returns 0 once EOSE is seen. The subscriber blocks waiting for live events
+# after EOSE by design, so it is run under `timeout` and reaped — the marker,
+# not the exit status, is the signal.
+workload_read_subscription() {
+  local cli="$1" seckey="$2" kind="$3" etag="$4" logfile="$5" limit="${6:-30}"
+  [[ -x "${cli}" ]] || { err "buzz-test-cli not executable: ${cli}"; return 1; }
+  BUZZ_PRIVATE_KEY="${seckey}" timeout "${limit}" \
+    "${cli}" --url "$(harness_relay_ws)" --subscribe --kind "${kind}" --channel "${etag}" \
+    > "${logfile}" 2>&1 || true
+  grep -qF "end of stored events" "${logfile}"
+}
+
 # workload_wait_reply <cli_bin> <driver_seckey> <root_event_id> <timeout_s>
 # The agent's reply is a comment on the root. Polling the root's history is the
 # read-side counterpart to the write we just made.
 workload_wait_reply() {
   local cli="$1" seckey="$2" root="$3" timeout="${4:-90}" waited=0 out
   while (( waited < timeout )); do
-    out="$(BUZZ_PRIVATE_KEY="${seckey}" BUZZ_RELAY_URL="$(harness_relay_ws)" \
-      "${cli}" projects history --root "${root}" 2>/dev/null || true)"
+    out="$(workload_read_history "${cli}" "${seckey}" "${root}")"
     if echo "${out}" | grep -qF "buzz-gates stub agent"; then
       return 0
     fi

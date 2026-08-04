@@ -64,42 +64,67 @@ checker. Phase A is what catches a checker that has been quietly reduced to
 `Ok(())`. `buzz-conformance` depends on no production buzz crate (its
 `Cargo.toml` "Independence rule"), so the OpenSSL gap does not touch it.
 
-**Phase B — live trace replay. BLOCKED.**
-Intended: run the candidate relay with trace emission on, drive the scripted
-workload, replay the emitted JSONL through `check_trace`. Two blockers, both
-outside `scripts/selfhost/gates/**` (which is the only tree this runner owns),
-so they are reported rather than silently patched:
+**Phase B — live trace replay. REAL.**
+Stands up the isolated harness, runs the **candidate relay from source** with
+`BUZZ_CONFORMANCE_TRACE_PATH` pointed at a file in the run's evidence directory,
+drives the shared workload's write/read half against it, stops the relay with
+`SIGTERM`, and replays the JSONL the relay actually wrote through `check-trace`.
 
-> **B1 — no runtime tracer binding.**
-> `crates/buzz-relay/src/state.rs:799` — `AppState::new` hardcodes
-> `tracer: Arc::new(crate::conformance::NoopTracer)` and nothing ever replaces
-> it; `main.rs` never touches `state.tracer`. The comment there anticipates
-> "conformance tests overwrite this with a `JsonlTracer` after construction",
-> but no such call site exists.
-> **Needed:** honour an env var and bind
-> `crate::conformance::JsonlTracer::create(path)`
-> (`crates/buzz-relay/src/conformance/tracers.rs:37`) instead of `NoopTracer`.
-> Proposed contract, which this gate already probes for:
-> `BUZZ_CONFORMANCE_TRACE_PATH=<file>`.
+| step | what it does |
+|---|---|
+| bring-up | `buzz-gates` compose project, schema reset, community seeded at `localhost:3031` |
+| trace on | relay started with `BUZZ_CONFORMANCE_TRACE_PATH=<evidence>/relay-trace.jsonl` |
+| workload | `workload_announce_repo` (kind:30617 write) → `workload_open_issue` (kind:1621 write) → `workload_read_history` ×2 identities (REQ reads) — all from `lib/workload.sh`, the same functions gates 3 and 4 use |
+| stop | `harness_relay_stop` (SIGTERM); `JsonlTracer` flushes per line so a clean stop leaves no partial line |
+| replay | `check-trace --group-by state --require write_insert_global,read_message_rows <trace>` |
+
+The two blockers this gate used to report are closed:
+
+> **B1 — runtime tracer binding.** `Config::from_env` parses
+> `BUZZ_CONFORMANCE_TRACE_PATH` (`crates/buzz-relay/src/config.rs`) and
+> `AppState::new` binds `JsonlTracer` through
+> `crate::conformance::tracer_for_trace_path`
+> (`crates/buzz-relay/src/conformance/tracers.rs`). **Unset — the production
+> default — still binds `NoopTracer` and opens no file.** A path that cannot be
+> opened aborts startup rather than downgrading to the no-op: a relay that was
+> asked to trace and silently did not would hand this gate an empty file.
 >
-> **B2 — no replay entrypoint.**
-> `crates/buzz-conformance/Cargo.toml` declares no `[[bin]]` and no
-> `[[example]]`, and there is no `src/bin/` or `examples/`. `check_trace`
-> (`crates/buzz-conformance/src/checker.rs:74`) is a library API with nothing a
-> shell gate can invoke against a captured `.jsonl`.
-> **Needed:** a small bin/example reading JSONL on stdin, building a `Scenario`,
-> calling `check_trace`, exiting non-zero on `Err`.
+> **B2 — replay entrypoint.** `crates/buzz-conformance/src/bin/check-trace.rs`.
+> Reads a JSONL trace (or `-` for stdin), replays it through `check_trace`,
+> prints a structured summary (`--json` for the machine-readable form), and
+> exits **0** conform / **1** non-conformant / **2** could-not-read. Exit 1 and
+> 2 are never conflated — a typo'd path must not read as a spec violation.
 
-The **emitters themselves are already wired** — `handlers/ingest.rs` and
-`handlers/req.rs` both emit through `state.tracer` — so only the switch and the
-replay CLI are missing. `gate-conformance.sh:probe_emission_wiring` detects both
-conditions *at runtime* and cites the live `file:line`, so the gate begins
-working by itself the day either lands, and fails loudly (rather than silently
-passing) if the wiring appears while the driver here is still a stub.
+`probe_emission_wiring` is still there and still runs first, but **inverted**: it
+now asserts the wiring exists and fails the gate, with a full-width banner naming
+the missing file, if any of it has gone away. It also refuses the *half*-wired
+state — a tree that parses the variable but still hardcodes `NoopTracer` in
+`state.rs` is called out by name. The runtime counterpart is the trace file's own
+existence: a relay that ignored the variable leaves no file, and phase B fails
+`no-trace-file` rather than replaying nothing and calling it clean.
 
-**So, plainly:** gate 2 currently proves **the checker**, not **this relay**.
-The stamp records that distinction in `gates[].details.phase_b`; do not read the
-one-word `pass` as evidence the candidate relay is spec-conformant.
+**What phase B does not do.** It does **not** start `buzz-acp`. The seams the
+trace schema covers are the relay's ingest and read paths (`handlers/ingest.rs`,
+`handlers/req.rs` are the only emit sites), and booting the ACP stub would give
+this gate a second, unrelated way to go red while proving nothing about
+`MultiTenantRelay.tla`. The agent lifecycle is gates 3 and 4. It is also **not a
+proof**: trace conformance judges only the executions actually run, and this is
+one repo announce, one issue and two history reads. Widening it means widening
+`lib/workload.sh`, which is shared on purpose.
+
+**One mode is weaker than it looks.** Under the default `--group-by state`,
+`check-trace` partitions the file by `state_after` — because a live trace is many
+requests from many actors, and `check_trace` bootstraps one model state per
+scenario. That keeps `non_interference`, `illegal_transition` and
+`coverage_breach` fully live, but makes `state_mismatch` unreachable *within* a
+partition (the partition key is the tuple that check compares). That mode is
+carried by phase A's fixtures. `--group-by none` replays the whole file as one
+scenario and restores it, and is correct for a single-request trace.
+
+**So, plainly:** a `pass` now means both halves held — the checker still bites,
+**and** this candidate relay emitted a trace it accepts. `gates[].details.phase_b`
+carries the trace's `sha256` and byte count plus the full replay report, so the
+claim is re-checkable against the file in the evidence directory.
 
 ### 3. `skew` — version-skew matrix
 
@@ -238,7 +263,11 @@ Format: `<test-id> | <reason> | <YYYY-MM-DD>`. See the file's own header.
 | `promotable_with_waivers` | as above, but waivers were applied — needs a deployer policy |
 | `blocked` | at least one gate failed |
 | `refused` | artifacts or `HEAD` moved mid-run — **never deploy**, regardless of gate results |
-| `incomplete` | a gate produced no result, or gates were dry-run only |
+| `incomplete` | a gate produced no result, was dry-run only, or reported `blocked` (it could not run for an environmental reason) |
+
+A gate result that is neither `pass` nor one of the states named above also lands
+on `incomplete` rather than falling through to `promotable`. "We could not check"
+must never be readable as "we checked".
 
 ### Hash binding
 
@@ -426,7 +455,15 @@ connect / discover / enrol / reply / shutdown path is.
 | `lib/candidate.sh` | artifact identification, staging, and hash binding |
 | `lib/harness.sh` | isolated stack lifecycle + marker assertions |
 | `lib/waivers.sh` | waiver parsing/classification, failure extraction |
-| `lib/workload.sh` | the one synthetic scenario, shared by skew and soak |
+| `lib/workload.sh` | the one synthetic scenario, shared by conformance, skew and soak |
+
+Gate 2 also depends on two things outside this directory, both of which its
+probe asserts before running:
+
+| path | role |
+|---|---|
+| `crates/buzz-relay/src/conformance/tracers.rs` | `tracer_for_trace_path` — the `BUZZ_CONFORMANCE_TRACE_PATH` switch. `None` ⇒ `NoopTracer`, unchanged production behaviour |
+| `crates/buzz-conformance/src/bin/check-trace.rs` | the replay entrypoint phase B invokes |
 
 Each gate writes exactly one `result.json` into its evidence directory. That file
 is the **only** contract between a gate and `stamp.sh`; no verdict is ever
@@ -462,11 +499,38 @@ it:
      change — which is why the candidate is now **staged out of `target/`**
      before locking. After that fix the same run stamps
      `promotable_with_waivers` with `binding.bound: true` and zero drift.
-* **Gate 2 — phase A run for real, green.** 13 tests across the checker's unit
-  and replay-fixture suites, including `bad_host_channel_mismatch_is_illegal_transition`,
-  `foreign_row_leak_is_non_interference` and `coverage_breach_is_caught`. Phase B
-  reports BLOCKED with both `file:line` citations resolved dynamically at runtime
-  (it located `state.rs:799` itself).
+* **Gate 2 — both phases run for real, green.** Phase A: 41 tests across the
+  checker's unit suite, the `check-trace` binary's own suite, the proptests and
+  the replay fixtures — including `bad_host_channel_mismatch_is_illegal_transition`,
+  `foreign_row_leak_is_non_interference` and `coverage_breach_is_caught`.
+  Phase B, live on this host: harness up → candidate relay started with
+  `BUZZ_CONFORMANCE_TRACE_PATH` → workload → clean stop → replay.
+  **5 trace steps, 2 partitions, `write_insert_global=3 read_message_rows=2`,
+  verdict CONFORM, 81s**, zero relay `ERROR` lines, teardown verified at zero
+  containers with `buzz-harness` (up 44h) and `buzz-prod` untouched throughout.
+* **Gate 2's coverage requirement caught a real gap on its first live run**,
+  which is the best evidence it is not decorative. The first run captured
+  **two writes and zero reads** and went red on
+  `coverage breach: required actions never emitted anywhere in the trace:
+  ["read_message_rows"]`. Cause: the `buzz` CLI reads through the relay's HTTP
+  bridge (`POST /query`), which is a *different* read path from the WebSocket
+  `handle_req` where the trace's read emit sites live. Without the requirement
+  the run would have passed on a trace with no read observations at all — which
+  would have meant `Inv_NonInterference`, the invariant this whole gate exists
+  for, was never once evaluated. Fixed by driving the traced path with
+  `buzz-test-cli` (`workload_read_subscription`). A follow-up refinement for the
+  same reason: the workload now also posts a kind:1 comment on the root, so the
+  read observations come back with **rows to confine** instead of
+  `row_communities: []`, which would have satisfied the invariant vacuously.
+* **The relay's trace switch was exercised both ways on a live relay**, against
+  this same isolated harness. Unset: relay boots, serves a write, logs no
+  `ERROR`, and **no `.jsonl` is created anywhere** — the no-op tracer opens
+  nothing, which is the production default. Pointed at an unopenable path: the
+  relay **refuses to start**, panicking in `AppState::new` after the DB and
+  Redis connect but before it serves anything, with
+  `BUZZ_CONFORMANCE_TRACE_PATH=…: cannot open the conformance trace file for
+  writing (…). Refusing to start: a relay asked to emit a conformance trace that
+  cannot write one would run untraced and hand its gate an empty file.`
 * **Gates 3 and 4 — implemented, NOT yet run green end to end on this host.**
   The marker tables above are derived from source, not from an observed
   transcript. Treat the first live run as a debugging session, not as a verdict.

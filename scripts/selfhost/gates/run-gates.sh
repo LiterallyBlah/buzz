@@ -221,7 +221,9 @@ gate_tests() {
   # unknown option.
   run_gate tests gate-tests.sh --waivers "${GATES_WAIVER_FILE}" ${extra[@]+"${extra[@]}"}
 }
-gate_conformance() { run_gate conformance gate-conformance.sh; }
+# Phase B stands up the isolated harness and runs the candidate relay from
+# source, so this gate needs the same profile/project plumbing as 3 and 4.
+gate_conformance() { run_gate conformance gate-conformance.sh --profile "${GATES_PROFILE}" --project-name "${GATES_PROJECT}"; }
 gate_skew()        { run_gate skew gate-skew.sh --profile "${GATES_PROFILE}" --project-name "${GATES_PROJECT}"; }
 gate_soak()        { run_gate soak gate-soak.sh --profile "${GATES_PROFILE}" --project-name "${GATES_PROJECT}" --soak-duration "${GATES_SOAK_DURATION}"; }
 

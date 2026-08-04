@@ -613,8 +613,11 @@ pub struct AppState {
     pub author_type_cache: Arc<moka::sync::Cache<(CommunityId, Vec<u8>), bool>>,
 
     /// Runtime conformance tracer. Production binds [`crate::conformance::NoopTracer`]
-    /// (zero cost). Conformance tests bind [`crate::conformance::JsonlTracer`] to
-    /// record traces for replay against `docs/spec/MultiTenantRelay.tla`.
+    /// (zero cost). Setting `BUZZ_CONFORMANCE_TRACE_PATH`
+    /// ([`crate::config::Config::conformance_trace_path`]) binds
+    /// [`crate::conformance::JsonlTracer`] instead, recording traces for replay
+    /// against `docs/spec/MultiTenantRelay.tla` — that is what
+    /// `scripts/selfhost/gates/gate-conformance.sh` phase B drives.
     /// See `crates/buzz-conformance/` and `crate::conformance` for the
     /// schema, emitter helpers, and the independent checker.
     pub tracer: Arc<dyn buzz_conformance::Tracer>,
@@ -649,6 +652,48 @@ impl AppState {
         let max_connections = config.max_connections;
         let max_concurrent_handlers = config.max_concurrent_handlers;
         let search_arc = Arc::new(search);
+
+        // ---- runtime conformance tracer selection -------------------------
+        //
+        // DEFAULT PATH IS UNCHANGED. `config.conformance_trace_path` is `None`
+        // unless `BUZZ_CONFORMANCE_TRACE_PATH` is set to a non-empty value, and
+        // `tracer_for_trace_path(None)` evaluates to `Arc::new(NoopTracer)` —
+        // character-for-character the expression this binding used before the
+        // switch existed. No file is opened, no syscall is made, no branch is
+        // added to any request path (the choice is taken once, here), and
+        // `NoopTracer::record` is still an empty function body. A production
+        // relay cannot tell this commit from its predecessor.
+        //
+        // FAILING TO OPEN THE FILE ABORTS STARTUP. It would be easy to fall
+        // back to the no-op on error, and that would be wrong: the relay would
+        // then run untraced while its operator believed it was tracing, and the
+        // conformance gate would replay an absent-or-empty file. The crate this
+        // trace feeds says it plainly — "Coverage breach is load-bearing.
+        // Without it, trace conformance is decorative logging"
+        // (crates/buzz-conformance/src/lib.rs:35) — and evidence that silently
+        // vanishes is precisely the breach that mode exists to catch. A relay
+        // that was asked to trace and cannot must refuse to run, so the failure
+        // is a loud boot error instead of a quiet green gate.
+        //
+        // Panic (rather than threading a Result through `AppState::new`) is the
+        // established idiom at this constructor for unrecoverable startup
+        // configuration — see the `.expect(...)` on `GitStore::new` and
+        // `GitPackCache::new` a few lines below, which are the same class of
+        // "the operator configured something that cannot work" failure.
+        let tracer =
+            crate::conformance::tracer_for_trace_path(config.conformance_trace_path.as_deref())
+                .unwrap_or_else(|err| {
+                    panic!(
+                "BUZZ_CONFORMANCE_TRACE_PATH={}: cannot open the conformance trace file for \
+                 writing ({err}). Refusing to start: a relay asked to emit a conformance trace \
+                 that cannot write one would run untraced and hand its gate an empty file.",
+                config
+                    .conformance_trace_path
+                    .as_deref()
+                    .unwrap_or_else(|| std::path::Path::new("<unset>"))
+                    .display()
+            )
+                });
 
         let audit_arc = audit.into().map(Arc::new);
         let (audit_tx, mut audit_rx) = mpsc::channel::<buzz_audit::NewAuditEntry>(1000);
@@ -792,11 +837,9 @@ impl AppState {
                     .time_to_live(std::time::Duration::from_secs(300))
                     .build(),
             ),
-            // Default to NoopTracer: production builds pay zero cost.
-            // Conformance tests overwrite this with a JsonlTracer after
-            // construction (see test helpers in
-            // `crates/buzz-test-client` once those land).
-            tracer: Arc::new(crate::conformance::NoopTracer),
+            // NoopTracer unless BUZZ_CONFORMANCE_TRACE_PATH asked for a
+            // JsonlTracer; selected above, where the rationale lives.
+            tracer,
             mesh: Arc::new(std::sync::OnceLock::new()),
         };
         (

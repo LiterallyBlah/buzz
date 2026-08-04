@@ -277,6 +277,25 @@ pub struct Config {
     /// Whether the configured web bundle serves Git browser routes in addition
     /// to the public invite landing page. Defaults to false.
     pub serve_git_web_gui: bool,
+
+    /// Optional JSONL destination for the runtime conformance trace
+    /// (`BUZZ_CONFORMANCE_TRACE_PATH`).
+    ///
+    /// **Unset is the production default and means "behave exactly as before".**
+    /// `AppState::new` binds [`crate::conformance::NoopTracer`] — the same
+    /// zero-work tracer it has always bound — and no file is opened, so the
+    /// default deployment pays nothing for this switch existing.
+    ///
+    /// When set, `AppState::new` binds
+    /// [`crate::conformance::JsonlTracer`] against this path instead, and the
+    /// relay emits one `buzz_conformance::TraceStep` per line at the
+    /// ingest/read seam for replay against `docs/spec/MultiTenantRelay.tla`.
+    /// The file is **truncated** at startup so a run's trace is only that run's.
+    ///
+    /// A path that cannot be opened is a hard startup failure, not a silent
+    /// downgrade to the no-op tracer — see the rationale in `state.rs` where
+    /// the tracer is bound.
+    pub conformance_trace_path: Option<std::path::PathBuf>,
 }
 
 fn parse_bind_addr(raw: &str) -> Result<SocketAddr, ConfigError> {
@@ -919,6 +938,25 @@ impl Config {
             tracing::info!("BUZZ_WEB_DIR={} — serving web UI from relay", dir.display());
         }
 
+        // Runtime conformance trace destination. Same shape as BUZZ_WEB_DIR
+        // above: absent, empty, or whitespace-only all mean "off", so an
+        // orchestrator that exports the variable with an empty value (a very
+        // common shell accident) gets today's production behaviour rather than
+        // a relay that tries to open "" and refuses to boot.
+        let conformance_trace_path = std::env::var("BUZZ_CONFORMANCE_TRACE_PATH")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .map(std::path::PathBuf::from);
+        if let Some(ref path) = conformance_trace_path {
+            warn!(
+                "BUZZ_CONFORMANCE_TRACE_PATH={} — runtime conformance tracing is ON. \
+                 Every ingest/read seam writes a JSONL trace step to this file. \
+                 This is a gate/CI setting; production leaves it unset.",
+                path.display()
+            );
+        }
+
         // Reject explicitly-configured secrets that are too short.
         // The auto-generated fallback is always 64 hex chars (32 bytes), so this
         // only fires when someone sets BUZZ_GIT_HOOK_HMAC_SECRET to a weak value.
@@ -984,6 +1022,7 @@ impl Config {
             admin,
             web_dir,
             serve_git_web_gui,
+            conformance_trace_path,
         })
     }
 }
@@ -1185,6 +1224,44 @@ mod tests {
         assert_eq!(overridden, Some(40));
         assert_eq!(zero, None, "zero must fall back to inheriting");
         assert_eq!(junk, None, "unparsable value must fall back to inheriting");
+    }
+
+    /// The production default must stay `None` — that is what makes
+    /// `AppState::new` bind the no-op tracer and pay nothing. Blank and
+    /// whitespace-only are also `None`: an orchestrator exporting the variable
+    /// with an empty value is a shell accident, not a request to trace, and
+    /// treating it as one would make the relay refuse to boot on `open("")`.
+    ///
+    /// (This test does not run on the self-hosted staging box — `buzz-relay`'s
+    /// test target needs OpenSSL headers that host lacks. See
+    /// `scripts/selfhost/gates/README.md`.)
+    #[test]
+    fn conformance_trace_path_unset_or_blank_is_none() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let previous = std::env::var_os("BUZZ_CONFORMANCE_TRACE_PATH");
+
+        std::env::remove_var("BUZZ_CONFORMANCE_TRACE_PATH");
+        let unset = Config::from_env().expect("config").conformance_trace_path;
+
+        std::env::set_var("BUZZ_CONFORMANCE_TRACE_PATH", "   ");
+        let blank = Config::from_env().expect("config").conformance_trace_path;
+
+        std::env::set_var("BUZZ_CONFORMANCE_TRACE_PATH", "  /tmp/buzz-trace.jsonl  ");
+        let set = Config::from_env().expect("config").conformance_trace_path;
+
+        if let Some(value) = previous {
+            std::env::set_var("BUZZ_CONFORMANCE_TRACE_PATH", value);
+        } else {
+            std::env::remove_var("BUZZ_CONFORMANCE_TRACE_PATH");
+        }
+
+        assert_eq!(unset, None, "unset must leave the no-op tracer in place");
+        assert_eq!(blank, None, "whitespace-only must leave the no-op in place");
+        assert_eq!(
+            set.as_deref(),
+            Some(std::path::Path::new("/tmp/buzz-trace.jsonl")),
+            "a set path must be trimmed and honoured verbatim"
+        );
     }
 
     #[test]
