@@ -37,14 +37,104 @@ safe to give it root.
 Two rules make the separation real rather than decorative:
 
 1. **A document cannot be its own authorisation.** The manifest is authored by
-   whoever built the release. So `--ack-migrations` — the acknowledgement that
-   a schema change is not backward-compatible — is a command-line flag, not a
-   manifest field, and the systemd unit does not pass it. An unattended drop
-   can never run a forward-only migration by itself.
-2. **An unverified claim is refused, not ignored.** `promoted_by` must be
-   `null` until something actually verifies it (Phase 2). A manifest asserting
-   an approval nothing checked would read like authority in an audit log, which
-   is worse than asserting nothing.
+   whoever built the release. So every acknowledgement — `--ack-migrations`,
+   `--ack-waivers`, `--allow-unstamped`, `--allow-unattributed` — is a
+   command-line flag, not a manifest field, and the systemd unit passes none of
+   them. An unattended drop can never soften its own requirements.
+2. **An unverified claim is refused, not ignored.** Both promotion claims are
+   re-derived from something outside the manifest: the promote stamp is
+   re-hashed and re-joined from the file staged beside it, and `promoted_by` is
+   re-asked of the live relay. A manifest asserting an approval nothing checked
+   would read like authority in an audit log, which is worse than asserting
+   nothing — so nothing is taken on the manifest's word.
+
+## What travels with a release, and who is making the claim
+
+Two fields, two different claims, deliberately not merged. Collapsing them is
+how an audit log stops being able to say which one was actually made.
+
+| Field | The claim | Made by | Re-derived from |
+|---|---|---|---|
+| `staging_stamp` | *the gates passed on these exact bytes* | the staging judge (`scripts/selfhost/gates/`) | `promote-stamp.json`, staged in the drop, re-hashed against `staging_stamp.stamp_sha256` |
+| `promoted_by` | *a human with a key approved this revision* | the owner | the live relay, via `buzz projects release-check` |
+
+Neither implies the other. A green suite is not permission to ship, and an
+owner's approval is not evidence that anything was tested.
+
+**The stamp's hash joins, and the one that does not exist.** The stamp records
+a sha256 per gated artifact and the manifest records one per shipped component,
+so `acp` and `cli` join exactly: the bytes that were tested are provably the
+bytes being installed. The relay does **not** join. The gates exercise a
+`buzz-relay` built from source; the manifest ships a Docker image id. Those are
+different bytes of the same commit, so the relay half of a stamp is bound by
+`source_commit` alone. The deployer prints that distinction as
+`relay-image=COMMIT-ONLY` rather than letting a green line imply a check it did
+not make. Closing the gap means having the gates build and exercise the image
+itself; until then, do not describe the relay as hash-bound.
+
+**The approval's commit join.** `release-check` prints
+`{authorized, reason, root, revision, commit, owner, decided_at}` and exits 0
+only when authorized. The deployer requires exit 0 **and**
+`verdict.commit == manifest.source_commit`. Without that second half, any
+approval by that owner of any revision would authorise any manifest — the
+deployer would be checking that a decision exists, not that it is about these
+bytes.
+
+**"No verdict" is not "no".** `release-check` prints its verdict whenever it
+reached one and prints nothing when it could not (network down, relay
+unreachable, subcommand missing). The deployer treats empty stdout as
+**blocked**. Reading a missing answer as `false` would mean refusing forever the
+day the relay is slow; reading it as `true` would mean shipping unapproved code
+the day the relay is down. Only "blocked" is safe, and it is the one that
+requires the absence of output to be part of the contract — which is why
+`release-check` is specified that way.
+
+## The enforcement matrix
+
+|  | `--inbox` (unattended) | direct invocation |
+|---|---|---|
+| no `staging_stamp` | **refused** | refused unless `--allow-unstamped` (loud `WARN`) |
+| verdict `promotable` | proceeds | proceeds |
+| verdict `promotable_with_waivers` | **refused** — the unit passes no flag | requires `--ack-waivers` |
+| any other verdict | **refused** | **refused** — no flag exists |
+| stamp file missing or re-hashes differently | **refused** | **refused** — no flag exists |
+| `promoted_by: null` | **refused** | refused unless `--allow-unattributed` (loud `WARN`) |
+| `release-check` unauthorized, or its `commit` ≠ `source_commit` | **refused** | **refused** — no flag exists |
+| `release-check` reached no verdict | **refused** | **refused** |
+| `migrations: ack-required` | **refused** — the unit passes no flag | requires `--ack-migrations` |
+
+`--allow-unstamped`, `--allow-unattributed` and `--stamp-file` are **usage
+errors** under `--inbox`, not warnings. A flag that is accepted and quietly does
+nothing is a flag somebody will believe worked; refusing it outright means "an
+unattended deploy needs the whole ceremony" cannot be softened even by a human
+typing `--inbox` by hand. If you must ship an unstamped or unapproved release,
+point the deployer at the manifest directly — which is also the shape that keeps
+a person in the room.
+
+The two rows with no escape hatch at all are the ones where a flag would be
+meaningless. A stamp that does not re-hash, or an approval for a different
+commit, is not a policy you can acknowledge — it is a document that does not
+describe this release.
+
+## Verifying with the deployed CLI, not the candidate
+
+When `cli` is a component there are two `buzz` binaries on the box: the deployed
+`/opt/buzz/bin/buzz` and the candidate staged in the drop. The deployer runs
+`release-check` with the **deployed** one.
+
+The candidate is the thing being authorised. Asking it whether it is authorised
+makes the release its own auditor: a `release-check` that always printed
+`{"authorized": true}` would install itself, and nothing between here and there
+would notice. The deployed binary was, by construction, admitted by a previous
+run of this same gate. That is not a strong guarantee — it is a chain of
+custody, not a proof — but it is a guarantee the current release cannot
+manufacture, which is the only property that matters at this step.
+
+The cost is real: an older deployed CLI may not know the subcommand at all.
+That lands in the "no verdict" row above and is refused, which means the upgrade
+path for a box whose CLI predates `release-check` is a human installing one CLI
+by hand. That is the correct amount of friction for "teach the box how to check
+approvals".
 
 ## What the executor guarantees
 
@@ -128,6 +218,64 @@ sixty seconds, and a crash at second 45 is exactly what this catches.
 **CLI gate** — `buzz --help` exits 0. A smoke test, not a feature test: it
 proves the binary is the right architecture, its links resolve and its argument
 parser builds. Anything deeper belongs in the staging gates.
+
+## Drain: finish what is running before you swap it
+
+`SIGTERM` gives an in-flight prompt a thirty-second grace and then aborts it, so
+a model turn three minutes into a refactor dies mid-sentence — and a queued
+project event, already announced on its issue as `state=queued`, is dropped on
+the floor with the indicator still lit. Restarting an agent is therefore never
+invisible: somebody's turn is cut, or somebody's issue promises work no process
+is holding.
+
+Drain is the third lever. Before each agent unit is replaced, the deployer
+publishes an **owner-signed control frame** — `buzz agents drain --agent <hex>`
+— telling the runtime to stop admitting work, finish what it holds, and exit 0.
+Because the units are `Restart=on-failure`, exit 0 means the unit stays down
+until the deployer starts it again, which is exactly the window a binary swap
+needs. The full wire contract lives in `crates/buzz-acp/src/drain.rs`; the
+sender is `crates/buzz-cli/src/agent_drain.rs`.
+
+Two properties of the sequence are worth stating:
+
+* **Publishing is not draining.** The CLI can only report that the relay
+  accepted the frame; its ack says `drain_confirmed: false` and always will.
+  What the deployer waits on is the unit reaching `inactive` — the process
+  stopping is the only evidence the drain was honoured.
+* **The wait is bounded, and the bound is a compromise.** The agent's own drain
+  bound is `max_turn + 100s` (7300s at the default `BUZZ_ACP_MAX_TURN_DURATION`),
+  which is far longer than `buzz-deployer.service`'s `TimeoutStartSec=45min`.
+  Waiting the full agent bound would get the *deployer* killed by systemd
+  mid-swap, which is strictly worse than giving up loudly. So the deployer waits
+  `BUZZ_DEPLOY_DRAIN_WAIT_SECONDS` (default 600) per unit and then falls back to
+  a restart, saying so. Raising it means raising `TimeoutStartSec` too:
+  `(wait × agent units) + gates + backup` must fit inside the unit's budget.
+
+**Every fallback is loud.** Drain not configured, key file unreadable, no pubkey
+for the unit, a deployed CLI too old to have the subcommand, publish failed, or
+the wait expired — each emits a `status=WARN` naming the missing precondition
+and then does the old SIGTERM restart. It is never skipped and never silent: an
+operator who believes in-flight turns were finished when they were killed is
+worse off than one who knows they were killed.
+
+Rollback does **not** drain. Draining is a courtesy to work in flight, and the
+work in flight during a rollback is being done by a binary this run has just
+proven bad. Asking it politely to finish would be waiting on the thing that
+failed — and a restart is also the only path that works when the process is
+already wedged.
+
+Configuration is two variables, both documented in
+[`scripts/selfhost/units/README.md`](../scripts/selfhost/units/README.md):
+
+```bash
+BUZZ_DEPLOY_OWNER_KEY_FILE=/opt/buzz/agents/deploy-owner.env   # the OWNER's key
+BUZZ_DEPLOY_AGENT_PUBKEYS="buzz-claude:<64-hex> buzz-codex:<64-hex>"
+```
+
+The agent **public** keys come from configuration and never from the agents' own
+env files. Those files hold `BUZZ_PRIVATE_KEY`, and a root process opening them
+to derive something public would be reading a secret it has no business knowing.
+The cheapest way to keep that true is to never open the file.
 
 ## Migrations: expand → migrate → contract
 
@@ -250,54 +398,53 @@ Two rules:
   so "deploy failed, rolled back" cannot be mistaken for a claim an agent made
   about its own work.
 
-## Later phases
+## The division of labour between the gates and the deployer
 
-The seams are already cut. Each is one function or one field, with one caller,
-so a later phase is a diff you can read in one sitting rather than a policy
-sprinkled through the runbook.
+**The gates decide whether a candidate is fit to ship; the deployer decides
+whether the box survived shipping it.** Those are different questions with
+different evidence, which is why the deploy-time gates in `deploy.sh`
+deliberately stay shallow (liveness, startup lines, a `--help`) — depth belongs
+on the staging side, before anything is live. `scripts/selfhost/gates/README.md`
+documents what each staging gate does and does not prove; read it before
+treating a `promotable` as a guarantee about, say, the relay's spec conformance.
 
-**Phase 2 — authorization.** `gate_authorization()` in `deploy.sh` is the only
-caller-facing hook, and `promoted_by` in the manifest is the only field. Today
-the function logs `SKIP` and the field must be `null`. Phase 2 replaces the
-function body with signature verification against the owner pubkey and drops
-the `null` allowance from the schema in the same change. Nothing else moves.
-
-**Phase 3 — staging promotion stamp.** `scripts/selfhost/gates/` is the staging
-judge: `run-gates.sh` runs the suite and `stamp.sh` emits
-`gates/promote-stamp.json` (`schema: "buzz.staging.promote-stamp/v1"`). The
-split is already meaningful today: **the gates decide whether a candidate is
-fit to ship; the deployer decides whether the box survived shipping it.** Those
-are different questions with different evidence, which is why the deploy-time
-gates in `deploy.sh` deliberately stay shallow (liveness, startup lines, a
-`--help`) — depth belongs on the staging side, before anything is live.
-
-The two halves already agree on the thing that makes them composable: the stamp
-binds its verdict to artifact hashes, and the manifest binds its identity to
-the same hashes. Phase 3 is therefore a *cross-check*, not a new mechanism —
-the stamp's `candidate.artifacts[].sha256` must equal the manifest's
-`components.<name>.sha256`, and a mismatch means the evidence describes
-different bytes than the release. The manifest grows one reserved field for the
-stamp (or a reference to it) beside `promoted_by`, verified in the same
-function. The intended verdict policy, stated now so it is not improvised
-later:
+The deployer's verdict policy, matching the table the gates publish:
 
 | Stamp verdict | Deployer |
 |---|---|
 | `promotable` | proceed |
-| `promotable_with_waivers` | refuse unattended; require an explicit command-line acknowledgement, the same shape as `--ack-migrations`. A human waived red tests; a human should be present when they ship. |
-| `blocked` / `incomplete` | refuse |
-| `refused` | refuse, loudly — the evidence does not describe the current bytes, and gate results are irrelevant in that state |
+| `promotable_with_waivers` | requires `--ack-waivers`; refused unattended, because the unit passes no flag |
+| `blocked` / `incomplete` | refuse — no flag exists |
+| `refused` | refuse — the evidence does not describe the current bytes, and gate results are irrelevant in that state |
 
-**Phase 4 — drain signal.** Today the relay is force-recreated and the agents
-are restarted outright; in-flight work is whatever the process was doing when
-it got `SIGTERM`. The seam is the moment between "gates passed" and "restart":
-a drain step would tell the component to stop accepting new work, wait for
-in-flight turns to finish, and only then restart. `restart_relay()` and
-`restart_agents()` are the two functions that grow a pre-step; the manifest
-grows a per-component drain budget. Nothing about ordering or rollback changes,
-which is why it is safe to defer.
+The last three are also refused one step earlier: `mint-manifest.py` will not
+mint a release from a stamp that is not promotable, so a `blocked` candidate
+does not become a drop in the first place. Both ends state the rule so neither
+can quietly become the exception.
 
-**Phase 5 — desktop updater.** The desktop app is released through
+## Still ahead
+
+**Drain for the relay.** `restart_agents()` drains; `restart_relay()` still
+force-recreates the container. The relay has no equivalent of the ACP control
+frame — there is nothing to send it — so closing this means giving the relay a
+"stop admitting, finish in-flight requests" mode first. Until then a relay swap
+is a hard recreate and the deploy-time window is whatever a container restart
+costs.
+
+**Hash-binding the relay image.** The gates test a from-source `buzz-relay` and
+the manifest ships an image id, so the relay is bound to a stamp by
+`source_commit` alone (see above). The fix is on the gates' side: build and
+exercise the `buzz-local:<tag>` image via the repo `Dockerfile`, so the artifact
+gated is the artifact shipped and the stamp can carry an `image_id` that joins
+exactly.
+
+**Stamp freshness.** `staging_stamp.stamped_at` is advisory: nothing expires a
+stamp. A month-old `promotable` for a commit that is still `source_commit` is
+still accepted, and it should be — the bytes have not changed — but the box it
+was gated against has. Enforcing an age would need a policy nobody has argued
+for yet, and inventing one here would be worse than saying it is not enforced.
+
+**Desktop updater.** The desktop app is released through
 `.release/desktop-candidate.json` and `scripts/desktop_release.py`, a pipeline
 this one deliberately mirrors rather than merges with: desktop ships to users
 through an updater and a signed tag, self-host ships to one box through a

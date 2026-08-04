@@ -49,10 +49,24 @@ A full three-component release, schema-neutral:
   },
   "deploy_order": ["relay-image", "acp", "cli"],
   "migrations": "none",
-  "promoted_by": null,
+  "promoted_by": {
+    "root": "c3f1…64 hex…",
+    "revision": "9b02…64 hex…",
+    "owner": "7a41…64 hex…"
+  },
+  "staging_stamp": {
+    "stamp_sha256": "397d199181ea9eb01beec3cb1dfd3438d9814f77df785431064f367300d32586",
+    "verdict": "promotable",
+    "stamped_at": "2026-08-04T17:05:00Z",
+    "waived": 0
+  },
   "notes": "Projects feature merge. Watch buzz-claude for enrolment replay."
 }
 ```
+
+That release drop also contains `promote-stamp.json` — the stamp itself, staged
+beside the manifest and re-hashed by the deployer against `stamp_sha256`. The
+summary above is for reading; the file is the evidence.
 
 A relay-only hotfix is a complete, normal manifest too — and is the shape you
 should reach for by default, because the smallest change that fixes the problem
@@ -67,9 +81,16 @@ is the safest change to ship:
   "deploy_order": ["relay-image"],
   "migrations": "none",
   "promoted_by": null,
+  "staging_stamp": null,
   "notes": "Fixes the 502 on /pair. No agent or CLI change."
 }
 ```
+
+Both promotion fields are `null` there, which is a legal manifest and an
+**unshippable** one under `--inbox`: the deployer refuses an unattended deploy
+that nothing judged and nobody approved. A hotfix in that shape has to be run by
+hand with `--allow-unstamped --allow-unattributed`, which is the correct amount
+of friction for "ship something at 3am that no gate has seen".
 
 ## Fields
 
@@ -83,7 +104,8 @@ is the safest change to ship:
 | `components` | yes | A subset of `relay-image`, `acp`, `cli`. Identity only — see below. |
 | `deploy_order` | yes | A permutation of the `components` keys. Not a subset, not a superset. `relay-image` must be first if present. |
 | `migrations` | yes | `none` \| `backward-safe` \| `ack-required`. See below. |
-| `promoted_by` | yes | **Reserved — Phase 2 authorization slot.** Must be `null` today. |
+| `promoted_by` | yes | `{root, revision, owner}` — where the owner's approval can be re-derived from, or `null` for a release nobody approved. See below. |
+| `staging_stamp` | no | `{stamp_sha256, verdict, stamped_at, waived}` — a summary of the promote stamp the gates issued, or `null`. Optional in the schema so that older manifests still validate; **required by the deployer under `--inbox`.** See below. |
 | `notes` | yes | Free text for whoever reads the journal at 3am. May be empty; an empty `notes` on a migration-bearing release is a smell. |
 
 ## Component identity, and what is deliberately absent
@@ -156,36 +178,90 @@ migrations on startup. That is why the class matters at deploy time rather than
 at some later "run the migrations" step — by the time the relay gate passes,
 the schema has already moved.
 
-## `promoted_by` — the Phase 2 seam
+## The two promotion claims
 
-Must be `null` today, and a non-null value is **refused rather than ignored**.
-A manifest that claims an approval nothing verifies is strictly worse than one
-that claims nothing, because it reads like authority to the next person who
-greps the audit log.
+`promoted_by` says *a human with a key approved this*. `staging_stamp` says
+*the gates passed*. They are separate fields because they are separate claims,
+and a pipeline that collapsed them would leave an audit log unable to say which
+one was actually made.
 
-Phase 2 replaces the single `gate_authorization()` function in `deploy.sh` with
-real signature verification and drops the `null` allowance from the schema in
-the same change. The anticipated shape is already documented in the schema:
+### `promoted_by` — where the approval can be found
 
 ```json
 "promoted_by": {
-  "kind": "owner-approval",
-  "pubkey": "<64-hex owner>",
-  "event": "<64-hex approval event>",
-  "sig": "<128-hex>"
+  "root": "<64-hex pull-request root event>",
+  "revision": "<64-hex 1619 update event, or the root's own id>",
+  "owner": "<64-hex pubkey whose approval counts>"
 }
 ```
 
-One function, one caller, one schema field. See `docs/selfhost-releases.md` for
-the rest of the Phase 2–5 seams.
+Three ids, and deliberately **not** a signature. A signature copied into a
+manifest proves only that whoever wrote the manifest could copy a signature, and
+re-checking it locally would be re-checking the manifest against itself. These
+fields name a *question* instead:
+
+```bash
+buzz projects release-check --root <root> --revision <revision> --owner <owner>
+```
+
+The deployer asks it of the live relay using the **deployed** `/opt/buzz/bin/buzz`
+— never the candidate staged in the drop, because a release must not vouch for
+itself — and requires exit 0 **and** a verdict whose `commit` equals this
+manifest's `source_commit`. That last equality is what stops an approval of one
+commit authorising a release of another.
+
+`null` means nobody approved it. That is legal, refused outright under
+`--inbox`, and allowed by hand with `--allow-unattributed`.
+
+### `staging_stamp` — what the gates found
+
+```json
+"staging_stamp": {
+  "stamp_sha256": "<64-hex of promote-stamp.json as staged>",
+  "verdict": "promotable" | "promotable_with_waivers",
+  "stamped_at": "<the stamp's own UTC timestamp>",
+  "waived": 0
+}
+```
+
+A *summary*. The evidence is `promote-stamp.json`
+(`schema: "buzz.staging.promote-stamp/v1"`, written by
+`scripts/selfhost/gates/stamp.sh`), which `--stage` copies into the release drop
+beside `manifest.json` under that fixed name. The deployer re-hashes the file
+against `stamp_sha256` and re-derives every claim from the original, so the
+summary is never load-bearing on its own.
+
+The minter refuses to embed a stamp that is not `promotable` or
+`promotable_with_waivers`, whose `binding.bound` is not `true`, whose
+`candidate.source_commit` is not this manifest's, whose `acp`/`cli` hashes
+disagree with the components being shipped, or whose `verdict` and waiver count
+contradict each other. `waived` is summed from
+`gates[].details.waivers.applied` rather than read off a total, because a total
+is a claim and a list is evidence.
+
+The filename is fixed in the code, never a path in the manifest — the same rule
+that keeps `install_path` out of the format. `deploy.sh --stamp-file <path>`
+exists for the un-staged shape (`--out`, where the stamp lives wherever the
+operator keeps it) and is a usage error under `--inbox`, where the drop is
+self-contained by construction.
+
+**The relay does not hash-join.** The gates test a `buzz-relay` built from
+source; the manifest ships a Docker image id. Different bytes, same commit — so
+the relay half of a stamp is bound by `source_commit` alone, and the deployer
+prints `relay-image=COMMIT-ONLY` rather than implying a check it did not make.
+
+See `docs/selfhost-releases.md` for the full enforcement matrix.
 
 ## Minting
 
 ```bash
-# From the build worktree, after docker build and cargo build --release.
+# From the build worktree, after docker build, cargo build --release, and a
+# green run of scripts/selfhost/gates/run-gates.sh.
 scripts/selfhost/mint-manifest.py generate \
   --name projects-merge \
   --components relay-image,acp,cli \
+  --staging-stamp scripts/selfhost/gates/promote-stamp.json \
+  --promoted-by <root>:<revision>:<owner> \
   --notes "…" \
   --stage /opt/buzz/releases/incoming
 
@@ -195,16 +271,29 @@ scripts/selfhost/deploy.sh --artifact-root "$PWD" /tmp/m.json          # dry run
 scripts/selfhost/deploy.sh --artifact-root "$PWD" --execute /tmp/m.json
 ```
 
+A drop minted without `--staging-stamp` and `--promoted-by` is refused by an
+unattended deploy. That is the point: the flags are how the two claims get made,
+and a release that makes neither is one the deployer will only ship with a human
+typing `--allow-unstamped --allow-unattributed`.
+
 The minter refuses an uncommitted worktree (`--allow-dirty` overrides, and
 records nothing about the edits — use it only when you genuinely know the
-binaries predate them), refuses to build or pull anything, and refuses to
-classify a non-empty migrations delta for you. It ends by validating its own
-output: a minter that cannot validate what it just minted is a minter nobody
-should trust.
+binaries predate them), refuses to build or pull anything, refuses to classify a
+non-empty migrations delta for you, and refuses to embed a stamp that does not
+describe this release. It ends by validating its own output: a minter that
+cannot validate what it just minted is a minter nobody should trust.
 
-Re-validate at any time — this is also exactly what `deploy.sh` runs at
-preflight:
+Re-validate at any time — this is also (bar two deliberate exceptions) exactly
+what `deploy.sh` runs at preflight:
 
 ```bash
 scripts/selfhost/mint-manifest.py validate --manifest /tmp/m.json --artifact-root "$PWD"
 ```
+
+`deploy.sh` passes `--no-repo` and `--no-stamp-file` and takes those two checks
+back itself, for two different reasons. `--no-repo` because HEAD equality is
+only provable in the build worktree and the deployer may be a systemd unit
+pointed at the shared object store. `--no-stamp-file` because the check is
+right, but its *name* matters: "the promote stamp did not verify" has to reach
+the journal as `preflight.stamp` rather than as one line inside a validator's
+output. Step names are an interface.

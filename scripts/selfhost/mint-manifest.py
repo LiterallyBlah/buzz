@@ -21,6 +21,16 @@ What this tool is NOT allowed to do, and why:
   ``none``, because that is arithmetic. A non-empty delta demands an explicit
   ``--migrations backward-safe|ack-required`` from a human who read the SQL.
   Guessing here is how you find out at 3am that rollback does not roll back.
+* It never judges and it never approves. ``--staging-stamp`` copies in a
+  verdict the gates reached; ``--promoted-by`` records where an owner's approval
+  can be found. Both are *pointers to evidence produced elsewhere*, re-derived
+  here and re-derived again by the deployer. A minter that could mint its own
+  promotion would be the author signing their own release.
+
+Two claims travel with a release and they are deliberately separate fields:
+``staging_stamp`` says *the gates passed*, ``promoted_by`` says *a human with a
+key approved this*. Neither implies the other, and a pipeline that collapsed
+them would make an audit log unable to say which one was actually made.
 
 Usage:
 
@@ -28,6 +38,8 @@ Usage:
         --components relay-image,acp,cli --notes "..." --out /tmp/manifest.json
 
     scripts/selfhost/mint-manifest.py generate --name projects-merge \\
+        --staging-stamp scripts/selfhost/gates/promote-stamp.json \\
+        --promoted-by <root>:<revision>:<owner> \\
         --stage /opt/buzz/releases/incoming        # atomic inbox drop
 
     scripts/selfhost/mint-manifest.py validate --manifest /path/to/manifest.json
@@ -69,6 +81,175 @@ COMPONENTS = ("relay-image", "acp", "cli")
 # The relay is the leg everything else stands on. If it is in the release it
 # moves first — encoded here so a hand-edited deploy_order cannot invert it.
 FIRST_IF_PRESENT = "relay-image"
+
+# --------------------------------------------------------------------------
+# The staging promotion stamp.
+#
+# scripts/selfhost/gates/stamp.sh writes it; this tool summarises it into the
+# manifest and stages the file itself beside manifest.json so the deployer can
+# re-derive every claim from the original rather than from our summary. The
+# summary is a convenience for reading; the file is the evidence.
+# --------------------------------------------------------------------------
+
+STAMP_SCHEMA_ID = "buzz.staging.promote-stamp/v1"
+
+# A fixed name inside the release drop, never a path the manifest chooses. Same
+# reasoning as the absent install_path: the deployer runs as root, and a
+# manifest that could name a file for it to open is a manifest that can point it
+# somewhere else.
+STAMP_FILENAME = "promote-stamp.json"
+
+# The two verdicts the gates call promotable. A closed set, checked by equality:
+# `startswith("promotable")` would also accept a future `promotable_but_expired`,
+# which is the exact mistake gates/README.md warns about.
+STAMP_PROMOTABLE = ("promotable", "promotable_with_waivers")
+
+# Roles the stamp hashes that a manifest also ships as a hashed component. The
+# relay is missing from this list on purpose and it is the one thing about this
+# join worth understanding: the gates test a relay binary built from source
+# (target/<profile>/buzz-relay) and the manifest ships a Docker image id. Those
+# are different bytes of the same commit, so there is no hash to compare. The
+# relay half of a stamp is bound by source_commit ALONE, and every tool that
+# consumes it says so rather than implying a verification it did not perform.
+STAMP_JOINABLE_ROLES = ("acp", "cli")
+
+
+def stamp_artifact_sha(stamp: dict, role: str) -> str | None:
+    """The sha256 the stamp recorded for `role`, or None if it hashed no such thing."""
+    candidate = stamp.get("candidate") or {}
+    for artifact in candidate.get("artifacts") or []:
+        if isinstance(artifact, dict) and artifact.get("role") == role and artifact.get("present"):
+            sha = artifact.get("sha256")
+            return sha if isinstance(sha, str) else None
+    return None
+
+
+def stamp_waived_count(stamp: dict) -> int:
+    """Waived test failures in force across every gate.
+
+    Summed from the same field the gates write (`gates[].details.waivers.applied`)
+    rather than read off a total the stamp states, because a total is a claim and
+    a list is evidence.
+    """
+    total = 0
+    for gate in stamp.get("gates") or []:
+        if not isinstance(gate, dict):
+            continue
+        waivers = (gate.get("details") or {}).get("waivers") or {}
+        applied = waivers.get("applied") or []
+        if isinstance(applied, list):
+            total += len(applied)
+    return total
+
+
+def check_stamp(stamp: dict, data: dict, label: str, errors: list[str]) -> dict | None:
+    """Every claim a stamp has to survive before a manifest may summarise it.
+
+    Returns the summary that goes into the manifest, or None when the stamp is
+    not fit to be summarised. Populates `errors` either way, because an operator
+    fixing a broken promotion wants the whole list.
+    """
+    if stamp.get("schema") != STAMP_SCHEMA_ID:
+        errors.append(
+            f"{label}: schema is {stamp.get('schema')!r}, expected {STAMP_SCHEMA_ID!r} — "
+            "this file is not a promotion stamp this tool was written against"
+        )
+        return None
+
+    verdict = stamp.get("verdict")
+    if verdict not in STAMP_PROMOTABLE:
+        errors.append(
+            f"{label}: verdict is {verdict!r}. Only {' and '.join(STAMP_PROMOTABLE)} may be "
+            "minted into a release. A `refused` stamp in particular means the artifacts or "
+            "HEAD moved mid-run, so the gate results describe different bytes than these — "
+            "re-run the gates, do not deploy"
+        )
+        return None
+
+    binding = stamp.get("binding") or {}
+    if binding.get("bound") is not True:
+        errors.append(
+            f"{label}: binding.bound is not true — the bytes the gates exercised are not the "
+            "bytes this stamp describes, so its verdict says nothing about this release"
+        )
+
+    stamped_commit = (stamp.get("candidate") or {}).get("source_commit")
+    if stamped_commit != data["source_commit"]:
+        errors.append(
+            f"{label}: candidate.source_commit {str(stamped_commit)[:12]} does not match the "
+            f"manifest's {data['source_commit'][:12]} — this is a stamp for a different tree, "
+            "and joining it to this release would let one commit's evidence authorise another's"
+        )
+
+    # The hash join, where one exists. A component the stamp never hashed is
+    # reported by the deployer as commit-bound rather than treated as verified;
+    # a component it hashed DIFFERENTLY is fatal, because then two tools have
+    # measured the same role and disagreed.
+    for role in STAMP_JOINABLE_ROLES:
+        component = (data.get("components") or {}).get(role)
+        if not component:
+            continue
+        stamped = stamp_artifact_sha(stamp, role)
+        if stamped is None:
+            continue
+        if stamped != component["sha256"]:
+            errors.append(
+                f"{label}: {role} was gated as {stamped[:16]}… but this release ships "
+                f"{component['sha256'][:16]}… — the evidence describes a different binary"
+            )
+
+    waived = stamp_waived_count(stamp)
+    if verdict == "promotable" and waived:
+        errors.append(
+            f"{label}: verdict is `promotable` but {waived} waiver(s) are recorded in "
+            "gates[].details.waivers.applied. stamp.sh downgrades to "
+            "`promotable_with_waivers` whenever a waiver applies, so one of these two "
+            "fields has been edited"
+        )
+    if verdict == "promotable_with_waivers" and not waived:
+        errors.append(
+            f"{label}: verdict is `promotable_with_waivers` but no waivers are recorded — "
+            "the same disagreement, in the other direction"
+        )
+
+    stamped_at = stamp.get("stamped_at")
+    if not isinstance(stamped_at, str) or not stamped_at:
+        errors.append(f"{label}: stamped_at is missing or not a string")
+        stamped_at = ""
+
+    if errors:
+        return None
+    return {"verdict": verdict, "stamped_at": stamped_at, "waived": waived}
+
+
+def read_stamp(path: Path, errors: list[str]) -> dict | None:
+    try:
+        return json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        errors.append(f"cannot read promotion stamp {path}: {exc}")
+        return None
+
+
+def parse_promoted_by(raw: str) -> dict:
+    """Parse `--promoted-by <root>:<revision>:<owner>` into the manifest object.
+
+    Three ids, colon separated, in the order `buzz projects release-check` takes
+    them. Deliberately not four fields with a `kind` discriminator: there is one
+    kind of authorization the deployer knows how to verify, and a field naming
+    others it does not would be a promise.
+    """
+    parts = raw.split(":")
+    if len(parts) != 3:
+        raise SystemExit(
+            "--promoted-by must be <root>:<revision>:<owner> — three 64-hex ids, colon "
+            f"separated (got {len(parts)} field(s)). The revision is the 1619 update event "
+            "id, or the root's own id for a release cut before the first revision."
+        )
+    root, revision, owner = (part.strip().lower() for part in parts)
+    for name, value in (("root", root), ("revision", revision), ("owner", owner)):
+        if not re.fullmatch(r"[0-9a-f]{64}", value):
+            raise SystemExit(f"--promoted-by {name} must be 64 hex characters, got {value!r}")
+    return {"root": root, "revision": revision, "owner": owner}
 
 
 def git(*args: str) -> str:
@@ -259,6 +440,8 @@ def validate_manifest(
     check_artifacts: bool = True,
     check_repo: bool = True,
     check_image: bool = True,
+    check_stamp_file: bool = True,
+    stamp_path: Path | None = None,
 ) -> list[str]:
     """Every check the deployer relies on, in one place both tools can call.
 
@@ -289,13 +472,46 @@ def validate_manifest(
             "the release: the relay is the leg everything else stands on"
         )
 
-    if data["promoted_by"] is not None:
-        errors.append(
-            "promoted_by must be null in Phase 1. Nothing verifies a promotion "
-            "claim yet, and an unverified claim that reads as authority in an "
-            "audit log is worse than no claim at all. See gate_authorization() "
-            "in deploy.sh for the Phase 2 seam."
-        )
+    # promoted_by's SHAPE is the schema's job now that something verifies its
+    # CONTENT: gate_authorization() in deploy.sh runs `buzz projects
+    # release-check` against the live relay and requires the verdict's commit to
+    # equal source_commit. The old blanket rejection existed only because
+    # nothing checked it, and a claim nobody checks is worse than no claim; that
+    # is no longer the situation. Null stays legal and stays loud — the deployer
+    # refuses it outright under --inbox and demands --allow-unattributed from a
+    # human otherwise.
+
+    # The stamp file, re-derived rather than believed. `check_stamp_file=False`
+    # is the same accommodation `check_repo=False` is: deploy.sh takes this one
+    # check back so it can report it under its own `preflight.stamp` step name
+    # (which is an interface) instead of burying it in a validator's output.
+    if data.get("staging_stamp") is not None and check_stamp_file:
+        summary = data["staging_stamp"]
+        path = stamp_path or (artifact_root / STAMP_FILENAME)
+        if not path.is_file():
+            errors.append(
+                f"staging_stamp: the manifest summarises a promotion stamp but {path} does "
+                "not exist. The summary is not the evidence; without the file nothing here "
+                "can be re-derived"
+            )
+        else:
+            digest = sha256_file(path)
+            if digest != summary["stamp_sha256"]:
+                errors.append(
+                    f"staging_stamp: {path} hashes to {digest[:16]}…, manifest says "
+                    f"{summary['stamp_sha256'][:16]}… — the stamp changed after minting"
+                )
+            else:
+                stamp = read_stamp(path, errors)
+                if stamp is not None:
+                    fresh = check_stamp(stamp, data, f"staging_stamp ({path.name})", errors)
+                    if fresh is not None:
+                        for field in ("verdict", "stamped_at", "waived"):
+                            if fresh[field] != summary[field]:
+                                errors.append(
+                                    f"staging_stamp.{field} is {summary[field]!r} but the "
+                                    f"stamp says {fresh[field]!r}"
+                                )
 
     if check_repo:
         try:
@@ -369,7 +585,7 @@ def worktree_is_dirty() -> str:
     return "\n".join(f"  {line.strip()}" for line in out.splitlines()) if out else ""
 
 
-def build_manifest(args: argparse.Namespace) -> tuple[dict, Path]:
+def build_manifest(args: argparse.Namespace) -> tuple[dict, Path, Path | None]:
     selected = [c.strip() for c in args.components.split(",") if c.strip()]
     unknown = [c for c in selected if c not in COMPONENTS]
     if unknown:
@@ -441,14 +657,36 @@ def build_manifest(args: argparse.Namespace) -> tuple[dict, Path]:
         "components": components,
         "deploy_order": order,
         "migrations": migrations,
-        # Phase 1 has no authorization authority to record. See the schema.
-        "promoted_by": None,
+        # Where the owner's approval can be re-derived from, or null for a
+        # release nobody has approved. Null is not the safe default — it is the
+        # honest one, and the deployer treats it as a refusal unless a human is
+        # standing there. See the schema.
+        "promoted_by": parse_promoted_by(args.promoted_by) if args.promoted_by else None,
+        # Filled in below when a stamp was supplied, so the field is always
+        # present and always says the same kind of thing: null means "no gate
+        # evidence travels with this release", never "the field is old".
+        "staging_stamp": None,
         "notes": args.notes,
     }
-    return manifest, artifact_root
+
+    stamp_source: Path | None = None
+    if args.staging_stamp:
+        stamp_source = Path(args.staging_stamp).resolve()
+        errors: list[str] = []
+        stamp = read_stamp(stamp_source, errors)
+        summary = check_stamp(stamp, manifest, str(stamp_source), errors) if stamp else None
+        if errors or summary is None:
+            raise SystemExit(
+                "promotion stamp is not fit to mint:\n  " + "\n  ".join(errors)
+            )
+        # The file's own hash, taken here and re-taken by the deployer. This is
+        # the only thing that ties the summary above to the evidence below it.
+        manifest["staging_stamp"] = {"stamp_sha256": sha256_file(stamp_source), **summary}
+
+    return manifest, artifact_root, stamp_source
 
 
-def stage(manifest: dict, artifact_root: Path, inbox: Path) -> Path:
+def stage(manifest: dict, artifact_root: Path, inbox: Path, stamp_source: Path | None) -> Path:
     """Assemble a self-contained release directory and hand it over atomically.
 
     The staging-then-rename dance is the drop protocol the deployer's .path
@@ -481,6 +719,15 @@ def stage(manifest: dict, artifact_root: Path, inbox: Path) -> Path:
         spec["artifact"] = basename
         sums.append(f"{spec['sha256']}  {basename}")
 
+    # The evidence travels with the release. Copying the stamp in — rather than
+    # recording where it lived — is what lets the deployer re-derive the whole
+    # promotion from the drop alone, on a box where /tmp/buzz-gates/<run_id> was
+    # cleaned up an hour ago. Fixed name, so nothing in the manifest chooses a
+    # file for a root process to open.
+    if stamp_source is not None:
+        shutil.copy2(stamp_source, staging / STAMP_FILENAME)
+        sums.append(f"{staged['staging_stamp']['stamp_sha256']}  {STAMP_FILENAME}")
+
     (staging / "manifest.json").write_text(json.dumps(staged, indent=2) + "\n")
     if sums:
         (staging / "SHA256SUMS").write_text("\n".join(sums) + "\n")
@@ -500,20 +747,25 @@ def stage(manifest: dict, artifact_root: Path, inbox: Path) -> Path:
 
 
 def generate(args: argparse.Namespace) -> None:
-    manifest, artifact_root = build_manifest(args)
+    manifest, artifact_root, stamp_source = build_manifest(args)
 
     if args.stage:
-        final = stage(manifest, artifact_root, Path(args.stage))
+        final = stage(manifest, artifact_root, Path(args.stage), stamp_source)
         print(json.dumps({"staged": str(final), "name": manifest["name"],
                           "source_commit": manifest["source_commit"],
                           "components": manifest["deploy_order"],
-                          "migrations": manifest["migrations"]}, indent=2))
+                          "migrations": manifest["migrations"],
+                          "staging_stamp": manifest["staging_stamp"],
+                          "promoted_by": manifest["promoted_by"]}, indent=2))
         return
 
     problems = validate_manifest(
         manifest,
         artifact_root=artifact_root,
         check_image="relay-image" in manifest["components"],
+        # Un-staged, the stamp stays wherever the operator keeps it; the
+        # manifest names no path to it, so validation has to be told.
+        stamp_path=stamp_source,
     )
     if problems:
         raise SystemExit("minted manifest failed its own validation:\n  " + "\n  ".join(problems))
@@ -543,14 +795,26 @@ def validate(args: argparse.Namespace) -> None:
         check_artifacts=not args.no_artifacts,
         check_repo=not args.no_repo,
         check_image=not args.no_image and "relay-image" in data.get("components", {}),
+        check_stamp_file=not args.no_stamp_file,
+        stamp_path=Path(args.staging_stamp).resolve() if args.staging_stamp else None,
     )
     if problems:
         raise SystemExit("manifest invalid:\n  " + "\n  ".join(problems))
+    stamp = data.get("staging_stamp")
+    # Say what was checked, including the two things that were not: an
+    # unstamped release and an unattributed one both validate, and a report
+    # that did not distinguish them from the checked case would be the
+    # comfortable lie this whole pipeline is built to avoid.
+    promotion = (
+        f"stamp: {stamp['verdict']} ({stamp['waived']} waived)" if stamp else "stamp: none"
+    )
+    approval = "approved-by-owner" if data.get("promoted_by") else "unattributed"
     print(
         f"validated selfhost release manifest {path} "
         f"({data['name']} @ {data['source_commit'][:12]}, "
         f"components: {', '.join(data['deploy_order'])}, "
-        f"migrations: {data['migrations']})"
+        f"migrations: {data['migrations']}, "
+        f"{promotion}, {approval})"
     )
 
 
@@ -572,6 +836,15 @@ def main() -> None:
     gen.add_argument("--stage", help="assemble a self-contained release dir under this inbox and rename it into place")
     gen.add_argument("--allow-dirty", action="store_true",
                      help="mint despite uncommitted tracked changes (source_commit will not describe the tree)")
+    gen.add_argument("--staging-stamp",
+                     help="path to gates/promote-stamp.json. Its claims are re-derived against "
+                          "this manifest, summarised into staging_stamp, and (with --stage) the "
+                          f"file itself is copied into the drop as {STAMP_FILENAME}")
+    gen.add_argument("--promoted-by",
+                     help="<root>:<revision>:<owner> — three 64-hex ids naming the owner "
+                          "authorization the deployer re-derives with `buzz projects "
+                          "release-check`. Omit for an unattributed release, which the deployer "
+                          "refuses unattended")
 
     val = sub.add_parser("validate", help="re-derive every claim in a manifest")
     val.add_argument("--manifest", required=True)
@@ -579,6 +852,12 @@ def main() -> None:
     val.add_argument("--no-artifacts", action="store_true", help="skip hashing (structure only)")
     val.add_argument("--no-repo", action="store_true", help="skip the source_commit/HEAD check")
     val.add_argument("--no-image", action="store_true", help="skip the docker image identity check")
+    val.add_argument("--staging-stamp",
+                     help=f"where the stamp file is (default: <artifact-root>/{STAMP_FILENAME})")
+    val.add_argument("--no-stamp-file", action="store_true",
+                     help="skip re-deriving the stamp file; the staging_stamp summary is still "
+                          "schema-checked. deploy.sh passes this so it can report the stamp "
+                          "under its own preflight step")
 
     args = parser.parse_args()
     generate(args) if args.command == "generate" else validate(args)

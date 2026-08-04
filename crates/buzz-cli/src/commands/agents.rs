@@ -11,6 +11,7 @@ use nostr::PublicKey;
 use serde_json::json;
 use uuid::Uuid;
 
+use crate::agent_drain::{build_drain, DRAIN_CONTROL_TYPE};
 use crate::agent_management::{build_create, build_update, CreateAgentDraft, UpdateAgentDraft};
 use crate::client::BuzzClient;
 use crate::error::CliError;
@@ -625,7 +626,55 @@ pub async fn dispatch(command: AgentsCmd, client: &BuzzClient) -> Result<(), Cli
         }
 
         AgentsCmd::Archived => cmd_archived(client).await,
+
+        AgentsCmd::Drain { agent, reason } => {
+            validate_hex64(&agent)?;
+            let built = build_drain(client.keys(), &agent, reason.as_deref())?;
+            // Kind 24200 is ephemeral, and the relay rejects ephemeral kinds
+            // over HTTP — the same WebSocket path `draft-create` uses.
+            let response = client.publish_ephemeral_event(built.event).await?;
+            let owner = client.keys().public_key().to_hex().to_ascii_lowercase();
+            println!("{}", drain_ack(&response, &built.agent, &owner)?);
+            Ok(())
+        }
     }
+}
+
+/// The `agents drain` acknowledgement: the relay's own response, plus the three
+/// facts a caller cannot recover from it.
+///
+/// A separate function because the ack is a contract two very different readers
+/// depend on — a human at a terminal and `deploy.sh` deciding whether to wait —
+/// and a contract that lives inline in a match arm is a contract no test can
+/// hold still.
+///
+/// `drain_confirmed` is a literal `false` and is not derived from anything.
+/// That is the whole point: this process observed a *delivery*. The drain
+/// happens afterwards, in another process, on a schedule set by whatever work
+/// that process is holding. A field computed from the publish result would be
+/// reporting the wrong event under the right name, and a deployer that believed
+/// it would install a binary over a running turn.
+fn drain_ack(response: &str, agent: &str, owner: &str) -> Result<serde_json::Value, CliError> {
+    let mut output: serde_json::Value = serde_json::from_str(response)
+        .map_err(|e| CliError::Other(format!("invalid relay response: {e}")))?;
+    if let Some(obj) = output.as_object_mut() {
+        obj.insert("agent".into(), agent.into());
+        // The signer, restated because it is the field the agent checks: a
+        // drain from the wrong key is accepted by the relay and then dropped by
+        // the agent, and the only way to diagnose that afterwards is to know
+        // which key was used.
+        obj.insert("owner".into(), owner.into());
+        obj.insert("type".into(), DRAIN_CONTROL_TYPE.into());
+        obj.insert("drain_confirmed".into(), false.into());
+        obj.insert(
+            "note".into(),
+            "The relay accepted the frame. Whether the agent drained is not observable \
+             from here: watch its journal for 'drain requested by owner' and wait for the \
+             process to exit 0. A drained agent stays down until something starts it."
+                .into(),
+        );
+    }
+    Ok(output)
 }
 
 /// Require `BUZZ_AUTH_TAG` and parse the owner pubkey from it. Used only by
@@ -1873,5 +1922,184 @@ mod activity_tests {
         )
         .await;
         assert_eq!(results, vec![(me.public_key().to_hex(), false)]);
+    }
+}
+
+/// The drain publish path, driven end to end against a WebSocket relay.
+///
+/// The frame's *shape* is proved in `crate::agent_drain`; what is proved here
+/// is the part only the command owns: that `agents drain` reaches the relay at
+/// all, and that it reaches it over WebSocket. That distinction is not
+/// pedantry — kind 24200 is ephemeral, the relay refuses ephemeral kinds over
+/// HTTP, and a drain sent down the HTTP path would be rejected at the one
+/// moment nobody is watching (a deploy, unattended, at 3am). A test relay that
+/// only spoke HTTP would have passed.
+#[cfg(test)]
+mod drain_publish_tests {
+    use std::net::SocketAddr;
+    use std::sync::{Arc, Mutex};
+
+    use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+    use axum::extract::State;
+    use axum::response::Response;
+    use axum::routing::any;
+    use axum::Router;
+    use nostr::Keys;
+    use serde_json::Value;
+    use tokio::net::TcpListener;
+
+    use super::*;
+    use crate::AgentsCmd;
+
+    /// Every EVENT the relay was handed, in order.
+    type Received = Arc<Mutex<Vec<Value>>>;
+
+    /// A NIP-42 relay that accepts everything and remembers what it was sent.
+    ///
+    /// It answers `AUTH` and `EVENT` with `OK … true` and nothing else, which
+    /// is the whole protocol `buzz_ws_client::publish_event` drives. Accepting
+    /// unconditionally is deliberate: this test is about what the CLI sends,
+    /// and a relay with opinions would let a policy failure masquerade as a
+    /// send failure.
+    async fn ws_relay() -> (String, Received) {
+        let received: Received = Arc::new(Mutex::new(Vec::new()));
+        let app = Router::new()
+            .route(
+                "/",
+                any(
+                    |State(seen): State<Received>, upgrade: WebSocketUpgrade| async move {
+                        let response: Response =
+                            upgrade.on_upgrade(move |socket| serve(socket, seen));
+                        response
+                    },
+                ),
+            )
+            .with_state(received.clone());
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr: SocketAddr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (format!("http://{addr}"), received)
+    }
+
+    async fn serve(mut socket: WebSocket, seen: Received) {
+        // The challenge comes first, unprompted: that is what the client waits
+        // for before it will authenticate.
+        let _ = socket
+            .send(Message::Text(r#"["AUTH","deadbeef"]"#.into()))
+            .await;
+        while let Some(Ok(message)) = socket.recv().await {
+            let Message::Text(text) = message else {
+                continue;
+            };
+            let Ok(frame) = serde_json::from_str::<Vec<Value>>(&text) else {
+                continue;
+            };
+            let verb = frame.first().and_then(Value::as_str).unwrap_or_default();
+            let Some(event) = frame.get(1) else { continue };
+            let id = event
+                .get("id")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            if verb == "EVENT" {
+                seen.lock().unwrap().push(event.clone());
+            }
+            let _ = socket
+                .send(Message::Text(
+                    serde_json::json!(["OK", id, true, ""]).to_string().into(),
+                ))
+                .await;
+        }
+    }
+
+    fn tag_value(event: &Value, name: &str) -> Option<String> {
+        event.get("tags")?.as_array()?.iter().find_map(|tag| {
+            let tag = tag.as_array()?;
+            (tag.first()?.as_str()? == name).then(|| tag.get(1)?.as_str().map(str::to_owned))?
+        })
+    }
+
+    #[tokio::test]
+    async fn a_drain_reaches_the_relay_over_websocket_signed_by_the_caller() {
+        let owner = Keys::generate();
+        let agent = Keys::generate();
+        let (url, received) = ws_relay().await;
+        let client = BuzzClient::new(url, owner.clone(), None, None).unwrap();
+
+        dispatch(
+            AgentsCmd::Drain {
+                agent: agent.public_key().to_hex(),
+                reason: Some("deploy projects-merge".into()),
+            },
+            &client,
+        )
+        .await
+        .expect("the drain publishes");
+
+        let events = received.lock().unwrap().clone();
+        assert_eq!(events.len(), 1, "exactly one frame is published");
+        let event = &events[0];
+        assert_eq!(event["kind"].as_u64(), Some(24_200));
+        assert_eq!(
+            event["pubkey"].as_str(),
+            Some(owner.public_key().to_hex().as_str()),
+            "the caller signs — the agent drops a control frame from anyone but its owner"
+        );
+        assert_eq!(
+            tag_value(event, "p").as_deref(),
+            Some(agent.public_key().to_hex().as_str()),
+            "the relay routes on `p`, so the drain must be p-tagged to the agent"
+        );
+        assert_eq!(tag_value(event, "frame").as_deref(), Some("control"));
+    }
+
+    /// The ack, field by field. `deploy.sh` and a human both read this, and the
+    /// one field that matters most is the one that is always false.
+    #[test]
+    fn the_ack_reports_delivery_and_refuses_to_claim_more() {
+        let relay = r#"{"event_id":"abc","accepted":true,"message":""}"#;
+        let ack = drain_ack(relay, "d".repeat(64).as_str(), "0".repeat(64).as_str()).unwrap();
+
+        assert_eq!(ack["event_id"], "abc");
+        assert_eq!(ack["accepted"], true);
+        assert_eq!(ack["agent"], "d".repeat(64));
+        assert_eq!(ack["owner"], "0".repeat(64));
+        assert_eq!(ack["type"], "drain");
+        assert_eq!(
+            ack["drain_confirmed"], false,
+            "this process saw a delivery, never a drain — the field is a constant"
+        );
+        assert!(ack["note"].as_str().unwrap().contains("exit 0"));
+    }
+
+    /// A relay answer that is not JSON is an error, not an ack with holes in
+    /// it: a caller parsing `{}` would read `drain_confirmed` as absent and
+    /// could not tell that from false.
+    #[test]
+    fn an_unparseable_relay_response_does_not_become_an_ack() {
+        assert!(drain_ack("not json", "a", "b").is_err());
+    }
+
+    /// A malformed pubkey must not open a socket. The gate is argument
+    /// validation, and it has to sit before the publish for the same reason the
+    /// peer-call ceiling does: an event that reaches the relay has already
+    /// happened.
+    #[tokio::test]
+    async fn a_bad_agent_pubkey_never_reaches_the_relay() {
+        let (url, received) = ws_relay().await;
+        let client = BuzzClient::new(url, Keys::generate(), None, None).unwrap();
+
+        let error = dispatch(
+            AgentsCmd::Drain {
+                agent: "not-a-pubkey".into(),
+                reason: None,
+            },
+            &client,
+        )
+        .await
+        .expect_err("a malformed agent is refused");
+        assert!(matches!(error, CliError::Usage(_)), "unexpected: {error:?}");
+        assert!(received.lock().unwrap().is_empty());
     }
 }

@@ -89,12 +89,52 @@
     },
     "promoted_by": {
       "type": ["object", "null"],
-      "description": "RESERVED — Phase 2 authorization slot. Must be null in Phase 1. A non-null value is rejected rather than ignored: a manifest that claims an approval nothing verifies is strictly worse than a manifest that claims nothing, because it reads like authority in an audit log. Phase 2 replaces the single gate_authorization() function in deploy.sh with real signature verification and this schema's `null` allowance is dropped in the same change. Anticipated shape: {\"kind\": \"owner-approval\", \"pubkey\": \"<64-hex>\", \"event\": \"<64-hex>\", \"sig\": \"<128-hex>\"}.",
+      "description": "WHO APPROVED THIS RELEASE — the coordinates of an owner authorization the deployer re-derives from the relay. Not the authorization itself: a signature copied into a manifest proves only that whoever wrote the manifest could copy a signature, and re-checking it locally would re-check the manifest against itself. These three fields name a question instead — `buzz projects release-check --root <root> --revision <revision> --owner <owner>` — and the deployer asks it of the live relay, requiring exit 0 AND a verdict whose `commit` equals this manifest's source_commit. That last equality is what stops an approval of one commit authorising a release of another. Null means nobody has approved this release: the deployer refuses it outright in inbox mode (an unattended deploy needs the whole ceremony) and requires --allow-unattributed from a human otherwise. Null is still allowed because a hand-driven emergency deploy is a real thing that should be loud rather than impossible.",
+      "additionalProperties": false,
+      "required": ["root", "revision", "owner"],
       "properties": {
-        "kind": { "type": "string" },
-        "pubkey": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
-        "event": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
-        "sig": { "type": "string", "pattern": "^[0-9a-f]{128}$" }
+        "root": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$",
+          "description": "The pull-request root event the approval lives on."
+        },
+        "revision": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$",
+          "description": "The revision being released — a 1619 update event id, or the root's own id for a release cut before the first revision."
+        },
+        "owner": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$",
+          "description": "The pubkey whose approval counts. Supplied here rather than discovered, because 'whose approval counts' is a policy the release states and the verifier checks, not something a relay query can answer."
+        }
+      }
+    },
+    "staging_stamp": {
+      "type": ["object", "null"],
+      "description": "WHAT THE GATES FOUND — a summary of the promotion stamp (`buzz.staging.promote-stamp/v1`, written by scripts/selfhost/gates/stamp.sh) that this candidate earned. Deliberately a SIBLING of promoted_by and never a substitute for it: 'the gates passed' and 'a human with a key approved this' are different claims, and collapsing them is how an audit log starts lying about which one was actually made. Optional — a manifest may carry neither, either or both — but the deployer requires it in inbox mode. This object is a summary, not the evidence: the stamp file itself is staged into the release drop as `promote-stamp.json` beside manifest.json, and the deployer re-hashes it against stamp_sha256 and re-derives every join before believing any of this. A fixed filename, not a path in the manifest, for the same reason install paths are not in the manifest.",
+      "additionalProperties": false,
+      "required": ["stamp_sha256", "verdict", "stamped_at", "waived"],
+      "properties": {
+        "stamp_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$",
+          "description": "SHA-256 of the stamp file as staged. The binding between this summary and the evidence it summarises; without it the summary is just a claim the manifest makes about itself."
+        },
+        "verdict": {
+          "type": "string",
+          "enum": ["promotable", "promotable_with_waivers"],
+          "description": "The stamp's verdict, restricted here to the two the gates call promotable. `blocked`, `refused` and `incomplete` are not minted at all — a release built on failed evidence is refused where it is authored, not where it is deployed. `promotable_with_waivers` is NOT equal to `promotable`: a human decided some red tests do not block, and the deployer requires --ack-waivers on the command line before it will ship one."
+        },
+        "stamped_at": {
+          "type": "string",
+          "description": "The stamp's own UTC timestamp, copied through. Advisory: nothing expires a stamp today, and pretending a duration is enforced would be worse than not stating one."
+        },
+        "waived": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "How many waived test failures were in force, summed across gates[].details.waivers.applied. Zero exactly when the verdict is `promotable` — the minter refuses a stamp where those two disagree, because one of them has been edited."
+        }
       }
     },
     "notes": {

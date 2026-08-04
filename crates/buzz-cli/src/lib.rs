@@ -1,3 +1,4 @@
+pub mod agent_drain;
 pub mod agent_management;
 mod client;
 mod commands;
@@ -474,6 +475,37 @@ Examples:\n  \
 buzz agents archived"
     )]
     Archived,
+    /// Tell an agent to stop admitting work, finish what it holds, and exit 0
+    /// (owner-signed control frame, kind 24200)
+    #[command(
+        after_help = "THIS COMMAND CANNOT CONFIRM THE DRAIN COMPLETED. It reports that the \
+relay accepted the frame — nothing more. Whether the agent received it, \
+honoured it, and finished is process-side: watch the unit's journal for \
+`drain requested by owner` and wait for the process to exit 0. The ack's \
+`drain_confirmed` field is always false for exactly this reason.\n\n\
+The frame must be signed by the agent's resolved OWNER — set BUZZ_PRIVATE_KEY \
+to the owner's key. An agent drops a control frame from anyone else, and this \
+command cannot tell in advance which key that is, so a wrongly-signed drain \
+publishes successfully and is then ignored.\n\n\
+A drained agent stays down: the units are Restart=on-failure and a drain \
+exits 0. Something has to start it again — that is the deployer's job, and \
+the reason this is a swap primitive rather than a restart.\n\n\
+Draining twice is harmless. The runtime is idempotent and a second frame does \
+not extend the bound.\n\n\
+Examples:\n  \
+buzz agents drain --agent <AGENT_PUBKEY>\n  \
+buzz agents drain --agent <AGENT_PUBKEY> --reason 'deploy projects-merge'"
+    )]
+    Drain {
+        /// The agent to drain (64-char hex pubkey). Never a private key: this
+        /// command needs only the identity it is addressing.
+        #[arg(long)]
+        agent: String,
+        /// Free text recorded in the agent's log line (max 500 chars; the
+        /// agent logs the first 200)
+        #[arg(long)]
+        reason: Option<String>,
+    },
 }
 
 /// Subcommands for `buzz projects` — the relay reads a project-routed agent
@@ -2480,6 +2512,7 @@ mod tests {
                 "call-result",
                 "draft-create",
                 "draft-update",
+                "drain",
                 "siblings",
                 "unarchive"
             ]
@@ -2714,7 +2747,7 @@ mod tests {
     #[test]
     fn subcommand_counts_are_stable() {
         let expected: Vec<(&str, usize)> = vec![
-            ("agents", 9),
+            ("agents", 10),
             ("canvas", 2),
             ("channels", 16),
             ("dms", 4),

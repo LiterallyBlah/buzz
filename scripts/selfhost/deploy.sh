@@ -33,6 +33,19 @@
 #   5. FAILURE ROLLS BACK. Any gate failure restores the previous binaries and
 #      the previous image, restarts, re-gates, and exits nonzero with a report.
 #      Rollback undoes exactly what this run did, and nothing else.
+#   6. A DOCUMENT CANNOT BE ITS OWN AUTHORISATION. Two claims travel with a
+#      release and neither is taken on the manifest's word: the staging gates'
+#      promote stamp (re-hashed from the file staged beside the manifest) and
+#      the owner's approval (re-derived from the live relay with `buzz projects
+#      release-check`). They are separate fields because "the tests passed" and
+#      "a human approved this" are separate claims, and every weakening of
+#      either is a command-line act that the systemd unit does not perform.
+#   7. DRAIN BEFORE YOU SWAP. An agent is asked to stop admitting work, finish
+#      what it holds and exit 0 before its binary is replaced. When drain is not
+#      configured, or the deployed CLI cannot send one, the deployer says so
+#      loudly and falls back to the old SIGTERM restart. It never falls back
+#      silently: an operator who believes turns were finished when they were
+#      killed is worse off than one who knows they were killed.
 #
 # OUTPUT CONTRACT
 #
@@ -97,6 +110,76 @@ AGENT_GATE_SECONDS="${BUZZ_DEPLOY_AGENT_GATE_SECONDS:-60}"
 FULL_BACKUP_MAX_AGE_MIN="${BUZZ_DEPLOY_FULL_BACKUP_MAX_AGE_MIN:-60}"
 MIN_FREE_MIB="${BUZZ_DEPLOY_MIN_FREE_MIB:-2048}"
 
+# -----------------------------------------------------------------------------
+# Promotion evidence.
+#
+# The staging gates (scripts/selfhost/gates/) write a hash-bound promote stamp;
+# the minter summarises it into the manifest and copies the file itself into the
+# release drop. This deployer re-derives it rather than believing the summary,
+# because a manifest summarising its own evidence is a document vouching for
+# itself. The filename is fixed here and in mint-manifest.py, never read from
+# the manifest — same rule as the install paths below: a root process does not
+# take file paths from a document an agent wrote.
+# -----------------------------------------------------------------------------
+STAMP_FILENAME="promote-stamp.json"
+STAMP_SCHEMA_ID="buzz.staging.promote-stamp/v1"
+
+# -----------------------------------------------------------------------------
+# Authorization.
+#
+# `buzz projects release-check` answers "has the owner approved this exact
+# revision" against the live relay. Two properties of that command are the
+# reason this deployer can use it at all: it prints its verdict as JSON on
+# stdout in every case it reached one, and it prints NOTHING when it could not
+# reach one. So "no verdict" and "unauthorized" are distinguishable here, and
+# they must be — a deployer that read a missing answer as `false` would be
+# refusing every release on the day the relay was down, and one that read it as
+# `true` would be shipping on that same day.
+#
+# BUZZ_DEPLOY_RELEASE_REPO optionally pins which repository an approval may come
+# from. It is configuration and not a manifest field on purpose: "which
+# repository may authorise a release of mine" is a statement about the box, and
+# a manifest that stated its own scope would be choosing its own auditor.
+# -----------------------------------------------------------------------------
+RELEASE_REPO_COORD="${BUZZ_DEPLOY_RELEASE_REPO:-}"
+RELEASE_CHECK_TIMEOUT="${BUZZ_DEPLOY_RELEASE_CHECK_TIMEOUT:-60}"
+
+# -----------------------------------------------------------------------------
+# Drain.
+#
+# Both settings are unset by default, and that default is a WARN and a fallback
+# to the old SIGTERM restart — never silence. A drain that quietly did not
+# happen is worse than no drain at all: the operator believes in-flight turns
+# were finished, and they were killed.
+#
+#   BUZZ_DEPLOY_OWNER_KEY_FILE  an env file (KEY=VALUE) holding the OWNER's
+#                               BUZZ_PRIVATE_KEY, and optionally BUZZ_RELAY_URL.
+#                               A drain frame is only honoured when signed by
+#                               the agent's resolved owner, so this is the one
+#                               key that can send one.
+#   BUZZ_DEPLOY_AGENT_PUBKEYS   "buzz-claude:<64-hex> buzz-codex:<64-hex>" —
+#                               unit name to agent PUBLIC key.
+#
+# The pubkeys come from configuration and never from the agents' own env files.
+# Those files hold BUZZ_PRIVATE_KEY, and a deployer that opened them to derive a
+# pubkey would be a root process reading every agent's secret to learn something
+# public. It has no business knowing an agent's private key, and the cheapest
+# way to keep that true is to never open the file.
+#
+# The wait is bounded and the bound is a compromise stated out loud: the agent's
+# own drain bound is max_turn+100s (7300s at the default BUZZ_ACP_MAX_TURN_DURATION),
+# which is far longer than buzz-deployer.service's TimeoutStartSec=45min. Waiting
+# the full agent bound would get the DEPLOYER killed by systemd mid-swap, which
+# is strictly worse than a loud fallback. So the default waits ten minutes per
+# unit — two units and the gates still fit inside the unit budget — and says so
+# when it gives up. Raising this means raising TimeoutStartSec too; the
+# arithmetic is (DRAIN_WAIT × agent units) + gates + backup < TimeoutStartSec.
+# -----------------------------------------------------------------------------
+OWNER_KEY_FILE="${BUZZ_DEPLOY_OWNER_KEY_FILE:-}"
+AGENT_PUBKEYS_RAW="${BUZZ_DEPLOY_AGENT_PUBKEYS:-}"
+DRAIN_WAIT_SECONDS="${BUZZ_DEPLOY_DRAIN_WAIT_SECONDS:-600}"
+DRAIN_PUBLISH_TIMEOUT="${BUZZ_DEPLOY_DRAIN_PUBLISH_TIMEOUT:-90}"
+
 # The lines buzz-acp must emit within the gate window. Verified against
 # crates/buzz-acp/src/lib.rs and crates/buzz-acp/src/relay.rs at 0fa54b3c:
 # a startup banner, an initialised agent, the projects publisher, and a clean
@@ -147,9 +230,14 @@ EXECUTE=false
 MANIFEST=""
 ARTIFACT_ROOT=""
 INBOX_ROOT=""
+INBOX_MODE=false          # set by parse_args; the whole enforcement matrix hangs off it
 RELEASE_DIR=""
 ANNOUNCE_ROOT="${BUZZ_ANNOUNCE_ROOT:-}"
 ACK_MIGRATIONS=false
+ACK_WAIVERS=false
+ALLOW_UNSTAMPED=false
+ALLOW_UNATTRIBUTED=false
+STAMP_FILE=""             # resolved in main(): --stamp-file, or beside the manifest
 RELAY_RESTART_MODE="${BUZZ_DEPLOY_RELAY_RESTART:-run.sh}"
 declare -a ONLY_COMPONENTS=()
 
@@ -220,6 +308,21 @@ Usage: deploy.sh [options] <manifest.json>
                             "ack-required". Deliberately a command-line act,
                             not a manifest field, so an unattended inbox drop
                             can never run a forward-only migration by itself.
+  --ack-waivers             Required when the promote stamp's verdict is
+                            "promotable_with_waivers". A human decided some red
+                            tests do not block; a human should be present when
+                            they ship. Same shape and same reasoning as
+                            --ack-migrations, and likewise not passed by the
+                            systemd unit.
+  --stamp-file <path>       Where the promote stamp is (default: <artifact
+                            root>/promote-stamp.json). Direct invocation only —
+                            an inbox drop is self-contained by construction and
+                            must not be told to look elsewhere.
+  --allow-unstamped         Deploy a release carrying no promote stamp. Direct
+                            invocation only, and loud: nothing has judged these
+                            bytes.
+  --allow-unattributed      Deploy a release whose promoted_by is null. Direct
+                            invocation only, and loud: nobody has approved it.
   --announce-root <hex>     Post progress comments on this issue/PR root event.
                             Needs BUZZ_RELAY_URL, BUZZ_PRIVATE_KEY,
                             BUZZ_ANNOUNCE_REPO_OWNER and BUZZ_ANNOUNCE_REPO_ID.
@@ -229,6 +332,17 @@ Usage: deploy.sh [options] <manifest.json>
                             or systemd (systemctl restart of the relay unit,
                             which stops the whole compose project first).
   -h, --help                This.
+
+Enforcement matrix (what each mode requires of a release):
+
+                        --inbox (unattended)      direct invocation
+  promote stamp         REQUIRED                  required, or --allow-unstamped
+  verdict w/ waivers    REFUSED (no flag passed)  requires --ack-waivers
+  promoted_by null      REFUSED                   requires --allow-unattributed
+  migrations=ack-req.   REFUSED (no flag passed)  requires --ack-migrations
+
+Every "requires <flag>" is a command-line act the systemd unit does not
+perform, so nothing in the left column can be reached by dropping a file.
 
 Exit codes: 0 ok · 1 refused/blocked · 2 usage or bad manifest · 3 failed and
 rolled back · 4 failed AND ROLLBACK FAILED.
@@ -368,9 +482,15 @@ load_manifest() {
   # deploy time the executor may be a systemd unit pointed at the shared object
   # store, where HEAD is whatever main happens to be. preflight_source_commit()
   # below states which of the two claims it was able to make.
+  #
+  # --no-stamp-file is taken back for a different reason: the check is right
+  # here, but its NAME matters. Step names in this journal are an interface, and
+  # "the promote stamp did not verify" has to arrive as `preflight.stamp` rather
+  # than as one line inside a validator's output. preflight_stamp() runs the
+  # same code, through the same tool, and reports it under its own name.
   local out
   if ! out="$(python3 "${MINTER}" validate --manifest "${MANIFEST}" \
-        --artifact-root "${ARTIFACT_ROOT}" --no-repo 2>&1)"; then
+        --artifact-root "${ARTIFACT_ROOT}" --no-repo --no-stamp-file 2>&1)"; then
     step_fail "preflight.manifest" "$(printf '%s' "${out}" | tr '\n' ' ')"
     finish 2 "manifest invalid"
   fi
@@ -398,6 +518,23 @@ for c in ("acp", "cli"):
         out(f"{c}_artifact", comps[c]["artifact"])
         out(f"{c}_sha256", comps[c]["sha256"])
         out(f"{c}_bytes", str(comps[c]["bytes"]))
+# The two promotion claims, flattened. Presence is its own field so the shell
+# never has to distinguish "absent" from "empty string" — the difference
+# between "no stamp travelled with this release" and "the stamp field was
+# blank" is exactly the kind of ambiguity an enforcement gate must not have.
+stamp = m.get("staging_stamp")
+out("has_stamp", "yes" if stamp else "no")
+if stamp:
+    out("stamp_sha256", stamp["stamp_sha256"])
+    out("stamp_verdict", stamp["verdict"])
+    out("stamp_stamped_at", stamp["stamped_at"])
+    out("stamp_waived", str(stamp["waived"]))
+approval = m.get("promoted_by")
+out("has_promoted_by", "yes" if approval else "no")
+if approval:
+    out("approval_root", approval["root"])
+    out("approval_revision", approval["revision"])
+    out("approval_owner", approval["owner"])
 out("notes", " ".join((m.get("notes") or "").split()))
 PY
   )
@@ -693,21 +830,250 @@ preflight_stack() {
 }
 
 # -----------------------------------------------------------------------------
-# PHASE 2 SEAM — authorization.
+# Preflight: the staging promote stamp.
 #
-# This function is the single place a later phase wires owner approval in. It
-# is deliberately one function with one caller, so the change is a diff you can
-# read in one sitting rather than a policy sprinkled through the runbook.
+# The stamp is the staging judge's verdict on these exact bytes. Three things
+# are checked and they are three different claims:
 #
-# Phase 1 posture: promoted_by must be null. An unverified promotion claim is
-# refused rather than ignored, because a manifest asserting an approval that
-# nothing checked will read like authority to the next person who greps the
-# audit log. The minter enforces the same rule; both ends state it so neither
-# can quietly become the exception.
+#   1. The FILE is the file that was summarised — sha256 of the staged
+#      promote-stamp.json against the manifest's staging_stamp.stamp_sha256.
+#      Without this the summary is a claim the manifest makes about itself.
+#   2. The stamp's own claims still hold — binding.bound, the source_commit
+#      join, and the per-artifact hash join. Delegated to mint-manifest.py so
+#      there is exactly one implementation of "valid" and it is the one that
+#      minted the release.
+#   3. The VERDICT is one this deployer accepts, which is a policy question and
+#      is answered here.
+#
+# On the relay half, plainly: the gates test a buzz-relay built from source and
+# the manifest ships a Docker image id. Those are different bytes of the same
+# commit, so there is NO hash join for the relay — it is bound by source_commit
+# alone. That is a real weakening of the guarantee and this deployer states it
+# in the journal rather than letting a green line imply a check it did not make.
+# -----------------------------------------------------------------------------
+preflight_stamp() {
+  if [[ "${MF[has_stamp]}" != "yes" ]]; then
+    if ${INBOX_MODE}; then
+      refuse "preflight.stamp" \
+        "this release carries no staging_stamp, and an unattended inbox deploy requires one. Nothing has judged these bytes: no gate ran, or its verdict was not carried. Mint with --staging-stamp <promote-stamp.json>, or deploy it by hand with --allow-unstamped and watch it."
+      return 0
+    fi
+    if ! ${ALLOW_UNSTAMPED}; then
+      refuse "preflight.stamp" \
+        "this release carries no staging_stamp. Pass --allow-unstamped to deploy it anyway; the flag exists so that shipping ungated bytes is a thing you typed, not a thing that happened."
+      return 0
+    fi
+    step_warn "preflight.stamp" \
+      "UNGATED RELEASE — no staging_stamp, and --allow-unstamped was passed. NOTHING has tested these bytes: no suite, no conformance replay, no skew matrix, no soak. The deploy-time gates below only prove the box survived the swap."
+    return 0
+  fi
+
+  if [[ ! -f "${STAMP_FILE}" ]]; then
+    refuse "preflight.stamp" \
+      "the manifest summarises a promote stamp but ${STAMP_FILE} does not exist. The summary is not the evidence; without the file nothing here can be re-derived."
+    return 0
+  fi
+
+  # (1) The file is the file. Re-hashed here rather than left to the validator
+  # because "the evidence I am about to read is the evidence that was minted"
+  # deserves its own line in the journal, the same way the artifact hashes do.
+  local actual
+  actual="$(sha256sum "${STAMP_FILE}" | cut -d' ' -f1)"
+  if [[ "${actual}" != "${MF[stamp_sha256]}" ]]; then
+    refuse "preflight.stamp" \
+      "${STAMP_FILE} hashes to ${actual:0:16}… but the manifest recorded ${MF[stamp_sha256]:0:16}…; the stamp was edited after minting. Nothing below this line can be trusted about this release."
+    return 0
+  fi
+  step_pass "preflight.stamp" \
+    "${STAMP_FILE} sha256=${actual:0:16}… matches the manifest's staging_stamp"
+
+  # (2) The stamp's claims, re-derived by the tool that minted them.
+  local out
+  if ! out="$(python3 "${MINTER}" validate --manifest "${MANIFEST}" \
+        --artifact-root "${ARTIFACT_ROOT}" --staging-stamp "${STAMP_FILE}" \
+        --no-repo --no-artifacts --no-image 2>&1)"; then
+    refuse "preflight.stamp" \
+      "the promote stamp does not describe this release: $(printf '%s' "${out}" | tr '\n' ' ')"
+    return 0
+  fi
+
+  # What was actually joined, component by component. A deployer that printed
+  # only "stamp verified" would let the relay's commit-only binding pass for a
+  # hash binding, which is the one misreading this whole file exists to prevent.
+  local joins bound
+  while IFS=$'\t' read -r key value; do
+    case "${key}" in
+      joins) joins="${value}" ;;
+      bound) bound="${value}" ;;
+    esac
+  done < <(python3 - "${MANIFEST}" "${STAMP_FILE}" <<'PY'
+import json, sys
+manifest = json.load(open(sys.argv[1]))
+stamp = json.load(open(sys.argv[2]))
+staged = {a.get("role"): a for a in (stamp.get("candidate") or {}).get("artifacts") or []}
+parts = []
+for role in ("acp", "cli"):
+    if role not in manifest["components"]:
+        continue
+    entry = staged.get(role)
+    if entry and entry.get("present") and entry.get("sha256"):
+        parts.append(f"{role}=sha256-joined")
+    else:
+        # The gates never hashed this role, so the only thing tying the tested
+        # bytes to the shipped bytes is the commit. Named, not glossed.
+        parts.append(f"{role}=COMMIT-ONLY(stamp hashed no {role})")
+if "relay-image" in manifest["components"]:
+    parts.append("relay-image=COMMIT-ONLY(gates test a from-source binary, this ships an image id)")
+print("joins\t" + ", ".join(parts))
+# Lowercased back to its JSON spelling: this line is quoting the stamp, and a
+# Python-flavoured `True` in a journal invites someone to grep for the wrong
+# thing when they go looking for it in the file.
+print("bound\t" + json.dumps((stamp.get("binding") or {}).get("bound")))
+PY
+  )
+  step_pass "preflight.stamp" \
+    "stamp ${STAMP_SCHEMA_ID} binds to ${MF[source_commit]:0:12}, binding.bound=${bound}; joins: ${joins}"
+
+  # (3) The verdict policy. A closed enum, compared by equality: a prefix match
+  # would also accept a future `promotable_but_expired`.
+  case "${MF[stamp_verdict]}" in
+    promotable)
+      step_pass "preflight.stamp" \
+        "verdict=promotable stamped_at=${MF[stamp_stamped_at]} waived=0 — every gate passed with no waivers"
+      ;;
+    promotable_with_waivers)
+      if ! ${ACK_WAIVERS}; then
+        refuse "preflight.stamp" \
+          "verdict=promotable_with_waivers (${MF[stamp_waived]} waived test failure(s)) and --ack-waivers was not passed. A human decided some red tests do not block; a human should be present when they ship. The acknowledgement is a command-line act on purpose, and the systemd unit does not pass it — so an unattended inbox drop can never ship waived failures by itself. See gates/waivers.txt for what was waived and why."
+        return 0
+      fi
+      step_pass "preflight.stamp" \
+        "verdict=promotable_with_waivers acknowledged on the command line; ${MF[stamp_waived]} waived test failure(s) are shipping. See gates/waivers.txt."
+      ;;
+    *)
+      refuse "preflight.stamp" \
+        "verdict=${MF[stamp_verdict]} is not a verdict this deployer ships. Only 'promotable' (unconditionally) and 'promotable_with_waivers' (with --ack-waivers) are acceptable; anything else means the gates did not clear these bytes."
+      ;;
+  esac
+}
+
+# -----------------------------------------------------------------------------
+# Preflight: owner authorization.
+#
+# WHICH BINARY VERIFIES, AND WHY IT IS THE OLD ONE
+#
+#   When `cli` is a component, there are two `buzz` binaries on this box: the
+#   deployed /opt/buzz/bin/buzz and the candidate staged in the drop. The
+#   candidate is the newer, more capable, more likely-correct one — and this
+#   deployer deliberately uses the DEPLOYED binary anyway.
+#
+#   The candidate is the thing being authorised. Asking it whether it is
+#   authorised makes the release its own auditor: a `release-check` that always
+#   printed `{"authorized": true}` would install itself, and nothing between
+#   here and there would notice. The deployed binary was, by construction,
+#   admitted by a previous run of this same gate. That is not a strong
+#   guarantee, but it is a guarantee the current release cannot manufacture,
+#   which is the only property that matters here.
+#
+#   The cost is real and worth stating: an older CLI may not know the
+#   `projects release-check` subcommand at all. That case is handled the only
+#   safe way — no verdict on stdout is treated as BLOCKED, never as false, and
+#   never as pass.
 # -----------------------------------------------------------------------------
 gate_authorization() {
-  step_skip "preflight.authorization" \
-    "Phase 1: no authorization policy is installed. The manifest's promoted_by is required to be null (enforced by mint-manifest.py). Phase 2 replaces this function with signature verification against the owner pubkey."
+  if [[ "${MF[has_promoted_by]}" != "yes" ]]; then
+    if ${INBOX_MODE}; then
+      refuse "preflight.authorization" \
+        "promoted_by is null and this is an unattended inbox deploy. Nobody has approved this release, and an unattended deploy is exactly the case where 'nobody approved it' must be fatal: there is no human present to be the approval. Mint with --promoted-by <root>:<revision>:<owner>, or deploy it by hand with --allow-unattributed."
+      return 0
+    fi
+    if ! ${ALLOW_UNATTRIBUTED}; then
+      refuse "preflight.authorization" \
+        "promoted_by is null: this release carries no owner approval. Pass --allow-unattributed to deploy it anyway — the flag exists so that shipping an unapproved release is a thing you typed."
+      return 0
+    fi
+    step_warn "preflight.authorization" \
+      "UNATTRIBUTED RELEASE — promoted_by is null and --allow-unattributed was passed. No owner has approved these bytes; the audit trail for this deploy is this line and whoever ran the command."
+    return 0
+  fi
+
+  if [[ ! -x "${BUZZ_CLI}" ]]; then
+    refuse "preflight.authorization" \
+      "manifest claims an owner approval but ${BUZZ_CLI} is not executable, so nothing can re-derive it. A claim nobody can check is not an approval."
+    return 0
+  fi
+
+  local -a check_args=(
+    projects release-check
+    --root "${MF[approval_root]}"
+    --revision "${MF[approval_revision]}"
+    --owner "${MF[approval_owner]}"
+  )
+  [[ -n "${RELEASE_REPO_COORD}" ]] && check_args+=(--repo "${RELEASE_REPO_COORD}")
+
+  step_info "preflight.authorization" \
+    "asking the DEPLOYED ${BUZZ_CLI} (never the candidate — a release must not vouch for itself): release-check root=${MF[approval_root]:0:12} revision=${MF[approval_revision]:0:12} owner=${MF[approval_owner]:0:12}${RELEASE_REPO_COORD:+ repo=${RELEASE_REPO_COORD}}"
+
+  local verdict_file err_file rc=0
+  verdict_file="$(mktemp -t buzz-deploy-verdict.XXXXXX)"
+  err_file="$(mktemp -t buzz-deploy-verdict-err.XXXXXX)"
+  timeout "${RELEASE_CHECK_TIMEOUT}" "${BUZZ_CLI}" "${check_args[@]}" \
+    >"${verdict_file}" 2>"${err_file}" || rc=$?
+
+  # The absence of stdout JSON is part of release-check's contract: it prints a
+  # verdict whenever it reached one and nothing when it could not. So an empty
+  # stdout is "could not determine", which this deployer treats as blocked. It
+  # is NOT false — refusing to distinguish those two would mean deploying on the
+  # day the relay is unreachable, or refusing forever on the day it is slow.
+  if [[ ! -s "${verdict_file}" ]]; then
+    local why
+    why="$(head -2 "${err_file}" | tr '\n' ' ')"
+    rm -f "${verdict_file}" "${err_file}"
+    refuse "preflight.authorization" \
+      "release-check produced NO verdict (exit ${rc}): ${why:-<no output>}. 'Could not determine' is not 'unauthorized' and is certainly not 'authorized' — a deployer treats a missing answer as blocked. If ${BUZZ_CLI} predates the subcommand, install a newer CLI by hand first; a candidate cannot be trusted to authorise itself."
+    return 0
+  fi
+
+  local authorized commit reason decided_at
+  while IFS=$'\t' read -r key value; do
+    case "${key}" in
+      authorized) authorized="${value}" ;;
+      commit) commit="${value}" ;;
+      reason) reason="${value}" ;;
+      decided_at) decided_at="${value}" ;;
+    esac
+  done < <(python3 - "${verdict_file}" <<'PY'
+import json, sys
+try:
+    v = json.load(open(sys.argv[1]))
+except Exception as exc:              # noqa: BLE001 - any unreadable verdict is "no verdict"
+    print(f"authorized\tunparseable ({exc})")
+    raise SystemExit(0)
+print("authorized\t" + ("true" if v.get("authorized") is True else "false"))
+print("commit\t" + str(v.get("commit") or ""))
+print("reason\t" + " ".join(str(v.get("reason") or "").split()))
+print("decided_at\t" + str(v.get("decided_at") or ""))
+PY
+  )
+  rm -f "${verdict_file}" "${err_file}"
+
+  if [[ "${authorized:-}" != "true" || "${rc}" -ne 0 ]]; then
+    refuse "preflight.authorization" \
+      "the owner has NOT authorized this release (exit ${rc}, authorized=${authorized:-<none>}): ${reason:-no reason given}"
+    return 0
+  fi
+
+  # The join that makes the approval mean this release. Without it, an approval
+  # of any revision by this owner would authorise any manifest: the deployer
+  # would be checking that a decision exists, not that it is about these bytes.
+  if [[ "${commit:-}" != "${MF[source_commit]}" ]]; then
+    refuse "preflight.authorization" \
+      "the owner approved commit ${commit:-<none>} but this release ships ${MF[source_commit]}. An approval of one commit does not authorise a release of another, and this is exactly the substitution the check exists to catch."
+    return 0
+  fi
+
+  step_pass "preflight.authorization" \
+    "owner ${MF[approval_owner]:0:12} authorized revision ${MF[approval_revision]:0:12} at ${decided_at:-unknown}; verdict commit == manifest source_commit ${commit:0:12} (verified with the deployed ${BUZZ_CLI})"
 }
 
 # -----------------------------------------------------------------------------
@@ -1011,20 +1377,190 @@ journal_since() {
   esac
 }
 
+# -----------------------------------------------------------------------------
+# Drain.
+#
+# `SIGTERM` gives an in-flight prompt thirty seconds and then aborts it, so a
+# model turn three minutes into a refactor dies mid-sentence and a queued
+# project event — already announced on its issue as `state=queued` — is dropped
+# on the floor. Drain is the third lever: an owner-signed control frame that
+# tells the runtime to stop admitting, finish what it holds, and exit 0. The
+# unit is Restart=on-failure, so exit 0 means it stays down until this script
+# starts it again, which is precisely the window a binary swap needs.
+#
+# Everything here is best-effort by design and loud on every path that is not
+# the good one. A drain that silently did not happen would leave the operator
+# believing in-flight turns were finished when they were killed — strictly worse
+# than the honest SIGTERM this falls back to.
+# -----------------------------------------------------------------------------
+
+# The agent pubkey configured for a unit, from BUZZ_DEPLOY_AGENT_PUBKEYS.
+# Public keys only, and never read from the agent's own env file: that file
+# holds BUZZ_PRIVATE_KEY, and a root process opening it to learn something
+# public would be reading a secret it has no business knowing.
+agent_pubkey_for() {
+  local unit="${1%.service}" entry
+  for entry in ${AGENT_PUBKEYS_RAW}; do
+    if [[ "${entry%%:*}" == "${unit}" ]]; then
+      printf '%s' "${entry#*:}"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# One KEY=VALUE out of the owner key file, unquoted. Parsed rather than sourced:
+# sourcing an env file executes it, and this script runs as root. The file is
+# meant to hold a key, not a program.
+owner_env_value() {
+  local name="$1"
+  sed -n "s/^[[:space:]]*${name}=//p" "${OWNER_KEY_FILE}" 2>/dev/null | tail -1 \
+    | sed -e 's/\r$//' -e 's/^"\(.*\)"$/\1/' -e "s/^'\(.*\)'\$/\1/"
+}
+
+# Publish the drain frame. The owner's key is read inside this function and
+# exported into a subshell rather than passed as an argument, because
+# run_mutation echoes its argument list into the journal and a private key in a
+# deploy transcript is a private key on a screen in an incident channel.
+drain_publish() {
+  local pubkey="$1"
+  local key relay
+  key="$(owner_env_value BUZZ_PRIVATE_KEY)"
+  [[ -n "${key}" ]] || return 1
+  relay="$(owner_env_value BUZZ_RELAY_URL)"
+  (
+    export BUZZ_PRIVATE_KEY="${key}"
+    if [[ -n "${relay}" ]]; then export BUZZ_RELAY_URL="${relay}"; fi
+    timeout "${DRAIN_PUBLISH_TIMEOUT}" "${BUZZ_CLI}" agents drain \
+      --agent "${pubkey}" \
+      --reason "deploy ${MF[name]} @ ${MF[source_commit]:0:12}: replacing buzz-acp" \
+      >/dev/null
+  )
+}
+
+# Wait for a drained unit to actually stop. Returns 0 when the unit is down
+# (whatever it is down for), 1 when the wait expired with it still running.
+wait_for_agent_stopped() {
+  local unit="$1" step="$2"
+  if ! ${EXECUTE}; then
+    step_plan "${step}" "would poll systemctl is-active ${unit} for up to ${DRAIN_WAIT_SECONDS}s"
+    return 0
+  fi
+  local deadline=$(( $(date +%s) + DRAIN_WAIT_SECONDS ))
+  local started state
+  started="$(date +%s)"
+  while :; do
+    state="$(systemctl is-active "${unit}" 2>/dev/null || true)"
+    case "${state}" in
+      inactive)
+        step_pass "${step}" \
+          "${unit} finished its work and exited cleanly after $(( $(date +%s) - started ))s"
+        return 0
+        ;;
+      failed)
+        # Down, so the swap can proceed — but a drained runtime leaves through
+        # its ordinary Ok(()) tail and systemd records that as inactive. `failed`
+        # means it exited non-zero, which is not what a drain does.
+        step_warn "${step}" \
+          "${unit} is 'failed', not 'inactive': it stopped, but not the way a drain stops. Something else ended that process; check its journal before trusting this deploy."
+        return 0
+        ;;
+    esac
+    if (( $(date +%s) >= deadline )); then
+      step_warn "${step}" \
+        "${unit} is still ${state:-unknown} after ${DRAIN_WAIT_SECONDS}s. Its own drain bound is max_turn+100s, which is longer than this wait and longer than the unit's TimeoutStartSec — so a long turn outlasting this is expected, not broken. Falling back to a restart, which SIGTERMs it."
+      return 1
+    fi
+    sleep 5
+  done
+}
+
+# Drain one agent. Returns 0 when the unit is stopped and may simply be started,
+# 1 when the caller must fall back to a plain restart. Every 1 is preceded by a
+# WARN saying which precondition was missing.
+drain_agent() {
+  local unit="$1" step="acp.drain.${1%.service}"
+  if [[ -z "${OWNER_KEY_FILE}" ]]; then
+    step_warn "${step}" \
+      "drain is not configured (BUZZ_DEPLOY_OWNER_KEY_FILE is unset), so ${unit} will be SIGTERMed instead: an in-flight turn is cut at the 30s grace and a queued project event is dropped. See scripts/selfhost/units/README.md to configure it."
+    return 1
+  fi
+  if [[ ! -r "${OWNER_KEY_FILE}" ]]; then
+    step_warn "${step}" \
+      "BUZZ_DEPLOY_OWNER_KEY_FILE=${OWNER_KEY_FILE} is not readable; falling back to a SIGTERM restart of ${unit}."
+    return 1
+  fi
+  local pubkey
+  if ! pubkey="$(agent_pubkey_for "${unit}")" || [[ -z "${pubkey}" ]]; then
+    step_warn "${step}" \
+      "no pubkey for ${unit%.service} in BUZZ_DEPLOY_AGENT_PUBKEYS='${AGENT_PUBKEYS_RAW}'; a drain frame is addressed to an agent pubkey and there is nothing to address. Falling back to a SIGTERM restart."
+    return 1
+  fi
+  if [[ ! "${pubkey}" =~ ^[0-9a-f]{64}$ ]]; then
+    step_warn "${step}" \
+      "pubkey for ${unit%.service} is not 64 lowercase hex ('${pubkey}'); falling back to a SIGTERM restart rather than publishing a frame nobody will match."
+    return 1
+  fi
+  # Feature-detect the sender. An older deployed CLI has no `agents drain`, and
+  # clap exits non-zero on an unknown subcommand — so this asks the binary
+  # rather than assuming a version.
+  if ! "${BUZZ_CLI}" agents drain --help >/dev/null 2>&1; then
+    step_warn "${step}" \
+      "${BUZZ_CLI} has no 'agents drain' subcommand (it predates the drain sender), so ${unit} will be SIGTERMed instead. Install a newer CLI to get drains; this run falls back to the old behaviour rather than skipping the restart."
+    return 1
+  fi
+
+  # Deliberately not run_mutation: a drain that could not be published is a
+  # WARN and a degraded deploy, not a FAIL. `grep status=FAIL` is the whole
+  # triage procedure for this journal, and a line there has to mean "the deploy
+  # is in trouble" — not "the deploy did the older, blunter thing".
+  if ! ${EXECUTE}; then
+    step_plan "${step}" \
+      "would publish an owner-signed drain frame to ${unit%.service} (${pubkey:0:12}…) via ${BUZZ_CLI}, then wait for the unit to stop"
+  else
+    step_info "${step}" \
+      "publishing an owner-signed drain frame to ${unit%.service} (${pubkey:0:12}…) via ${BUZZ_CLI}"
+    if ! drain_publish "${pubkey}"; then
+      step_warn "${step}" \
+        "publishing the drain frame failed; falling back to a SIGTERM restart of ${unit}. The agent never heard the request."
+      return 1
+    fi
+    # Publication is not drainage. The CLI can only report that the relay
+    # accepted the frame — its own ack says `drain_confirmed: false` — and
+    # whether the agent honoured it is visible only in the agent stopping.
+    step_pass "${step}" \
+      "the relay accepted the drain frame for ${unit%.service}; that is delivery, not drainage — now waiting for the process to finish and exit"
+  fi
+  wait_for_agent_stopped "${unit}" "acp.drained.${unit%.service}" || return 1
+  return 0
+}
+
 restart_agents() {
   # One leg at a time. Restarting both agents together halves the wall clock
   # and doubles the blast radius: if the new binary is bad, the second unit is
   # already down before the first one's gate has said so. Restarting them in
   # sequence means a failure leaves one working agent and a clean rollback.
-  local unit step cursor
+  local unit step cursor drained
   for unit in "${AGENT_UNITS[@]}"; do
     step="acp.restart.${unit%.service}"
+    # Drain first, and only then take the journal cursor: a drained unit logs
+    # its own shutdown, and a cursor taken before the drain would feed those
+    # lines to the startup gate as if the new process had emitted them.
+    drained=false
+    if drain_agent "${unit}"; then drained=true; fi
     cursor="$(journal_cursor "${unit}")"
-    run_mutation "${step}" "restart ${unit} onto the new buzz-acp" \
-      systemctl restart "${unit}" || return 1
+    if ${drained}; then
+      run_mutation "${step}" "start ${unit} on the new buzz-acp (drained, so it is already stopped)" \
+        systemctl start "${unit}" || return 1
+    else
+      run_mutation "${step}" "restart ${unit} onto the new buzz-acp (SIGTERM — this run did not drain it)" \
+        systemctl restart "${unit}" || return 1
+    fi
     ${EXECUTE} && RESTARTED_AGENTS+=("${unit}")
     gate_agent "${unit}" "acp.gate.${unit%.service}" "${cursor}" || return 1
-    announce "agent" "Deploy \`${MF[name]}\`: \`${unit}\` restarted and passed its startup gate."
+    local how="restarted (SIGTERM, not drained)"
+    ${drained} && how="drained and restarted"
+    announce "agent" "Deploy \`${MF[name]}\`: \`${unit}\` ${how} and passed its startup gate."
   done
   return 0
 }
@@ -1104,6 +1640,11 @@ rollback() {
     fi
   fi
 
+  # No drain on the way back. Draining is a courtesy to work in flight, and the
+  # work in flight here is being done by a binary this run has just proven bad;
+  # asking it politely to finish would be waiting on the thing that failed.
+  # Rollback restarts outright, which is also the only path that works when the
+  # process is already wedged or gone.
   local unit cursor
   for unit in "${RESTARTED_AGENTS[@]}"; do
     cursor="$(journal_cursor "${unit}")"
@@ -1220,6 +1761,10 @@ parse_args() {
       --artifact-root) ARTIFACT_ROOT="${2:?--artifact-root needs a path}"; shift ;;
       --component) ONLY_COMPONENTS+=("${2:?--component needs a name}"); shift ;;
       --ack-migrations) ACK_MIGRATIONS=true ;;
+      --ack-waivers) ACK_WAIVERS=true ;;
+      --allow-unstamped) ALLOW_UNSTAMPED=true ;;
+      --allow-unattributed) ALLOW_UNATTRIBUTED=true ;;
+      --stamp-file) STAMP_FILE="${2:?--stamp-file needs a path}"; shift ;;
       --announce-root) ANNOUNCE_ROOT="${2:?--announce-root needs an event id}"; shift ;;
       --relay-restart) RELAY_RESTART_MODE="${2:?--relay-restart needs a mode}"; shift ;;
       -h|--help) usage; exit 0 ;;
@@ -1234,9 +1779,25 @@ parse_args() {
   if [[ -z "${INBOX_ROOT}" && -z "${MANIFEST}" ]]; then
     die_usage "need a manifest path or --inbox <root>"
   fi
+  [[ -n "${INBOX_ROOT}" ]] && INBOX_MODE=true
+
+  # The three flags that weaken a requirement inbox mode declares absolute are
+  # refused OUTRIGHT there rather than ignored with a warning. A flag that is
+  # accepted and quietly does nothing is a flag someone will believe worked;
+  # and refusing it here means the rule "an unattended deploy needs the whole
+  # ceremony" cannot be softened even by a human typing --inbox by hand. If you
+  # need to ship an unstamped or unapproved release, point the deployer at the
+  # manifest directly — which is also the shape that keeps a person present.
+  if ${INBOX_MODE}; then
+    ${ALLOW_UNSTAMPED} && die_usage "--allow-unstamped cannot be used with --inbox: an unattended deploy requires a promote stamp. Deploy the manifest directly if you must ship ungated bytes."
+    ${ALLOW_UNATTRIBUTED} && die_usage "--allow-unattributed cannot be used with --inbox: an unattended deploy requires an owner approval. Deploy the manifest directly if you must ship an unapproved release."
+    [[ -n "${STAMP_FILE}" ]] && die_usage "--stamp-file cannot be used with --inbox: a release drop is self-contained and its stamp is the one staged beside its manifest."
+  fi
+
   if [[ -n "${ANNOUNCE_ROOT}" && ! "${ANNOUNCE_ROOT}" =~ ^[0-9a-f]{64}$ ]]; then
     die_usage "--announce-root must be a 64-char hex event id"
   fi
+  return 0
 }
 
 # -----------------------------------------------------------------------------
@@ -1252,6 +1813,9 @@ main() {
   [[ -n "${INBOX_ROOT}" ]] && select_release
   [[ -f "${MANIFEST}" ]] || { emit preflight.manifest FAIL "no such manifest: ${MANIFEST}"; finish 2 "manifest missing"; }
   [[ -n "${ARTIFACT_ROOT}" ]] || ARTIFACT_ROOT="$(cd "$(dirname "${MANIFEST}")" && pwd)"
+  # Beside the manifest by default, which is where --stage puts it and the only
+  # place an inbox drop is allowed to have it.
+  [[ -n "${STAMP_FILE}" ]] || STAMP_FILE="${ARTIFACT_ROOT}/${STAMP_FILENAME}"
 
   load_manifest
 
@@ -1264,6 +1828,11 @@ main() {
   preflight_migrations
   preflight_disk
   preflight_stack
+  # The two promotion claims, last because they are the most expensive (a hash
+  # and a relay round trip) and because everything above them is a property of
+  # the box rather than of the release: if the stack is already broken, "was
+  # this approved" is not the question you need answered first.
+  preflight_stamp
   gate_authorization
 
   if ${BLOCKED}; then
