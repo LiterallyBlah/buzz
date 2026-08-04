@@ -4213,6 +4213,34 @@ pub(crate) struct ProjectArm<'a> {
 ///
 /// The flush is the ordinary pool path, not a project-specific one, so queue
 /// ownership, in-flight accounting and activity stay a single mechanism.
+/// A first-contact shape worth paying the exact-root read for: a comment that
+/// visibly mentions this agent, or a peer-call envelope naming it as callee.
+///
+/// The second arm is what makes the decision matrix's
+/// `TrustedAgent + Invocation => EnrolAndWake` reachable on an `Unknown` root.
+/// Without it the matrix permitted an enrolment the resolver never supplied a
+/// root binding for, and a trusted peer's first call on a fresh issue — an
+/// envelope that was cryptographically exact down to its recomputed call id —
+/// was refused with nothing but a debug line (#0a81a1ca, 2026-08-04). A call
+/// addresses by construction — sole `p` naming the callee, verified id — so it
+/// is not asked to also @mention in prose: prose is the human grammar, and the
+/// envelope is the agent one.
+fn first_contact_shape(event: &project::VerifiedProjectEvent, agent_pubkey_hex: &str) -> bool {
+    match event.kind() {
+        k if k == buzz_core::kind::KIND_TEXT_NOTE => {
+            event_mentions_agent(event.event(), agent_pubkey_hex)
+        }
+        k if k == buzz_core::peer_call::KIND_PEER_CALL => matches!(
+            peer_call::call_marker(
+                &peer_call::VerifiedPeerEvent::from_project(event),
+                agent_pubkey_hex,
+            ),
+            project::CallMarker::Invocation
+        ),
+        _ => false,
+    }
+}
+
 /// Resolve the separately signed root needed by comment-first enrolment.
 ///
 /// `Err` is transient and the caller must not dispatch (or spend dedupe) yet.
@@ -4228,12 +4256,11 @@ async fn resolve_comment_first_candidate(
     let project::ProjectEvent::Routed { route, event, .. } = project_event else {
         return Ok(None);
     };
-    if event.kind() != buzz_core::kind::KIND_TEXT_NOTE
+    if !first_contact_shape(event, agent_pubkey_hex)
         || matches!(
             enrolments.state_of(route.root()),
             project::RootState::Active
         )
-        || !event_mentions_agent(event.event(), agent_pubkey_hex)
     {
         return Ok(None);
     }
@@ -5235,13 +5262,41 @@ fn handle_project_event(
             }
 
             let Some(origin) = decision.origin.clone() else {
-                tracing::debug!(
-                    ?source,
-                    root = %route.root(),
-                    kind = event.kind(),
-                    effect = ?decision.effect,
-                    "project event refused — nothing enrolled, queued or spent"
-                );
+                // A refused peer-call invocation that names this agent gets an
+                // INFO line, not debug. Twice in one day (roots bdc226e9 and
+                // 0a81a1ca) a silent refusal here was indistinguishable from an
+                // outage: the caller re-sent, a human watched nothing happen,
+                // and diagnosis required a debug-level restart. The refusal may
+                // be entirely correct — that is exactly why it must say so out
+                // loud, with enough of the decision to name which gate said no.
+                if event.kind() == buzz_core::peer_call::KIND_PEER_CALL
+                    && matches!(
+                        peer_call::call_marker(
+                            &peer_call::VerifiedPeerEvent::from_project(event),
+                            &dispatch.identity.agent.hex().to_ascii_lowercase(),
+                        ),
+                        project::CallMarker::Invocation
+                    )
+                {
+                    tracing::info!(
+                        ?source,
+                        root = %route.root(),
+                        effect = ?decision.effect,
+                        caller = %event.author(),
+                        "peer call named this agent but was refused — the call \
+                         stays on the relay; if the caller is trusted and the \
+                         root unknown, an enrolment candidate could not be \
+                         resolved or the author gate declined it"
+                    );
+                } else {
+                    tracing::debug!(
+                        ?source,
+                        root = %route.root(),
+                        kind = event.kind(),
+                        effect = ?decision.effect,
+                        "project event refused — nothing enrolled, queued or spent"
+                    );
+                }
                 return ProjectDispatched::Ignored;
             };
 
@@ -15028,6 +15083,157 @@ for line in sys.stdin:
     /// dispatch derives it.
     fn route_key_of(root: &nostr::Event) -> uuid::Uuid {
         project::project_route_key(&root.id.to_hex()).expect("a root id is a route key")
+    }
+
+    /// A well-formed NIP-PC invocation from `caller` to `agent` on `root`,
+    /// exactly the envelope the CLI publishes: derived call id, hop from path.
+    fn project_call_from(
+        caller: &Keys,
+        agent: &Keys,
+        repo_id: &str,
+        root: &nostr::Event,
+        task: &str,
+    ) -> nostr::Event {
+        let caller_hex = caller.public_key().to_hex();
+        buzz_sdk::builders::build_peer_call(
+            &caller_hex,
+            task,
+            &buzz_sdk::builders::PeerCallMeta {
+                callee: agent.public_key().to_hex(),
+                route: buzz_core::peer_call::PeerCallRoute::Project {
+                    coordinate: format!("30617:{}:{repo_id}", agent.public_key().to_hex()),
+                    root: root.id.to_hex(),
+                },
+                nonce: "00112233445566778899aabbccddeeff".into(),
+                hop: 1,
+                visited: vec![caller_hex.clone()],
+            },
+        )
+        .expect("well-formed call")
+        .sign_with_keys(caller)
+        .expect("sign")
+    }
+
+    /// **The live #0a81a1ca failure, through the production dispatch path.**
+    ///
+    /// hermes-gateway's first call on a fresh issue was cryptographically
+    /// exact — recomputed call id, route, hop, visited — and this agent
+    /// refused it with a debug line. The resolver only supplied enrolment
+    /// candidates for kind-1 comments with a visible mention, so the decision
+    /// matrix's `TrustedAgent + Invocation => EnrolAndWake` arm was
+    /// unreachable on any root nobody had commented `@agent` on first: the
+    /// matrix permitted what the resolver never fed it. A trusted peer's
+    /// first call must enrol the root and run the task.
+    #[tokio::test]
+    async fn a_trusted_agents_first_call_enrols_an_unknown_root() {
+        let recorder = PromptRecorder::new();
+        let mut rt = Runtime::new(&recorder).await;
+        let agent = rt.agent.clone();
+        let caller = Keys::generate();
+        rt.externals.insert(caller.public_key().to_hex());
+        rt.discover_announced_by(&agent, "call-first").await;
+
+        let root =
+            desktop_root_on_an_owned_repo(&rt.owner, &agent, "call-first", "no address here");
+        let candidate = fetched_root_candidate(&rt, &root).await;
+        let call = project_call_from(&caller, &agent, "call-first", &root, "first-contact task");
+
+        // The resolver change under test: a peer-call envelope naming this
+        // agent is a first-contact shape, so the run loop would have resolved
+        // exactly this candidate for exactly this event.
+        let verified = project::VerifiedProjectEvent::verify(call.clone())
+            .await
+            .expect("call verifies");
+        assert!(
+            first_contact_shape(&verified, &agent.public_key().to_hex()),
+            "an invocation naming this agent is first contact"
+        );
+
+        let dispatched = rt
+            .drive_with_candidate(
+                &routed(call, project::ProjectSubscription::PeerCall).await,
+                Some(candidate),
+            )
+            .await;
+        assert!(
+            matches!(dispatched, ProjectDispatched::Queued { queued: true, .. }),
+            "a trusted peer's first call must queue a turn, got {dispatched:?}"
+        );
+        assert!(
+            rt.enrolments.get(&root.id.to_hex()).is_some(),
+            "the call must enrol the root it rode in on"
+        );
+        let prompts = recorder.prompts(1).await;
+        assert!(
+            prompts[0].contains("first-contact task"),
+            "the turn must carry the call's task:\n{}",
+            prompts[0]
+        );
+    }
+
+    /// The caller not being approved keeps the same envelope out: first
+    /// contact is a shape, and TrustedAgent is a grant — the resolver may
+    /// fetch the root, but the author gate still refuses a stranger.
+    #[tokio::test]
+    async fn a_strangers_first_call_still_enrols_nothing() {
+        let recorder = PromptRecorder::new();
+        let mut rt = Runtime::new(&recorder).await;
+        let agent = rt.agent.clone();
+        let stranger = Keys::generate();
+        // Deliberately NOT inserted into rt.externals.
+        rt.discover_announced_by(&agent, "call-first").await;
+
+        let root =
+            desktop_root_on_an_owned_repo(&rt.owner, &agent, "call-first", "no address here");
+        let candidate = fetched_root_candidate(&rt, &root).await;
+        let call = project_call_from(&stranger, &agent, "call-first", &root, "should never run");
+
+        let dispatched = rt
+            .drive_with_candidate(
+                &routed(call, project::ProjectSubscription::PeerCall).await,
+                Some(candidate),
+            )
+            .await;
+        assert!(
+            !matches!(dispatched, ProjectDispatched::Queued { queued: true, .. }),
+            "a stranger's call must not queue, got {dispatched:?}"
+        );
+        assert!(
+            rt.enrolments.get(&root.id.to_hex()).is_none(),
+            "a stranger's call must not enrol"
+        );
+    }
+
+    /// The predicate's negatives, pinned: a result is not first contact, a
+    /// call for somebody else is not first contact, and a comment without a
+    /// visible mention still is not — the kind-1 arm is unchanged.
+    #[tokio::test]
+    async fn first_contact_shape_refuses_what_it_must() {
+        let recorder = PromptRecorder::new();
+        let rt = Runtime::new(&recorder).await;
+        let agent = rt.agent.clone();
+        let caller = Keys::generate();
+        let other = Keys::generate();
+        let root =
+            desktop_root_on_an_owned_repo(&rt.owner, &agent, "call-first", "no address here");
+        let agent_hex = agent.public_key().to_hex();
+
+        let for_other = project_call_from(&caller, &other, "call-first", &root, "not for us");
+        let verified = project::VerifiedProjectEvent::verify(for_other)
+            .await
+            .expect("verifies");
+        assert!(
+            !first_contact_shape(&verified, &agent_hex),
+            "a call naming somebody else is not our first contact"
+        );
+
+        let bare_root = project::VerifiedProjectEvent::verify(root)
+            .await
+            .expect("verifies");
+        assert!(
+            !first_contact_shape(&bare_root, &agent_hex),
+            "a root event is not a first-contact comment or call"
+        );
     }
 
     /// **The live Phase 3e failure, through the production dispatch path.**
