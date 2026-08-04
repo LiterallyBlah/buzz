@@ -6093,10 +6093,19 @@ mod project_discovery_ingestion_tests {
             "an authorised reopen must restore the watch"
         );
 
-        // ── 4. …and the next comment runs exactly one turn ───────────────────
+        // ── 4. …and the next addressed comment runs exactly one turn ─────────
+        //
+        // Addressed, because the watch alone no longer buys a turn: under the
+        // target-only rule a reopened root wakes for a comment that names this
+        // agent and stays quiet for one that does not.
         let after_reopen = process
             .watched(follow_up_comment(
-                &owner, &owner, &agent, "demo", &root, "and now?",
+                &owner,
+                &owner,
+                &agent,
+                "demo",
+                &root,
+                &format!("@{} and now?", agent.public_key().to_hex()),
             ))
             .await;
         assert!(
@@ -13022,19 +13031,25 @@ for line in sys.stdin:
         recorder.prompts(1).await;
         assert_eq!(rt.queue.queued_event_count(&route_key), 0);
 
-        // Same root, same timestamp, different event.
-        let comment = EventBuilder::new(nostr::Kind::TextNote, "and it fails on CI too")
-            .tags([
-                nostr::Tag::parse([
-                    "a",
-                    &format!("30617:{}:demo", rt.owner.public_key().to_hex()),
-                ])
-                .unwrap(),
-                nostr::Tag::parse(["e", &root_id, "", "root"]).unwrap(),
+        // Same root, same timestamp, different event. Addressed to the agent
+        // because this test is about *dedup*, not addressing: an unaddressed
+        // comment is now correctly ignored, which would hide what it asserts.
+        let comment = EventBuilder::new(
+            nostr::Kind::TextNote,
+            format!("@{} and it fails on CI too", rt.agent.public_key().to_hex()),
+        )
+        .tags([
+            nostr::Tag::parse([
+                "a",
+                &format!("30617:{}:demo", rt.owner.public_key().to_hex()),
             ])
-            .custom_created_at(created)
-            .sign_with_keys(&rt.owner)
-            .expect("sign");
+            .unwrap(),
+            nostr::Tag::parse(["e", &root_id, "", "root"]).unwrap(),
+            nostr::Tag::parse(["p", &rt.agent.public_key().to_hex()]).unwrap(),
+        ])
+        .custom_created_at(created)
+        .sign_with_keys(&rt.owner)
+        .expect("sign");
         let dispatched = rt
             .drive(
                 &routed(

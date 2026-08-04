@@ -7284,8 +7284,8 @@ impl AddressingEvidence {
     /// All three conditions are required, and each rules out a different way of
     /// being wrong:
     ///
-    /// - somebody is named — otherwise this is a bare follow-up, which an
-    ///   active root must still act on;
+    /// - somebody is named — otherwise this is a bare follow-up, which this
+    ///   predicate has nothing to say about;
     /// - that somebody is not us, by key *or* by display name — a comment that
     ///   names us is ours no matter who else it also names;
     /// - the event actually `p`-tags another key — this is what makes the name
@@ -7293,11 +7293,16 @@ impl AddressingEvidence {
     ///   behind it names nobody the relay agreed to deliver to, so it must not
     ///   silence a turn.
     ///
+    /// Under the target-only rule a bare follow-up does not wake an active root
+    /// either, so this predicate no longer decides that case — but it still
+    /// answers a different question, and conflating "names somebody else" with
+    /// "names nobody" would lose the distinction the enrolment paths rely on.
+    ///
     /// An agent with no configured display name cannot satisfy the second
     /// condition honestly: `@Its Own Name` would read as somebody else's, and
     /// it would fall silent on exactly the comments meant for it. Not knowing
-    /// its own name means it has no opinion here, so it keeps the older, wider
-    /// behaviour and wakes.
+    /// its own name means it has no opinion here — it never suppresses on that
+    /// basis, and key syntax still addresses it.
     pub(crate) fn directed_at_another_party(&self) -> bool {
         self.knows_own_name && self.named_anyone && !self.named_self && self.p_tags_another
     }
@@ -7802,27 +7807,42 @@ pub(crate) fn classify_project_event(
 /// | Root state | Explicit mention | Inherited / watched |
 /// |---|---|---|
 /// | `Unknown` | enrol and wake | ignore — nothing enrolled us |
-/// | `Active` | wake | wake, unless the comment addresses another agent |
+/// | `Active` | wake | ignore — not addressed to us |
 /// | `Dormant` | reactivate and wake | ignore — stays dormant |
 ///
-/// The active row is the one with a second condition on it. Continuation still
-/// needs no re-tag — a bare follow-up wakes, and that is the whole point of the
-/// row. But "no re-tag required" was being read as "no addressing considered at
-/// all", so an approved human writing `@Other Agent please take this` woke every
-/// agent that had ever been enrolled on the root, because Desktop copies prior
-/// participants into every later comment's `p` set. A comment that names
-/// somebody, names a `p`-tagged party, and does not name us is not our turn.
+/// **Target-only.** Every row now requires the comment to address *this* agent.
+/// The active row used to wake on anything an approved human wrote, on the
+/// theory that a continuation needs no re-tag. That is true of a two-party
+/// conversation and false of these roots, which are shared: Desktop copies prior
+/// participants into every later comment's `p` set, so "no re-tag required"
+/// meant every agent ever enrolled woke on every comment, including
+/// `@Other Agent please take this`. An inherited `p` is propagation, not intent,
+/// and it is the only thing a bare follow-up has to offer.
+///
+/// The cost is deliberate and worth naming: a bare `yes, go ahead` no longer
+/// wakes anybody. On a root with one agent that reads as a regression; on a root
+/// with three it is the difference between one answer and three. Addressing is
+/// how a shared thread picks an addressee, and there is no silent default that
+/// is right for both.
+///
+/// `directed_elsewhere` is kept as a separate guard rather than folded into the
+/// addressing check. It is not redundant here: [`Addressing::ExplicitMention`]
+/// is also reachable via a *fresh* `p` tag with complete history, so a comment
+/// can name another agent in prose while still carrying explicit-`p` evidence
+/// for us. Naming somebody else wins.
 fn wake_or_enrol(
     root_state: RootState,
     addressing: Addressing,
     directed_elsewhere: bool,
 ) -> ProjectEffect {
     match root_state {
-        // An active root continues without re-tagging: this is the follow-up
-        // comment that the enrolment `#p` REQ alone could never deliver — but a
-        // comment explicitly handed to another agent is not that follow-up.
+        // A comment handed to a different agent is never ours, whatever else it
+        // carries — checked before addressing for exactly that reason.
         RootState::Active if directed_elsewhere => ProjectEffect::Ignore,
-        RootState::Active => ProjectEffect::Wake,
+        RootState::Active => match addressing {
+            Addressing::ExplicitMention => ProjectEffect::Wake,
+            Addressing::InheritedParticipant | Addressing::WatchedRoot => ProjectEffect::Ignore,
+        },
         RootState::Unknown | RootState::Dormant => match addressing {
             Addressing::ExplicitMention => ProjectEffect::EnrolAndWake,
             Addressing::InheritedParticipant | Addressing::WatchedRoot => ProjectEffect::Ignore,
@@ -13102,10 +13122,15 @@ mod tests {
         );
     }
 
-    /// The property the fix must not cost: an ordinary follow-up names nobody,
-    /// and an active root still acts on it without any re-tag.
+    /// Target-only: a bare follow-up names nobody, so it wakes nobody.
+    ///
+    /// This is the deliberate cost of the policy, asserted rather than left
+    /// implicit. "Names nobody" and "names somebody else" stay distinguishable —
+    /// `directed_at_another_party` is still false here — but on a shared root
+    /// they now reach the same effect, because an inherited `p` is the only
+    /// thing a bare follow-up offers and propagation is not intent.
     #[tokio::test]
-    async fn an_active_root_still_wakes_on_a_bare_follow_up() {
+    async fn an_active_root_does_not_wake_on_a_bare_follow_up() {
         let evidence = directed_evidence("yes, go ahead with that", &[AGENT_PK]).await;
 
         assert!(
@@ -13122,8 +13147,35 @@ mod tests {
                 false,
                 evidence.directed_at_another_party(),
             ),
+            ProjectEffect::Ignore,
+            "an inherited `p` is propagation, not a request for a turn"
+        );
+    }
+
+    /// …and the same root wakes the moment the comment names this agent.
+    ///
+    /// The pair matters more than either half: it is the difference between
+    /// "target-only" and "deaf".
+    #[tokio::test]
+    async fn an_active_root_wakes_when_the_follow_up_names_this_agent() {
+        let evidence = directed_evidence("@Claude yes, go ahead with that", &[AGENT_PK]).await;
+
+        assert!(
+            !evidence.directed_at_another_party(),
+            "it names us, so it is not handed elsewhere"
+        );
+        assert_eq!(
+            classify_project_event(
+                classify_kind(KIND_TEXT_NOTE),
+                ProjectAuthor::AuthorisedHuman,
+                CallMarker::None,
+                RootState::Active,
+                Addressing::ExplicitMention,
+                false,
+                evidence.directed_at_another_party(),
+            ),
             ProjectEffect::Wake,
-            "continuation still needs no re-tag"
+            "an addressed follow-up is this agent's turn"
         );
     }
 
@@ -13186,10 +13238,12 @@ mod tests {
         }
     }
 
-    /// An agent with no configured name loses the discrimination and keeps the
-    /// old, wider behaviour rather than guessing.
+    /// An agent with no configured name cannot tell "excluded" from "not
+    /// mentioned", so it must not read the comment as excluding it — but under
+    /// the target-only rule that no longer buys it a turn either. Both halves
+    /// are asserted: the evidence stays honest, and the effect is still nothing.
     #[tokio::test]
-    async fn an_unnamed_agent_falls_back_to_waking() {
+    async fn an_unnamed_agent_does_not_infer_exclusion_and_still_does_not_wake() {
         let keys = Keys::generate();
         let event = EventBuilder::new(
             Kind::Custom(KIND_TEXT_NOTE as u16),
@@ -13220,8 +13274,8 @@ mod tests {
                 false,
                 evidence.directed_at_another_party(),
             ),
-            ProjectEffect::Wake,
-            "without a display name the agent keeps the older, wider behaviour"
+            ProjectEffect::Ignore,
+            "not inferring exclusion is not the same as being addressed"
         );
     }
 
@@ -14032,10 +14086,22 @@ mod tests {
     }
 
     #[test]
-    fn an_active_root_continues_without_re_tagging() {
-        // The regression test for the original Phase 1 gap: a follow-up comment
-        // does not tag the agent again, and must still reach the session.
-        for addressing in ALL_ADDRESSING {
+    fn an_active_root_continues_only_for_a_comment_that_names_this_agent() {
+        // Replaces the original Phase 1 assertion that *every* addressing woke
+        // an active root. That was written for a two-party conversation; these
+        // roots are shared, and a `p` copied forward by Desktop is the only
+        // evidence the other two variants carry.
+        assert_eq!(
+            comment(
+                ProjectAuthor::AuthorisedHuman,
+                CallMarker::None,
+                RootState::Active,
+                Addressing::ExplicitMention,
+            ),
+            ProjectEffect::Wake,
+            "an addressed follow-up still needs no *re-enrolment*"
+        );
+        for addressing in [Addressing::InheritedParticipant, Addressing::WatchedRoot] {
             assert_eq!(
                 comment(
                     ProjectAuthor::AuthorisedHuman,
@@ -14043,8 +14109,8 @@ mod tests {
                     RootState::Active,
                     addressing,
                 ),
-                ProjectEffect::Wake,
-                "{addressing:?}"
+                ProjectEffect::Ignore,
+                "{addressing:?} is propagation, not intent"
             );
         }
     }
@@ -15247,7 +15313,7 @@ mod tests {
     }
 
     #[test]
-    fn a_later_inherited_p_does_not_re_enrol() {
+    fn a_later_inherited_p_neither_re_enrols_nor_wakes() {
         let effect = classify_project_event(
             classify_kind(KIND_TEXT_NOTE),
             ProjectAuthor::AuthorisedHuman,
@@ -15257,10 +15323,32 @@ mod tests {
             false,
             false,
         );
-        assert_eq!(effect, ProjectEffect::Wake, "an active root continues");
-        assert_ne!(effect, ProjectEffect::EnrolAndWake, "it does not re-enrol");
         assert_eq!(
-            apply_processing_mode(effect, ProcessingMode::Replay),
+            effect,
+            ProjectEffect::Ignore,
+            "a copied `p` asks for nothing"
+        );
+        assert_ne!(effect, ProjectEffect::EnrolAndWake, "it does not re-enrol");
+
+        // The addressed counterpart still both wakes and declines to re-enrol,
+        // which is the distinction this test was originally written to hold.
+        let addressed = classify_project_event(
+            classify_kind(KIND_TEXT_NOTE),
+            ProjectAuthor::AuthorisedHuman,
+            CallMarker::None,
+            RootState::Active,
+            Addressing::ExplicitMention,
+            false,
+            false,
+        );
+        assert_eq!(addressed, ProjectEffect::Wake, "an active root continues");
+        assert_ne!(
+            addressed,
+            ProjectEffect::EnrolAndWake,
+            "it does not re-enrol"
+        );
+        assert_eq!(
+            apply_processing_mode(addressed, ProcessingMode::Replay),
             ProjectEffect::RefreshContext
         );
     }

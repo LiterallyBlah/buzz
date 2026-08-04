@@ -13418,16 +13418,23 @@ mod tests {
             // the one the prompt assertions read.
             let batch = queue.flush_next().expect("the queued turn flushes");
 
+            // Addressed to the agent. The watched REQ matches on `#e` and
+            // carries no `p` requirement, so a comment can arrive on it naming
+            // nobody — and under the target-only rule that comment is context,
+            // not a turn. What this scenario proves is that a `#e` reference to
+            // an enrolled root is *admitted* on the generation that asked for
+            // it, so the comment has to be one that would wake.
             let comment = peer
                 .publish(
                     &crate::project::watched_sub_id(1),
                     InboundSpec {
                         signer: PeerSigner::Owner,
                         kind: buzz_core::kind::KIND_TEXT_NOTE as u16,
-                        content: "any progress on this?".to_string(),
+                        content: format!("@{agent_hex} any progress on this?"),
                         tags: vec![
                             vec!["a".to_string(), coordinate.clone()],
                             vec!["e".to_string(), root.to_hex()],
+                            vec!["p".to_string(), agent_hex.clone()],
                         ],
                     },
                 )
@@ -14381,6 +14388,9 @@ for line in sys.stdin:
             "an authorised reopen restores the watch"
         );
 
+        // Addressed: a reopened watch admits the comment, and the target-only
+        // rule decides whether it becomes a turn. Both have to hold for the
+        // reopen to mean anything, so the comment names the agent.
         let after_reopen = run_loop
             .deliver_live(participant_comment(
                 &owner,
@@ -14388,7 +14398,7 @@ for line in sys.stdin:
                 &coordinate,
                 &root_id,
                 STARTUP + 30,
-                "and now?",
+                &format!("@{} and now?", agent.public_key().to_hex()),
             ))
             .await;
         assert!(
@@ -14396,7 +14406,7 @@ for line in sys.stdin:
                 after_reopen,
                 crate::ProjectDispatched::Queued { queued: true, .. }
             ),
-            "and the next comment invokes exactly once — got {after_reopen:?}"
+            "and the next addressed comment invokes exactly once — got {after_reopen:?}"
         );
     }
 
