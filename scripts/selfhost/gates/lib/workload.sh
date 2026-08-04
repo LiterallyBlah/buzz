@@ -50,10 +50,18 @@ workload_generate_key() {
 # Registers the pid with the harness so teardown reaps it even on a mid-gate
 # abort. Returns after the connect marker appears (or fails on timeout).
 workload_start_acp() {
-  local acp_bin="$1" logfile="$2" seckey="$3" state_dir="$4" owner_pub="${5:-}"
+  local acp_bin="$1" logfile="$2" seckey="$3" state_dir="$4" owner_pub="${5:-}" cli_bin="${6:-}"
   mkdir -p "${state_dir}"
 
   [[ -x "${acp_bin}" ]] || { err "acp binary not executable: ${acp_bin}"; return 1; }
+
+  # The [Project] prompt tells the agent to run `buzz issues comment …`, and
+  # the stub executes that fence verbatim — so `buzz` must resolve. Prepend
+  # the gate CLI's directory when the caller names one; the stub then replies
+  # through the same CLI + REST + relay path a production agent uses, which is
+  # the whole point of the reply assertion.
+  local stub_path="${PATH}"
+  [[ -n "${cli_bin}" ]] && stub_path="$(dirname "${cli_bin}"):${PATH}"
 
   # The driver keypair is this run's human: BUZZ_ACP_AGENT_OWNER is what gives
   # its issues enrolment authority, exactly as the production agents carry
@@ -61,6 +69,7 @@ workload_start_acp() {
   # a stranger's issue on an agent-owned repository enrols nothing, silently —
   # which run 5 of the first live gate day demonstrated end to end.
   setsid env \
+    PATH="${stub_path}" \
     BUZZ_PRIVATE_KEY="${seckey}" \
     BUZZ_RELAY_URL="$(harness_relay_ws)" \
     ${owner_pub:+BUZZ_ACP_AGENT_OWNER="${owner_pub}"} \

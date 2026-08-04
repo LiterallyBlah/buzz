@@ -196,7 +196,7 @@ run_pairing() {
     workload_announce_repo "${cli}" "${agent_sec}" "${repo_id}" \
       > "${dir}/repo-create.log" 2>&1 || failures+=("repo-announce")
 
-    acp_pid="$(workload_start_acp "${acp_bin}" "${acp_log}" "${agent_sec}" "${dir}/state" "${driver_pub}")" \
+    acp_pid="$(workload_start_acp "${acp_bin}" "${acp_log}" "${agent_sec}" "${dir}/state" "${driver_pub}" "${cli}")" \
       || failures+=("acp-start")
 
     wait_for_marker "${acp_log}" "connected to relay at" 90 \
@@ -211,7 +211,11 @@ run_pairing() {
     if root="$(workload_open_issue "${cli}" "${driver_sec}" "${agent_pub}" "${repo_id}")" \
        && [[ -n "${root}" ]]; then
       echo "${root}" > "${dir}/root-event-id.txt"
-      wait_for_marker "${acp_log}" "root history reconstruction complete" 90 \
+      # A FRESH root has no history to reconstruct, so the reconstruction line
+      # never prints for it — the line that proves enrolment-with-a-turn on a
+      # new root is the queue admission itself (run 6's debug trace: queued=true
+      # one second after the issue landed, then agent_claimed).
+      wait_for_marker "${acp_log}" "project event queued for a turn" 90 \
         || failures+=("marker:fresh-root-enrolment")
       workload_wait_reply "${cli}" "${driver_sec}" "${root}" 120 \
         || failures+=("no-agent-reply")

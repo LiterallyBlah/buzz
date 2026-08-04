@@ -36,6 +36,7 @@
 // =============================================================================
 
 import { appendFileSync } from "node:fs";
+import { execSync } from "node:child_process";
 
 const LOG = process.env.GATES_STUB_LOG || "";
 const REPLY =
@@ -96,13 +97,42 @@ function handle(msg) {
 
     case "session/prompt": {
       const sessionId = params?.sessionId ?? `buzz-gates-stub-${sessionSeq}`;
-      // Stream one agent message chunk, exactly as a real adapter would, so the
-      // harness's turn bookkeeping sees content before the stop reason.
+      // On PROJECT turns the runtime does not publish the agent's text: the
+      // [Project] prompt hands the agent an exact fenced `buzz issues comment
+      // …` command and a real agent EXECUTES it (the runtime's own doc says
+      // the command is "spelled out rather than described" for precisely this
+      // reason). A text-only stub therefore proves nothing about the reply
+      // path — the first live gate day established that no comment can ever
+      // appear. So: when the prompt carries a fenced reply command, run it,
+      // exactly as Claude-with-a-terminal would, with the body on stdin. The
+      // stub inherits BUZZ_PRIVATE_KEY / BUZZ_RELAY_URL from buzz-acp, which
+      // is the same inheritance the production adapters rely on; `buzz` is
+      // resolved via PATH, which the harness points at the gate's CLI.
+      const promptText = (params?.prompt ?? [])
+        .map((p) => (p?.type === "text" ? p.text : ""))
+        .join("\n");
+      const fence = promptText.match(/```bash\n([\s\S]*?)```/);
+      let text = REPLY;
+      if (fence && /\b(issues|pr) comment\b/.test(fence[1])) {
+        try {
+          execSync(`set -euo pipefail\n${fence[1]}`, {
+            input: REPLY,
+            shell: "/bin/bash",
+            stdio: ["pipe", "pipe", "pipe"],
+            timeout: 30_000,
+          });
+          text = `${REPLY} (reply command executed)`;
+        } catch (e) {
+          // Surface the failure in the streamed text so the gate's evidence
+          // shows WHY no comment landed, rather than a silent no-reply.
+          text = `reply command failed: ${String(e?.stderr ?? e).slice(0, 300)}`;
+        }
+      }
       notify("session/update", {
         sessionId,
         update: {
           sessionUpdate: "agent_message_chunk",
-          content: { type: "text", text: REPLY },
+          content: { type: "text", text },
         },
       });
       reply(id, { stopReason: "end_turn" });

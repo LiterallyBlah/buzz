@@ -124,7 +124,7 @@ IFS=$'\t' read -r DRIVER_SEC DRIVER_PUB <<< "${keys:-$'\t'}"
 ACP_PID=""
 if [[ ${#FAILURES[@]} -eq 0 ]]; then
   ACP_PID="$(workload_start_acp "$(candidate_bin acp "${REPO_ROOT}" "${PROFILE}")" \
-              "${ACP_LOG}" "${AGENT_SEC}" "${EVIDENCE}/state" "${DRIVER_PUB}")" || FAILURES+=("acp-start")
+              "${ACP_LOG}" "${AGENT_SEC}" "${EVIDENCE}/state" "${DRIVER_PUB}" "${CLI}")" || FAILURES+=("acp-start")
   wait_for_marker "${ACP_LOG}" "connected to relay at" 90 || FAILURES+=("marker:connected")
 fi
 
