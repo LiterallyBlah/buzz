@@ -247,6 +247,18 @@ pub fn start_managed_agent_runtime(
     start_managed_agent_runtime_pair_lazy(pubkey, relay_url, app)
 }
 
+/// Start a managed runtime pair.
+///
+/// Provider I/O happens *here*, before `start_pair_locked` takes the
+/// transition, store and runtime-map locks. Those locks are app-global, and a
+/// probe under them makes status polling and every unrelated agent wait out a
+/// provider round trip that is allowed to run for 30 seconds.
+///
+/// The snapshot the probe is derived from is optimistic. `start_pair_locked`
+/// re-resolves the descriptor authoritatively under the locks and refuses a
+/// verdict that no longer matches; we then re-probe and try once more. A second
+/// disagreement means the configuration is changing faster than we can measure
+/// it, and the start fails closed rather than spawning on an unproven provider.
 fn start_pair(
     pubkey: String,
     relay_url: String,
@@ -254,6 +266,71 @@ fn start_pair(
     expected_updated_at: Option<&str>,
     app: AppHandle,
 ) -> Result<ManagedAgentRuntimeStatus, String> {
+    use crate::managed_agents::readiness::provider_cache::{
+        ProbeFreshness, STALE_PROVIDER_PREFLIGHT,
+    };
+
+    // Every user-visible way of asking an agent to (re)start lands here —
+    // manual restart, the setup card's Retry, an auth-completion bounce, a
+    // Doctor restart — so it always re-probes rather than answering from a
+    // verdict taken before the user acted.
+    let mut prepared = prepare_pair_preflight(&app, &pubkey, ProbeFreshness::ForceRefresh);
+    for attempt in 0..2 {
+        match start_pair_locked(
+            &pubkey,
+            &relay_url,
+            lazy,
+            expected_updated_at,
+            &app,
+            &prepared,
+        ) {
+            Err(error) if error == STALE_PROVIDER_PREFLIGHT && attempt == 0 => {
+                prepared = prepare_pair_preflight(&app, &pubkey, ProbeFreshness::ForceRefresh);
+            }
+            outcome => return outcome,
+        }
+    }
+    Err(STALE_PROVIDER_PREFLIGHT.to_string())
+}
+
+/// Snapshot the record without the store lock and probe from it.
+///
+/// A lock-free read is the whole point: the verdict is only a candidate, and
+/// `start_pair_locked` revalidates it. A record we cannot read here yields "no
+/// gate", and the locked path then produces the real, specific error for it.
+fn prepare_pair_preflight(
+    app: &AppHandle,
+    pubkey: &str,
+    freshness: crate::managed_agents::readiness::provider_cache::ProbeFreshness,
+) -> crate::managed_agents::readiness::provider_cache::PreparedPreflight {
+    use crate::managed_agents::readiness::provider_cache::PreparedPreflight;
+
+    let Ok(records) = load_managed_agents(app) else {
+        return PreparedPreflight::NotApplicable;
+    };
+    let Some(record) = records
+        .iter()
+        .find(|record| record.pubkey.eq_ignore_ascii_case(pubkey))
+    else {
+        return PreparedPreflight::NotApplicable;
+    };
+    if record.backend != BackendKind::Local {
+        return PreparedPreflight::NotApplicable;
+    }
+    crate::managed_agents::prepare_provider_preflight(app, record, freshness)
+}
+
+fn start_pair_locked(
+    pubkey: &str,
+    relay_url: &str,
+    lazy: bool,
+    expected_updated_at: Option<&str>,
+    app: &AppHandle,
+    prepared: &crate::managed_agents::readiness::provider_cache::PreparedPreflight,
+) -> Result<ManagedAgentRuntimeStatus, String> {
+    let app = app.clone();
+    let pubkey = pubkey.to_string();
+    let relay_url = relay_url.to_string();
     let state = app.state::<AppState>();
     let _transition = state
         .managed_agent_runtime_transition
@@ -294,18 +371,15 @@ fn start_pair(
         .lock()
         .ok()
         .map(|keys| keys.public_key().to_hex());
-    // The interactive start command. Every user-visible way of asking an agent
-    // to (re)start lands here — manual restart, the setup card's Retry, an
-    // auth-completion bounce, a Doctor restart — so it always re-probes the
-    // provider rather than answering from a verdict taken before the user
-    // acted.
+    // The provider was already asked, outside every lock above. This only
+    // checks the answer still describes what we are about to run.
     let mut process = spawn_agent_child(
         &app,
         record,
         &key.relay_url,
         lazy,
         owner.as_deref(),
-        crate::managed_agents::readiness::provider_cache::ProbeFreshness::ForceRefresh,
+        prepared,
     )?;
     let now = crate::util::now_iso();
     let receipt = ManagedAgentRuntimeReceipt {

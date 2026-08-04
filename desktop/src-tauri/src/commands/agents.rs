@@ -395,6 +395,20 @@ pub(super) async fn start_local_agent_with_preflight(
         );
     ensure_relay_mesh_for_record(app, mesh_model_id.as_deref(), allow_fresh_create_start).await?;
 
+    // Provider preflight before the store and runtime-map locks below. A
+    // programmatic start is always user-initiated (create-agent, Doctor
+    // post-install restart), so it re-probes rather than trusting a verdict
+    // taken before whatever the user just did — and it does so out here, where
+    // the wait costs nobody else their lock. `start_managed_agent_process`
+    // re-resolves the descriptor under the locks and refuses a verdict that no
+    // longer matches, which fails the start closed rather than spawning
+    // unproven.
+    let prepared_preflight = crate::managed_agents::prepare_provider_preflight(
+        app,
+        &record_snapshot,
+        crate::managed_agents::readiness::provider_cache::ProbeFreshness::ForceRefresh,
+    );
+
     let _store_guard = state
         .managed_agents_store_lock
         .lock()
@@ -429,7 +443,13 @@ pub(super) async fn start_local_agent_with_preflight(
             }
         }
     }
-    start_managed_agent_process(app, record, &mut runtimes, Some(owner_hex))?;
+    start_managed_agent_process(
+        app,
+        record,
+        &mut runtimes,
+        Some(owner_hex),
+        &prepared_preflight,
+    )?;
     save_managed_agents(app, &records)?;
     if let Some(saved_record) = records.iter().find(|r| r.pubkey == pubkey) {
         retain_managed_agent_pending(app, state, saved_record);

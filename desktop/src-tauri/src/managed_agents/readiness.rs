@@ -480,20 +480,10 @@ pub(crate) fn provider_probe_applies(effective_command: &str) -> bool {
     known_acp_runtime(effective_command).is_some_and(|rt| rt.id == "claude")
 }
 
-/// The result of a provider preflight, ready to be stamped on the generation
-/// that the caller is about to start.
-///
-/// Carrying the fingerprint alongside the verdict is what makes the stamp
-/// meaningful: status reads the *generation's* answer, so a later cache result
-/// for a since-changed descriptor cannot retroactively describe a process that
-/// is already running.
-#[derive(Debug, Clone)]
-pub(crate) struct ProviderPreflight {
-    /// The verdict for the descriptor that was actually probed.
-    pub capability: provider_probe::ProviderCapability,
-    /// The fingerprint the verdict belongs to.
-    pub fingerprint: provider_cache::CapabilityFingerprint,
-}
+/// The verdict type lives with the cache that produces it — see
+/// [`provider_cache::ProviderPreflight`]. Only its mapping onto a setup
+/// requirement belongs here, next to the rest of the requirement taxonomy.
+pub(crate) use provider_cache::ProviderPreflight;
 
 impl ProviderPreflight {
     /// The requirement to add to a setup payload, or `None` when ready.
@@ -510,35 +500,6 @@ impl ProviderPreflight {
                 Some(ProviderCapabilityState::AdapterProblem.requirement())
             }
         }
-    }
-}
-
-/// Run the provider preflight for a resolved spawn.
-///
-/// Returns `None` when the gate does not apply to this runtime — the caller
-/// then behaves exactly as it did before this phase existed.
-///
-/// The caller must hold no transition, store, or runtime-map lock: this blocks
-/// for as long as a provider round-trip takes, and a probe under a lock would
-/// stall every other agent in the app.
-///
-/// After the probe returns, the caller must recompute the fingerprint and
-/// compare it against [`ProviderPreflight::fingerprint`]. A descriptor that
-/// changed while we were probing (a persona edit, a credential change, an
-/// adapter upgrade) invalidates the verdict, and using it anyway would gate the
-/// new configuration on the old one's answer.
-pub(crate) fn provider_preflight(
-    cache: &provider_cache::ProviderReadinessCache,
-    invocation: &provider_probe::ProbeInvocation,
-    freshness: provider_cache::ProbeFreshness,
-) -> ProviderPreflight {
-    let fingerprint = provider_cache::fingerprint(invocation);
-    let capability = cache.resolve(&fingerprint, freshness, || {
-        provider_probe::run_provider_probe(invocation)
-    });
-    ProviderPreflight {
-        capability,
-        fingerprint,
     }
 }
 

@@ -151,6 +151,35 @@ fn classified_error_from_json(
     }
 }
 
+/// Classify a parsed inbound message *before* it is published anywhere.
+///
+/// Returns `Some` only when `msg` is the JSON-RPC error response the caller is
+/// waiting for **and** that error is a terminal authentication failure. Every
+/// other message — notifications, agent-initiated requests, responses to other
+/// ids, ordinary errors, successful results — returns `None` and keeps its
+/// existing diagnostics untouched.
+///
+/// This exists so the read loops can decide what is safe to log before they
+/// log it. A provider's own expired-credential error is the one response most
+/// likely to quote account, header, or token material back at us, and a wire
+/// log or an observer record cannot be recalled once written.
+fn terminal_auth_in_response(
+    msg: &serde_json::Value,
+    expected_id: u64,
+    identity: &AdapterIdentity,
+    stage: AuthStage,
+) -> Option<TerminalAuth> {
+    if msg.get("method").is_some() {
+        return None;
+    }
+    let id = msg.get("id")?;
+    if *id != serde_json::json!(expected_id) {
+        return None;
+    }
+    let error = msg.get("error")?;
+    terminal_auth::classify_jsonrpc_error(error, identity, stage)
+}
+
 fn build_initialize_params() -> serde_json::Value {
     serde_json::json!({
         "protocolVersion": 2,
@@ -659,6 +688,41 @@ impl AcpClient {
     /// Return the pool slot index for this agent process.
     pub(crate) fn observer_agent_index(&self) -> Option<usize> {
         self.observer_agent_index
+    }
+
+    /// Publish one parsed inbound message to the wire log and the observer feed.
+    ///
+    /// `terminal` is the pre-computed classification from
+    /// [`terminal_auth_in_response`]. When it fired, the raw line and the raw
+    /// message are dropped here and never published: only the closed
+    /// categorical values already carried by [`TerminalAuth`] — plus the
+    /// response id, which is our own counter — are emitted. Everything else
+    /// keeps its existing full-fidelity diagnostics.
+    fn publish_inbound(
+        &self,
+        trimmed: &str,
+        msg: &serde_json::Value,
+        terminal: Option<TerminalAuth>,
+    ) {
+        let Some(auth) = terminal else {
+            tracing::debug!(target: "acp::wire", "← {trimmed}");
+            self.observe("acp_read", msg.clone());
+            return;
+        };
+        let id = msg.get("id").cloned().unwrap_or(serde_json::Value::Null);
+        tracing::debug!(
+            target: "acp::wire",
+            "← <terminal auth error response, body withheld> id={id} {auth}"
+        );
+        self.observe(
+            "acp_terminal_auth",
+            serde_json::json!({
+                "response_id": id,
+                "adapter": auth.adapter.as_str(),
+                "stage": auth.stage.as_str(),
+                "signal": auth.signal.as_str(),
+            }),
+        );
     }
 
     /// Emit a semantic event to the local observer feed, if enabled.
@@ -1272,12 +1336,16 @@ impl AcpClient {
                 continue;
             }
 
-            // Only log and reset idle after we have a valid non-empty line.
-            tracing::debug!(target: "acp::wire", "← {trimmed}");
-
+            // Parse before publishing: what a line is allowed to say in a log
+            // depends on what it turns out to be, and a raw `←` line here was
+            // reaching tracing and observer evidence ahead of any
+            // classification.
             let msg: serde_json::Value = match serde_json::from_str(trimmed) {
                 Ok(v) => v,
                 Err(e) => {
+                    // Unparseable, so there is no response to classify and
+                    // nothing to withhold — ordinary diagnostics apply.
+                    tracing::debug!(target: "acp::wire", "← {trimmed}");
                     self.observe(
                         "acp_parse_error",
                         serde_json::json!({
@@ -1292,13 +1360,25 @@ impl AcpClient {
                     continue;
                 }
             };
-            self.observe("acp_read", msg.clone());
+            let terminal = terminal_auth_in_response(
+                &msg,
+                expected_id,
+                &self.adapter_identity,
+                self.pending_stage,
+            );
+            self.publish_inbound(trimmed, &msg, terminal);
 
             // Check if this is a response to our expected request (has matching id
             // AND no `method` field — a `method` field means it's an agent-initiated
             // request, not a response, even if the id happens to match).
             if let Some(id) = msg.get("id") {
                 if *id == serde_json::json!(expected_id) && msg.get("method").is_none() {
+                    // Reuse the classification made before publication rather
+                    // than redoing it: one decision, so the error returned and
+                    // the evidence written can never disagree.
+                    if let Some(terminal) = terminal {
+                        return Err(AcpError::TerminalAuth(terminal));
+                    }
                     if let Some(error) = msg.get("error") {
                         return Err(classified_error_from_json(
                             error,
@@ -1600,11 +1680,13 @@ impl AcpClient {
                         continue;
                     }
 
-                    tracing::debug!(target: "acp::wire", "← {trimmed}");
-
+                    // Parse before publishing — see `read_until_response` for
+                    // why the raw line cannot be logged until it has been
+                    // classified.
                     let msg: serde_json::Value = match serde_json::from_str(trimmed) {
                         Ok(v) => v,
                         Err(e) => {
+                            tracing::debug!(target: "acp::wire", "← {trimmed}");
                             self.observe(
                                 "acp_parse_error",
                                 serde_json::json!({
@@ -1619,7 +1701,13 @@ impl AcpClient {
                             continue;
                         }
                     };
-                    self.observe("acp_read", msg.clone());
+                    let terminal = terminal_auth_in_response(
+                        &msg,
+                        expected_id,
+                        &self.adapter_identity,
+                        AuthStage::Prompt,
+                    );
+                    self.publish_inbound(trimmed, &msg, terminal);
 
                     let activity_now = Instant::now();
                     idle_deadline = activity_now + idle_timeout;
@@ -1739,7 +1827,12 @@ impl AcpClient {
                                             .send(crate::pool::SteerAck::PromptCompletedNeutral);
                                     }
                                     // Prompt responses share the session-creation
-                                    // classifier: one seam, one taxonomy.
+                                    // classifier: one seam, one taxonomy. The
+                                    // pre-publication classification is reused
+                                    // so the error and the evidence agree.
+                                    if let Some(terminal) = terminal {
+                                        return Err(AcpError::TerminalAuth(terminal));
+                                    }
                                     return Err(classified_error_from_json(
                                         error,
                                         &self.adapter_identity,
@@ -4597,5 +4690,231 @@ mod tests {
             msg.contains("sandbox_workspace_write"),
             "error must mention sandbox_workspace_write"
         );
+    }
+}
+
+/// Redaction of terminal-authentication responses at the read seam.
+///
+/// The provider's own expired-credential error is the response most likely to
+/// quote account, header or token material back at us. These tests drive the
+/// two real read loops against a fake adapter whose otherwise-authentic
+/// terminal error carries a sentinel, and prove the sentinel reaches neither
+/// tracing, nor observer evidence, nor the returned error — while an ordinary
+/// provider error keeps every diagnostic it had.
+#[cfg(test)]
+mod terminal_auth_redaction_tests {
+    use super::*;
+    use crate::observer::ObserverHandle;
+    use crate::terminal_auth::AdapterIdentity;
+
+    /// A value the adapter must never be able to launder into our records.
+    const SECRET_SENTINEL: &str = "SECRET_SENTINEL_9f3a2b";
+
+    /// A terminal Claude auth error that also carries the sentinel, exactly as
+    /// a provider quoting the rejected credential back at us would.
+    fn terminal_error_line(id: u64) -> String {
+        format!(
+            r#"{{"jsonrpc":"2.0","id":{id},"error":{{"code":-32000,"message":"API Error: OAuth session expired and could not be refreshed (token {SECRET_SENTINEL})","data":{{"authorization":"Bearer {SECRET_SENTINEL}"}}}}}}"#
+        )
+    }
+
+    /// An ordinary retryable provider error carrying the same sentinel.
+    fn transient_error_line(id: u64) -> String {
+        format!(
+            r#"{{"jsonrpc":"2.0","id":{id},"error":{{"code":-32000,"message":"API Error: 429 rate limit exceeded ({SECRET_SENTINEL})"}}}}"#
+        )
+    }
+
+    /// Captures every formatted tracing event of the current thread in memory.
+    #[derive(Clone, Default)]
+    struct CapturedTracing(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl CapturedTracing {
+        fn text(&self) -> String {
+            let buffer = self.0.lock().unwrap_or_else(|e| e.into_inner());
+            String::from_utf8_lossy(&buffer).into_owned()
+        }
+    }
+
+    impl std::io::Write for CapturedTracing {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedTracing {
+        type Writer = Self;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// Install a thread-local capturing subscriber at TRACE.
+    ///
+    /// Thread-local rather than global so this cannot swallow or be polluted by
+    /// any other test's output. `#[tokio::test]` runs the future on this very
+    /// thread, so the guard covers the whole read loop.
+    fn capture_tracing() -> (CapturedTracing, tracing::subscriber::DefaultGuard) {
+        let logs = CapturedTracing::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(logs.clone())
+            .with_max_level(tracing::Level::TRACE)
+            .with_ansi(false)
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+        (logs, guard)
+    }
+
+    /// A Claude-family client whose adapter emits `line` and then goes quiet.
+    async fn claude_client_emitting(line: &str, observer: &ObserverHandle) -> AcpClient {
+        let mut client = AcpClient::spawn(
+            "bash",
+            &["-c".into(), format!("printf '%s\\n' '{line}'; sleep 30")],
+            &[],
+            false,
+        )
+        .await
+        .expect("spawn fake adapter");
+        client.adapter_identity = AdapterIdentity::from_command("claude-agent-acp");
+        client.set_observer(Some(observer.clone()), 0);
+        client
+    }
+
+    /// Every observer payload, serialised, plus the kinds that were emitted.
+    fn observed(observer: &ObserverHandle) -> (String, Vec<String>) {
+        let events = observer.snapshot();
+        let kinds = events.iter().map(|e| e.kind.clone()).collect();
+        let payloads = events
+            .iter()
+            .map(|e| e.payload.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        (payloads, kinds)
+    }
+
+    fn assert_nothing_leaked(logs: &CapturedTracing, observer: &ObserverHandle, error: &AcpError) {
+        let traced = logs.text();
+        let (payloads, kinds) = observed(observer);
+        let displayed = error.to_string();
+
+        for (surface, text) in [
+            ("tracing", traced.as_str()),
+            ("observer evidence", payloads.as_str()),
+            ("the returned error", displayed.as_str()),
+        ] {
+            assert!(
+                !text.contains(SECRET_SENTINEL),
+                "{surface} leaked the sentinel: {text}"
+            );
+            assert!(
+                !text.contains("OAuth session expired"),
+                "{surface} leaked the raw provider message: {text}"
+            );
+            assert!(
+                !text.contains("Bearer"),
+                "{surface} leaked the raw error data: {text}"
+            );
+        }
+        assert!(
+            !kinds.iter().any(|kind| kind == "acp_read"),
+            "the raw response must not be published as evidence: {kinds:?}"
+        );
+        assert!(
+            kinds.iter().any(|kind| kind == "acp_terminal_auth"),
+            "a categorical terminal-auth record must still be published: {kinds:?}"
+        );
+        assert!(
+            payloads.contains("claude") && payloads.contains("claude_oauth_unrefreshable"),
+            "the categorical record must name adapter and signal: {payloads}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_terminal_auth_session_response_is_never_published_raw() {
+        let (logs, _tracing) = capture_tracing();
+        let observer = ObserverHandle::in_process();
+        let mut client = claude_client_emitting(&terminal_error_line(7), &observer).await;
+        client.pending_stage = AuthStage::SessionNew;
+
+        let error = client
+            .read_until_response(7)
+            .await
+            .expect_err("a terminal auth response must be an error");
+
+        let AcpError::TerminalAuth(terminal) = &error else {
+            panic!("expected a typed terminal auth error, got {error:?}");
+        };
+        assert_eq!(terminal.stage, AuthStage::SessionNew);
+        assert_eq!(terminal.adapter, terminal_auth::AdapterFamily::Claude);
+        assert_nothing_leaked(&logs, &observer, &error);
+        client.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_terminal_auth_prompt_response_is_never_published_raw() {
+        let (logs, _tracing) = capture_tracing();
+        let observer = ObserverHandle::in_process();
+        let mut client = claude_client_emitting(&terminal_error_line(11), &observer).await;
+
+        let max_duration = std::time::Duration::from_secs(30);
+        let error = client
+            .read_until_response_with_idle_timeout(
+                "prompt",
+                11,
+                std::time::Duration::from_secs(10),
+                tokio::time::Instant::now() + max_duration,
+                max_duration,
+            )
+            .await
+            .expect_err("a terminal auth response must be an error");
+
+        let AcpError::TerminalAuth(terminal) = &error else {
+            panic!("expected a typed terminal auth error, got {error:?}");
+        };
+        assert_eq!(terminal.stage, AuthStage::Prompt);
+        assert_nothing_leaked(&logs, &observer, &error);
+        client.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn an_ordinary_provider_error_keeps_its_full_diagnostics() {
+        // The control: redaction must be scoped to terminal auth, or every
+        // unrelated failure becomes undebuggable.
+        let (logs, _tracing) = capture_tracing();
+        let observer = ObserverHandle::in_process();
+        let mut client = claude_client_emitting(&transient_error_line(3), &observer).await;
+        client.pending_stage = AuthStage::SessionNew;
+
+        let error = client
+            .read_until_response(3)
+            .await
+            .expect_err("an error response must be an error");
+
+        assert!(
+            matches!(error, AcpError::AgentError { .. }),
+            "a rate limit must stay an ordinary retryable error, got {error:?}"
+        );
+        let (payloads, kinds) = observed(&observer);
+        assert!(
+            kinds.iter().any(|kind| kind == "acp_read"),
+            "ordinary traffic keeps its raw evidence: {kinds:?}"
+        );
+        assert!(
+            payloads.contains(SECRET_SENTINEL),
+            "ordinary traffic is not redacted: {payloads}"
+        );
+        assert!(
+            logs.text().contains("429 rate limit exceeded"),
+            "ordinary traffic keeps its wire log: {}",
+            logs.text()
+        );
+        client.shutdown().await;
     }
 }

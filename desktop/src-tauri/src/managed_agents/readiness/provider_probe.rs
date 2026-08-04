@@ -149,58 +149,178 @@ pub(crate) fn build_probe_env(
     env
 }
 
+/// Every field schema v1 defines. Anything else means we are reading output
+/// from a version of the helper we do not understand.
+///
+/// Kept in lockstep with `ProbeReport` in `crates/buzz-acp/src/provider_probe.rs`
+/// — that struct is the producer, this list is the consumer, and a field added
+/// to one without the other is exactly the drift this closed set catches.
+const SCHEMA_V1_FIELDS: &[&str] = &[
+    "schema_version",
+    "status",
+    "stage",
+    "reason",
+    "adapter_id",
+    "adapter_name",
+    "adapter_version",
+    "stop_reason",
+];
+
+/// The stages the helper may report, in the order the probe walks them.
+const PROBE_STAGES: &[&str] = &["spawn", "initialize", "session_new", "prompt", "cleanup"];
+
+/// The only stage a ready verdict may claim.
+///
+/// A turn that completed is a turn the helper then tore down, so anything
+/// earlier is a verdict about a probe that had not finished.
+const READY_STAGE: &str = "cleanup";
+
+/// The only adapter this gate is ever applied to.
+///
+/// The desktop gates local Claude runtimes and nothing else, so a report
+/// naming any other adapter describes a probe of the wrong thing — the
+/// `adapter_mismatch` case, arriving by a different route.
+const EXPECTED_ADAPTER_ID: &str = "claude";
+
 /// Parse the helper's stdout under the strict schema-v1 contract.
 ///
-/// Anything that is not exactly one JSON object of the expected shape fails
-/// closed as [`ProviderCapability::AdapterProblem`] — including trailing data,
-/// an unknown schema version, an unknown enum value, and a `ready` verdict that
-/// does not carry `stop_reason: "end_turn"`.
+/// The object must be *closed* (no field outside [`SCHEMA_V1_FIELDS`]),
+/// *complete* (every field the branch requires), and *consistent* (no field the
+/// branch forbids). A ready verdict additionally has to prove which boundary
+/// completed: the contracted stage, the expected adapter identity, and
+/// `stop_reason: "end_turn"`.
+///
+/// Everything else — trailing data, an unknown schema version, an unknown enum
+/// value, a missing or mistyped field, a ready object carrying a `reason`, a
+/// not-ready object carrying a `stop_reason` — fails closed as
+/// [`ProviderCapability::AdapterProblem`]. A readiness gate that guesses at a
+/// half-understood object is worse than one that admits it cannot tell.
 pub(crate) fn parse_probe_stdout(stdout: &[u8]) -> ProviderCapability {
+    parse_schema_v1(stdout).unwrap_or(ProviderCapability::AdapterProblem)
+}
+
+/// The strict parse, with `None` standing for every rejection.
+fn parse_schema_v1(stdout: &[u8]) -> Option<ProviderCapability> {
     if stdout.len() > MAX_STDOUT_BYTES {
-        return ProviderCapability::AdapterProblem;
+        return None;
     }
-    let Ok(text) = std::str::from_utf8(stdout) else {
-        return ProviderCapability::AdapterProblem;
-    };
+    let text = std::str::from_utf8(stdout).ok()?;
 
     // One object, nothing after it. `into_iter().next()` on a stream reader
     // would silently tolerate a second document; the desktop must not.
     let mut stream =
         serde_json::Deserializer::from_str(text.trim()).into_iter::<serde_json::Value>();
-    let Some(Ok(value)) = stream.next() else {
-        return ProviderCapability::AdapterProblem;
-    };
+    let value = stream.next()?.ok()?;
     if stream.next().is_some() {
-        return ProviderCapability::AdapterProblem;
+        return None;
     }
-    let Some(object) = value.as_object() else {
-        return ProviderCapability::AdapterProblem;
-    };
+    let object = value.as_object()?;
 
-    if object.get("schema_version").and_then(|v| v.as_u64()) != Some(EXPECTED_SCHEMA_VERSION) {
-        return ProviderCapability::AdapterProblem;
+    // Closed membership first: an unknown field means the producer and this
+    // parser disagree about what the object means, and every check below would
+    // then be reasoning about a shape it does not actually have.
+    if object
+        .keys()
+        .any(|key| !SCHEMA_V1_FIELDS.contains(&key.as_str()))
+    {
+        return None;
     }
 
-    match object.get("status").and_then(|v| v.as_str()) {
-        Some("ready") => {
-            // A ready verdict is only accepted with the one stop reason that
-            // means a turn actually completed.
-            if object.get("stop_reason").and_then(|v| v.as_str()) == Some("end_turn") {
-                ProviderCapability::Ready
-            } else {
-                ProviderCapability::AdapterProblem
+    if object.get("schema_version")?.as_u64()? != EXPECTED_SCHEMA_VERSION {
+        return None;
+    }
+
+    let stage = object.get("stage")?.as_str()?;
+    if !PROBE_STAGES.contains(&stage) {
+        return None;
+    }
+
+    if object.get("adapter_id")?.as_str()? != EXPECTED_ADAPTER_ID {
+        return None;
+    }
+
+    // Optional, but when present they must be the strings the schema says.
+    for optional in ["adapter_name", "adapter_version"] {
+        if let Some(value) = object.get(optional) {
+            value.as_str()?;
+        }
+    }
+
+    match object.get("status")?.as_str()? {
+        "ready" => {
+            // A ready verdict is the only one that authorises a start, so it
+            // carries the whole burden of proof: the right boundary, the right
+            // adapter, a completed turn — and no not-ready residue.
+            if object.contains_key("reason") {
+                return None;
+            }
+            if stage != READY_STAGE {
+                return None;
+            }
+            if object.get("stop_reason")?.as_str()? != "end_turn" {
+                return None;
+            }
+            Some(ProviderCapability::Ready)
+        }
+        "not_ready" => {
+            if object.contains_key("stop_reason") {
+                return None;
+            }
+            match object.get("reason")?.as_str()? {
+                "authentication_required" => Some(ProviderCapability::AuthenticationRequired),
+                "provider_rejected" | "timed_out" => Some(ProviderCapability::Unknown),
+                "protocol_error" | "adapter_mismatch" | "cleanup_failed" => {
+                    Some(ProviderCapability::AdapterProblem)
+                }
+                // An unrecognised reason is a contract we do not understand.
+                _ => None,
             }
         }
-        Some("not_ready") => match object.get("reason").and_then(|v| v.as_str()) {
-            Some("authentication_required") => ProviderCapability::AuthenticationRequired,
-            Some("provider_rejected") | Some("timed_out") => ProviderCapability::Unknown,
-            Some("protocol_error") | Some("adapter_mismatch") | Some("cleanup_failed") => {
-                ProviderCapability::AdapterProblem
-            }
-            // An unrecognised reason is a contract we do not understand.
-            _ => ProviderCapability::AdapterProblem,
-        },
-        _ => ProviderCapability::AdapterProblem,
+        _ => None,
+    }
+}
+
+// ── Gate applicability ───────────────────────────────────────────────────────
+
+/// What the provider gate requires of one spawn.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ProviderGate {
+    /// Not a gated runtime, or static readiness already failed. The provider is
+    /// not contacted and the caller behaves exactly as it did before this phase
+    /// existed.
+    NotApplicable,
+    /// The gate applies. Probe through this sidecar — the same binary the
+    /// runtime spawn resolved, never an independently guessed one.
+    Probe { acp_binary: PathBuf },
+    /// The gate applies but the sidecar the runtime would spawn cannot be
+    /// resolved.
+    ///
+    /// This must never collapse into [`Self::NotApplicable`]. Callers read
+    /// "not applicable" as "carry on", so a missing sidecar returning it would
+    /// let a configured, resolvable Claude runtime start with no capability
+    /// proof at all — the gate silently disabling itself at exactly the moment
+    /// something is already wrong.
+    Unavailable,
+}
+
+/// Decide what the provider gate requires.
+///
+/// `gate_applies` is the runtime-family decision (local Claude only) and
+/// `static_checks_passed` is ordinary readiness — a spawn already headed for
+/// setup mode has nothing to prove and must not reach a provider.
+/// `effective_acp_binary` is the sidecar the runtime spawn itself resolved;
+/// this function never resolves one of its own.
+pub(crate) fn provider_gate(
+    gate_applies: bool,
+    static_checks_passed: bool,
+    effective_acp_binary: Option<PathBuf>,
+) -> ProviderGate {
+    if !gate_applies || !static_checks_passed {
+        return ProviderGate::NotApplicable;
+    }
+    match effective_acp_binary {
+        Some(acp_binary) => ProviderGate::Probe { acp_binary },
+        None => ProviderGate::Unavailable,
     }
 }
 
@@ -470,6 +590,161 @@ mod tests {
         assert_eq!(
             parse_probe_stdout(&oversized),
             ProviderCapability::AdapterProblem
+        );
+    }
+
+    #[test]
+    fn an_incomplete_ready_object_is_not_a_ready_verdict() {
+        // The candidate-1 counterexample: it says `ready` and `end_turn`, but
+        // it never says *what* completed. Without the stage and the adapter
+        // identity there is nothing tying this verdict to a Claude probe that
+        // actually finished a turn.
+        assert_eq!(
+            parse_probe_stdout(
+                br#"{"schema_version":1,"status":"ready","stop_reason":"end_turn"}"#
+            ),
+            ProviderCapability::AdapterProblem,
+            "a ready verdict must prove which boundary completed"
+        );
+    }
+
+    #[test]
+    fn a_ready_verdict_requires_the_contracted_stage_and_adapter() {
+        let cases: [(&str, &[u8]); 5] = [
+            (
+                "missing stage",
+                br#"{"schema_version":1,"status":"ready","adapter_id":"claude","stop_reason":"end_turn"}"#,
+            ),
+            (
+                "a stage before the turn finished",
+                br#"{"schema_version":1,"status":"ready","stage":"prompt","adapter_id":"claude","stop_reason":"end_turn"}"#,
+            ),
+            (
+                "an unknown stage",
+                br#"{"schema_version":1,"status":"ready","stage":"warmup","adapter_id":"claude","stop_reason":"end_turn"}"#,
+            ),
+            (
+                "missing adapter identity",
+                br#"{"schema_version":1,"status":"ready","stage":"cleanup","stop_reason":"end_turn"}"#,
+            ),
+            (
+                "another adapter's identity",
+                br#"{"schema_version":1,"status":"ready","stage":"cleanup","adapter_id":"codex","stop_reason":"end_turn"}"#,
+            ),
+        ];
+        for (why, body) in cases {
+            assert_eq!(
+                parse_probe_stdout(body),
+                ProviderCapability::AdapterProblem,
+                "{why} must fail closed"
+            );
+        }
+    }
+
+    #[test]
+    fn a_field_outside_the_closed_schema_fails_closed() {
+        // An unknown field means the producer and this parser disagree about
+        // what the object means — including a plausible-looking one that a
+        // careless reader would take as reassurance.
+        for body in [
+            br#"{"schema_version":1,"status":"ready","stage":"cleanup","adapter_id":"claude","stop_reason":"end_turn","authenticated":true}"#.as_slice(),
+            br#"{"schema_version":1,"status":"not_ready","stage":"prompt","reason":"timed_out","adapter_id":"claude","detail":"anything"}"#.as_slice(),
+        ] {
+            assert_eq!(parse_probe_stdout(body), ProviderCapability::AdapterProblem);
+        }
+    }
+
+    #[test]
+    fn internally_inconsistent_branches_fail_closed() {
+        // A ready object carrying a not-ready field, and a not-ready object
+        // carrying the ready-only field. Either means the producer is not the
+        // one we think it is.
+        let ready_with_reason = br#"{"schema_version":1,"status":"ready","stage":"cleanup","adapter_id":"claude","stop_reason":"end_turn","reason":"authentication_required"}"#;
+        assert_eq!(
+            parse_probe_stdout(ready_with_reason),
+            ProviderCapability::AdapterProblem
+        );
+
+        let not_ready_with_stop_reason = br#"{"schema_version":1,"status":"not_ready","stage":"prompt","reason":"authentication_required","adapter_id":"claude","stop_reason":"end_turn"}"#;
+        assert_eq!(
+            parse_probe_stdout(not_ready_with_stop_reason),
+            ProviderCapability::AdapterProblem,
+            "an authentication failure must not be readable as a completed turn"
+        );
+
+        let not_ready_without_reason =
+            br#"{"schema_version":1,"status":"not_ready","stage":"prompt","adapter_id":"claude"}"#;
+        assert_eq!(
+            parse_probe_stdout(not_ready_without_reason),
+            ProviderCapability::AdapterProblem
+        );
+    }
+
+    #[test]
+    fn mistyped_fields_fail_closed() {
+        for body in [
+            br#"{"schema_version":1,"status":"ready","stage":"cleanup","adapter_id":"claude","stop_reason":"end_turn","adapter_name":7}"#.as_slice(),
+            br#"{"schema_version":1,"status":"ready","stage":1,"adapter_id":"claude","stop_reason":"end_turn"}"#.as_slice(),
+            br#"{"schema_version":1,"status":"ready","stage":"cleanup","adapter_id":true,"stop_reason":"end_turn"}"#.as_slice(),
+        ] {
+            assert_eq!(parse_probe_stdout(body), ProviderCapability::AdapterProblem);
+        }
+    }
+
+    #[test]
+    fn the_optional_identity_fields_are_accepted_when_well_formed() {
+        // The helper omits these when the adapter reports no `serverInfo`, so
+        // requiring them would fail a legitimate probe; accepting anything in
+        // them would not.
+        let with_identity = br#"{"schema_version":1,"status":"ready","stage":"cleanup","adapter_id":"claude","adapter_name":"claude-code-acp","adapter_version":"1.2.3","stop_reason":"end_turn"}"#;
+        assert_eq!(parse_probe_stdout(with_identity), ProviderCapability::Ready);
+    }
+
+    // ── gate applicability ─────────────────────────────────────────────────
+
+    #[test]
+    fn the_gate_probes_the_sidecar_the_runtime_resolved() {
+        // The effective sidecar is an absolute path chosen by the spawn path.
+        // Nothing here consults PATH, so a bare `buzz-acp` that happens not to
+        // be resolvable on this machine cannot change the answer.
+        let effective = PathBuf::from("/opt/Buzz.app/Contents/MacOS/buzz-acp");
+        assert_eq!(
+            provider_gate(true, true, Some(effective.clone())),
+            ProviderGate::Probe {
+                acp_binary: effective
+            }
+        );
+    }
+
+    #[test]
+    fn an_unresolvable_sidecar_fails_closed_rather_than_disabling_the_gate() {
+        // The candidate-1 bypass: this returned "no gate", and callers read
+        // that as permission to start.
+        assert_eq!(
+            provider_gate(true, true, None),
+            ProviderGate::Unavailable,
+            "a missing sidecar must not silently disable the gate"
+        );
+        assert_ne!(provider_gate(true, true, None), ProviderGate::NotApplicable);
+    }
+
+    #[test]
+    fn the_gate_is_not_applicable_to_other_runtimes_or_failed_static_checks() {
+        let binary = Some(PathBuf::from("/opt/buzz-acp"));
+        assert_eq!(
+            provider_gate(false, true, binary.clone()),
+            ProviderGate::NotApplicable,
+            "a non-Claude runtime keeps its existing behaviour"
+        );
+        assert_eq!(
+            provider_gate(true, false, binary),
+            ProviderGate::NotApplicable,
+            "setup mode must not contact a provider"
+        );
+        // Even with no sidecar at all, a non-applicable gate stays silent.
+        assert_eq!(
+            provider_gate(false, true, None),
+            ProviderGate::NotApplicable
         );
     }
 

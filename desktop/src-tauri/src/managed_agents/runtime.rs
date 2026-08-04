@@ -445,29 +445,30 @@ pub(crate) fn configure_runtime_cli(
     }
 }
 
-/// Spawn an agent process without holding any locks on records or runtimes.
-/// Returns the child process and log path on success. The caller is responsible
-/// for updating `ManagedAgentRecord` fields and inserting into the runtimes map.
+/// Spawn an agent process. Returns the child process and log path on success.
+/// The caller is responsible for updating `ManagedAgentRecord` fields and
+/// inserting into the runtimes map.
+///
+/// Callers reach this holding their lifecycle locks, so nothing here may block
+/// on anything external. In particular it contacts no provider — see
+/// `prepared_preflight` below.
 ///
 /// `owner_hex`: the workspace owner's pubkey, used as a fallback for legacy
 /// records that have no NIP-OA `auth_tag`. See `build_respond_to_env`.
-/// `freshness` decides whether the provider preflight may reuse a cached
-/// verdict. A user-initiated start — manual restart, setup Retry, auth
-/// completion, a Doctor or post-install restart — passes
-/// [`ProbeFreshness::ForceRefresh`]: the user has just done something they
-/// expect the app to notice, and answering from a verdict taken before they
-/// did it would make the retry look broken. Automatic launch restore passes
-/// [`ProbeFreshness::Cached`].
 ///
-/// [`ProbeFreshness::ForceRefresh`]: crate::managed_agents::readiness::provider_cache::ProbeFreshness::ForceRefresh
-/// [`ProbeFreshness::Cached`]: crate::managed_agents::readiness::provider_cache::ProbeFreshness::Cached
+/// `prepared_preflight` is the provider verdict the caller obtained from
+/// [`prepare_provider_preflight`] **before** it took any lifecycle lock. This
+/// function contacts no provider: it re-resolves the descriptor authoritatively
+/// and verifies the verdict still describes it. A verdict that no longer
+/// matches fails the spawn; the caller may re-prepare and retry once, but must
+/// never start without one.
 pub fn spawn_agent_child(
     app: &AppHandle,
     record: &ManagedAgentRecord,
     relay_url: &str,
     lazy: bool,
     owner_hex: Option<&str>,
-    freshness: crate::managed_agents::readiness::provider_cache::ProbeFreshness,
+    prepared_preflight: &crate::managed_agents::readiness::provider_cache::PreparedPreflight,
 ) -> Result<crate::managed_agents::ManagedAgentProcess, String> {
     if let Some(error) = spawn_key_refusal(record) {
         return Err(error);
@@ -560,22 +561,7 @@ pub fn spawn_agent_child(
     // relay this child may connect to, regardless of the record/workspace default.
     let effective_relay_url = runtime_key.relay_url.clone();
 
-    // Augment PATH for DMG launches so child processes can find:
-    //   - bundled CLI via ~/.local/bin symlink
-    //   - nvm-managed node/npm (nvm initializes only in interactive shells)
-    //   - bundled sidecars (buzz, buzz-acp, etc.) via exe parent (Contents/MacOS/)
-    //   - runtimes (node, python, etc.) via login shell PATH
-    let nvm_bin = dirs::home_dir()
-        .as_deref()
-        .and_then(super::find_nvm_default_bin);
-    let augmented_path = build_augmented_path(
-        dirs::home_dir(),
-        std::env::current_exe()
-            .ok()
-            .and_then(|exe| exe.parent().map(std::path::Path::to_path_buf)),
-        login_shell_path(),
-        nvm_bin,
-    );
+    let augmented_path = spawn_augmented_path();
 
     let mut command = std::process::Command::new(&resolved_acp_command);
     if let Some(home) = super::default_agent_workdir() {
@@ -643,23 +629,32 @@ pub fn spawn_agent_child(
 
         // ── Provider-capability preflight ────────────────────────────────────
         //
-        // Static checks run first and, when they already fail, the provider is
-        // never contacted: an agent with no credentials configured has nothing
-        // to prove and setup mode must not reach out.
+        // The provider was already contacted, by `prepare_provider_preflight`,
+        // before this caller took a single lifecycle lock. All that happens
+        // here is the check that the verdict still describes the descriptor we
+        // just resolved authoritatively — a comparison, not a round trip. That
+        // split is deliberate: this function runs with the caller's transition,
+        // store and runtime-map locks held, and a 30-second provider call under
+        // them stalls status polling and every other agent in the app.
         //
-        // This runs at the shared spawn boundary, which by construction holds
-        // no records or runtimes lock (see this function's contract) — so
-        // interactive start, pair start, restore, setup retry, auth completion,
-        // Doctor/post-install restart, and managed restart all inherit the gate
-        // without any of them being able to bypass it.
+        // Static checks are part of the gate decision on both sides: an agent
+        // with no credentials configured has nothing to prove and setup mode
+        // must not reach out.
         let mut static_readiness = agent_readiness(&effective);
-        provider_preflight = run_provider_preflight(
-            app,
+        let (gate, invocation) = provider_gate_inputs(
+            record,
             &descriptor,
             augmented_path.as_deref(),
             matches!(static_readiness, AgentReadiness::Ready),
-            freshness,
         );
+        // A stale verdict refuses the spawn outright. It is never downgraded to
+        // "no gate": that is the shape of bypass this phase exists to prevent.
+        provider_preflight = crate::managed_agents::readiness::provider_cache::verify(
+            prepared_preflight,
+            &gate,
+            &invocation,
+        )
+        .map_err(|error| error.to_string())?;
         if let Some(requirement) = provider_preflight.as_ref().and_then(|p| p.requirement()) {
             eprintln!(
                 "buzz-desktop: agent {} failed the provider preflight — entering setup mode",
@@ -1015,50 +1010,74 @@ pub fn spawn_agent_child(
     })
 }
 
-/// Run the provider-capability preflight for a resolved spawn, if it applies.
+/// The PATH a spawned harness receives.
 ///
-/// Returns `None` when the gate does not apply (a non-Claude runtime) or when
-/// the static checks already failed — in the latter case the agent is going to
-/// setup mode regardless, and setup mode must not contact a provider.
+/// Augmented for DMG launches so child processes can find:
+///   - bundled CLI via ~/.local/bin symlink
+///   - nvm-managed node/npm (nvm initializes only in interactive shells)
+///   - bundled sidecars (buzz, buzz-acp, etc.) via exe parent (Contents/MacOS/)
+///   - runtimes (node, python, etc.) via login shell PATH
 ///
-/// # Staleness
+/// Shared with the provider preflight, whose fingerprint covers the effective
+/// environment: a probe run with a different PATH would be a probe of a
+/// different adapter.
+fn spawn_augmented_path() -> Option<String> {
+    let nvm_bin = dirs::home_dir()
+        .as_deref()
+        .and_then(super::find_nvm_default_bin);
+    build_augmented_path(
+        dirs::home_dir(),
+        std::env::current_exe()
+            .ok()
+            .and_then(|exe| exe.parent().map(std::path::Path::to_path_buf)),
+        login_shell_path(),
+        nvm_bin,
+    )
+}
+
+/// Derive the provider gate and the probe invocation for a resolved spawn.
 ///
-/// The probe blocks, and during it the descriptor can change underneath us (a
-/// persona edit, a credential change, an adapter upgrade). We therefore
-/// re-derive the fingerprint afterwards and retry once when it moved. A second
-/// disagreement means the configuration is changing faster than we can measure
-/// it, and we fail closed to `Unknown` rather than gating the new descriptor on
-/// the old one's answer.
-fn run_provider_preflight(
-    app: &AppHandle,
+/// Called twice per start: once by [`prepare_provider_preflight`] with no locks
+/// held, and once by [`spawn_agent_child`] under the caller's locks. The two
+/// derivations are independent, and their agreement is *checked* by fingerprint
+/// rather than assumed — that check is what stops a spawn proceeding on a
+/// verdict about a descriptor that has since moved.
+fn provider_gate_inputs(
+    record: &ManagedAgentRecord,
     descriptor: &crate::managed_agents::readiness::EffectiveHarnessDescriptor,
     augmented_path: Option<&str>,
     static_checks_passed: bool,
-    freshness: crate::managed_agents::readiness::provider_cache::ProbeFreshness,
-) -> Option<crate::managed_agents::readiness::ProviderPreflight> {
-    use crate::managed_agents::readiness::{
-        provider_cache, provider_preflight, provider_probe, provider_probe_applies,
-        ProviderPreflight,
-    };
-    use tauri::Manager;
+) -> (
+    crate::managed_agents::readiness::provider_probe::ProviderGate,
+    crate::managed_agents::readiness::provider_probe::ProbeInvocation,
+) {
+    use crate::managed_agents::readiness::{provider_probe, provider_probe_applies};
 
-    if !provider_probe_applies(&descriptor.command) || !static_checks_passed {
-        return None;
-    }
+    // The sidecar the runtime spawn itself resolves — not an independently
+    // guessed `buzz-acp`. Probing a different binary than the one about to run
+    // would prove nothing about it, and failing to find a hard-coded name used
+    // to disable the gate entirely.
+    let acp_binary = resolve_command(&record.acp_command);
+    let gate = provider_probe::provider_gate(
+        provider_probe_applies(&descriptor.command),
+        static_checks_passed,
+        acp_binary.clone(),
+    );
 
-    let acp_binary = resolve_command("buzz-acp")?;
-    let cwd = provider_probe::probe_working_dir();
-    // Mirror the runtime spawn's own command resolution so the probe exercises
+    // Mirror the runtime spawn's own adapter resolution so the probe exercises
     // the same binary the agent will.
     let agent_command = resolve_command(&descriptor.command)
         .map(|p| p.display().to_string())
         .unwrap_or_else(|| descriptor.command.clone());
 
-    let build = || provider_probe::ProbeInvocation {
-        acp_binary: acp_binary.clone(),
+    let invocation = provider_probe::ProbeInvocation {
+        // Deliberately not a fingerprint input, so an unresolvable sidecar
+        // still yields a well-defined fingerprint for the fail-closed verdict.
+        acp_binary: acp_binary
+            .unwrap_or_else(|| std::path::PathBuf::from(record.acp_command.clone())),
         agent_command: agent_command.clone(),
         agent_args: descriptor.args.clone(),
-        cwd: cwd.clone(),
+        cwd: provider_probe::probe_working_dir(),
         env: provider_probe::build_probe_env(
             &descriptor.env,
             augmented_path,
@@ -1066,27 +1085,70 @@ fn run_provider_preflight(
             &descriptor.args,
         ),
     };
+    (gate, invocation)
+}
+
+/// Resolve the provider-capability verdict for `record`. **Hold no locks.**
+///
+/// This is the only place in the desktop that contacts a provider for
+/// readiness, and it exists as a separate call precisely so it can be made
+/// *before* a start path takes the transition, store and runtime-map locks.
+/// Those locks are app-global; a probe under them makes status polling and
+/// every unrelated agent wait out a provider round trip that is allowed to take
+/// 30 seconds.
+///
+/// The record it reads is an optimistic snapshot. Nothing is decided here:
+/// [`spawn_agent_child`] re-resolves the descriptor authoritatively under the
+/// caller's locks and refuses any verdict whose fingerprint no longer matches,
+/// so a configuration that moved while we were probing cannot be started on the
+/// old answer.
+///
+/// `freshness` decides whether a cached verdict may be reused. A user-initiated
+/// start — manual restart, the setup card's Retry, an auth-completion bounce, a
+/// Doctor or post-install restart — passes [`ProbeFreshness::ForceRefresh`]:
+/// the user has just done something they expect the app to notice, and
+/// answering from a verdict taken before they did it would make the retry look
+/// broken. Automatic launch restore passes [`ProbeFreshness::Cached`].
+///
+/// [`ProbeFreshness::ForceRefresh`]: crate::managed_agents::readiness::provider_cache::ProbeFreshness::ForceRefresh
+/// [`ProbeFreshness::Cached`]: crate::managed_agents::readiness::provider_cache::ProbeFreshness::Cached
+pub fn prepare_provider_preflight(
+    app: &AppHandle,
+    record: &ManagedAgentRecord,
+    freshness: crate::managed_agents::readiness::provider_cache::ProbeFreshness,
+) -> crate::managed_agents::readiness::provider_cache::PreparedPreflight {
+    use crate::managed_agents::readiness::{provider_cache, EffectiveAgentEnv};
+    use crate::managed_agents::{agent_readiness, AgentReadiness};
+    use tauri::Manager;
+
+    let personas = super::load_personas(app).unwrap_or_default();
+    let global = crate::managed_agents::load_global_agent_config(app).unwrap_or_default();
+    let Ok(descriptor) =
+        crate::managed_agents::resolve_effective_harness_descriptor(record, &personas, &global)
+    else {
+        // A dangling harness id makes the spawn itself fail long before the
+        // gate could matter, and there is no descriptor to probe.
+        return provider_cache::PreparedPreflight::NotApplicable;
+    };
+
+    let runtime_meta = known_acp_runtime(&descriptor.command);
+    let effective = EffectiveAgentEnv {
+        env: descriptor.env.clone(),
+        config_file_path: runtime_meta.and_then(|r| r.config_file_path),
+        effective_command: descriptor.command.clone(),
+    };
+    let static_checks_passed = matches!(agent_readiness(&effective), AgentReadiness::Ready);
+
+    let augmented_path = spawn_augmented_path();
+    let (gate, invocation) = provider_gate_inputs(
+        record,
+        &descriptor,
+        augmented_path.as_deref(),
+        static_checks_passed,
+    );
 
     let state = app.state::<crate::app_state::AppState>();
-    let cache = &state.provider_readiness;
-
-    for _ in 0..2 {
-        let invocation = build();
-        let preflight = provider_preflight(cache, &invocation, freshness);
-        // Re-derive from a freshly built invocation: equal means nothing that
-        // could change the verdict moved while we were probing.
-        if provider_cache::fingerprint(&build()) == preflight.fingerprint {
-            return Some(preflight);
-        }
-        eprintln!(
-            "buzz-desktop: harness descriptor changed during the provider preflight — re-probing"
-        );
-    }
-
-    Some(ProviderPreflight {
-        capability: provider_probe::ProviderCapability::Unknown,
-        fingerprint: provider_cache::fingerprint(&build()),
-    })
+    provider_cache::prepare(&state.provider_readiness, &gate, &invocation, freshness)
 }
 
 fn child_rust_log_filter() -> String {
@@ -1097,11 +1159,17 @@ fn child_rust_log_filter() -> String {
     }
 }
 
+/// Start a managed agent under the caller's already-held runtime-map lock.
+///
+/// `prepared_preflight` must have been produced by
+/// [`prepare_provider_preflight`] before that lock was taken — this function
+/// runs entirely inside it and must not contact a provider.
 pub fn start_managed_agent_process(
     app: &AppHandle,
     record: &mut ManagedAgentRecord,
     runtimes: &mut HashMap<ManagedAgentRuntimeKey, ManagedAgentPairRuntime>,
     owner_hex: Option<&str>,
+    prepared_preflight: &crate::managed_agents::readiness::provider_cache::PreparedPreflight,
 ) -> Result<(), String> {
     let relay_url = {
         use tauri::Manager;
@@ -1129,16 +1197,13 @@ pub fn start_managed_agent_process(
     // Scalar PIDs are migration-only and never establish pair liveness.
     record.runtime_pid = None;
 
-    // A programmatic start is always user-initiated (create-agent, Doctor
-    // post-install restart), so it re-probes rather than trusting a verdict
-    // taken before whatever the user just did.
     let mut process = spawn_agent_child(
         app,
         record,
         &key.relay_url,
         false,
         owner_hex,
-        crate::managed_agents::readiness::provider_cache::ProbeFreshness::ForceRefresh,
+        prepared_preflight,
     )?;
     let now = now_iso();
     let receipt = super::ManagedAgentRuntimeReceipt {

@@ -373,9 +373,15 @@ fn data_carries_auth_token(data: &serde_json::Value) -> bool {
 /// phrase itself is matched in full — no partial word ever fires this.
 const CLAUDE_OAUTH_UNREFRESHABLE: &str = "OAuth session expired and could not be refreshed";
 
-/// Prose the Claude CLI emits when an access token has expired
-/// ("OAuth access token has expired. Re-authenticate to continue.").
-const CLAUDE_REAUTHENTICATE: &str = "Re-authenticate";
+/// Exact prose the Claude CLI emits when its OAuth access token has expired.
+///
+/// Matched in full. A bare `Re-authenticate` substring is not enough and must
+/// never be used: adapters relay *other* services' login prompts through the
+/// same channel — `GitHub integration unavailable. Re-authenticate GitHub to
+/// continue.` is an ordinary tool failure, and classifying it as terminal
+/// would durably tombstone the user's request over a GitHub token.
+const CLAUDE_ACCESS_TOKEN_EXPIRED: &str =
+    "OAuth access token has expired. Re-authenticate to continue.";
 
 /// The HTTP-401 form Claude surfaces through the adapter.
 const CLAUDE_API_UNAUTHORIZED: &str = "API Error: 401";
@@ -384,11 +390,16 @@ const CLAUDE_API_UNAUTHORIZED: &str = "API Error: 401";
 ///
 /// Scoped to [`AdapterFamily::Claude`] by the caller. Ordered most-specific
 /// first so the recorded signal names the strongest evidence present.
+///
+/// Every form here is matched as a *complete observed phrase*. Each one is
+/// permitted to be wrapped in the adapter's own framing (`API Error: …`,
+/// `Internal error: …`), which is why these are substring tests rather than
+/// equality — but no individual word of any phrase can fire on its own.
 fn claude_legacy_signal(message: &str) -> Option<AuthSignal> {
     if message.contains(CLAUDE_OAUTH_UNREFRESHABLE) {
         return Some(AuthSignal::ClaudeOauthUnrefreshable);
     }
-    if message.contains(CLAUDE_REAUTHENTICATE) {
+    if message.contains(CLAUDE_ACCESS_TOKEN_EXPIRED) {
         return Some(AuthSignal::ClaudeReauthenticate);
     }
     if message.contains(CLAUDE_API_UNAUTHORIZED) {
@@ -562,6 +573,30 @@ mod tests {
                     "non-Claude adapter must stay retryable: {message}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn another_services_login_prompt_is_not_a_claude_auth_failure() {
+        // A Claude session relays *other* services' authentication prose. A
+        // bare `Re-authenticate` substring classified all of it as terminal,
+        // which would durably tombstone the user's request over someone
+        // else's expired token.
+        let messages = [
+            "GitHub integration unavailable. Re-authenticate GitHub to continue.",
+            "Re-authenticate with Jira to continue.",
+            "mcp server 'linear' rejected the request: re-authenticate and retry",
+            "Slack token rejected — please Re-authenticate.",
+            // The right words, but not the observed Claude sentence.
+            "OAuth access token has expired.",
+            "Re-authenticate to continue.",
+        ];
+        for message in messages {
+            let error = json!({"code": -32000, "message": message});
+            assert!(
+                classify_jsonrpc_error(&error, &claude(), AuthStage::Prompt).is_none(),
+                "an unrelated re-auth instruction must stay retryable: {message}"
+            );
         }
     }
 

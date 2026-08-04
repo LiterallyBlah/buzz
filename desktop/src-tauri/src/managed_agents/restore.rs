@@ -274,6 +274,29 @@ pub async fn restore_managed_agents_on_launch(
         return Ok(());
     }
 
+    // ── Provider preflight (no lock held) ────────────────────────────────
+    //
+    // Deliberately before the transition lock below. A probe is allowed to run
+    // for 30 seconds, and holding the app-global transition lock across one
+    // would make every status poll and every unrelated lifecycle operation wait
+    // out the whole restore. Launch restore is the one start path the user did
+    // not just ask for, so it uses `Cached` and the agents being restored
+    // together share one verdict per descriptor rather than probing the same
+    // provider once each.
+    let prepared_preflights: std::collections::HashMap<String, _> = agents_to_start
+        .iter()
+        .map(|record| {
+            (
+                record.pubkey.clone(),
+                super::prepare_provider_preflight(
+                    app,
+                    record,
+                    super::readiness::provider_cache::ProbeFreshness::Cached,
+                ),
+            )
+        })
+        .collect();
+
     // Serialize spawning and runtime registration with shutdown cleanup. The
     // shutdown flag is rechecked after taking the lock so shutdown either
     // prevents this transition or waits until every child is tracked and can
@@ -287,8 +310,15 @@ pub async fn restore_managed_agents_on_launch(
     }
 
     // ── Phase B (transition lock held): resolve commands and spawn in parallel ──
+    // An agent whose preflight was never prepared (it appeared between the two
+    // passes) gets "no gate", and `spawn_agent_child` then refuses it if the
+    // gate does in fact apply.
+    let no_preflight = super::readiness::provider_cache::PreparedPreflight::NotApplicable;
+
     let spawn_results: Vec<AgentSpawnResult> = std::thread::scope(|scope| {
         let owner_hex_ref = owner_hex.as_deref();
+        let prepared_preflights = &prepared_preflights;
+        let no_preflight = &no_preflight;
         let handles: Vec<_> = agents_to_start
             .iter()
             .filter(|_| !shutdown_started.load(Ordering::SeqCst))
@@ -330,20 +360,24 @@ pub async fn restore_managed_agents_on_launch(
                                             // mid-turn session is not resumed by an
                                             // eager child — and silently reintroduces
                                             // N idle brains on every launch.
-                                            // Launch restore is the one start
-                                            // path the user did not just ask
-                                            // for, so it may share a live
-                                            // verdict across the agents being
-                                            // restored together rather than
-                                            // probing the same provider once
-                                            // per agent.
+                                            //
+                                            // The provider verdict was taken
+                                            // above, before the transition
+                                            // lock. Restore does not re-probe
+                                            // on a stale verdict: it holds that
+                                            // lock, so a retry here would be
+                                            // provider I/O under it. The agent
+                                            // records the refusal and the next
+                                            // start recovers.
                                             spawn_agent_child(
                                                 app,
                                                 record,
                                                 &key.relay_url,
                                                 true,
                                                 owner_hex_ref,
-                                                crate::managed_agents::readiness::provider_cache::ProbeFreshness::Cached,
+                                                prepared_preflights
+                                                    .get(&record.pubkey)
+                                                    .unwrap_or(no_preflight),
                                             )
                                         }) {
                                         Ok(process) => SpawnOutcome::Spawned(key, process),

@@ -28,7 +28,9 @@ use std::time::{Duration, Instant};
 
 use sha2::{Digest, Sha256};
 
-use super::provider_probe::{ProbeInvocation, ProviderCapability};
+use super::provider_probe::{
+    run_provider_probe, ProbeInvocation, ProviderCapability, ProviderGate,
+};
 
 /// Fingerprint schema version. Bumping it invalidates every cached verdict,
 /// which is the correct response to changing what the inputs mean.
@@ -199,44 +201,45 @@ impl ProviderReadinessCache {
         // ── Claim the probe, or wait for the one already running ────────────
         {
             let mut map = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            // Set once this call has actually waited on an in-flight probe.
+            // That probe is running concurrently with us, so its verdict is
+            // not a verdict from *before* the user acted — which is the only
+            // thing a forced refresh is entitled to reject.
+            let mut joined_in_flight = false;
             loop {
                 let slot = map.entry(key.clone()).or_default();
 
-                if freshness == ProbeFreshness::Cached {
-                    if let Some(cached) = slot.verdict.clone() {
-                        if Instant::now() < cached.expires_at {
-                            return cached.capability;
-                        }
-                    }
-                }
-
-                if !slot.probing {
-                    // A forced refresh drops the stale verdict now, so a
-                    // concurrent cached reader cannot pick it up while we
-                    // re-probe.
-                    if freshness == ProbeFreshness::ForceRefresh {
-                        slot.verdict = None;
-                    }
-                    slot.probing = true;
-                    break;
-                }
-
-                // Someone else is probing this exact fingerprint. Wait for it
-                // rather than spawning a second adapter against the same
-                // provider.
-                map = self.finished.wait(map).unwrap_or_else(|e| e.into_inner());
-
-                // A forced refresh does not get to consume the verdict it was
-                // waiting on — it asked for a fresh one. Loop again; the slot
-                // is now free and this iteration will claim it.
-                if freshness == ProbeFreshness::ForceRefresh {
-                    continue;
-                }
-                if let Some(cached) = map.get(&key).and_then(|s| s.verdict.clone()) {
-                    if Instant::now() < cached.expires_at {
+                if let Some(cached) = slot.verdict.clone() {
+                    let usable = Instant::now() < cached.expires_at
+                        && match freshness {
+                            ProbeFreshness::Cached => true,
+                            ProbeFreshness::ForceRefresh => joined_in_flight,
+                        };
+                    if usable {
                         return cached.capability;
                     }
                 }
+
+                if slot.probing {
+                    // Someone is already contacting this exact provider with
+                    // this exact descriptor. Both kinds of caller share it: a
+                    // forced refresh exists to bypass an *old* verdict, not to
+                    // queue behind the live one and then ask again. Claiming a
+                    // fresh probe here is what turned eight concurrent Retry
+                    // clicks into eight serial provider calls.
+                    joined_in_flight = true;
+                    map = self.finished.wait(map).unwrap_or_else(|e| e.into_inner());
+                    continue;
+                }
+
+                // A forced refresh drops the stale verdict now, so a
+                // concurrent cached reader cannot pick it up while we
+                // re-probe.
+                if freshness == ProbeFreshness::ForceRefresh {
+                    slot.verdict = None;
+                }
+                slot.probing = true;
+                break;
             }
         }
 
@@ -265,6 +268,107 @@ impl ProviderReadinessCache {
     #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.inner.lock().unwrap().len()
+    }
+}
+
+// ── Prepare / verify ─────────────────────────────────────────────────────────
+//
+// Provider I/O is the slowest thing a start path does — up to the probe's
+// 30-second deadline — and every desktop lifecycle lock is app-global. So the
+// gate is split in two: `prepare` does all of the waiting and holds nothing,
+// `verify` does all of the deciding and holds no I/O. A caller runs `prepare`
+// before it takes the transition, store and runtime-map locks, and `verify`
+// after, which is what keeps status polling and every other agent responsive
+// while one agent is starting.
+
+/// The result of a provider preflight, ready to be stamped on the generation
+/// that the caller is about to start.
+///
+/// Carrying the fingerprint alongside the verdict is what makes the stamp
+/// meaningful: status reads the *generation's* answer, so a later cache result
+/// for a since-changed descriptor cannot retroactively describe a process that
+/// is already running — and `verify` can tell that the descriptor moved while
+/// the probe was in flight.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ProviderPreflight {
+    /// The verdict for the descriptor that was actually probed.
+    pub capability: ProviderCapability,
+    /// The fingerprint the verdict belongs to.
+    pub fingerprint: CapabilityFingerprint,
+}
+
+/// A verdict computed with no lifecycle lock held.
+#[derive(Debug, Clone)]
+pub(crate) enum PreparedPreflight {
+    /// The gate did not apply to the descriptor the caller snapshotted.
+    NotApplicable,
+    /// A verdict, valid only for the fingerprint it carries.
+    Verdict(ProviderPreflight),
+}
+
+/// Returned by [`verify`] when the descriptor resolved under the caller's locks
+/// is not the one that was probed.
+///
+/// User-facing on purpose: the caller either retries once with a fresh probe or
+/// refuses the start. It must never spawn.
+pub(crate) const STALE_PROVIDER_PREFLIGHT: &str =
+    "provider readiness changed while the agent was starting";
+
+/// Resolve the provider verdict for `invocation`. **Hold no locks.**
+///
+/// Blocking: this is where the subprocess, the adapter spawn and the provider
+/// round-trip happen.
+pub(crate) fn prepare(
+    cache: &ProviderReadinessCache,
+    gate: &ProviderGate,
+    invocation: &ProbeInvocation,
+    freshness: ProbeFreshness,
+) -> PreparedPreflight {
+    match gate {
+        ProviderGate::NotApplicable => PreparedPreflight::NotApplicable,
+        // The gate applies but cannot be run. Fail closed with a verdict, not
+        // by disappearing: an adapter problem is exactly what an unresolvable
+        // sidecar is, and it routes the user to the same repair affordance.
+        ProviderGate::Unavailable => PreparedPreflight::Verdict(ProviderPreflight {
+            capability: ProviderCapability::AdapterProblem,
+            fingerprint: fingerprint(invocation),
+        }),
+        ProviderGate::Probe { .. } => {
+            let fingerprint = fingerprint(invocation);
+            let capability =
+                cache.resolve(&fingerprint, freshness, || run_provider_probe(invocation));
+            PreparedPreflight::Verdict(ProviderPreflight {
+                capability,
+                fingerprint,
+            })
+        }
+    }
+}
+
+/// Check a prepared verdict against the descriptor resolved under the caller's
+/// locks. **Performs no I/O**, so it is safe to call with every lock held.
+///
+/// `Ok(None)` means the gate does not apply and the caller proceeds exactly as
+/// it did before this phase existed. `Err` means the descriptor moved while we
+/// were probing — a persona edit, a credential change, an adapter upgrade —
+/// and the old answer says nothing about the new configuration.
+pub(crate) fn verify(
+    prepared: &PreparedPreflight,
+    gate: &ProviderGate,
+    invocation: &ProbeInvocation,
+) -> Result<Option<ProviderPreflight>, &'static str> {
+    if matches!(gate, ProviderGate::NotApplicable) {
+        return Ok(None);
+    }
+    match prepared {
+        // The caller's snapshot said the gate did not apply, but the
+        // authoritative descriptor says it does. That disagreement is itself
+        // the staleness.
+        PreparedPreflight::NotApplicable => Err(STALE_PROVIDER_PREFLIGHT),
+        PreparedPreflight::Verdict(verdict) if verdict.fingerprint == fingerprint(invocation) => {
+            Ok(Some(verdict.clone()))
+        }
+        PreparedPreflight::Verdict(_) => Err(STALE_PROVIDER_PREFLIGHT),
     }
 }
 
@@ -518,6 +622,292 @@ mod tests {
             1,
             "eight equal concurrent requests must produce exactly one probe"
         );
+    }
+
+    #[test]
+    fn concurrent_forced_refreshes_share_one_probe() {
+        // The candidate-1 defect: eight users' worth of Retry clicks (setup
+        // card, manual restart, Doctor) arriving together each waited for the
+        // in-flight probe and then claimed another one — eight serial provider
+        // calls for one question.
+        let cache = StdArc::new(ProviderReadinessCache::new());
+        let fp = fingerprint(&invocation());
+        let calls = StdArc::new(AtomicUsize::new(0));
+        let started = StdArc::new(std::sync::Barrier::new(8));
+
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let cache = StdArc::clone(&cache);
+                let fp = fp.clone();
+                let calls = StdArc::clone(&calls);
+                let started = StdArc::clone(&started);
+                std::thread::spawn(move || {
+                    started.wait();
+                    cache.resolve(&fp, ProbeFreshness::ForceRefresh, || {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        // Hold the slot long enough that every other thread is
+                        // definitely inside the wait rather than racing ahead.
+                        std::thread::sleep(Duration::from_millis(200));
+                        ProviderCapability::AuthenticationRequired
+                    })
+                })
+            })
+            .collect();
+
+        for handle in handles {
+            assert_eq!(
+                handle.join().expect("thread"),
+                ProviderCapability::AuthenticationRequired,
+                "every forced caller must get the shared verdict"
+            );
+        }
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "eight concurrent forced refreshes must produce exactly one probe"
+        );
+    }
+
+    #[test]
+    fn a_forced_refresh_still_bypasses_a_verdict_that_predates_it() {
+        // Sharing an in-flight probe must not become "reuse whatever is
+        // cached": a forced refresh that arrives when nothing is running still
+        // has to go and ask.
+        let cache = ProviderReadinessCache::new();
+        let fp = fingerprint(&invocation());
+        let calls = AtomicUsize::new(0);
+        let mut probe = || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            ProviderCapability::Ready
+        };
+
+        cache.resolve(&fp, ProbeFreshness::Cached, &mut probe);
+        cache.resolve(&fp, ProbeFreshness::ForceRefresh, &mut probe);
+        cache.resolve(&fp, ProbeFreshness::ForceRefresh, &mut probe);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            3,
+            "each sequential forced refresh re-probes"
+        );
+    }
+
+    #[test]
+    fn forced_refreshes_of_different_fingerprints_stay_independent() {
+        let cache = StdArc::new(ProviderReadinessCache::new());
+        let calls = StdArc::new(AtomicUsize::new(0));
+
+        let handles: Vec<_> = (0..4)
+            .map(|i| {
+                let cache = StdArc::clone(&cache);
+                let calls = StdArc::clone(&calls);
+                let mut inv = invocation();
+                inv.agent_args = vec![format!("acp-{i}")];
+                let fp = fingerprint(&inv);
+                std::thread::spawn(move || {
+                    cache.resolve(&fp, ProbeFreshness::ForceRefresh, || {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        std::thread::sleep(Duration::from_millis(50));
+                        ProviderCapability::Ready
+                    })
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().expect("thread");
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 4);
+        assert_eq!(cache.len(), 4);
+    }
+
+    #[test]
+    fn a_cached_caller_joining_an_in_flight_forced_refresh_does_not_add_a_probe() {
+        // Mixed traffic: launch restore (Cached) and a Retry click
+        // (ForceRefresh) landing together must still be one provider call.
+        let cache = StdArc::new(ProviderReadinessCache::new());
+        let fp = fingerprint(&invocation());
+        let calls = StdArc::new(AtomicUsize::new(0));
+        let started = StdArc::new(std::sync::Barrier::new(6));
+
+        let handles: Vec<_> = (0..6)
+            .map(|i| {
+                let cache = StdArc::clone(&cache);
+                let fp = fp.clone();
+                let calls = StdArc::clone(&calls);
+                let started = StdArc::clone(&started);
+                let freshness = if i % 2 == 0 {
+                    ProbeFreshness::Cached
+                } else {
+                    ProbeFreshness::ForceRefresh
+                };
+                std::thread::spawn(move || {
+                    started.wait();
+                    cache.resolve(&fp, freshness, || {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        std::thread::sleep(Duration::from_millis(200));
+                        ProviderCapability::Ready
+                    })
+                })
+            })
+            .collect();
+        for handle in handles {
+            assert_eq!(handle.join().expect("thread"), ProviderCapability::Ready);
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    // ── prepare / verify ───────────────────────────────────────────────────
+
+    #[test]
+    fn a_not_applicable_gate_never_reaches_the_provider() {
+        let cache = ProviderReadinessCache::new();
+        let prepared = prepare(
+            &cache,
+            &ProviderGate::NotApplicable,
+            &invocation(),
+            ProbeFreshness::ForceRefresh,
+        );
+        assert!(matches!(prepared, PreparedPreflight::NotApplicable));
+        assert_eq!(cache.len(), 0, "no fingerprint was ever probed");
+        assert_eq!(
+            verify(&prepared, &ProviderGate::NotApplicable, &invocation()),
+            Ok(None)
+        );
+    }
+
+    #[test]
+    fn an_unavailable_gate_prepares_a_fail_closed_verdict_without_probing() {
+        let cache = ProviderReadinessCache::new();
+        let prepared = prepare(
+            &cache,
+            &ProviderGate::Unavailable,
+            &invocation(),
+            ProbeFreshness::ForceRefresh,
+        );
+        let PreparedPreflight::Verdict(verdict) = &prepared else {
+            panic!("an unavailable gate must still produce a verdict");
+        };
+        assert_eq!(verdict.capability, ProviderCapability::AdapterProblem);
+        assert_eq!(cache.len(), 0, "nothing was probed");
+        // And it survives verification, so the caller enters setup mode rather
+        // than starting unproven.
+        let checked = verify(&prepared, &ProviderGate::Unavailable, &invocation())
+            .expect("an unavailable gate is not stale");
+        assert_eq!(
+            checked.expect("a verdict").capability,
+            ProviderCapability::AdapterProblem
+        );
+    }
+
+    #[test]
+    fn verify_accepts_only_the_descriptor_that_was_probed() {
+        let cache = ProviderReadinessCache::new();
+        let gate = ProviderGate::Probe {
+            acp_binary: std::path::PathBuf::from("/opt/buzz/buzz-acp"),
+        };
+        let prepared = prepare(&cache, &gate, &invocation(), ProbeFreshness::Cached);
+
+        assert!(verify(&prepared, &gate, &invocation()).is_ok());
+
+        // A persona edit lands between the probe and the spawn.
+        let mut moved = invocation();
+        moved.agent_args = vec!["acp".into(), "--dangerously-skip-permissions".into()];
+        assert_eq!(
+            verify(&prepared, &gate, &moved),
+            Err(STALE_PROVIDER_PREFLIGHT),
+            "a descriptor that moved must not be gated on the old answer"
+        );
+
+        // And a snapshot that thought the gate did not apply cannot authorise
+        // a spawn that finds it does.
+        assert_eq!(
+            verify(&PreparedPreflight::NotApplicable, &gate, &invocation()),
+            Err(STALE_PROVIDER_PREFLIGHT)
+        );
+    }
+
+    #[test]
+    fn verify_does_no_provider_io() {
+        // `verify` is the half that runs with every lifecycle lock held, so it
+        // must never be able to reach the cache, let alone a subprocess.
+        let cache = ProviderReadinessCache::new();
+        let gate = ProviderGate::Probe {
+            acp_binary: std::path::PathBuf::from("/opt/buzz/buzz-acp"),
+        };
+        let prepared = prepare(&cache, &gate, &invocation(), ProbeFreshness::Cached);
+        let before = cache.len();
+        for _ in 0..20 {
+            let _ = verify(&prepared, &gate, &invocation());
+        }
+        assert_eq!(cache.len(), before, "verify must not touch the cache");
+    }
+
+    #[test]
+    fn lifecycle_locks_stay_free_while_provider_io_is_in_flight() {
+        // The candidate-1 defect was structural: the start path held the
+        // transition, store and runtime-map locks across the probe, so status
+        // polling and every unrelated agent queued behind a provider call that
+        // can take 30 seconds. This drives a probe that blocks until told to
+        // finish, and proves the locked half of the gate — plus a stand-in for
+        // status polling — runs to completion meanwhile.
+        let transition = StdArc::new(std::sync::Mutex::new(0usize));
+        let store = StdArc::new(std::sync::Mutex::new(0usize));
+        let runtimes = StdArc::new(std::sync::Mutex::new(0usize));
+
+        let cache = StdArc::new(ProviderReadinessCache::new());
+        let gate = ProviderGate::Probe {
+            acp_binary: std::path::PathBuf::from("/opt/buzz/buzz-acp"),
+        };
+        let fp = fingerprint(&invocation());
+        // Rendezvous: the prober has entered provider I/O; and, later, it may
+        // leave. Barriers rather than sleeps so the ordering is deterministic.
+        let inside_probe = StdArc::new(std::sync::Barrier::new(2));
+        let may_finish = StdArc::new(std::sync::Barrier::new(2));
+
+        let prober = {
+            let (cache, fp, inside_probe, may_finish) = (
+                StdArc::clone(&cache),
+                fp.clone(),
+                StdArc::clone(&inside_probe),
+                StdArc::clone(&may_finish),
+            );
+            std::thread::spawn(move || {
+                // Exactly what the start path now does: no lifecycle lock is
+                // even in scope here.
+                cache.resolve(&fp, ProbeFreshness::ForceRefresh, || {
+                    inside_probe.wait();
+                    may_finish.wait();
+                    ProviderCapability::Ready
+                })
+            })
+        };
+
+        inside_probe.wait();
+
+        // Provider I/O is in flight. Everything that needs the app-global
+        // lifecycle locks must still work.
+        {
+            let mut transition = transition.lock().expect("transition lock");
+            let mut store = store.lock().expect("store lock");
+            let mut runtimes = runtimes.lock().expect("runtime map lock");
+            *transition += 1;
+            *store += 1;
+            *runtimes += 1;
+
+            // The locked half of the gate is pure comparison, so it is safe
+            // here — and it must not block.
+            let prepared = PreparedPreflight::Verdict(ProviderPreflight {
+                capability: ProviderCapability::Ready,
+                fingerprint: fp.clone(),
+            });
+            assert!(verify(&prepared, &gate, &invocation()).is_ok());
+        }
+
+        // Only now let the provider call complete.
+        may_finish.wait();
+        assert_eq!(prober.join().expect("prober"), ProviderCapability::Ready);
+        assert_eq!(*transition.lock().expect("transition lock"), 1);
+        assert_eq!(*store.lock().expect("store lock"), 1);
+        assert_eq!(*runtimes.lock().expect("runtime map lock"), 1);
     }
 
     #[test]
