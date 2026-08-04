@@ -232,6 +232,40 @@ export function useProjectUnreadCount(): number {
   return useProjectUnreadSnapshot().unreadRootCount;
 }
 
+/**
+ * Keeps one root's unread entry clear while its detail view is on screen.
+ *
+ * Clearing only on mount would let the badge light for the exact thread the
+ * user is reading: the live listener marks on arrival and knows nothing about
+ * what is open. The detail view pins "open" here instead, and arrival-marks on
+ * this root are erased as they land — the thread itself is already rendering
+ * the event, so the mark never said anything the screen was not.
+ *
+ * The clear is deferred to a microtask because it runs inside the store's own
+ * notification: deleting synchronously would re-enter `rebuildSnapshot` while
+ * the listener loop is still walking the previous change.
+ */
+export function useClearProjectUnreadWhileOpen(
+  rootId: string | null | undefined,
+): void {
+  React.useEffect(() => {
+    if (!rootId) return;
+
+    let cancelled = false;
+    clearProjectUnreadRoot(rootId);
+    const unsubscribe = subscribeToProjectUnread(() => {
+      if (!getProjectUnreadSnapshot().entriesByRootId.has(rootId)) return;
+      queueMicrotask(() => {
+        if (!cancelled) clearProjectUnreadRoot(rootId);
+      });
+    });
+    return () => {
+      cancelled = true;
+      unsubscribe();
+    };
+  }, [rootId]);
+}
+
 /** Unread roots within one project, for per-project surfaces. */
 export function useProjectUnreadRootIds(
   projectId: string | null | undefined,

@@ -32,6 +32,7 @@ import {
   relativeTime,
 } from "@/features/projects/lib/projectsViewHelpers";
 import { canReviewProjectPullRequest } from "@/features/projects/pullRequestReviews";
+import { useClearProjectUnreadWhileOpen } from "@/features/projects/projectUnreadStore";
 import { useLiveProjectRoot } from "@/features/projects/useLiveProjectRoot";
 import type { UserProfileLookup } from "@/features/profile/lib/identity";
 import { useIdentityQuery } from "@/shared/api/hooks";
@@ -522,6 +523,9 @@ export function ProjectPullRequestDetail({
   // On the detail view, not the panel: the Home inbox renders this component
   // directly, and a pull request open there is just as live.
   useLiveProjectRoot(project.id, pullRequest.id);
+  // Same placement, same reason: whatever surface shows this thread is the
+  // surface reading it, so its unread mark has nothing left to say.
+  useClearProjectUnreadWhileOpen(pullRequest.id);
   const [
     expandedReviewHistoryPullRequestIds,
     setExpandedReviewHistoryPullRequestIds,
