@@ -330,12 +330,20 @@ pub async fn restore_managed_agents_on_launch(
                                             // mid-turn session is not resumed by an
                                             // eager child — and silently reintroduces
                                             // N idle brains on every launch.
+                                            // Launch restore is the one start
+                                            // path the user did not just ask
+                                            // for, so it may share a live
+                                            // verdict across the agents being
+                                            // restored together rather than
+                                            // probing the same provider once
+                                            // per agent.
                                             spawn_agent_child(
                                                 app,
                                                 record,
                                                 &key.relay_url,
                                                 true,
                                                 owner_hex_ref,
+                                                crate::managed_agents::readiness::provider_cache::ProbeFreshness::Cached,
                                             )
                                         }) {
                                         Ok(process) => SpawnOutcome::Spawned(key, process),

@@ -14,11 +14,12 @@
 //! - **Queue** — all events accumulate; batched on the next flush cycle.
 
 use nostr::{Event, ToBech32};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 use crate::config::DedupMode;
+use crate::terminal_auth_store::{TerminalAuthStore, TerminalAuthStoreError};
 
 /// Maximum events queued per channel before oldest events are dropped.
 const MAX_PENDING_PER_CHANNEL: usize = 500;
@@ -206,6 +207,14 @@ pub struct EventQueue {
     /// Must be strictly greater than `max_turn_duration` so a turn running to
     /// the hard cap returns via `mark_complete` before the backstop fires.
     in_flight_deadline: Duration,
+    /// Durable record of events terminally disposed of by an authentication
+    /// failure. `None` before [`attach_terminal_auth_store`] runs, which is
+    /// the pre-configuration window in tests and helper subcommands; the
+    /// harness attaches it before the relay connects, so no live event is ever
+    /// admitted while the filter is absent.
+    ///
+    /// [`attach_terminal_auth_store`]: EventQueue::attach_terminal_auth_store
+    terminal_auth: Option<TerminalAuthStore>,
 }
 
 impl EventQueue {
@@ -227,7 +236,138 @@ impl EventQueue {
             cancel_reasons: HashMap::new(),
             withheld_native_steer: HashMap::new(),
             in_flight_deadline: Duration::from_secs(DEFAULT_IN_FLIGHT_DEADLINE_SECS),
+            terminal_auth: None,
         }
+    }
+
+    /// Install the durable terminal-auth disposition store.
+    ///
+    /// Called once, immediately after configuration and before the pool is
+    /// initialised or the relay is connected, so no event can reach
+    /// [`push`](Self::push) while the filter is missing.
+    pub fn attach_terminal_auth_store(&mut self, store: TerminalAuthStore) {
+        tracing::info!(
+            dispositions = store.len(),
+            path = %store.path().display(),
+            "terminal-auth store loaded"
+        );
+        self.terminal_auth = Some(store);
+    }
+
+    /// Whether `event_id` has been terminally disposed of by an authentication
+    /// failure and must never be dispatched again.
+    pub fn is_terminally_disposed(&self, event_id: &str) -> bool {
+        self.terminal_auth
+            .as_ref()
+            .is_some_and(|store| store.contains(event_id))
+    }
+
+    /// Durably record every event in `batch` as terminally disposed.
+    ///
+    /// Collects the unique IDs from both the normal and the cancelled halves —
+    /// a merged batch owns both, and leaving the cancelled half untombstoned
+    /// would let it return through `flush_next`'s cancelled-batch fallback.
+    ///
+    /// All-or-none. On `Err` neither disk nor memory changed, and the caller
+    /// must not send a notice, must not report completion, and must stop.
+    pub fn commit_terminal_auth_disposition(
+        &mut self,
+        batch: &FlushBatch,
+    ) -> Result<usize, TerminalAuthStoreError> {
+        let ids: BTreeSet<String> = batch
+            .events
+            .iter()
+            .chain(batch.cancelled_events.iter())
+            .map(|be| be.event.id.to_hex())
+            .collect();
+        let count = ids.len();
+
+        let Some(store) = self.terminal_auth.as_mut() else {
+            // No store means no durable promise can be made. Refusing here is
+            // what keeps the ordering contract honest: the caller treats this
+            // exactly like a write failure rather than proceeding to notice
+            // and completion on an in-memory-only disposition.
+            return Err(TerminalAuthStoreError::NoStore);
+        };
+        store.commit_batch(ids)?;
+        Ok(count)
+    }
+
+    /// Remove and return every buffered batch, ignoring retry throttles.
+    ///
+    /// Used by the terminal lazy-wake path, which must dispose of *all*
+    /// affected work rather than leaving some of it parked behind a backoff
+    /// deadline for a wake that will never come. Unlike
+    /// [`flush_next`](Self::flush_next) this respects no throttle and marks
+    /// nothing in-flight — the caller owns each returned batch outright.
+    ///
+    /// In-flight channels are skipped: those batches belong to a running
+    /// prompt task and return through the ordinary result path.
+    pub fn drain_all_pending_batches(&mut self) -> Vec<FlushBatch> {
+        let mut channel_ids: Vec<Uuid> = self
+            .queues
+            .iter()
+            .filter(|(id, q)| !q.is_empty() && !self.in_flight_channels.contains(id))
+            .map(|(id, _)| *id)
+            .chain(
+                self.cancelled_batches
+                    .keys()
+                    .filter(|id| !self.in_flight_channels.contains(id))
+                    .copied(),
+            )
+            .chain(
+                self.withheld_native_steer
+                    .iter()
+                    .filter(|(id, e)| !e.is_empty() && !self.in_flight_channels.contains(id))
+                    .map(|(id, _)| *id),
+            )
+            .collect();
+        channel_ids.sort();
+        channel_ids.dedup();
+
+        let mut batches = Vec::new();
+        for channel_id in channel_ids {
+            let mut events: Vec<BatchEvent> = self
+                .queues
+                .remove(&channel_id)
+                .unwrap_or_default()
+                .into_iter()
+                // Withheld goose-native steer events were never delivered to
+                // an agent, so they are as much a part of this channel's
+                // affected work as the queued ones.
+                .chain(
+                    self.withheld_native_steer
+                        .remove(&channel_id)
+                        .unwrap_or_default(),
+                )
+                .map(|qe| BatchEvent {
+                    event: qe.event,
+                    prompt_tag: qe.prompt_tag,
+                    received_at: qe.received_at,
+                    project: qe.project,
+                })
+                .collect();
+            events.sort_by_key(|be| be.event.created_at);
+
+            let cancelled_events = self
+                .cancelled_batches
+                .remove(&channel_id)
+                .unwrap_or_default();
+            let cancel_reason = self.cancel_reasons.remove(&channel_id);
+            self.retry_after.remove(&channel_id);
+            self.retry_counts.remove(&channel_id);
+
+            if events.is_empty() && cancelled_events.is_empty() {
+                continue;
+            }
+            batches.push(FlushBatch {
+                channel_id,
+                events,
+                cancelled_events,
+                cancel_reason,
+            });
+        }
+        batches
     }
 
     /// Set the in-flight backstop deadline from the configured max turn
@@ -266,6 +406,24 @@ impl EventQueue {
     ///
     /// Returns `true` if the event was accepted, `false` if dropped.
     pub fn push(&mut self, event: QueuedEvent) -> bool {
+        // Terminal-auth filter, first thing and on every path.
+        //
+        // `push` is the single common funnel for ordinary channel events,
+        // peer calls, project routes, reconnect overlap, relay history replay
+        // and reconstructed queues, so filtering here — before any dedup,
+        // capacity or reaction handling — is what makes the durable promise
+        // total. A filtered event must not react, wake, steer, or enqueue, so
+        // it returns `false` exactly like any other rejected event.
+        let event_id = event.event.id.to_hex();
+        if self.is_terminally_disposed(&event_id) {
+            tracing::info!(
+                channel_id = %event.channel_id,
+                event_id = %event_id,
+                "rejecting event with a durable terminal-auth disposition"
+            );
+            return false;
+        }
+
         if matches!(self.dedup_mode, DedupMode::Drop)
             && self.in_flight_channels.contains(&event.channel_id)
         {
@@ -650,6 +808,20 @@ impl EventQueue {
     #[cfg(test)]
     pub fn set_retry_count_for_test(&mut self, channel_id: Uuid, count: u32) {
         self.retry_counts.insert(channel_id, count);
+    }
+
+    /// The channel's current retry-attempt counter. Test-only, so a
+    /// disposition test can prove that terminal auth leaves no retry metadata
+    /// behind while a transient failure advances it.
+    #[cfg(test)]
+    pub fn retry_count_for_test(&self, channel_id: Uuid) -> Option<u32> {
+        self.retry_counts.get(&channel_id).copied()
+    }
+
+    /// The channel's current backoff deadline, if throttled. Test-only.
+    #[cfg(test)]
+    pub fn retry_deadline_for_test(&self, channel_id: Uuid) -> Option<Instant> {
+        self.retry_after.get(&channel_id).copied()
     }
 
     /// Drop all queued (non-in-flight) events for a channel.
@@ -2146,6 +2318,293 @@ mod tests {
             prompt_tag: "test".into(),
             project: None,
         }
+    }
+
+    // ── terminal-auth dispositions ─────────────────────────────────────────
+
+    const TEST_PUBKEY: &str = "aa11bb22cc33dd44ee55ff66aa77bb88cc99dd00ee11ff22aa33bb44cc55dd66";
+
+    fn queue_with_store(temp: &tempfile::TempDir, mode: DedupMode) -> EventQueue {
+        let mut queue = EventQueue::new(mode);
+        queue.attach_terminal_auth_store(
+            TerminalAuthStore::load(temp.path(), TEST_PUBKEY).expect("fresh store"),
+        );
+        queue
+    }
+
+    /// A project-origin queued event, so the filter can be proven to cover the
+    /// project route as well as the ordinary channel path.
+    fn make_queued_project(channel_id: Uuid, content: &str) -> QueuedEvent {
+        let mut queued = make_queued(channel_id, content);
+        queued.prompt_tag = "project".into();
+        queued
+    }
+
+    #[test]
+    fn a_complete_batch_commits_atomically_across_normal_and_cancelled_events() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let mut queue = queue_with_store(&temp, DedupMode::Queue);
+        let channel_id = Uuid::new_v4();
+
+        let normal: Vec<QueuedEvent> = (0..3)
+            .map(|i| make_queued(channel_id, &format!("normal {i}")))
+            .collect();
+        let cancelled: Vec<QueuedEvent> = (0..2)
+            .map(|i| make_queued(channel_id, &format!("cancelled {i}")))
+            .collect();
+        let all_ids: Vec<String> = normal
+            .iter()
+            .chain(cancelled.iter())
+            .map(|e| e.event.id.to_hex())
+            .collect();
+
+        let batch = FlushBatch {
+            channel_id,
+            events: normal
+                .into_iter()
+                .map(|qe| BatchEvent {
+                    event: qe.event,
+                    prompt_tag: qe.prompt_tag,
+                    received_at: qe.received_at,
+                    project: qe.project,
+                })
+                .collect(),
+            cancelled_events: cancelled
+                .into_iter()
+                .map(|qe| BatchEvent {
+                    event: qe.event,
+                    prompt_tag: qe.prompt_tag,
+                    received_at: qe.received_at,
+                    project: qe.project,
+                })
+                .collect(),
+            cancel_reason: Some(CancelReason::Steer),
+        };
+
+        assert_eq!(
+            queue
+                .commit_terminal_auth_disposition(&batch)
+                .expect("commit"),
+            5,
+            "every unique event in both halves of the batch must be disposed"
+        );
+        for id in &all_ids {
+            assert!(queue.is_terminally_disposed(id), "{id} must be disposed");
+        }
+    }
+
+    #[test]
+    fn a_batch_that_repeats_an_event_compacts_it() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let mut queue = queue_with_store(&temp, DedupMode::Queue);
+        let channel_id = Uuid::new_v4();
+        let queued = make_queued(channel_id, "duplicated");
+        let event = BatchEvent {
+            event: queued.event,
+            prompt_tag: queued.prompt_tag,
+            received_at: queued.received_at,
+            project: queued.project,
+        };
+        let batch = FlushBatch {
+            channel_id,
+            events: vec![event.clone()],
+            cancelled_events: vec![event],
+            cancel_reason: None,
+        };
+        assert_eq!(
+            queue
+                .commit_terminal_auth_disposition(&batch)
+                .expect("commit"),
+            1
+        );
+    }
+
+    #[test]
+    fn a_queue_with_no_store_refuses_to_promise_a_disposition() {
+        // Without a store there is no durable promise to make, and pretending
+        // otherwise is what would let a request revive on the next restart.
+        let mut queue = EventQueue::new(DedupMode::Queue);
+        let channel_id = Uuid::new_v4();
+        let queued = make_queued(channel_id, "hello");
+        let batch = FlushBatch {
+            channel_id,
+            events: vec![BatchEvent {
+                event: queued.event,
+                prompt_tag: queued.prompt_tag,
+                received_at: queued.received_at,
+                project: queued.project,
+            }],
+            cancelled_events: vec![],
+            cancel_reason: None,
+        };
+        assert!(matches!(
+            queue.commit_terminal_auth_disposition(&batch),
+            Err(TerminalAuthStoreError::NoStore)
+        ));
+    }
+
+    #[test]
+    fn tombstoned_channel_and_project_events_are_rejected_before_enqueue() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let mut queue = queue_with_store(&temp, DedupMode::Queue);
+        let channel_id = Uuid::new_v4();
+        let project_key = Uuid::new_v4();
+
+        let channel_event = make_queued(channel_id, "channel work");
+        let project_event = make_queued_project(project_key, "project work");
+        let survivor = make_queued(channel_id, "unaffected");
+
+        let batch = FlushBatch {
+            channel_id,
+            events: vec![
+                BatchEvent {
+                    event: channel_event.event.clone(),
+                    prompt_tag: channel_event.prompt_tag.clone(),
+                    received_at: channel_event.received_at,
+                    project: None,
+                },
+                BatchEvent {
+                    event: project_event.event.clone(),
+                    prompt_tag: project_event.prompt_tag.clone(),
+                    received_at: project_event.received_at,
+                    project: None,
+                },
+            ],
+            cancelled_events: vec![],
+            cancel_reason: None,
+        };
+        queue
+            .commit_terminal_auth_disposition(&batch)
+            .expect("commit");
+
+        assert!(
+            !queue.push(channel_event),
+            "a tombstoned channel event must be rejected"
+        );
+        assert!(
+            !queue.push(project_event),
+            "a tombstoned project event must be rejected"
+        );
+        assert!(queue.push(survivor), "unaffected events still enqueue");
+
+        assert_eq!(pending_count(&queue), 1);
+        assert!(queue.flush_next().is_some());
+        assert!(
+            queue.flush_next().is_none(),
+            "no tombstoned event may reach a batch"
+        );
+    }
+
+    #[test]
+    fn the_filter_runs_before_drop_mode_dedup() {
+        // Drop mode returns `false` for in-flight channels too, so the filter
+        // is proven by the *absence* of an enqueue on a channel that is not
+        // in flight — and by the event still being rejected once it is.
+        let temp = tempfile::tempdir().expect("temp dir");
+        let mut queue = queue_with_store(&temp, DedupMode::Drop);
+        let channel_id = Uuid::new_v4();
+        let doomed = make_queued(channel_id, "doomed");
+        let batch = FlushBatch {
+            channel_id,
+            events: vec![BatchEvent {
+                event: doomed.event.clone(),
+                prompt_tag: doomed.prompt_tag.clone(),
+                received_at: doomed.received_at,
+                project: None,
+            }],
+            cancelled_events: vec![],
+            cancel_reason: None,
+        };
+        queue
+            .commit_terminal_auth_disposition(&batch)
+            .expect("commit");
+
+        assert!(!queue.push(doomed.clone()));
+        assert_eq!(pending_count(&queue), 0);
+
+        // Replay of the same event — the shape a relay reconnect produces —
+        // is still rejected.
+        assert!(!queue.push(doomed));
+        assert_eq!(pending_count(&queue), 0);
+    }
+
+    #[test]
+    fn a_disposition_survives_a_simulated_process_restart() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let channel_id = Uuid::new_v4();
+        let doomed = make_queued(channel_id, "doomed");
+
+        {
+            let mut queue = queue_with_store(&temp, DedupMode::Queue);
+            let batch = FlushBatch {
+                channel_id,
+                events: vec![BatchEvent {
+                    event: doomed.event.clone(),
+                    prompt_tag: doomed.prompt_tag.clone(),
+                    received_at: doomed.received_at,
+                    project: None,
+                }],
+                cancelled_events: vec![],
+                cancel_reason: None,
+            };
+            queue
+                .commit_terminal_auth_disposition(&batch)
+                .expect("commit");
+        }
+
+        // A brand-new process: fresh queue, store reloaded from disk. History
+        // replay re-offers the same event and it must still be refused.
+        let mut restarted = queue_with_store(&temp, DedupMode::Queue);
+        assert!(!restarted.push(doomed));
+        assert_eq!(pending_count(&restarted), 0);
+        assert!(restarted.flush_next().is_none());
+    }
+
+    #[test]
+    fn drain_all_pending_batches_ignores_retry_backoff() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let mut queue = queue_with_store(&temp, DedupMode::Queue);
+        let throttled = Uuid::new_v4();
+        let plain = Uuid::new_v4();
+
+        queue.push(make_queued(throttled, "throttled work"));
+        queue.push(make_queued(plain, "plain work"));
+
+        // Put `throttled` under a retry backoff — `flush_next` would skip it,
+        // but a runtime that will never wake again must still dispose of it.
+        let batch = queue.flush_next().expect("first batch");
+        let throttled_first = batch.channel_id;
+        queue.requeue(batch);
+        // Mirror the real ordering: requeue then mark_complete releases the
+        // in-flight hold while leaving the backoff deadline in place.
+        queue.mark_complete(throttled_first);
+        assert!(queue.retry_after.contains_key(&throttled_first));
+
+        let drained = queue.drain_all_pending_batches();
+        let drained_channels: HashSet<Uuid> = drained.iter().map(|b| b.channel_id).collect();
+        assert_eq!(
+            drained_channels,
+            HashSet::from([throttled, plain]),
+            "every buffered channel must be drained regardless of backoff"
+        );
+        assert_eq!(pending_count(&queue), 0);
+        assert!(queue.drain_all_pending_batches().is_empty());
+    }
+
+    #[test]
+    fn drain_all_pending_batches_leaves_in_flight_channels_alone() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let mut queue = queue_with_store(&temp, DedupMode::Queue);
+        let channel_id = Uuid::new_v4();
+        queue.push(make_queued(channel_id, "in flight"));
+        let _in_flight = queue.flush_next().expect("batch");
+        queue.push(make_queued(channel_id, "queued behind"));
+
+        assert!(
+            queue.drain_all_pending_batches().is_empty(),
+            "an in-flight channel's work returns through the result path, not here"
+        );
+        assert_eq!(pending_count(&queue), 1);
     }
 
     fn pending_count(q: &EventQueue) -> usize {

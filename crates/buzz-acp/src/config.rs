@@ -216,6 +216,33 @@ pub struct AuthMethodsArgs {
     pub json: bool,
 }
 
+/// CLI args for `buzz-acp provider-probe` — one disposable end-to-end turn.
+///
+/// The probe answers exactly one question: can the configured adapter, right
+/// now, complete a minimal tool-disabled turn against its provider? Nothing
+/// else — not model discovery, not login state, not adapter version policy.
+/// Its output is a single compact JSON object of safe categorical values.
+#[derive(Debug, Parser)]
+#[command(
+    name = "buzz-acp provider-probe",
+    about = "Run one disposable tool-disabled turn to prove the provider is usable"
+)]
+pub struct ProviderProbeArgs {
+    #[command(flatten)]
+    pub agent: AuthAgentArgs,
+
+    /// Working directory for the disposable session. Must exist. Defaults to
+    /// the current directory.
+    #[arg(long)]
+    pub cwd: Option<PathBuf>,
+
+    /// Output the schema-versioned JSON object. Accepted for symmetry with the
+    /// other helper subcommands; the probe has no human-readable mode because
+    /// its only consumer is the desktop readiness gate.
+    #[arg(long)]
+    pub json: bool,
+}
+
 /// CLI args for `buzz-acp authenticate` — start an adapter-owned login flow.
 #[derive(Debug, Parser)]
 #[command(
@@ -340,6 +367,12 @@ pub struct CliArgs {
 
     #[arg(long, env = "BUZZ_ACP_CONFIG", default_value = "./buzz-acp.toml")]
     pub config: PathBuf,
+
+    /// Directory for durable harness state (currently the terminal-auth
+    /// disposition store). Defaults to `buzz-acp-state/` beside the resolved
+    /// `buzz-acp.toml`, so moving the config moves the state with it.
+    #[arg(long, env = "BUZZ_ACP_STATE_DIR")]
+    pub state_dir: Option<PathBuf>,
 
     #[arg(long, env = "BUZZ_ACP_DEDUP", default_value = "queue", value_enum)]
     pub dedup: DedupMode,
@@ -542,6 +575,9 @@ pub struct Config {
     pub channels_override: Option<Vec<String>>,
     pub no_mention_filter: bool,
     pub config_path: PathBuf,
+    /// Directory holding durable harness state. Resolved from `--state-dir` /
+    /// `BUZZ_ACP_STATE_DIR`, or defaulted beside `config_path`.
+    pub state_dir: PathBuf,
     pub context_message_limit: u32,
     /// Maximum turns per session before proactive rotation. 0 = disabled.
     pub max_turns_per_session: u32,
@@ -1122,6 +1158,10 @@ impl Config {
             kinds_override: args.kinds,
             channels_override: args.channels,
             no_mention_filter: args.no_mention_filter,
+            state_dir: crate::terminal_auth_store::resolve_state_dir(
+                args.state_dir.as_deref(),
+                &args.config,
+            ),
             config_path: args.config,
             context_message_limit: args.context_message_limit,
             max_turns_per_session: args.max_turns_per_session,
@@ -1500,6 +1540,7 @@ pub(crate) fn test_config(mode: SubscribeMode) -> Config {
         channels_override: None,
         no_mention_filter: false,
         config_path: PathBuf::from("./buzz-acp.toml"),
+        state_dir: PathBuf::from("./buzz-acp-state"),
         context_message_limit: 12,
         max_turns_per_session: 0,
         presence_enabled: true,

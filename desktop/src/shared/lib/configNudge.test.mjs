@@ -412,6 +412,78 @@ test("nudgePresent_extractNonNull_and_stripRemovesSentinel", () => {
   );
 });
 
+// ── provider_capability surface ───────────────────────────────────────────────
+
+const PROVIDER_AUTH_REQUIRED = {
+  surface: "provider_capability",
+  state: "authentication_required",
+  setup_copy: "Claude rejected this agent's credentials.",
+};
+
+test("provider_capability payload round-trips through the sentinel", () => {
+  const payload = {
+    agent_name: "Fizz",
+    agent_pubkey: FIZZ_PUBKEY,
+    requirements: [PROVIDER_AUTH_REQUIRED],
+  };
+  assert.deepEqual(
+    extractConfigNudge(
+      withSentinel("**Fizz** cannot reach its provider.", payload),
+    ),
+    payload,
+  );
+});
+
+test("every provider_capability state is accepted", () => {
+  for (const state of [
+    "authentication_required",
+    "unknown",
+    "adapter_problem",
+  ]) {
+    const payload = {
+      agent_name: "Fizz",
+      agent_pubkey: FIZZ_PUBKEY,
+      requirements: [{ ...PROVIDER_AUTH_REQUIRED, state }],
+    };
+    const parsed = extractConfigNudge(withSentinel("prose", payload));
+    assert.equal(parsed?.requirements[0].state, state, state);
+  }
+});
+
+test("an unknown provider_capability state rejects the whole payload", () => {
+  // Partial acceptance would render a row whose state the card cannot switch
+  // on, so the guard refuses the payload rather than the single row.
+  const payload = {
+    agent_name: "Fizz",
+    agent_pubkey: FIZZ_PUBKEY,
+    requirements: [{ ...PROVIDER_AUTH_REQUIRED, state: "something_new" }],
+  };
+  assert.equal(extractConfigNudge(withSentinel("prose", payload)), null);
+});
+
+test("a provider_capability row without setup copy is rejected", () => {
+  const payload = {
+    agent_name: "Fizz",
+    agent_pubkey: FIZZ_PUBKEY,
+    requirements: [{ surface: "provider_capability", state: "unknown" }],
+  };
+  assert.equal(extractConfigNudge(withSentinel("prose", payload)), null);
+});
+
+test("provider_capability mixes with the pre-existing surfaces", () => {
+  const payload = {
+    agent_name: "Fizz",
+    agent_pubkey: FIZZ_PUBKEY,
+    requirements: [
+      { surface: "env_key", key: "ANTHROPIC_API_KEY" },
+      PROVIDER_AUTH_REQUIRED,
+    ],
+  };
+  const parsed = extractConfigNudge(withSentinel("prose", payload));
+  assert.equal(parsed?.requirements.length, 2);
+  assert.equal(parsed?.requirements[1].surface, "provider_capability");
+});
+
 test("nudgeAbsent_extractNull_markdownNodeShown", () => {
   // When there is no sentinel, extractConfigNudge returns null, meaning
   // markdown.tsx renders `markdownNode` normally (no card, no suppression).

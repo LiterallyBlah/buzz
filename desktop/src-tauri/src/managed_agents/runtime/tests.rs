@@ -1275,6 +1275,7 @@ fn make_pair_runtime_placeholder() -> crate::managed_agents::ManagedAgentPairRun
         setup_mode: false,
         adapter_availability: None,
         start_nonce: "test-nonce".to_string(),
+        provider_preflight: None,
         #[cfg(windows)]
         job: None,
     };

@@ -115,6 +115,19 @@ pub(crate) enum RequirementPayload {
     },
     /// Git for Windows is missing; open Agent runtimes for the installation guide.
     GitBash,
+    /// The static checks passed but a bounded disposable turn against the
+    /// provider did not complete.
+    ///
+    /// The desktop is the sole source of this verdict — the setup listener
+    /// never contacts a provider itself. It only renders the copy the desktop
+    /// computed, so a nudge can never become a second, weaker probe.
+    ProviderCapability {
+        /// Categorical outcome: `authentication_required`, `unknown`, or
+        /// `adapter_problem`.
+        state: String,
+        /// Desktop-authored instruction copy.
+        setup_copy: String,
+    },
 }
 
 impl RequirementPayload {
@@ -189,6 +202,9 @@ impl RequirementPayload {
             RequirementPayload::GitBash => {
                 "install Git for Windows (open Agent runtimes in Settings to diagnose)".to_string()
             }
+            // The desktop already phrased this for the exact outcome it saw;
+            // rewording it here would only risk contradicting the card.
+            RequirementPayload::ProviderCapability { setup_copy, .. } => setup_copy.clone(),
         }
     }
 }
@@ -720,6 +736,52 @@ mod tests {
             payload.requirements.as_slice(),
             [RequirementPayload::GitBash]
         ));
+    }
+
+    #[test]
+    fn setup_payload_round_trips_the_provider_capability_surface() {
+        // The desktop is the sole author of this surface; the listener must
+        // accept it and render the desktop's own copy verbatim.
+        let json = r#"{
+            "agent_name": "Fizz",
+            "agent_pubkey": "aabbcc",
+            "requirements": [{
+                "surface": "provider_capability",
+                "state": "authentication_required",
+                "setup_copy": "Claude rejected this agent's credentials."
+            }]
+        }"#;
+        let payload: SetupPayload = serde_json::from_str(json).expect("payload deserializes");
+        let [requirement] = payload.requirements.as_slice() else {
+            panic!("expected exactly one requirement");
+        };
+        assert!(matches!(
+            requirement,
+            RequirementPayload::ProviderCapability { state, .. } if state == "authentication_required"
+        ));
+        assert_eq!(
+            requirement.instruction(),
+            "Claude rejected this agent's credentials.",
+            "the listener must not reword the desktop's copy"
+        );
+
+        // Round-trips back out for the config-nudge sentinel the desktop card
+        // parses.
+        let reserialized = serde_json::to_value(requirement).expect("serialize");
+        assert_eq!(reserialized["surface"], "provider_capability");
+        assert_eq!(reserialized["state"], "authentication_required");
+    }
+
+    #[test]
+    fn provider_capability_states_all_deserialize() {
+        for state in ["authentication_required", "unknown", "adapter_problem"] {
+            let json = format!(
+                r#"{{"agent_name":"F","agent_pubkey":"aa","requirements":[{{"surface":"provider_capability","state":"{state}","setup_copy":"copy"}}]}}"#
+            );
+            let payload: SetupPayload =
+                serde_json::from_str(&json).unwrap_or_else(|e| panic!("{state}: {e}"));
+            assert_eq!(payload.requirements.len(), 1);
+        }
     }
 
     #[test]

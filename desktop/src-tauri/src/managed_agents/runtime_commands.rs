@@ -56,7 +56,18 @@ fn status_for_with(
     let command = record_agent_command(record, personas);
     let metadata = super::known_acp_runtime(&command);
     let effective = resolve_effective_agent_env(record, personas, metadata, global);
-    let local_setup = matches!(agent_readiness(&effective), AgentReadiness::Ready);
+    // `local_setup` means "this agent can do work". Static readiness answers
+    // half of that; the running generation's provider stamp answers the other
+    // half. Reading the stamp — not a fresh cache lookup — is what keeps the
+    // status describing the process that is actually running: a verdict that
+    // landed after this generation started belongs to a different moment.
+    let local_setup = matches!(agent_readiness(&effective), AgentReadiness::Ready)
+        && runtime.is_none_or(|runtime| {
+            runtime
+                .provider_preflight
+                .as_ref()
+                .is_none_or(|preflight| preflight.capability.is_ready())
+        });
     ManagedAgentRuntimeStatus {
         pubkey: key.pubkey.clone(),
         relay_url: key.relay_url.clone(),
@@ -283,7 +294,19 @@ fn start_pair(
         .lock()
         .ok()
         .map(|keys| keys.public_key().to_hex());
-    let mut process = spawn_agent_child(&app, record, &key.relay_url, lazy, owner.as_deref())?;
+    // The interactive start command. Every user-visible way of asking an agent
+    // to (re)start lands here — manual restart, the setup card's Retry, an
+    // auth-completion bounce, a Doctor restart — so it always re-probes the
+    // provider rather than answering from a verdict taken before the user
+    // acted.
+    let mut process = spawn_agent_child(
+        &app,
+        record,
+        &key.relay_url,
+        lazy,
+        owner.as_deref(),
+        crate::managed_agents::readiness::provider_cache::ProbeFreshness::ForceRefresh,
+    )?;
     let now = crate::util::now_iso();
     let receipt = ManagedAgentRuntimeReceipt {
         key: key.clone(),

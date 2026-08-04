@@ -7,8 +7,38 @@
 use std::time::Duration;
 use tokio::time::Instant;
 
+use crate::terminal_auth::TerminalAuth;
+
 const INITIAL_RETRY_DELAY: Duration = Duration::from_secs(5);
 const MAX_RETRY_DELAY: Duration = Duration::from_secs(300);
+
+/// Why a lazy pool wake failed.
+///
+/// The distinction is typed rather than inferred from an error string:
+/// `Transient` keeps the existing bounded backoff, `TerminalAuth` has no
+/// deadline at all and never wakes again on its own. Erasing the difference
+/// into `anyhow` would put an expired credential on the same five-second
+/// retry ladder as a busy provider.
+#[derive(Debug, Clone)]
+pub(crate) enum PoolStartError {
+    /// A non-retryable authentication failure classified at the ACP seam.
+    TerminalAuth(TerminalAuth),
+    /// Anything else — spawn failure, protocol error, provider outage.
+    Transient(String),
+}
+
+impl PoolStartError {
+    /// A safe, categorical summary for logs and lifecycle events. Carries no
+    /// provider text for the terminal-auth case.
+    pub(crate) fn summary(&self) -> String {
+        match self {
+            Self::TerminalAuth(terminal) => {
+                format!("terminal authentication failure ({terminal})")
+            }
+            Self::Transient(message) => message.clone(),
+        }
+    }
+}
 
 #[derive(Debug)]
 pub(crate) enum PoolLifecycle<P> {
@@ -21,6 +51,13 @@ pub(crate) enum PoolLifecycle<P> {
         attempt: u32,
         retry_at: Instant,
         error: String,
+    },
+    /// The provider rejected our credentials. There is no retry deadline and
+    /// no automatic wake: advancing the clock changes nothing, because the
+    /// credential can only be repaired outside this process. Only an explicit
+    /// fresh lifecycle (a restart after re-authentication) leaves this state.
+    BlockedAuth {
+        terminal: TerminalAuth,
     },
 }
 
@@ -48,7 +85,12 @@ impl<P> PoolLifecycle<P> {
             Self::Failed {
                 attempt, retry_at, ..
             } if now >= *retry_at => Some(attempt.saturating_add(1)),
-            Self::Waking { .. } | Self::Ready(_) | Self::Failed { .. } => None,
+            // BlockedAuth is absorbing: no amount of pending work or elapsed
+            // time makes an expired credential valid.
+            Self::Waking { .. }
+            | Self::Ready(_)
+            | Self::Failed { .. }
+            | Self::BlockedAuth { .. } => None,
         };
 
         if let Some(attempt) = next_attempt {
@@ -88,18 +130,29 @@ impl<P> PoolLifecycle<P> {
         }
     }
 
+    /// The terminal-auth disposition, when the lifecycle is blocked on one.
+    pub(crate) fn blocked_auth(&self) -> Option<TerminalAuth> {
+        match self {
+            Self::BlockedAuth { terminal } => Some(*terminal),
+            _ => None,
+        }
+    }
+
     pub(crate) fn cancel_wake(&mut self, attempt: u32, error: String, now: Instant) -> bool {
-        self.complete_wake(attempt, Err(error), now).is_ok()
+        self.complete_wake(attempt, Err(PoolStartError::Transient(error)), now)
+            .is_ok()
     }
 
     /// Complete the matching in-flight wake attempt.
     ///
-    /// A failure remains retryable. A result returned outside `Waking`, or from
-    /// an older attempt, is rejected: accepting it could replace a newer pool.
+    /// A transient failure remains retryable. A terminal authentication
+    /// failure does not: it enters `BlockedAuth`, which has no deadline. A
+    /// result returned outside `Waking`, or from an older attempt, is
+    /// rejected: accepting it could replace a newer pool.
     pub(crate) fn complete_wake(
         &mut self,
         completed_attempt: u32,
-        result: Result<P, String>,
+        result: Result<P, PoolStartError>,
         now: Instant,
     ) -> Result<(), &'static str> {
         let attempt = match self {
@@ -110,7 +163,8 @@ impl<P> PoolLifecycle<P> {
 
         *self = match result {
             Ok(pool) => Self::Ready(pool),
-            Err(error) => Self::Failed {
+            Err(PoolStartError::TerminalAuth(terminal)) => Self::BlockedAuth { terminal },
+            Err(PoolStartError::Transient(error)) => Self::Failed {
                 attempt,
                 retry_at: now + retry_delay(attempt),
                 error,
@@ -152,7 +206,11 @@ mod tests {
         let mut lifecycle = PoolLifecycle::<()>::listening();
         assert_eq!(lifecycle.start_wake_if_due(true, now), Some(1));
         lifecycle
-            .complete_wake(1, Err("provider unavailable".into()), now)
+            .complete_wake(
+                1,
+                Err(PoolStartError::Transient("provider unavailable".into())),
+                now,
+            )
             .unwrap();
 
         assert_eq!(
@@ -182,7 +240,11 @@ mod tests {
                 PoolLifecycle::Waking { attempt: actual } if actual == attempt
             ));
             lifecycle
-                .complete_wake(attempt, Err("no brain".into()), now)
+                .complete_wake(
+                    attempt,
+                    Err(PoolStartError::Transient("no brain".into())),
+                    now,
+                )
                 .unwrap();
 
             let expected = retry_delay(attempt);
@@ -205,7 +267,11 @@ mod tests {
         let mut lifecycle = PoolLifecycle::listening();
         assert_eq!(lifecycle.start_wake_if_due(true, now), Some(1));
         lifecycle
-            .complete_wake(1, Err("first attempt failed".into()), now)
+            .complete_wake(
+                1,
+                Err(PoolStartError::Transient("first attempt failed".into())),
+                now,
+            )
             .unwrap();
 
         let retry_at = match &lifecycle {
@@ -246,7 +312,11 @@ mod tests {
         let mut lifecycle = PoolLifecycle::<&str>::listening();
         assert_eq!(lifecycle.start_wake_if_due(true, now), Some(1));
         lifecycle
-            .complete_wake(1, Err("attempt one failed".into()), now)
+            .complete_wake(
+                1,
+                Err(PoolStartError::Transient("attempt one failed".into())),
+                now,
+            )
             .unwrap();
 
         let retry_at = match &lifecycle {
@@ -289,12 +359,103 @@ mod tests {
         assert_eq!(lifecycle.take_ready(), None);
     }
 
+    fn terminal() -> TerminalAuth {
+        TerminalAuth {
+            adapter: crate::terminal_auth::AdapterFamily::Claude,
+            stage: crate::terminal_auth::AuthStage::SessionNew,
+            signal: crate::terminal_auth::AuthSignal::Structured,
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn terminal_auth_wake_blocks_and_never_wakes_again() {
+        let now = Instant::now();
+        let mut lifecycle = PoolLifecycle::<()>::listening();
+        assert_eq!(lifecycle.start_wake_if_due(true, now), Some(1));
+        lifecycle
+            .complete_wake(1, Err(PoolStartError::TerminalAuth(terminal())), now)
+            .unwrap();
+
+        assert!(matches!(lifecycle, PoolLifecycle::BlockedAuth { .. }));
+        assert_eq!(lifecycle.blocked_auth(), Some(terminal()));
+        assert_eq!(
+            lifecycle.retry_at(),
+            None,
+            "blocked-auth must expose no retry deadline"
+        );
+        assert_eq!(lifecycle.failed_error(), None);
+
+        // Advancing time by an hour, with work pending the whole way, still
+        // never schedules a wake.
+        for minutes in [1_u64, 5, 30, 60] {
+            assert_eq!(
+                lifecycle.start_wake_if_due(true, now + Duration::from_secs(minutes * 60)),
+                None,
+                "blocked-auth must not wake after {minutes} minutes"
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn transient_wake_keeps_its_bounded_backoff_alongside_the_terminal_state() {
+        let now = Instant::now();
+        let mut lifecycle = PoolLifecycle::<()>::listening();
+        assert_eq!(lifecycle.start_wake_if_due(true, now), Some(1));
+        lifecycle
+            .complete_wake(
+                1,
+                Err(PoolStartError::Transient("provider down".into())),
+                now,
+            )
+            .unwrap();
+        assert_eq!(lifecycle.retry_at(), Some(now + INITIAL_RETRY_DELAY));
+        assert_eq!(lifecycle.failed_error(), Some("provider down"));
+        assert_eq!(lifecycle.blocked_auth(), None);
+        assert_eq!(
+            lifecycle.start_wake_if_due(true, now + INITIAL_RETRY_DELAY),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn a_fresh_lifecycle_after_reauthentication_accepts_work_again() {
+        let now = Instant::now();
+        let mut lifecycle = PoolLifecycle::<&str>::listening();
+        assert_eq!(lifecycle.start_wake_if_due(true, now), Some(1));
+        lifecycle
+            .complete_wake(1, Err(PoolStartError::TerminalAuth(terminal())), now)
+            .unwrap();
+        assert_eq!(lifecycle.start_wake_if_due(true, now), None);
+
+        // Only an explicit fresh lifecycle — what a restart builds — leaves
+        // the blocked state.
+        let mut restarted = PoolLifecycle::<&str>::listening();
+        assert_eq!(restarted.start_wake_if_due(true, now), Some(1));
+        restarted.complete_wake(1, Ok("pool"), now).unwrap();
+        assert!(matches!(restarted, PoolLifecycle::Ready("pool")));
+    }
+
+    #[test]
+    fn pool_start_error_summary_carries_no_provider_text() {
+        let summary = PoolStartError::TerminalAuth(terminal()).summary();
+        assert_eq!(
+            summary,
+            "terminal authentication failure (adapter=claude stage=session_new signal=structured)"
+        );
+        assert_eq!(
+            PoolStartError::Transient("spawn failed".into()).summary(),
+            "spawn failed"
+        );
+    }
+
     #[test]
     fn failed_state_preserves_attempt_deadline_and_error() {
         let now = Instant::now();
         let mut lifecycle = PoolLifecycle::<()>::listening();
         assert_eq!(lifecycle.start_wake_if_due(true, now), Some(1));
-        lifecycle.complete_wake(1, Err("boom".into()), now).unwrap();
+        lifecycle
+            .complete_wake(1, Err(PoolStartError::Transient("boom".into())), now)
+            .unwrap();
 
         match lifecycle {
             PoolLifecycle::Failed {

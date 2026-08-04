@@ -60,7 +60,32 @@ export type ConfigNudgeRequirement =
       surface: "missing_binary";
       /** The command name that was not found (e.g. "my-acp-agent"). */
       command: string;
+    }
+  | {
+      /**
+       * Static checks passed, but a bounded disposable turn against the
+       * provider did not complete. The gap the other surfaces cannot see: a
+       * hosted Claude session whose OAuth refresh has failed is installed, on
+       * PATH, and reports a login — and still cannot answer a message.
+       */
+      surface: "provider_capability";
+      /**
+       * - "authentication_required" → the provider rejected our credentials;
+       *   an interactive login is the fix.
+       * - "unknown"                 → no turn completed and we cannot say why
+       *   (timeout, rate limit, outage). Explicitly NOT a login diagnosis.
+       * - "adapter_problem"         → the adapter misbehaved; update it.
+       */
+      state: ProviderCapabilityState;
+      /** Desktop-authored instruction copy, rendered verbatim. */
+      setup_copy: string;
     };
+
+/** Categorical outcome of a provider-capability probe — mirrors Rust. */
+export type ProviderCapabilityState =
+  | "authentication_required"
+  | "unknown"
+  | "adapter_problem";
 
 /**
  * The structured payload embedded in the `buzz:config-nudge` sentinel block.
@@ -167,6 +192,13 @@ function isConfigNudgeRequirement(v: unknown): v is ConfigNudgeRequirement {
       );
     case "missing_binary":
       return typeof r.command === "string";
+    case "provider_capability":
+      return (
+        (r.state === "authentication_required" ||
+          r.state === "unknown" ||
+          r.state === "adapter_problem") &&
+        typeof r.setup_copy === "string"
+      );
     default:
       return false;
   }

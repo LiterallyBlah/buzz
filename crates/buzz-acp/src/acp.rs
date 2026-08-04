@@ -14,6 +14,7 @@ use tokio::process::{Child, ChildStdin, ChildStdout};
 use tokio_util::codec::{FramedRead, LinesCodec, LinesCodecError};
 
 use crate::observer::{ObserverContext, ObserverHandle};
+use crate::terminal_auth::{self, AdapterIdentity, AuthStage, TerminalAuth};
 use crate::usage::{TurnUsage, UsageTracker};
 
 /// Maximum allowed size of a single NDJSON line from the agent's stdout.
@@ -106,6 +107,18 @@ pub enum AcpError {
 
     #[error("Agent reported error (code {code}): {message}")]
     AgentError { code: i64, message: String },
+
+    /// A non-retryable authentication failure, classified at the ACP seam.
+    ///
+    /// Deliberately carries no upstream text. Everything inside
+    /// [`TerminalAuth`] is a closed enum, so this variant is safe to log,
+    /// display, and serialise anywhere — it cannot leak a token, a header, or
+    /// a credential document that happened to appear in the provider's error.
+    ///
+    /// Queue, lifecycle and Desktop code must branch on *this variant*, never
+    /// on the prose of [`AcpError::AgentError`].
+    #[error("Terminal authentication failure ({0})")]
+    TerminalAuth(TerminalAuth),
 }
 
 /// Build an [`AcpError::AgentError`] from a JSON-RPC error object,
@@ -119,6 +132,23 @@ fn agent_error_from_json(error: &serde_json::Value) -> AcpError {
         None => error.to_string(),
     };
     AcpError::AgentError { code, message }
+}
+
+/// Classify a JSON-RPC error object into either a typed terminal
+/// authentication failure or an ordinary retryable agent error.
+///
+/// This is the single seam every ACP response passes through, so session
+/// creation, the initial message, and the final prompt all share one
+/// classifier and cannot drift apart.
+fn classified_error_from_json(
+    error: &serde_json::Value,
+    identity: &AdapterIdentity,
+    stage: AuthStage,
+) -> AcpError {
+    match terminal_auth::classify_jsonrpc_error(error, identity, stage) {
+        Some(terminal) => AcpError::TerminalAuth(terminal),
+        None => agent_error_from_json(error),
+    }
 }
 
 fn build_initialize_params() -> serde_json::Value {
@@ -211,6 +241,19 @@ pub struct AcpClient {
     /// deltas. Both goose and buzz-agent emit this notification; goose gates
     /// on client capability advertisement, buzz-agent emits unconditionally.
     goose_usage: UsageTracker,
+    /// Who this process is, for terminal-auth compatibility matching.
+    ///
+    /// Seeded from the configured command at [`spawn`](Self::spawn) and
+    /// refined from the adapter's own `serverInfo`/`agentInfo` at
+    /// [`initialize`](Self::initialize). Only the derived family is retained —
+    /// see [`AdapterIdentity`].
+    adapter_identity: AdapterIdentity,
+    /// The ACP stage of the request currently awaiting a response.
+    ///
+    /// Set by every request path before it reads, so a classified
+    /// authentication failure can name the stage without the classifier
+    /// needing to know how the request was written.
+    pending_stage: AuthStage,
 }
 
 /// Recursively merge `overlay` into `base`, with `overlay` winning on scalar/shape
@@ -584,7 +627,17 @@ impl AcpClient {
             steering_supported: false,
             steer_rx: None,
             goose_usage: UsageTracker::default(),
+            adapter_identity: AdapterIdentity::from_command(command),
+            pending_stage: AuthStage::Other,
         })
+    }
+
+    /// The family the adapter reported for itself at `initialize`.
+    ///
+    /// [`AdapterFamily::Other`] before `initialize`, or when the adapter
+    /// reports a name we do not recognise.
+    pub fn reported_adapter_family(&self) -> terminal_auth::AdapterFamily {
+        self.adapter_identity.reported_family()
     }
 
     /// Attach a local observer feed to this ACP client.
@@ -634,6 +687,10 @@ impl AcpClient {
         // on ACP v2 ahead of the upstream ACP RFD. Revisit when that RFD merges.
         let params = build_initialize_params();
         let result = self.send_request("initialize", params).await?;
+        // Record who answered before anything else reads the result: every
+        // later classification depends on knowing which adapter family this
+        // process belongs to, and this is the only moment it tells us.
+        self.adapter_identity.observe_initialize(&result);
         self.steering_supported = result
             .pointer("/_meta/steering/supported")
             .and_then(|v| v.as_bool())
@@ -1110,6 +1167,10 @@ impl AcpClient {
         // Wrap write + read in a single timeout so a hung agent can't block forever.
         // We cannot use an async block that borrows `self` mutably across two awaits
         // inside timeout(), so we sequence them with early-return on timeout.
+        // Record the stage before reading so a classified authentication
+        // failure can name the ACP call it came from.
+        self.pending_stage = AuthStage::from_method(method);
+
         let timeout = Self::REQUEST_TIMEOUT;
         match tokio::time::timeout(timeout, self.write_ndjson(&msg)).await {
             Ok(result) => result?,
@@ -1239,7 +1300,11 @@ impl AcpClient {
             if let Some(id) = msg.get("id") {
                 if *id == serde_json::json!(expected_id) && msg.get("method").is_none() {
                     if let Some(error) = msg.get("error") {
-                        return Err(agent_error_from_json(error));
+                        return Err(classified_error_from_json(
+                            error,
+                            &self.adapter_identity,
+                            self.pending_stage,
+                        ));
                     }
                     return Ok(msg["result"].clone());
                 }
@@ -1673,7 +1738,13 @@ impl AcpClient {
                                         let _ = ack_tx
                                             .send(crate::pool::SteerAck::PromptCompletedNeutral);
                                     }
-                                    return Err(agent_error_from_json(error));
+                                    // Prompt responses share the session-creation
+                                    // classifier: one seam, one taxonomy.
+                                    return Err(classified_error_from_json(
+                                        error,
+                                        &self.adapter_identity,
+                                        AuthStage::Prompt,
+                                    ));
                                 }
                                 if let Some((_, _, ack_tx)) = pending_steer.take() {
                                     let _ =

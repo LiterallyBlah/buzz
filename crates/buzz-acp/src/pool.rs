@@ -1662,13 +1662,14 @@ pub async fn run_prompt_task(
                     Err(e) => {
                         // Session creation failed; pending canvas was never committed,
                         // so the next retry will re-fetch a fresh revision.
+                        let batch = requeue_batch_for_error(&ctx, &e, batch);
                         send_prompt_result(
                             &result_tx,
                             &turn_id,
                             agent,
                             source,
                             PromptOutcome::Error(e),
-                            requeue_batch_if_queue(&ctx, batch),
+                            batch,
                         );
                         return;
                     }
@@ -1861,13 +1862,14 @@ pub async fn run_prompt_task(
                         "initial_message failed for channel {cid}: {e} — invalidating session"
                     );
                     agent.state.invalidate(&source);
+                    let batch = requeue_batch_for_error(&ctx, &e, batch);
                     send_prompt_result(
                         &result_tx,
                         &turn_id,
                         agent,
                         source,
                         PromptOutcome::Error(e),
-                        requeue_batch_if_queue(&ctx, batch),
+                        batch,
                     );
                     return;
                 }
@@ -2368,7 +2370,10 @@ pub async fn run_prompt_task(
             // AgentError means the agent caught a problem before mutating
             // session state (e.g. bad LLM response). The session is healthy —
             // don't invalidate it. Other errors may have corrupted state.
-            if !matches!(e, AcpError::AgentError { .. }) {
+            // A terminal auth failure is reported by the agent before it
+            // mutates session state, same as any other AgentError — the
+            // session stays usable once the credential is repaired.
+            if !matches!(e, AcpError::AgentError { .. } | AcpError::TerminalAuth(_)) {
                 agent.state.invalidate(&source);
             }
             let usage = agent.acp.take_turn_usage();
@@ -2381,13 +2386,14 @@ pub async fn run_prompt_task(
                 Some(buzz_core::agent_turn_metric::StopReason::Error),
             )
             .await;
+            let batch = requeue_batch_for_error(&ctx, &e, batch);
             send_prompt_result(
                 &result_tx,
                 &turn_id,
                 agent,
                 source,
                 PromptOutcome::Error(e),
-                requeue_batch_if_queue(&ctx, batch),
+                batch,
             );
         }
     }
@@ -3339,6 +3345,27 @@ fn requeue_batch_if_queue(ctx: &PromptContext, batch: Option<FlushBatch>) -> Opt
         DedupMode::Queue => batch,
         DedupMode::Drop => None,
     }
+}
+
+/// Decide a failed batch's fate from the error that killed it.
+///
+/// A terminal authentication failure keeps its batch on **both** dedup modes.
+/// `Drop` would otherwise discard the events here, and the main loop would
+/// then have nothing to durably dispose of — the requests would vanish from
+/// memory while remaining perfectly revivable from relay history. Ownership
+/// must survive as far as the disposition commit; only then is the batch
+/// genuinely finished.
+///
+/// Every other error keeps the existing dedup-mode behaviour exactly.
+fn requeue_batch_for_error(
+    ctx: &PromptContext,
+    error: &AcpError,
+    batch: Option<FlushBatch>,
+) -> Option<FlushBatch> {
+    if matches!(error, AcpError::TerminalAuth(_)) {
+        return batch;
+    }
+    requeue_batch_if_queue(ctx, batch)
 }
 
 /// Map a cancelling [`ControlSignal`] to the [`CancelReason`] that should frame
@@ -6422,6 +6449,72 @@ mod tests {
             harness_name: "goose".to_string(),
             relay_url: "ws://127.0.0.1:3000".to_string(),
         }
+    }
+
+    // ── batch ownership on failure ───────────────────────────────────────────
+
+    fn terminal_auth_error() -> AcpError {
+        AcpError::TerminalAuth(crate::terminal_auth::TerminalAuth {
+            adapter: crate::terminal_auth::AdapterFamily::Claude,
+            stage: crate::terminal_auth::AuthStage::SessionNew,
+            signal: crate::terminal_auth::AuthSignal::ClaudeReauthenticate,
+        })
+    }
+
+    /// Terminal auth must keep the batch on *both* dedup modes: the main loop
+    /// needs the events in hand to make the durable disposition, and `Drop`
+    /// would otherwise throw them away while leaving them revivable from relay
+    /// history.
+    #[test]
+    fn terminal_auth_preserves_batch_ownership_in_both_dedup_modes() {
+        for mode in [DedupMode::Queue, DedupMode::Drop] {
+            let mut ctx = make_prompt_context_no_owner();
+            ctx.dedup_mode = mode;
+            let channel_id = Uuid::new_v4();
+            let batch = one_event_batch(channel_id);
+
+            let retained = requeue_batch_for_error(&ctx, &terminal_auth_error(), Some(batch));
+            let retained = retained
+                .unwrap_or_else(|| panic!("{mode:?} must keep the batch for the disposition"));
+            assert_eq!(retained.channel_id, channel_id);
+            assert_eq!(retained.events.len(), 1);
+        }
+    }
+
+    /// Every other error keeps the pre-existing dedup-mode behaviour exactly.
+    #[test]
+    fn ordinary_errors_keep_their_existing_dedup_mode_behaviour() {
+        let errors = [
+            AcpError::AgentError {
+                code: -32000,
+                message: "rate limited".into(),
+            },
+            AcpError::Io(std::io::Error::other("pipe broke")),
+            AcpError::Protocol("garbage".into()),
+        ];
+        for error in errors {
+            let mut queue_ctx = make_prompt_context_no_owner();
+            queue_ctx.dedup_mode = DedupMode::Queue;
+            assert!(
+                requeue_batch_for_error(&queue_ctx, &error, Some(one_event_batch(Uuid::new_v4())))
+                    .is_some(),
+                "queue mode keeps the batch for {error}"
+            );
+
+            let mut drop_ctx = make_prompt_context_no_owner();
+            drop_ctx.dedup_mode = DedupMode::Drop;
+            assert!(
+                requeue_batch_for_error(&drop_ctx, &error, Some(one_event_batch(Uuid::new_v4())))
+                    .is_none(),
+                "drop mode still drops the batch for {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_heartbeat_has_no_batch_to_preserve() {
+        let ctx = make_prompt_context_no_owner();
+        assert!(requeue_batch_for_error(&ctx, &terminal_auth_error(), None).is_none());
     }
 
     // ── render_canvas_section ────────────────────────────────────────────────

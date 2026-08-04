@@ -39,6 +39,8 @@ function requirementKey(
       return `git_bash:${index}`;
     case "missing_binary":
       return `missing_binary:${req.command}:${index}`;
+    case "provider_capability":
+      return `provider_capability:${req.state}:${index}`;
   }
 }
 
@@ -394,6 +396,28 @@ function RequirementRow({
             </code>{" "}
             not found in PATH — install it or check your PATH settings
           </span>
+        </div>
+      );
+    }
+    case "provider_capability": {
+      // The desktop already phrased this for the exact outcome its probe saw,
+      // so the row renders that copy verbatim. Only the adapter-problem state
+      // has an in-app destination; an authentication problem is fixed in the
+      // provider's own CLI, and an unknown outcome is fixed by waiting.
+      return (
+        <div className="flex items-center gap-2 text-xs leading-4 text-muted-foreground">
+          <span className="flex-1 [overflow-wrap:anywhere]">
+            {requirement.setup_copy}
+          </span>
+          {requirement.state === "adapter_problem" && (
+            <button
+              className="relative z-20 shrink-0 font-medium text-muted-foreground hover:underline"
+              onClick={onOpenDoctor}
+              type="button"
+            >
+              Open Agent runtimes →
+            </button>
+          )}
         </div>
       );
     }

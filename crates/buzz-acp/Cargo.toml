@@ -79,6 +79,7 @@ nix = { version = "0.31", default-features = false, features = ["signal"] }
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
 httparse = "1"
+tempfile = "3"
 # Test-only. The connected Phase A scenario has the agent's child process run
 # the real `buzz issues comment` argument parsing and dispatch, and captures the
 # signed event it submits over HTTP. `buzz-cli` does not depend on `buzz-acp`,

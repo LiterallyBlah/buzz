@@ -483,6 +483,15 @@ pub struct ManagedAgentProcess {
     pub adapter_availability: Option<AcpAvailabilityStatus>,
     /// Unpredictable identity shared only with this harness generation.
     pub start_nonce: String,
+    /// The provider-capability verdict this generation was started on.
+    ///
+    /// Runtime-only, never persisted. Status reads *this* stamp rather than a
+    /// fresh cache lookup: a verdict that arrived after the process started
+    /// describes a different moment, and possibly a different descriptor, than
+    /// the one this process is actually running.
+    ///
+    /// `None` for runtimes the provider gate does not apply to.
+    pub provider_preflight: Option<crate::managed_agents::readiness::ProviderPreflight>,
     /// Win32 Job Object owning the harness + its entire process tree. Closing
     /// the handle (via `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`) kills the whole
     /// tree — the Windows mirror of the Unix process-group teardown. `None`

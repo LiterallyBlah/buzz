@@ -9,9 +9,12 @@ mod peer_call;
 mod pool;
 mod pool_lifecycle;
 mod project;
+mod provider_probe;
 mod queue;
 mod relay;
 mod setup_mode;
+mod terminal_auth;
+mod terminal_auth_store;
 mod usage;
 
 pub use usage::TurnUsage;
@@ -33,7 +36,7 @@ use buzz_core::observer::{
 use clap::Parser;
 use config::{
     AuthAgentArgs, AuthMethodsArgs, AuthenticateArgs, Config, DedupMode, ModelsArgs,
-    MultipleEventHandling, RespondTo, SubscribeMode,
+    MultipleEventHandling, ProviderProbeArgs, RespondTo, SubscribeMode,
 };
 use filter::SubscriptionRule;
 use futures_util::FutureExt;
@@ -42,7 +45,7 @@ use pool::{
     AgentPool, ControlSignal, IdleSwitchResult, OwnedAgent, PromptContext, PromptOutcome,
     PromptResult, PromptSource, SessionState, TimeoutKind,
 };
-use pool_lifecycle::PoolLifecycle;
+use pool_lifecycle::{PoolLifecycle, PoolStartError};
 use queue::{CancelReason, EventQueue, FlushBatch, QueuedEvent, ThreadTags};
 use relay::{BuzzEvent, HarnessRelay, RelayEventPublisher};
 use tokio::sync::{mpsc, watch};
@@ -1595,6 +1598,16 @@ async fn tokio_main() -> Result<()> {
         return run_auth_methods(args).await;
     }
 
+    if is_subcommand("provider-probe") {
+        let filtered: Vec<String> = std::env::args()
+            .enumerate()
+            .filter(|(i, _)| *i != 1)
+            .map(|(_, a)| a)
+            .collect();
+        let args = ProviderProbeArgs::parse_from(&filtered);
+        return run_provider_probe(args).await;
+    }
+
     if is_subcommand("authenticate") {
         let filtered: Vec<String> = std::env::args()
             .enumerate()
@@ -1628,6 +1641,19 @@ async fn tokio_main() -> Result<()> {
 
     tracing::info!("buzz-acp starting: {}", config.summary());
 
+    // ── Durable terminal-auth dispositions ───────────────────────────────────
+    //
+    // Loaded here, immediately after configuration and before any agent is
+    // spawned or any relay socket is opened, so the filter is in place before
+    // the first event can possibly arrive. Anything other than "missing" that
+    // fails to validate stops startup: silently resetting the store would
+    // re-arm every request a previous run terminally disposed of.
+    let terminal_auth_store = terminal_auth_store::TerminalAuthStore::load(
+        &config.state_dir,
+        &config.keys.public_key().to_hex(),
+    )
+    .map_err(|e| anyhow::anyhow!("terminal-auth store error: {e}"))?;
+
     let observer = observer_bus_for(&config);
     if let Some(handle) = &observer {
         handle.emit(
@@ -1647,7 +1673,9 @@ async fn tokio_main() -> Result<()> {
     let mut pool = if config.lazy_pool {
         AgentPool::from_slots((0..config.agents).map(|_| None).collect())
     } else {
-        initialize_agent_pool(&PoolStartup::from_config(&config, observer.clone()), None).await?
+        initialize_agent_pool(&PoolStartup::from_config(&config, observer.clone()), None)
+            .await
+            .map_err(|e| anyhow::anyhow!("{}", e.summary()))?
     };
     let mut pool_ready = !config.lazy_pool;
     let mut pool_lifecycle: PoolLifecycle<AgentPool> = PoolLifecycle::listening();
@@ -1882,6 +1910,7 @@ async fn tokio_main() -> Result<()> {
     let dedup_mode = config.dedup_mode;
     let mut queue =
         EventQueue::new(dedup_mode).with_in_flight_deadline(config.max_turn_duration_secs);
+    queue.attach_terminal_auth_store(terminal_auth_store);
 
     // Online means the harness can receive work, not merely that its socket is
     // connected. Publishing after channel subscriptions gives desktop callers
@@ -1992,7 +2021,7 @@ async fn tokio_main() -> Result<()> {
     let (respawn_tx, mut respawn_rx) = mpsc::channel::<RespawnResult>(config.agents as usize);
     // JoinSet for respawn tasks so shutdown can abort them.
     let mut respawn_tasks: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
-    let (wake_tx, mut wake_rx) = mpsc::channel::<(u32, Result<AgentPool, String>)>(1);
+    let (wake_tx, mut wake_rx) = mpsc::channel::<(u32, Result<AgentPool, PoolStartError>)>(1);
     let mut wake_tasks: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
 
     // Channel for non-cancelling steer ack watchers to forward outcomes back
@@ -2145,7 +2174,7 @@ async fn tokio_main() -> Result<()> {
         Result(Box<PromptResult>),
         Panic(tokio::task::JoinError),
         SteerAck(SteerAckEvent),
-        Wake(u32, Result<AgentPool, String>),
+        Wake(u32, Result<AgentPool, PoolStartError>),
     }
 
     loop {
@@ -2172,9 +2201,7 @@ async fn tokio_main() -> Result<()> {
                 let wake_tx = wake_tx.clone();
                 let wake_shutdown = shutdown_rx.clone();
                 wake_tasks.spawn(async move {
-                    let result = initialize_agent_pool(&startup, Some(wake_shutdown))
-                        .await
-                        .map_err(|error| error.to_string());
+                    let result = initialize_agent_pool(&startup, Some(wake_shutdown)).await;
                     if let Err(error) = wake_tx.send((attempt, result)).await {
                         let (_attempt, result) = error.0;
                         if let Ok(mut abandoned_pool) = result {
@@ -3142,6 +3169,44 @@ async fn tokio_main() -> Result<()> {
                     tracing::warn!(attempt, error, "discarding stale pool wake result");
                     continue;
                 }
+                // A terminal wake never becomes ready. Every batch buffered for
+                // it is disposed of here under the same ordering as an
+                // in-flight failure — durable commit, then notice — because
+                // the events are just as unrunnable and just as revivable.
+                if let Some(terminal) = pool_lifecycle.blocked_auth() {
+                    let error = completion
+                        .as_ref()
+                        .err()
+                        .map(|e| e.summary())
+                        .unwrap_or_default();
+                    tracing::error!(
+                        attempt,
+                        terminal = %terminal,
+                        "lazy pool wake blocked on terminal authentication — \
+                         disposing of all buffered work; no further wake will be scheduled"
+                    );
+                    emit_runtime_lifecycle(
+                        observer.as_ref(),
+                        &runtime_start_nonce,
+                        &pubkey_hex,
+                        &config.relay_url,
+                        "failed",
+                        Some(&error),
+                    );
+                    if dispose_batches_for_terminal_auth(
+                        &mut queue,
+                        Some(&ctx.rest_client),
+                        terminal,
+                    )
+                    .is_err()
+                    {
+                        // Break rather than return: the shutdown drain below
+                        // still has to reap the wake task's children, and a
+                        // bare return would leave them to best-effort `Drop`.
+                        break;
+                    }
+                    continue;
+                }
                 match completion {
                     Ok(()) => {
                         pool = pool_lifecycle
@@ -3163,14 +3228,15 @@ async fn tokio_main() -> Result<()> {
                         }
                     }
                     Err(error) => {
-                        debug_assert_eq!(pool_lifecycle.failed_error(), Some(error.as_str()));
+                        let summary = error.summary();
+                        debug_assert_eq!(pool_lifecycle.failed_error(), Some(summary.as_str()));
                         emit_runtime_lifecycle(
                             observer.as_ref(),
                             &runtime_start_nonce,
                             &pubkey_hex,
                             &config.relay_url,
                             "failed",
-                            Some(&error),
+                            Some(&summary),
                         );
                     }
                 }
@@ -4874,33 +4940,66 @@ fn dispatch_pending(
     dispatched_channels
 }
 
-/// Returns `true` when `error` is a non-retryable authentication failure.
+/// The typed terminal-auth disposition carried by an outcome, if any.
 ///
-/// Retrying auth errors is harmful: the token won't self-repair between
-/// attempts, so each retry wastes an attempt slot, delays the visible failure,
-/// and burns the user's context window. Dead-letter immediately and surface a
-/// re-authentication hint instead.
+/// The classification itself happens once, at the ACP seam
+/// ([`crate::terminal_auth`]), so nothing outside that module ever matches on
+/// provider prose. This helper only reads the already-typed answer.
+fn terminal_auth_of(outcome: &PromptOutcome) -> Option<terminal_auth::TerminalAuth> {
+    match outcome {
+        PromptOutcome::Error(acp::AcpError::TerminalAuth(terminal)) => Some(*terminal),
+        _ => None,
+    }
+}
+
+/// The user-visible copy for a terminal authentication failure.
 ///
-/// # Classification rationale
+/// One string for every provider: the notice tells the user what to do, and
+/// naming the adapter's internal error would only leak provider text into a
+/// channel. Deliberately identical to the pre-existing wording so this phase
+/// changes disposition, not voice.
+const TERMINAL_AUTH_NOTICE: &str =
+    "⚠️ I couldn't process the last request: authentication failed. \
+     Please re-authenticate the CLI (e.g. run `claude /login` or `codex login`) \
+     and then re-send.";
+
+/// Durably dispose of every batch the queue is still holding, then notify.
 ///
-/// Auth failures arrive as [`acp::AcpError::AgentError`] with a message
-/// surfaced from the upstream CLI. Two narrow patterns reliably identify
-/// non-transient auth failures observed in the field:
+/// Used when the runtime itself is blocked on a terminal authentication
+/// failure and no wake will ever deliver these events. Each batch follows the
+/// same ordering as the in-flight path — durable commit, then notice — so a
+/// crash between the two suppresses a notice rather than reviving a request.
 ///
-/// - `"Re-authenticate"` — emitted by the Claude CLI when an OAuth token has
-///   expired ("OAuth access token has expired. Re-authenticate to continue.").
-///   Specific to the auth-expiry flow; does not appear in unrelated errors.
-/// - `"API Error: 401"` — present in Claude/Codex HTTP-401 responses; 401 is
-///   the standard auth-failure status and does not arise from network blips.
-///
-/// False positives (misclassifying a transient error as non-retryable) silently
-/// drop a user message, which is worse than a false negative (extra retries on
-/// an auth error). Both patterns are therefore chosen for high precision.
-fn is_auth_error(error: &acp::AcpError) -> bool {
-    let acp::AcpError::AgentError { message, .. } = error else {
-        return false;
-    };
-    message.contains("Re-authenticate") || message.contains("API Error: 401")
+/// Returns `Err(())` when any commit fails. The caller must then stop without
+/// reporting anything: a batch we could not promise to suppress must not be
+/// announced as terminal.
+fn dispose_batches_for_terminal_auth(
+    queue: &mut EventQueue,
+    rest_client: Option<&relay::RestClient>,
+    terminal: terminal_auth::TerminalAuth,
+) -> Result<usize, ()> {
+    let batches = queue.drain_all_pending_batches();
+    let mut disposed = 0usize;
+    for batch in batches {
+        match queue.commit_terminal_auth_disposition(&batch) {
+            Ok(count) => {
+                disposed += count;
+                spawn_failure_notice(rest_client, &batch, TERMINAL_AUTH_NOTICE.to_string());
+            }
+            Err(e) => {
+                tracing::error!(
+                    channel_id = %batch.channel_id,
+                    events = batch.events.len(),
+                    terminal = %terminal,
+                    error = %e,
+                    "failed to durably record terminal-auth disposition for buffered batch — \
+                     stopping harness without notice"
+                );
+                return Err(());
+            }
+        }
+    }
+    Ok(disposed)
 }
 
 /// Spawn a task that posts a user-visible failure notice to the relay.
@@ -5023,21 +5122,43 @@ fn handle_prompt_result(
                 } else {
                     hard_timeout_fate_suffix = Some(" — requeued for retry (recently active)");
                 }
-            } else if matches!(&result.outcome, PromptOutcome::Error(e) if is_auth_error(e)) {
-                // Auth errors are non-retryable: the token won't self-repair
-                // between retries, so requeueing only wastes attempt slots and
-                // delays the visible failure. Dead-letter immediately and tell
-                // the user to re-authenticate the CLI.
-                tracing::warn!(
-                    channel_id = %batch.channel_id,
-                    events = batch.events.len(),
-                    "dead-lettering batch immediately — non-retryable auth error"
-                );
-                let content = "⚠️ I couldn't process the last request: authentication failed. \
-                    Please re-authenticate the CLI (e.g. run `claude /login` or `codex login`) \
-                    and then re-send."
-                    .to_string();
-                spawn_failure_notice(rest_client, &batch, content);
+            } else if let Some(terminal) = terminal_auth_of(&result.outcome) {
+                // Terminal auth is not a retry candidate and not an ordinary
+                // dead-letter: the credential will not repair itself, and a
+                // batch left merely dropped from memory comes back on the
+                // next restart or history replay.
+                //
+                // The ordering below is the whole contract:
+                //   durable commit → notice → mark_complete
+                // and the commit is the linearisation point. Nothing before it
+                // is observable; nothing after it can revive.
+                match queue.commit_terminal_auth_disposition(&batch) {
+                    Ok(disposed) => {
+                        tracing::warn!(
+                            channel_id = %batch.channel_id,
+                            events = batch.events.len(),
+                            disposed,
+                            terminal = %terminal,
+                            "terminal authentication failure — batch durably disposed, no retry"
+                        );
+                        spawn_failure_notice(rest_client, &batch, TERMINAL_AUTH_NOTICE.to_string());
+                    }
+                    Err(e) => {
+                        // We could not promise non-revival, so we must not act
+                        // as though we had. No notice, no completion, no
+                        // release of the in-flight channel — stop instead, and
+                        // let a restart retry the whole disposition.
+                        tracing::error!(
+                            channel_id = %batch.channel_id,
+                            events = batch.events.len(),
+                            terminal = %terminal,
+                            error = %e,
+                            "failed to durably record terminal-auth disposition — stopping harness \
+                             without notice or completion rather than risking a revived request"
+                        );
+                        return LoopAction::Exit;
+                    }
+                }
             } else if let Some(dead) = queue.requeue(batch) {
                 let reason = match &result.outcome {
                     PromptOutcome::Timeout(TimeoutKind::Idle) => "the turn timed out".to_string(),
@@ -8043,10 +8164,15 @@ impl PoolStartup {
 async fn initialize_agent_pool(
     startup: &PoolStartup,
     mut shutdown: Option<watch::Receiver<()>>,
-) -> Result<AgentPool> {
+) -> Result<AgentPool, PoolStartError> {
     // One agent failing to start must not kill the whole pool.
     // Attempt each spawn under a 60-second timeout; a partial pool is valid.
     let mut agent_slots: Vec<Option<OwnedAgent>> = Vec::with_capacity(startup.agents as usize);
+    // The first terminal authentication failure seen while initializing any
+    // slot. Kept typed and separate from the partial-pool accounting: a slot
+    // that failed because the credential expired is not a slot that might
+    // succeed on retry, so if no slot came up we must say so precisely.
+    let mut terminal_auth: Option<terminal_auth::TerminalAuth> = None;
     for i in 0..startup.agents as usize {
         let spawn_result = AcpClient::spawn(
             &startup.command,
@@ -8065,7 +8191,9 @@ async fn initialize_agent_pool(
                         _ = shutdown.changed() => {
                             acp.shutdown().await;
                             shutdown_agent_slots(&mut agent_slots).await;
-                            return Err(anyhow::anyhow!("pool initialization cancelled by shutdown"));
+                            return Err(PoolStartError::Transient(
+                                "pool initialization cancelled by shutdown".into(),
+                            ));
                         }
                         result = initialize => result,
                     },
@@ -8108,7 +8236,16 @@ async fn initialize_agent_pool(
                         }));
                     }
                     Ok(Err(e)) => {
-                        tracing::error!(agent = i, "agent initialize failed: {e}");
+                        if let acp::AcpError::TerminalAuth(terminal) = &e {
+                            tracing::error!(
+                                agent = i,
+                                terminal = %terminal,
+                                "agent initialize rejected our credentials"
+                            );
+                            terminal_auth.get_or_insert(*terminal);
+                        } else {
+                            tracing::error!(agent = i, "agent initialize failed: {e}");
+                        }
                         acp.shutdown().await;
                         agent_slots.push(None);
                     }
@@ -8127,10 +8264,16 @@ async fn initialize_agent_pool(
     }
     let live_count = agent_slots.iter().filter(|slot| slot.is_some()).count();
     if live_count == 0 {
-        return Err(anyhow::anyhow!(
+        // Terminal auth wins over the generic message: a caller that retries
+        // this on a five-second ladder would be retrying an expired
+        // credential forever.
+        if let Some(terminal) = terminal_auth {
+            return Err(PoolStartError::TerminalAuth(terminal));
+        }
+        return Err(PoolStartError::Transient(format!(
             "all {} agents failed to start — cannot continue",
             startup.agents
-        ));
+        )));
     }
     if live_count < startup.agents as usize {
         tracing::warn!(
@@ -8244,6 +8387,34 @@ async fn run_auth_methods(args: AuthMethodsArgs) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// `buzz-acp provider-probe` — one disposable tool-disabled turn.
+///
+/// Writes exactly one compact JSON object to stdout and nothing else, on every
+/// path including failure. Diagnostics that would be useful to a human go to
+/// stderr, never to stdout, so the desktop's strict parser never has to
+/// tolerate trailing data.
+///
+/// The exit code mirrors the verdict (0 ready, 1 not ready) so a caller that
+/// cannot parse JSON still gets a usable answer, but the JSON is authoritative.
+async fn run_provider_probe(args: ProviderProbeArgs) -> Result<()> {
+    let agent_args = config::normalize_agent_args(&args.agent.agent_command, args.agent.agent_args);
+    let cwd = match args.cwd {
+        Some(cwd) => cwd,
+        None => std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("/")),
+    };
+
+    let report = provider_probe::run_probe(&args.agent.agent_command, &agent_args, &cwd).await;
+
+    // `to_string` (not `to_string_pretty`): one compact object, one line, no
+    // trailing data.
+    println!("{}", serde_json::to_string(&report)?);
+    if report.is_ready() {
+        Ok(())
+    } else {
+        std::process::exit(1);
+    }
 }
 
 /// `buzz-acp authenticate` — invoke one adapter-owned auth method.
@@ -9284,6 +9455,7 @@ mod build_mcp_servers_tests {
             channels_override: None,
             no_mention_filter: false,
             config_path: std::path::PathBuf::from("./buzz-acp.toml"),
+            state_dir: std::path::PathBuf::from("./buzz-acp-state"),
             context_message_limit: 12,
             max_turns_per_session: 0,
             presence_enabled: true,
@@ -9507,6 +9679,7 @@ mod error_outcome_emission_tests {
             channels_override: None,
             no_mention_filter: false,
             config_path: std::path::PathBuf::from("./buzz-acp.toml"),
+            state_dir: std::path::PathBuf::from("./buzz-acp-state"),
             context_message_limit: 12,
             max_turns_per_session: 0,
             presence_enabled: true,
@@ -10476,70 +10649,87 @@ mod error_outcome_emission_tests {
         assert_eq!(turn_errors_emitted_for(PromptOutcome::Error(app)).await, 1);
     }
 
-    // ── is_auth_error classification ───────────────────────────────────────
+    // ── typed terminal-auth classification ─────────────────────────────────
+    //
+    // Prose recognition itself is tested where it lives (`terminal_auth`).
+    // These cover the boundary this module owns: which outcomes the queue and
+    // lifecycle treat as terminal.
 
     #[test]
-    fn is_auth_error_matches_reauthenticate_message() {
-        let e = acp::AcpError::AgentError {
-            code: -32000,
-            message: "API Error: OAuth access token has expired. Re-authenticate to continue."
-                .to_string(),
+    fn terminal_auth_outcome_is_recognised_and_carried_intact() {
+        let terminal = terminal_auth::TerminalAuth {
+            adapter: terminal_auth::AdapterFamily::Claude,
+            stage: terminal_auth::AuthStage::Prompt,
+            signal: terminal_auth::AuthSignal::ClaudeOauthUnrefreshable,
         };
-        assert!(
-            is_auth_error(&e),
-            "Re-authenticate variant must be classified as auth error"
-        );
+        let outcome = PromptOutcome::Error(acp::AcpError::TerminalAuth(terminal));
+        assert_eq!(terminal_auth_of(&outcome), Some(terminal));
     }
 
     #[test]
-    fn is_auth_error_matches_401_message() {
-        let e = acp::AcpError::AgentError {
-            code: -32000,
-            message: "Internal error: API Error: 401 OAuth access token has expired.".to_string(),
-        };
-        assert!(
-            is_auth_error(&e),
-            "API Error: 401 variant must be classified as auth error"
-        );
+    fn ordinary_agent_errors_are_not_terminal_however_they_read() {
+        // The queue must not re-derive terminal-ness from prose. Even the
+        // exact legacy Claude wording, arriving as an untyped `AgentError`,
+        // stays retryable here — classification happens once, at the ACP seam.
+        for message in [
+            "API Error: 401 OAuth access token has expired. Re-authenticate to continue.",
+            "Usage credits required for 1M context — turn on usage credits",
+        ] {
+            let outcome = PromptOutcome::Error(acp::AcpError::AgentError {
+                code: -32000,
+                message: message.to_string(),
+            });
+            assert_eq!(terminal_auth_of(&outcome), None, "{message}");
+        }
     }
 
     #[test]
-    fn is_auth_error_rejects_other_agent_error_message() {
-        let e = acp::AcpError::AgentError {
-            code: -32601,
-            message: "Usage credits required for 1M context — turn on usage credits".to_string(),
-        };
-        assert!(
-            !is_auth_error(&e),
-            "usage-credit error must NOT be classified as auth error"
-        );
+    fn transport_and_non_error_outcomes_are_not_terminal() {
+        let cases = [
+            PromptOutcome::Error(acp::AcpError::Io(std::io::Error::other("pipe broke"))),
+            PromptOutcome::Error(acp::AcpError::WriteTimeout(std::time::Duration::from_secs(
+                5,
+            ))),
+            PromptOutcome::AgentExited,
+            PromptOutcome::Cancelled,
+            PromptOutcome::Ok(acp::StopReason::EndTurn),
+        ];
+        for outcome in cases {
+            assert_eq!(terminal_auth_of(&outcome), None);
+        }
     }
 
-    #[test]
-    fn is_auth_error_rejects_transport_errors() {
-        let io = acp::AcpError::Io(std::io::Error::other("pipe broke"));
-        assert!(
-            !is_auth_error(&io),
-            "I/O error must not be classified as auth error"
-        );
-        let timeout = acp::AcpError::WriteTimeout(std::time::Duration::from_secs(5));
-        assert!(
-            !is_auth_error(&timeout),
-            "WriteTimeout must not be classified as auth error"
-        );
+    /// A store rooted in a fresh temp dir, ready to attach to a test queue.
+    fn test_terminal_auth_store(
+        temp: &tempfile::TempDir,
+    ) -> crate::terminal_auth_store::TerminalAuthStore {
+        crate::terminal_auth_store::TerminalAuthStore::load(
+            temp.path(),
+            "aa11bb22cc33dd44ee55ff66aa77bb88cc99dd00ee11ff22aa33bb44cc55dd66",
+        )
+        .expect("fresh store loads empty")
     }
 
-    // ── auth error dead-letter behavior ────────────────────────────────────
+    fn terminal_auth_error() -> acp::AcpError {
+        acp::AcpError::TerminalAuth(terminal_auth::TerminalAuth {
+            adapter: terminal_auth::AdapterFamily::Claude,
+            stage: terminal_auth::AuthStage::Prompt,
+            signal: terminal_auth::AuthSignal::ClaudeApiUnauthorized,
+        })
+    }
 
-    /// An auth-class `PromptOutcome::Error` must dead-letter immediately
-    /// (the batch is never requeued) so the user sees a re-auth hint at once
-    /// rather than after 10 futile retries.
+    // ── terminal-auth disposition behavior ─────────────────────────────────
+
+    /// A terminal-auth `PromptOutcome::Error` must dispose of its batch
+    /// durably and immediately: never requeued, never retried, and never
+    /// revivable.
     #[tokio::test]
     async fn auth_error_dead_letters_immediately_without_requeueing() {
         let keys = nostr::Keys::generate();
         let event = nostr::EventBuilder::new(nostr::Kind::Custom(9), "test")
             .sign_with_keys(&keys)
             .unwrap();
+        let event_id = event.id.to_hex();
         let channel_id = uuid::Uuid::new_v4();
         let batch = FlushBatch {
             channel_id,
@@ -10553,11 +10743,7 @@ mod error_outcome_emission_tests {
             cancel_reason: None,
         };
 
-        let auth_error = acp::AcpError::AgentError {
-            code: -32000,
-            message: "API Error: 401 OAuth access token has expired. Re-authenticate to continue."
-                .to_string(),
-        };
+        let auth_error = terminal_auth_error();
 
         let agent = dummy_agent(0).await;
         let mut pool = AgentPool::from_slots(vec![None]);
@@ -10573,7 +10759,9 @@ mod error_outcome_emission_tests {
                 steer_tx: None,
             },
         );
+        let temp = tempfile::tempdir().expect("temp dir");
         let mut queue = EventQueue::new(config::DedupMode::Queue);
+        queue.attach_terminal_auth_store(test_terminal_auth_store(&temp));
         let config = test_config();
         let mut heartbeat_in_flight = false;
         let removed_channels = std::collections::HashSet::new();
@@ -10591,7 +10779,7 @@ mod error_outcome_emission_tests {
             outcome: PromptOutcome::Error(auth_error),
             batch: Some(batch),
         };
-        handle_prompt_result(
+        let action = handle_prompt_result(
             &mut pool,
             &mut queue,
             &config,
@@ -10604,6 +10792,7 @@ mod error_outcome_emission_tests {
             None,
             None,
         );
+        assert!(matches!(action, LoopAction::Continue));
 
         // The batch must not be requeued: pending_channels returns 0.
         assert_eq!(
@@ -10615,6 +10804,14 @@ mod error_outcome_emission_tests {
             queue.queued_event_count(&channel_id),
             0,
             "auth error must dead-letter immediately — no events should be pending"
+        );
+        assert!(
+            !queue.is_channel_in_flight(channel_id),
+            "in-flight ownership must be released after the disposition commits"
+        );
+        assert!(
+            queue.is_terminally_disposed(&event_id),
+            "the event must carry a durable disposition"
         );
     }
 
@@ -10701,6 +10898,239 @@ mod error_outcome_emission_tests {
             queue.queued_event_count(&channel_id),
             1,
             "non-auth application error must preserve the event for retry"
+        );
+    }
+
+    /// Everything a genuine in-flight batch needs to reach
+    /// `handle_prompt_result` on a specific attempt.
+    struct DispositionHarness {
+        pool: AgentPool,
+        queue: EventQueue,
+        config: Config,
+        crash_history: Vec<SlotCircuit>,
+        respawn_tx: mpsc::Sender<RespawnResult>,
+        _respawn_rx: mpsc::Receiver<RespawnResult>,
+        respawn_tasks: tokio::task::JoinSet<()>,
+        channel_id: Uuid,
+        event_ids: Vec<String>,
+    }
+
+    impl DispositionHarness {
+        /// Seed a batch that has already failed `prior_attempts` times and is
+        /// currently in flight, exactly as the dispatch path leaves it.
+        async fn seeded(
+            temp: Option<&tempfile::TempDir>,
+            dedup: config::DedupMode,
+            prior_attempts: u32,
+        ) -> (Self, FlushBatch) {
+            let channel_id = Uuid::new_v4();
+            let mut queue = EventQueue::new(dedup);
+            if let Some(temp) = temp {
+                queue.attach_terminal_auth_store(test_terminal_auth_store(temp));
+            }
+
+            let keys = nostr::Keys::generate();
+            let mut event_ids = Vec::new();
+            for i in 0..2 {
+                let event =
+                    nostr::EventBuilder::new(nostr::Kind::Custom(9), format!("request {i}"))
+                        .sign_with_keys(&keys)
+                        .unwrap();
+                event_ids.push(event.id.to_hex());
+                assert!(queue.push(QueuedEvent {
+                    channel_id,
+                    event,
+                    received_at: std::time::Instant::now(),
+                    prompt_tag: "test".into(),
+                    project: None,
+                }));
+            }
+
+            // Dispatch it for real so the channel is genuinely in flight, then
+            // stamp the attempt count the failure is supposed to happen on.
+            let batch = queue.flush_next().expect("batch dispatches");
+            queue.set_retry_count_for_test(channel_id, prior_attempts);
+            assert!(queue.is_channel_in_flight(channel_id));
+
+            let mut pool = AgentPool::from_slots(vec![None]);
+            let task_id = pool.join_set.spawn(async {}).id();
+            pool.task_map_mut().insert(
+                task_id,
+                crate::pool::TaskMeta {
+                    agent_index: 0,
+                    channel_id: Some(channel_id),
+                    turn_id: "disposition-turn".to_string(),
+                    recoverable_batch: None,
+                    control_tx: None,
+                    steer_tx: None,
+                },
+            );
+
+            let (respawn_tx, _respawn_rx) = mpsc::channel(8);
+            (
+                Self {
+                    pool,
+                    queue,
+                    config: test_config(),
+                    crash_history: vec![SlotCircuit {
+                        crash_times: Vec::new(),
+                        open_until: None,
+                        respawn_in_flight: false,
+                    }],
+                    respawn_tx,
+                    _respawn_rx,
+                    respawn_tasks: tokio::task::JoinSet::new(),
+                    channel_id,
+                    event_ids,
+                },
+                batch,
+            )
+        }
+
+        async fn run(&mut self, batch: FlushBatch, outcome: PromptOutcome) -> LoopAction {
+            let agent = dummy_agent(0).await;
+            let mut heartbeat_in_flight = false;
+            let removed_channels = std::collections::HashSet::new();
+            handle_prompt_result(
+                &mut self.pool,
+                &mut self.queue,
+                &self.config,
+                PromptResult {
+                    agent,
+                    source: PromptSource::Channel(self.channel_id),
+                    turn_id: "disposition-turn".to_string(),
+                    outcome,
+                    batch: Some(batch),
+                },
+                &mut heartbeat_in_flight,
+                &removed_channels,
+                &mut self.crash_history,
+                &self.respawn_tx,
+                &mut self.respawn_tasks,
+                None,
+                None,
+            )
+        }
+    }
+
+    /// A batch that has already burned six attempts and fails on the seventh
+    /// with terminal auth must finish there: nothing queued, nothing in
+    /// flight, no retry metadata, and a durable disposition for every event.
+    #[tokio::test]
+    async fn a_genuine_in_flight_batch_is_terminally_disposed_on_attempt_seven() {
+        for dedup in [config::DedupMode::Queue, config::DedupMode::Drop] {
+            let temp = tempfile::tempdir().expect("temp dir");
+            let (mut harness, batch) = DispositionHarness::seeded(Some(&temp), dedup, 6).await;
+            let channel_id = harness.channel_id;
+            let event_ids = harness.event_ids.clone();
+
+            let action = harness
+                .run(batch, PromptOutcome::Error(terminal_auth_error()))
+                .await;
+
+            assert!(matches!(action, LoopAction::Continue), "{dedup:?}");
+            assert_eq!(harness.queue.pending_channels(), 0, "{dedup:?}");
+            assert_eq!(
+                harness.queue.queued_event_count(&channel_id),
+                0,
+                "{dedup:?}"
+            );
+            assert!(
+                !harness.queue.is_channel_in_flight(channel_id),
+                "{dedup:?}: in-flight ownership must be released"
+            );
+            assert_eq!(
+                harness.queue.retry_count_for_test(channel_id),
+                None,
+                "{dedup:?}: no retry metadata may survive a terminal disposition"
+            );
+            for id in &event_ids {
+                assert!(
+                    harness.queue.is_terminally_disposed(id),
+                    "{dedup:?}: {id} must be durably disposed"
+                );
+            }
+            assert!(
+                harness.pool.task_map().is_empty(),
+                "{dedup:?}: the task map entry must be cleared"
+            );
+
+            // Simulated auth recovery: a fresh runtime over the same durable
+            // state cannot redispatch any of it.
+            let mut recovered = EventQueue::new(dedup);
+            recovered.attach_terminal_auth_store(test_terminal_auth_store(&temp));
+            for id in &event_ids {
+                assert!(recovered.is_terminally_disposed(id), "{dedup:?}");
+            }
+            assert!(recovered.flush_next().is_none(), "{dedup:?}");
+        }
+    }
+
+    /// The transient mirror of the test above: the same batch, same attempt,
+    /// an ordinary provider error. It must requeue once, advance to attempt
+    /// eight, and keep its backoff.
+    #[tokio::test]
+    async fn the_transient_mirror_requeues_once_and_advances_the_attempt() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let (mut harness, batch) =
+            DispositionHarness::seeded(Some(&temp), config::DedupMode::Queue, 6).await;
+        let channel_id = harness.channel_id;
+        let event_ids = harness.event_ids.clone();
+
+        let action = harness
+            .run(
+                batch,
+                PromptOutcome::Error(acp::AcpError::AgentError {
+                    code: -32000,
+                    message: "API Error: 500 internal server error".to_string(),
+                }),
+            )
+            .await;
+
+        assert!(matches!(action, LoopAction::Continue));
+        assert_eq!(
+            harness.queue.queued_event_count(&channel_id),
+            2,
+            "a transient failure must preserve the events for retry"
+        );
+        assert_eq!(
+            harness.queue.retry_count_for_test(channel_id),
+            Some(7),
+            "the attempt counter must advance from six to seven"
+        );
+        assert!(
+            harness.queue.retry_deadline_for_test(channel_id).is_some(),
+            "the backoff deadline must be preserved"
+        );
+        for id in &event_ids {
+            assert!(
+                !harness.queue.is_terminally_disposed(id),
+                "a transient failure must not dispose of anything"
+            );
+        }
+    }
+
+    /// When the durable commit cannot be made, the harness must say nothing
+    /// and stop. A notice or a completion here would claim a promise we do
+    /// not hold.
+    #[tokio::test]
+    async fn a_failed_persistence_exits_without_notice_or_completion() {
+        // No store attached — the same observable situation as a failed write.
+        let (mut harness, batch) =
+            DispositionHarness::seeded(None, config::DedupMode::Queue, 0).await;
+        let channel_id = harness.channel_id;
+
+        let action = harness
+            .run(batch, PromptOutcome::Error(terminal_auth_error()))
+            .await;
+
+        assert!(
+            matches!(action, LoopAction::Exit),
+            "an un-promisable disposition must stop the harness"
+        );
+        assert!(
+            harness.queue.is_channel_in_flight(channel_id),
+            "the channel must NOT be marked complete when the disposition failed"
         );
     }
 }

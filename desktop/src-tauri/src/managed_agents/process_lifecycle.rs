@@ -130,6 +130,7 @@ pub fn taskkill_tree(pid: u32) -> Result<(), String> {
 /// a [`ManagedAgentProcess`]. On job-assignment failure the process is still
 /// returned with `job: None` — teardown then falls back to `Child::kill()`,
 /// which kills only the harness (a degraded teardown beats a failed spawn).
+#[allow(clippy::too_many_arguments)]
 pub fn finish_spawn(
     child: std::process::Child,
     log_path: std::path::PathBuf,
@@ -137,6 +138,7 @@ pub fn finish_spawn(
     setup_mode: bool,
     adapter_availability: Option<super::AcpAvailabilityStatus>,
     start_nonce: String,
+    provider_preflight: Option<crate::managed_agents::readiness::ProviderPreflight>,
     agent_name: &str,
 ) -> super::ManagedAgentProcess {
     let job = create_job_for_child(child.id());
@@ -153,6 +155,7 @@ pub fn finish_spawn(
         setup_mode,
         adapter_availability,
         start_nonce,
+        provider_preflight,
         job,
     }
 }

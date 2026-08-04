@@ -53,6 +53,8 @@ use crate::managed_agents::{
 
 mod cli_login;
 pub(crate) mod cli_probe;
+pub(crate) mod provider_cache;
+pub(crate) mod provider_probe;
 
 // ── EffectiveAgentEnv ─────────────────────────────────────────────────────────
 
@@ -342,6 +344,61 @@ pub enum Requirement {
         /// The command name that was not found (e.g. `\"my-acp-agent\"`).
         command: String,
     },
+    /// The static checks passed but a bounded disposable turn against the
+    /// provider did not complete.
+    ///
+    /// This is the gap the other surfaces cannot see: a hosted Claude session
+    /// whose OAuth refresh has failed is installed, on PATH, and reports a
+    /// login — and still cannot answer a single message. Carries only the
+    /// categorical outcome, never the provider's own error text.
+    ProviderCapability {
+        /// What the probe concluded.
+        state: ProviderCapabilityState,
+        /// Human-readable instruction for the nudge card.
+        setup_copy: String,
+    },
+}
+
+/// The categorical outcome of a provider-capability probe, as surfaced to the
+/// UI.
+///
+/// Kept separate from the login surfaces on purpose: a timeout or an outage
+/// must not be shown to the user as "you are logged out", because acting on
+/// that advice (logging out and back in) is disruptive and would not help.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderCapabilityState {
+    /// The provider rejected our credentials. An interactive login is the fix.
+    AuthenticationRequired,
+    /// The provider did not complete a turn and we cannot say why. Retry later.
+    Unknown,
+    /// The adapter itself misbehaved — wrong binary, bad ACP, unclean exit.
+    AdapterProblem,
+}
+
+impl ProviderCapabilityState {
+    /// The nudge copy for this state.
+    pub(crate) fn setup_copy(self) -> &'static str {
+        match self {
+            Self::AuthenticationRequired => {
+                "Claude rejected this agent's credentials. Complete Claude Code authentication by running the Claude CLI, then retry."
+            }
+            Self::Unknown => {
+                "Claude did not complete a test turn for this agent. This is usually temporary — retry in a moment."
+            }
+            Self::AdapterProblem => {
+                "The Claude ACP adapter did not answer correctly. Update the adapter from Doctor, then retry."
+            }
+        }
+    }
+
+    /// Build the matching requirement.
+    pub(crate) fn requirement(self) -> Requirement {
+        Requirement::ProviderCapability {
+            state: self,
+            setup_copy: self.setup_copy().to_string(),
+        }
+    }
 }
 
 // ── AgentReadiness ────────────────────────────────────────────────────────────
@@ -408,6 +465,80 @@ pub(crate) fn agent_readiness(effective: &EffectiveAgentEnv) -> AgentReadiness {
         AgentReadiness::NotReady {
             requirements: missing,
         }
+    }
+}
+
+// ── Provider-capability preflight ────────────────────────────────────────────
+
+/// Whether a runtime is subject to the provider-capability gate.
+///
+/// Only local Claude runtimes. Codex, Goose, buzz-agent, custom and unknown
+/// harnesses keep their existing behaviour exactly: this phase adds a gate for
+/// the one provider whose failure mode motivated it, and widening it without
+/// evidence would slow every start for no benefit.
+pub(crate) fn provider_probe_applies(effective_command: &str) -> bool {
+    known_acp_runtime(effective_command).is_some_and(|rt| rt.id == "claude")
+}
+
+/// The result of a provider preflight, ready to be stamped on the generation
+/// that the caller is about to start.
+///
+/// Carrying the fingerprint alongside the verdict is what makes the stamp
+/// meaningful: status reads the *generation's* answer, so a later cache result
+/// for a since-changed descriptor cannot retroactively describe a process that
+/// is already running.
+#[derive(Debug, Clone)]
+pub(crate) struct ProviderPreflight {
+    /// The verdict for the descriptor that was actually probed.
+    pub capability: provider_probe::ProviderCapability,
+    /// The fingerprint the verdict belongs to.
+    pub fingerprint: provider_cache::CapabilityFingerprint,
+}
+
+impl ProviderPreflight {
+    /// The requirement to add to a setup payload, or `None` when ready.
+    pub(crate) fn requirement(&self) -> Option<Requirement> {
+        match self.capability {
+            provider_probe::ProviderCapability::Ready => None,
+            provider_probe::ProviderCapability::AuthenticationRequired => {
+                Some(ProviderCapabilityState::AuthenticationRequired.requirement())
+            }
+            provider_probe::ProviderCapability::Unknown => {
+                Some(ProviderCapabilityState::Unknown.requirement())
+            }
+            provider_probe::ProviderCapability::AdapterProblem => {
+                Some(ProviderCapabilityState::AdapterProblem.requirement())
+            }
+        }
+    }
+}
+
+/// Run the provider preflight for a resolved spawn.
+///
+/// Returns `None` when the gate does not apply to this runtime — the caller
+/// then behaves exactly as it did before this phase existed.
+///
+/// The caller must hold no transition, store, or runtime-map lock: this blocks
+/// for as long as a provider round-trip takes, and a probe under a lock would
+/// stall every other agent in the app.
+///
+/// After the probe returns, the caller must recompute the fingerprint and
+/// compare it against [`ProviderPreflight::fingerprint`]. A descriptor that
+/// changed while we were probing (a persona edit, a credential change, an
+/// adapter upgrade) invalidates the verdict, and using it anyway would gate the
+/// new configuration on the old one's answer.
+pub(crate) fn provider_preflight(
+    cache: &provider_cache::ProviderReadinessCache,
+    invocation: &provider_probe::ProbeInvocation,
+    freshness: provider_cache::ProbeFreshness,
+) -> ProviderPreflight {
+    let fingerprint = provider_cache::fingerprint(invocation);
+    let capability = cache.resolve(&fingerprint, freshness, || {
+        provider_probe::run_provider_probe(invocation)
+    });
+    ProviderPreflight {
+        capability,
+        fingerprint,
     }
 }
 
@@ -1416,6 +1547,115 @@ mod tests {
         };
         assert!(!r.is_ready());
         assert_eq!(r.requirements().len(), 1);
+    }
+
+    // ── Provider-capability gate ──────────────────────────────────────────
+
+    #[test]
+    fn only_local_claude_runtimes_are_subject_to_the_provider_gate() {
+        assert!(provider_probe_applies("claude-agent-acp"));
+        assert!(provider_probe_applies("claude-code-acp"));
+
+        // Everything else keeps its existing behaviour untouched.
+        for command in ["codex-acp", "goose", "buzz-agent", "my-acp-agent", ""] {
+            assert!(
+                !provider_probe_applies(command),
+                "{command} must not gain a provider gate"
+            );
+        }
+    }
+
+    #[test]
+    fn a_ready_preflight_adds_no_requirement() {
+        let preflight = ProviderPreflight {
+            capability: provider_probe::ProviderCapability::Ready,
+            fingerprint: provider_cache::fingerprint(&provider_probe::ProbeInvocation {
+                acp_binary: std::path::PathBuf::from("/opt/buzz-acp"),
+                agent_command: "claude-agent-acp".into(),
+                agent_args: vec!["acp".into()],
+                cwd: std::path::PathBuf::from("/tmp"),
+                env: BTreeMap::new(),
+            }),
+        };
+        assert_eq!(preflight.requirement(), None);
+    }
+
+    #[test]
+    fn each_failed_capability_maps_to_its_own_surface_and_copy() {
+        let fingerprint = provider_cache::fingerprint(&provider_probe::ProbeInvocation {
+            acp_binary: std::path::PathBuf::from("/opt/buzz-acp"),
+            agent_command: "claude-agent-acp".into(),
+            agent_args: vec![],
+            cwd: std::path::PathBuf::from("/tmp"),
+            env: BTreeMap::new(),
+        });
+        let cases = [
+            (
+                provider_probe::ProviderCapability::AuthenticationRequired,
+                ProviderCapabilityState::AuthenticationRequired,
+            ),
+            (
+                provider_probe::ProviderCapability::Unknown,
+                ProviderCapabilityState::Unknown,
+            ),
+            (
+                provider_probe::ProviderCapability::AdapterProblem,
+                ProviderCapabilityState::AdapterProblem,
+            ),
+        ];
+        for (capability, expected_state) in cases {
+            let preflight = ProviderPreflight {
+                capability: capability.clone(),
+                fingerprint: fingerprint.clone(),
+            };
+            let requirement = preflight
+                .requirement()
+                .unwrap_or_else(|| panic!("{capability:?} must produce a requirement"));
+            let Requirement::ProviderCapability { state, setup_copy } = requirement else {
+                panic!("{capability:?} must map to the provider-capability surface");
+            };
+            assert_eq!(state, expected_state);
+            assert_eq!(setup_copy, expected_state.setup_copy());
+            assert!(!setup_copy.is_empty());
+        }
+    }
+
+    /// The whole point of the `unknown` state: a slow or rate-limited provider
+    /// must not be shown to the user as a login problem, because logging out
+    /// and back in is disruptive and would not help.
+    #[test]
+    fn an_unknown_outcome_is_never_phrased_as_a_login_problem() {
+        let copy = ProviderCapabilityState::Unknown.setup_copy().to_lowercase();
+        for forbidden in ["log in", "login", "authenticate", "credential"] {
+            assert!(
+                !copy.contains(forbidden),
+                "unknown-state copy must not mention {forbidden:?}: {copy}"
+            );
+        }
+    }
+
+    #[test]
+    fn provider_capability_requirement_serializes_with_its_surface_tag() {
+        let json =
+            serde_json::to_value(ProviderCapabilityState::AuthenticationRequired.requirement())
+                .expect("serialize");
+        assert_eq!(json["surface"], "provider_capability");
+        assert_eq!(json["state"], "authentication_required");
+        assert!(json["setup_copy"].as_str().is_some_and(|s| !s.is_empty()));
+    }
+
+    #[test]
+    fn provider_capability_states_serialize_in_snake_case() {
+        for (state, wire) in [
+            (
+                ProviderCapabilityState::AuthenticationRequired,
+                "authentication_required",
+            ),
+            (ProviderCapabilityState::Unknown, "unknown"),
+            (ProviderCapabilityState::AdapterProblem, "adapter_problem"),
+        ] {
+            assert_eq!(serde_json::to_value(state).expect("serialize"), wire);
+        }
     }
 
     // ── Requirement serialization ─────────────────────────────────────────

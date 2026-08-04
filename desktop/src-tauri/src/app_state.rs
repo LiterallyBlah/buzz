@@ -52,6 +52,13 @@ pub struct AppState {
     pub managed_agents_store_lock: Mutex<()>,
     pub channel_templates_store_lock: Mutex<()>,
     pub managed_agent_processes: Mutex<HashMap<ManagedAgentRuntimeKey, ManagedAgentPairRuntime>>,
+    /// Bounded, app-scoped cache of provider-capability probe verdicts.
+    ///
+    /// App-scoped rather than process-global so it starts cold on every launch
+    /// and cannot outlive the configuration it was computed from, and never
+    /// persisted for the same reason.
+    pub provider_readiness:
+        crate::managed_agents::readiness::provider_cache::ProviderReadinessCache,
     pub huddle_state: Mutex<HuddleState>,
     pub huddle_audio: crate::huddle::tts_settings::HuddleAudioSettingsState,
     /// Tauri app handle — stored after setup so huddle commands can emit
@@ -215,6 +222,7 @@ pub fn build_app_state() -> AppState {
         managed_agents_store_lock: Mutex::new(()),
         channel_templates_store_lock: Mutex::new(()),
         managed_agent_processes: Mutex::new(HashMap::new()),
+        provider_readiness: Default::default(),
         session_config_cache: Mutex::new(HashMap::new()),
         huddle_state: Mutex::new(HuddleState::default()),
         huddle_audio: Default::default(),

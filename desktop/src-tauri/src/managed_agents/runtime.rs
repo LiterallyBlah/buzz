@@ -451,12 +451,23 @@ pub(crate) fn configure_runtime_cli(
 ///
 /// `owner_hex`: the workspace owner's pubkey, used as a fallback for legacy
 /// records that have no NIP-OA `auth_tag`. See `build_respond_to_env`.
+/// `freshness` decides whether the provider preflight may reuse a cached
+/// verdict. A user-initiated start — manual restart, setup Retry, auth
+/// completion, a Doctor or post-install restart — passes
+/// [`ProbeFreshness::ForceRefresh`]: the user has just done something they
+/// expect the app to notice, and answering from a verdict taken before they
+/// did it would make the retry look broken. Automatic launch restore passes
+/// [`ProbeFreshness::Cached`].
+///
+/// [`ProbeFreshness::ForceRefresh`]: crate::managed_agents::readiness::provider_cache::ProbeFreshness::ForceRefresh
+/// [`ProbeFreshness::Cached`]: crate::managed_agents::readiness::provider_cache::ProbeFreshness::Cached
 pub fn spawn_agent_child(
     app: &AppHandle,
     record: &ManagedAgentRecord,
     relay_url: &str,
     lazy: bool,
     owner_hex: Option<&str>,
+    freshness: crate::managed_agents::readiness::provider_cache::ProbeFreshness,
 ) -> Result<crate::managed_agents::ManagedAgentProcess, String> {
     if let Some(error) = spawn_key_refusal(record) {
         return Err(error);
@@ -617,6 +628,7 @@ pub fn spawn_agent_child(
     // on `ManagedAgentProcess` — used by `install_acp_runtime` to target only
     // stuck agents for auto-restart.
     let spawned_setup_mode;
+    let provider_preflight;
     {
         use crate::managed_agents::readiness::EffectiveAgentEnv;
         use crate::managed_agents::{agent_readiness, AgentReadiness, Requirement};
@@ -628,67 +640,110 @@ pub fn spawn_agent_child(
             config_file_path: runtime_meta.and_then(|r| r.config_file_path),
             effective_command: descriptor.command.clone(),
         };
-        // Compute the optional payload before touching the command.
-        let setup_payload_json =
-            if let AgentReadiness::NotReady { requirements } = agent_readiness(&effective) {
-                let reqs: Vec<serde_json::Value> = requirements
-                    .into_iter()
-                    .map(|r| match r {
-                        Requirement::NormalizedField { field } => serde_json::json!({
-                            "surface": "normalized_field",
-                            "field": field,
-                        }),
-                        Requirement::EnvKey { key } => serde_json::json!({
-                            "surface": "env_key",
-                            "key": key,
-                        }),
-                        Requirement::CliLogin {
-                            probe_args,
-                            setup_copy,
-                            availability,
-                        } => serde_json::json!({
-                            "surface": "cli_login",
-                            "probe_args": probe_args,
-                            "setup_copy": setup_copy,
-                            "availability": availability,
-                        }),
-                        Requirement::CliConfigInvalid {
-                            probe_args,
-                            setup_copy,
-                            diagnostic,
-                        } => serde_json::json!({
-                            "surface": "cli_config_invalid",
-                            "probe_args": probe_args,
-                            "setup_copy": setup_copy,
-                            "diagnostic": diagnostic,
-                        }),
-                        Requirement::GitBash => serde_json::json!({
-                            "surface": "git_bash",
-                        }),
-                        Requirement::MissingBinary { command } => serde_json::json!({
-                            "surface": "missing_binary",
-                            "command": command,
-                        }),
-                    })
-                    .collect();
-                let payload = serde_json::json!({
-                    "agent_name": record.name,
-                    "agent_pubkey": record.pubkey,
-                    "requirements": reqs,
-                });
-                match serde_json::to_string(&payload) {
-                    Ok(json) => Some(json),
-                    Err(e) => {
-                        eprintln!(
-                            "buzz-desktop: failed to serialize setup payload for {}: {e}",
-                            record.name
-                        );
-                        None
+
+        // ── Provider-capability preflight ────────────────────────────────────
+        //
+        // Static checks run first and, when they already fail, the provider is
+        // never contacted: an agent with no credentials configured has nothing
+        // to prove and setup mode must not reach out.
+        //
+        // This runs at the shared spawn boundary, which by construction holds
+        // no records or runtimes lock (see this function's contract) — so
+        // interactive start, pair start, restore, setup retry, auth completion,
+        // Doctor/post-install restart, and managed restart all inherit the gate
+        // without any of them being able to bypass it.
+        let mut static_readiness = agent_readiness(&effective);
+        provider_preflight = run_provider_preflight(
+            app,
+            &descriptor,
+            augmented_path.as_deref(),
+            matches!(static_readiness, AgentReadiness::Ready),
+            freshness,
+        );
+        if let Some(requirement) = provider_preflight.as_ref().and_then(|p| p.requirement()) {
+            eprintln!(
+                "buzz-desktop: agent {} failed the provider preflight — entering setup mode",
+                record.name
+            );
+            static_readiness = AgentReadiness::NotReady {
+                requirements: match static_readiness {
+                    AgentReadiness::Ready => vec![requirement],
+                    AgentReadiness::NotReady { mut requirements } => {
+                        requirements.push(requirement);
+                        requirements
                     }
-                }
-            } else {
-                None
+                },
             };
+        }
+
+        // Compute the optional payload before touching the command.
+        let setup_payload_json = if let AgentReadiness::NotReady { requirements } = static_readiness
+        {
+            let reqs: Vec<serde_json::Value> = requirements
+                .into_iter()
+                .map(|r| match r {
+                    Requirement::NormalizedField { field } => serde_json::json!({
+                        "surface": "normalized_field",
+                        "field": field,
+                    }),
+                    Requirement::EnvKey { key } => serde_json::json!({
+                        "surface": "env_key",
+                        "key": key,
+                    }),
+                    Requirement::CliLogin {
+                        probe_args,
+                        setup_copy,
+                        availability,
+                    } => serde_json::json!({
+                        "surface": "cli_login",
+                        "probe_args": probe_args,
+                        "setup_copy": setup_copy,
+                        "availability": availability,
+                    }),
+                    Requirement::CliConfigInvalid {
+                        probe_args,
+                        setup_copy,
+                        diagnostic,
+                    } => serde_json::json!({
+                        "surface": "cli_config_invalid",
+                        "probe_args": probe_args,
+                        "setup_copy": setup_copy,
+                        "diagnostic": diagnostic,
+                    }),
+                    Requirement::GitBash => serde_json::json!({
+                        "surface": "git_bash",
+                    }),
+                    Requirement::MissingBinary { command } => serde_json::json!({
+                        "surface": "missing_binary",
+                        "command": command,
+                    }),
+                    Requirement::ProviderCapability { state, setup_copy } => {
+                        serde_json::json!({
+                            "surface": "provider_capability",
+                            "state": state,
+                            "setup_copy": setup_copy,
+                        })
+                    }
+                })
+                .collect();
+            let payload = serde_json::json!({
+                "agent_name": record.name,
+                "agent_pubkey": record.pubkey,
+                "requirements": reqs,
+            });
+            match serde_json::to_string(&payload) {
+                Ok(json) => Some(json),
+                Err(e) => {
+                    eprintln!(
+                        "buzz-desktop: failed to serialize setup payload for {}: {e}",
+                        record.name
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
 
         spawned_setup_mode = setup_payload_json.is_some();
 
@@ -945,6 +1000,7 @@ pub fn spawn_agent_child(
         spawned_setup_mode,
         spawned_adapter_availability,
         start_nonce,
+        provider_preflight,
         &record.name,
     ));
     #[cfg(not(windows))]
@@ -955,6 +1011,81 @@ pub fn spawn_agent_child(
         setup_mode: spawned_setup_mode,
         adapter_availability: spawned_adapter_availability,
         start_nonce,
+        provider_preflight,
+    })
+}
+
+/// Run the provider-capability preflight for a resolved spawn, if it applies.
+///
+/// Returns `None` when the gate does not apply (a non-Claude runtime) or when
+/// the static checks already failed — in the latter case the agent is going to
+/// setup mode regardless, and setup mode must not contact a provider.
+///
+/// # Staleness
+///
+/// The probe blocks, and during it the descriptor can change underneath us (a
+/// persona edit, a credential change, an adapter upgrade). We therefore
+/// re-derive the fingerprint afterwards and retry once when it moved. A second
+/// disagreement means the configuration is changing faster than we can measure
+/// it, and we fail closed to `Unknown` rather than gating the new descriptor on
+/// the old one's answer.
+fn run_provider_preflight(
+    app: &AppHandle,
+    descriptor: &crate::managed_agents::readiness::EffectiveHarnessDescriptor,
+    augmented_path: Option<&str>,
+    static_checks_passed: bool,
+    freshness: crate::managed_agents::readiness::provider_cache::ProbeFreshness,
+) -> Option<crate::managed_agents::readiness::ProviderPreflight> {
+    use crate::managed_agents::readiness::{
+        provider_cache, provider_preflight, provider_probe, provider_probe_applies,
+        ProviderPreflight,
+    };
+    use tauri::Manager;
+
+    if !provider_probe_applies(&descriptor.command) || !static_checks_passed {
+        return None;
+    }
+
+    let acp_binary = resolve_command("buzz-acp")?;
+    let cwd = provider_probe::probe_working_dir();
+    // Mirror the runtime spawn's own command resolution so the probe exercises
+    // the same binary the agent will.
+    let agent_command = resolve_command(&descriptor.command)
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| descriptor.command.clone());
+
+    let build = || provider_probe::ProbeInvocation {
+        acp_binary: acp_binary.clone(),
+        agent_command: agent_command.clone(),
+        agent_args: descriptor.args.clone(),
+        cwd: cwd.clone(),
+        env: provider_probe::build_probe_env(
+            &descriptor.env,
+            augmented_path,
+            &agent_command,
+            &descriptor.args,
+        ),
+    };
+
+    let state = app.state::<crate::app_state::AppState>();
+    let cache = &state.provider_readiness;
+
+    for _ in 0..2 {
+        let invocation = build();
+        let preflight = provider_preflight(cache, &invocation, freshness);
+        // Re-derive from a freshly built invocation: equal means nothing that
+        // could change the verdict moved while we were probing.
+        if provider_cache::fingerprint(&build()) == preflight.fingerprint {
+            return Some(preflight);
+        }
+        eprintln!(
+            "buzz-desktop: harness descriptor changed during the provider preflight — re-probing"
+        );
+    }
+
+    Some(ProviderPreflight {
+        capability: provider_probe::ProviderCapability::Unknown,
+        fingerprint: provider_cache::fingerprint(&build()),
     })
 }
 
@@ -998,7 +1129,17 @@ pub fn start_managed_agent_process(
     // Scalar PIDs are migration-only and never establish pair liveness.
     record.runtime_pid = None;
 
-    let mut process = spawn_agent_child(app, record, &key.relay_url, false, owner_hex)?;
+    // A programmatic start is always user-initiated (create-agent, Doctor
+    // post-install restart), so it re-probes rather than trusting a verdict
+    // taken before whatever the user just did.
+    let mut process = spawn_agent_child(
+        app,
+        record,
+        &key.relay_url,
+        false,
+        owner_hex,
+        crate::managed_agents::readiness::provider_cache::ProbeFreshness::ForceRefresh,
+    )?;
     let now = now_iso();
     let receipt = super::ManagedAgentRuntimeReceipt {
         key: key.clone(),
