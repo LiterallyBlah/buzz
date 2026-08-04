@@ -1,8 +1,8 @@
 import { useQueryClient } from "@tanstack/react-query";
 import * as React from "react";
 
+import { createLiveSubscriptionSet } from "@/shared/api/liveSubscriptionSet";
 import { relayClient } from "@/shared/api/relayClient";
-import type { RelayEvent } from "@/shared/api/types";
 import { createTrailingDebounce } from "@/shared/lib/trailingDebounce";
 import {
   applyProjectRootEvent,
@@ -47,8 +47,6 @@ export function useLiveProjectRoot(
   React.useEffect(() => {
     if (!projectId || !rootId) return;
 
-    let disposed = false;
-    const disposers = new Map<number, () => Promise<void>>();
     const refresh = createTrailingDebounce(() => {
       for (const queryKey of [
         ["project", projectId, "issues"],
@@ -60,66 +58,51 @@ export function useLiveProjectRoot(
       }
     }, PROJECT_ROOT_REFRESH_DEBOUNCE_MS);
 
-    const handleEvent = (event: RelayEvent) => {
-      if (disposed) return;
+    // `perFilter` + `repairFailedOnly` is the load-bearing pair here: the two
+    // filters stand alone (a comment feed that opened is already useful
+    // without the revision feed), and a reconnect must re-send only the one
+    // whose REQ failed — the session replays what it accepted, so re-sending
+    // an accepted filter opens a second REQ for it and delivers every event
+    // twice. No timer retry: a failed open waits for the reconnect that says
+    // the relay is reachable again, which is the only news worth acting on
+    // for a panel that is only alive while it is on screen.
+    const liveRoot = createLiveSubscriptionSet({
+      buildGroup: (key, { nowSeconds }) =>
+        projectRootLiveFilters(key, nowSeconds),
+      open: (filter, onEvent) => relayClient.subscribeLive(filter, onEvent),
+      groupOpenPolicy: "perFilter",
+      onEvent: (event) => {
+        // Second gate, after the relay's own filtering: a relay that
+        // over-delivers must not put another root's comment in this panel.
+        const role = projectRootEventRole(event, rootId);
+        if (!role) return;
 
-      // Second gate, after the relay's own filtering: a relay that
-      // over-delivers must not put another root's comment in this panel.
-      const role = projectRootEventRole(event, rootId);
-      if (!role) return;
-
-      applyProjectRootEvent(queryClient, { event, projectId, rootId });
-      if (role !== "comment") refresh.trigger();
-    };
-
-    // Subscribe by index so a filter whose REQ failed (relay down at mount) is
-    // the only one retried on reconnect. The session replays subscriptions it
-    // accepted, so resubscribing those would open a second REQ for the same
-    // filter and deliver every event twice.
-    const subscribeMissingFilters = async () => {
-      const filters = projectRootLiveFilters(rootId);
-      await Promise.all(
-        filters.map(async (filter, index) => {
-          if (disposed || disposers.has(index)) return;
-          try {
-            const dispose = await relayClient.subscribeLive(
-              filter,
-              handleEvent,
-            );
-            if (disposed) {
-              void dispose();
-              return;
-            }
-            disposers.set(index, dispose);
-          } catch (error) {
-            console.error(
-              "Failed to subscribe to live project root updates",
-              rootId,
-              error,
-            );
-          }
-        }),
-      );
-    };
-
-    void subscribeMissingFilters();
-
-    const unsubscribeFromReconnects = relayClient.subscribeToReconnects(() => {
-      // Events published while the socket was down do not replay in full, so
-      // close the gap once with a refetch rather than leaving the panel to
-      // heal on its next mount.
-      refresh.trigger();
-      void subscribeMissingFilters();
+        applyProjectRootEvent(queryClient, { event, projectId, rootId });
+        if (role !== "comment") refresh.trigger();
+      },
+      onError: (error) => {
+        console.error(
+          "Failed to subscribe to live project root updates",
+          rootId,
+          error,
+        );
+      },
+      reconnect: {
+        strategy: "repairFailedOnly",
+        subscribeToReconnects: (listener) =>
+          relayClient.subscribeToReconnects(listener),
+        // Events published while the socket was down do not replay in full,
+        // so close the gap once with a refetch rather than leaving the panel
+        // to heal on its next mount.
+        onReconnect: () => refresh.trigger(),
+      },
     });
 
+    liveRoot.setKeys([rootId]);
+
     return () => {
-      disposed = true;
       refresh.cancel();
-      unsubscribeFromReconnects();
-      for (const dispose of disposers.values()) {
-        void dispose().catch(() => {});
-      }
-      disposers.clear();
+      void liveRoot.dispose();
     };
   }, [projectId, queryClient, rootId]);
 }

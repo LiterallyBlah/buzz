@@ -13,6 +13,11 @@ import {
   type WatchedProjectRoot,
   type WatchedProjectRootsResult,
 } from "@/features/projects/projectUnreadRoots";
+import {
+  createLiveSubscriptionSet,
+  DEFAULT_LIVE_SUBSCRIPTION_RETRY,
+  type LiveSubscriptionSet,
+} from "@/shared/api/liveSubscriptionSet";
 import { relayClient } from "@/shared/api/relayClient";
 import type { RelayEvent } from "@/shared/api/types";
 import { createTrailingDebounce } from "@/shared/lib/trailingDebounce";
@@ -43,9 +48,6 @@ const WORK_ITEMS_QUERY_KEY = ["projects", "work-items"] as const;
  * each time; a trailing debounce collapses the burst into one rebuild.
  */
 const WATCH_SET_REBUILD_DEBOUNCE_MS = 750;
-
-const SUBSCRIPTION_RETRY_BASE_MS = 1_000;
-const SUBSCRIPTION_RETRY_MAX_MS = 30_000;
 
 /**
  * Backlog depth requested per subscription.
@@ -99,6 +101,72 @@ function readWorkItemsSnapshots(
 
 function isWorkItemsQueryKey(queryKey: readonly unknown[]): boolean {
   return queryKey[0] === "projects" && queryKey[1] === "work-items";
+}
+
+/**
+ * The two REQs that cover the whole watch set.
+ *
+ * The set's single key is the sorted root-id list, because that is the unit
+ * the subscriptions are actually shaped by: a relay filter takes a list of
+ * tag values, so N watched roots still cost two REQs, and the pair is rebuilt
+ * only when the list itself changes.
+ *
+ * A factory rather than an inline literal because the hook has to be able to
+ * build a second one: a disposed set stays closed by design, and StrictMode's
+ * simulated unmount/remount would otherwise leave the hook holding a set that
+ * can never open again.
+ */
+function createWatchedRootSubscriptions(
+  onEvent: (event: RelayEvent) => void,
+): LiveSubscriptionSet {
+  return createLiveSubscriptionSet({
+    buildGroup: (rootIdsKey, { nowSeconds }) => {
+      const rootIds = rootIdsKey.split(",");
+      return [
+        // `since: now` keeps the relay from replaying the entire history of
+        // every watched root on mount — the badge is for what happens *while*
+        // you are running, and a backlog dump would light up every item you
+        // ever touched.
+        {
+          kinds: [...PROJECT_REPLY_KINDS],
+          "#e": rootIds,
+          limit: SUBSCRIPTION_LIMIT,
+          since: nowSeconds,
+        },
+        // Pull-request revisions address their root with an uppercase `E`,
+        // which is a different relay filter key — it cannot be folded into the
+        // filter above.
+        {
+          kinds: [...PROJECT_REVISION_KINDS],
+          "#E": rootIds,
+          limit: SUBSCRIPTION_LIMIT,
+          since: nowSeconds,
+        },
+      ];
+    },
+    open: (filter, handler) => relayClient.subscribeLive(filter, handler),
+    // Partial success is not usable: half the grammar would be silently
+    // missing, which reads as "nothing is happening" rather than as an error.
+    // The pair opens, fails, and retries as a unit — and shares one `since`.
+    groupOpenPolicy: "atomic",
+    onEvent: (event) => onEvent(event),
+    retry: DEFAULT_LIVE_SUBSCRIPTION_RETRY,
+    onError: (error) => {
+      console.error(
+        "Failed to subscribe to project work-item activity; retrying",
+        error,
+      );
+    },
+    // The relay session replays established live subscriptions itself on
+    // reconnect (see `relayReconnectReplay`), so reconnect is only a repair
+    // path here: it re-sends the pair only when it never opened (relay down
+    // when the set was built), short-circuiting the backoff on the way.
+    reconnect: {
+      strategy: "repairFailedOnly",
+      subscribeToReconnects: (listener) =>
+        relayClient.subscribeToReconnects(listener),
+    },
+  });
 }
 
 export function useProjectNotificationsLive({
@@ -206,127 +274,31 @@ export function useProjectNotificationsLive({
     onProjectActivity(event, root);
   });
 
+  const liveSetRef = React.useRef<LiveSubscriptionSet | null>(null);
   const rootIdsKey = watched.rootIdsKey;
 
   React.useEffect(() => {
     if (!enabled || rootIdsKey.length === 0) {
+      // Tear the pair down rather than leaving it watching a set nobody reads.
+      liveSetRef.current?.setKeys([]);
       return;
     }
 
-    const rootIds = rootIdsKey.split(",");
-    let isCancelled = false;
-    let disposers: Array<() => Promise<void>> = [];
-    let retryTimeout: number | undefined;
-    let retryAttempt = 0;
-    // Guards against a second opener starting while the first pair of
-    // subscribe() promises is still in flight — `disposers` is empty during
-    // that window, so it cannot be used as the "already open" test.
-    let isOpening = false;
+    if (liveSetRef.current === null) {
+      liveSetRef.current = createWatchedRootSubscriptions(handleProjectEvent);
+    }
 
-    const disposeAll = (current: Array<() => Promise<void>>) => {
-      void Promise.allSettled(current.map((dispose) => dispose()));
-    };
-
-    const openSubscriptions = () => {
-      if (isCancelled || isOpening || disposers.length > 0) {
-        return;
-      }
-      isOpening = true;
-
-      // `since: now` keeps the relay from replaying the entire history of
-      // every watched root on mount — the badge is for what happens *while*
-      // you are running, and a backlog dump would light up every item you
-      // ever touched.
-      const since = Math.floor(Date.now() / 1_000);
-
-      void Promise.allSettled([
-        relayClient.subscribeLive(
-          {
-            kinds: [...PROJECT_REPLY_KINDS],
-            "#e": rootIds,
-            limit: SUBSCRIPTION_LIMIT,
-            since,
-          },
-          handleProjectEvent,
-        ),
-        // Pull-request revisions address their root with an uppercase `E`,
-        // which is a different relay filter key — it cannot be folded into
-        // the filter above.
-        relayClient.subscribeLive(
-          {
-            kinds: [...PROJECT_REVISION_KINDS],
-            "#E": rootIds,
-            limit: SUBSCRIPTION_LIMIT,
-            since,
-          },
-          handleProjectEvent,
-        ),
-      ]).then((results) => {
-        isOpening = false;
-        const opened = results.flatMap((result) =>
-          result.status === "fulfilled" ? [result.value] : [],
-        );
-        const failures = results.filter(
-          (result) => result.status === "rejected",
-        );
-        for (const failure of failures) {
-          console.error(
-            "Failed to subscribe to project work-item activity; retrying",
-            failure.reason,
-          );
-        }
-
-        if (isCancelled) {
-          disposeAll(opened);
-          return;
-        }
-
-        if (failures.length > 0) {
-          // Partial success is not usable: half the grammar would be silently
-          // missing. Drop what opened and retry the pair together.
-          disposeAll(opened);
-          const delayMs = Math.min(
-            SUBSCRIPTION_RETRY_BASE_MS * 2 ** Math.min(retryAttempt, 5),
-            SUBSCRIPTION_RETRY_MAX_MS,
-          );
-          retryAttempt += 1;
-          retryTimeout = window.setTimeout(() => {
-            retryTimeout = undefined;
-            openSubscriptions();
-          }, delayMs);
-          return;
-        }
-
-        retryAttempt = 0;
-        disposers = opened;
-      });
-    };
-
-    openSubscriptions();
-
-    // The relay session replays established live subscriptions itself on
-    // reconnect (see `relayReconnectReplay`), so this listener is only a
-    // repair path: if the relay was down when the effect ran, every
-    // subscribe() rejected and `disposers` is empty. Reconnecting is the
-    // cheapest signal that retrying is worth it, so short-circuit the backoff.
-    const unsubscribeReconnects = relayClient.subscribeToReconnects(() => {
-      if (disposers.length === 0) {
-        retryAttempt = 0;
-        openSubscriptions();
-      }
-    });
-
-    return () => {
-      isCancelled = true;
-      unsubscribeReconnects();
-      if (retryTimeout !== undefined) {
-        window.clearTimeout(retryTimeout);
-      }
-      const current = disposers;
-      disposers = [];
-      disposeAll(current);
-    };
+    liveSetRef.current.setKeys([rootIdsKey]);
   }, [enabled, rootIdsKey]);
+
+  React.useEffect(() => {
+    return () => {
+      // Null the ref: a disposed set stays closed, so a remount (StrictMode
+      // simulates one) has to build a fresh one rather than reuse this.
+      void liveSetRef.current?.dispose();
+      liveSetRef.current = null;
+    };
+  }, []);
 
   return watched;
 }

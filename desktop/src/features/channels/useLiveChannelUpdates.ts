@@ -9,6 +9,11 @@ import {
   isThreadReply,
 } from "@/features/messages/lib/threading";
 import { shouldNotifyForEvent } from "@/features/notifications/lib/shouldNotify";
+import {
+  createLiveSubscriptionSet,
+  DEFAULT_LIVE_SUBSCRIPTION_RETRY,
+  type LiveSubscriptionSet,
+} from "@/shared/api/liveSubscriptionSet";
 import { relayClient } from "@/shared/api/relayClient";
 import {
   CHANNEL_EVENT_KINDS,
@@ -68,8 +73,113 @@ export type UseLiveChannelUpdatesOptions = {
   mutedChannelIds?: ReadonlySet<string>;
 };
 
-const LIVE_SUBSCRIPTION_RETRY_BASE_MS = 1_000;
-const LIVE_SUBSCRIPTION_RETRY_MAX_MS = 30_000;
+/**
+ * Mention subscriptions are identified by (pubkey, channel), not by channel.
+ *
+ * The REQ carries the reader's pubkey, so signing in as a different account
+ * makes every open mention subscription wrong — it is still watching for the
+ * previous account's name. Putting both in the key lets the ordinary set diff
+ * perform the swap (every stale key leaves, every new one arrives) instead of
+ * a bespoke "did the pubkey change?" reset path alongside it.
+ */
+const MENTION_KEY_SEPARATOR = "|";
+
+type MentionSubscriptionRequest = { channelId: string; pubkey: string };
+
+function mentionSubscriptionKey(pubkey: string, channelId: string) {
+  return `${pubkey}${MENTION_KEY_SEPARATOR}${channelId}`;
+}
+
+/**
+ * Split on the *first* separator only: the pubkey is normalized lowercase hex
+ * and cannot contain one, while a channel id is whatever the channel says it
+ * is — parsing from the left is the half that is guaranteed unambiguous.
+ */
+function parseMentionSubscriptionKey(key: string): MentionSubscriptionRequest {
+  const separatorIndex = key.indexOf(MENTION_KEY_SEPARATOR);
+  if (separatorIndex < 0) {
+    return { channelId: key, pubkey: "" };
+  }
+  return {
+    channelId: key.slice(separatorIndex + MENTION_KEY_SEPARATOR.length),
+    pubkey: key.slice(0, separatorIndex),
+  };
+}
+
+/**
+ * One live subscription per visible channel, reconciled against the channel
+ * list: a refetch that returns the same ids costs zero REQs, and a channel
+ * that stays in the list keeps the subscription it already had.
+ *
+ * A factory rather than an inline literal because the hook has to be able to
+ * build a second one: a disposed set stays closed by design, and StrictMode's
+ * simulated unmount/remount would otherwise leave the hook holding a set that
+ * can never open again.
+ */
+function createChannelMessageSubscriptions(params: {
+  onChannelEvent: (event: RelayEvent, channelId: string) => void;
+  onSubscriptionWindowOpen: (nowSeconds: number) => void;
+}): LiveSubscriptionSet {
+  return createLiveSubscriptionSet({
+    buildGroup: (channelId, { nowSeconds }) => [
+      {
+        kinds: [...CHANNEL_EVENT_KINDS],
+        "#h": [channelId],
+        limit: 1000,
+        since: nowSeconds,
+      },
+    ],
+    open: (filter, onEvent) => relayClient.subscribeLive(filter, onEvent),
+    // A channel is one filter, and each one stands alone: a channel whose REQ
+    // was rejected must not cost its neighbours their subscriptions.
+    groupOpenPolicy: "perFilter",
+    onEvent: params.onChannelEvent,
+    retry: DEFAULT_LIVE_SUBSCRIPTION_RETRY,
+    onBeforeOpen: (channelIds, { nowSeconds }) => {
+      if (channelIds.length > 0) params.onSubscriptionWindowOpen(nowSeconds);
+    },
+    onError: (error, channelId) => {
+      console.error(
+        "Failed to subscribe to live channel updates",
+        channelId,
+        error,
+      );
+    },
+    // Reconnects are handled by the hook's own listener, not here: the relay
+    // session replays the REQs it accepted, and what this hook owes a
+    // reconnect is a channel-list refetch plus a fresh backlog cutoff, neither
+    // of which is subscription management.
+  });
+}
+
+/**
+ * Mention subscriptions: the same lifecycle, opened through the relay client's
+ * own mention-filter builder rather than a filter this file writes, and keyed
+ * by (pubkey, channel) because both are baked into the REQ.
+ */
+function createMentionSubscriptions(
+  onMentionEvent: (event: RelayEvent) => void,
+): LiveSubscriptionSet {
+  return createLiveSubscriptionSet<MentionSubscriptionRequest>({
+    buildGroup: (key) => [parseMentionSubscriptionKey(key)],
+    open: (request, onEvent) =>
+      relayClient.subscribeToChannelMentionEvents(
+        request.channelId,
+        request.pubkey,
+        onEvent,
+      ),
+    groupOpenPolicy: "perFilter",
+    onEvent: (event) => onMentionEvent(event),
+    retry: DEFAULT_LIVE_SUBSCRIPTION_RETRY,
+    onError: (error, key) => {
+      console.error(
+        "Failed to subscribe to mention events",
+        parseMentionSubscriptionKey(key).channelId,
+        error,
+      );
+    },
+  });
+}
 
 // get_channels is an expensive O(channels) relay fan-out. Incoming traffic for
 // non-active channels arrives in bursts, so coalesce the refetch into a single
@@ -353,205 +463,61 @@ export function useLiveChannelUpdates(
     });
   }, [queryClient]);
 
-  const liveSubsRef = React.useRef(new Map<string, () => Promise<void>>());
+  const liveChannelSubsRef = React.useRef<LiveSubscriptionSet | null>(null);
+  const mentionSubsRef = React.useRef<LiveSubscriptionSet | null>(null);
 
   React.useEffect(() => {
-    let isCancelled = false;
-    let retryTimeout: number | undefined;
-    let retryAttempt = 0;
-
-    const syncSubs = async (): Promise<boolean> => {
-      const activeSubs = liveSubsRef.current;
-      const targetIds = new Set(channelIdsKey ? channelIdsKey.split(",") : []);
-
-      for (const [channelId, dispose] of activeSubs) {
-        if (!targetIds.has(channelId)) {
-          activeSubs.delete(channelId);
-          void dispose().catch(() => {});
-        }
-      }
-
-      if (targetIds.size > 0) {
+    if (liveChannelSubsRef.current === null) {
+      liveChannelSubsRef.current = createChannelMessageSubscriptions({
+        // handleIncomingMessage is a stable useEffectEvent, so a subscription
+        // that outlives the effect run that opened it still reaches the
+        // current render's closure — the reason these subs are diffed rather
+        // than torn down.
+        onChannelEvent: (event, channelId) =>
+          handleIncomingMessage(withChannelTagFallback(event, channelId)),
         // Record the subscription start time so handleDmEvent can distinguish
-        // backlog replays (created_at < startedAt) from live messages.
-        dmSubscriptionStartedAtRef.current = Math.floor(Date.now() / 1000);
-      }
+        // backlog replays (created_at < startedAt) from live messages. It has
+        // to move on every sync pass, retries included: the window that
+        // matters starts when the REQ is sent, not when the list changed.
+        onSubscriptionWindowOpen: (nowSeconds) => {
+          dmSubscriptionStartedAtRef.current = nowSeconds;
+        },
+      });
+    }
 
-      let anyFailed = false;
-      const additions = Array.from(targetIds)
-        .filter((channelId) => !activeSubs.has(channelId))
-        .map(async (channelId) => {
-          try {
-            const dispose = await relayClient.subscribeLive(
-              {
-                kinds: [...CHANNEL_EVENT_KINDS],
-                "#h": [channelId],
-                limit: 1000,
-                since: Math.floor(Date.now() / 1_000),
-              },
-              (event) =>
-                handleIncomingMessage(withChannelTagFallback(event, channelId)),
-            );
-            if (isCancelled) {
-              void dispose().catch(() => {});
-              return;
-            }
-            activeSubs.set(channelId, dispose);
-          } catch (err) {
-            anyFailed = true;
-            console.error(
-              "Failed to subscribe to live channel updates",
-              channelId,
-              err,
-            );
-          }
-        });
-      await Promise.allSettled(additions);
-      return !anyFailed;
-    };
-
-    const runSync = async () => {
-      const ok = await syncSubs();
-      if (isCancelled) return;
-      if (ok) {
-        retryAttempt = 0;
-        return;
-      }
-      const delayMs = Math.min(
-        LIVE_SUBSCRIPTION_RETRY_BASE_MS * 2 ** retryAttempt,
-        LIVE_SUBSCRIPTION_RETRY_MAX_MS,
-      );
-      retryAttempt += 1;
-      retryTimeout = window.setTimeout(() => {
-        retryTimeout = undefined;
-        void runSync();
-      }, delayMs);
-    };
-
-    void runSync();
-
-    return () => {
-      isCancelled = true;
-      if (retryTimeout !== undefined) {
-        window.clearTimeout(retryTimeout);
-      }
-    };
+    liveChannelSubsRef.current.setKeys(
+      channelIdsKey ? channelIdsKey.split(",") : [],
+    );
   }, [channelIdsKey]);
-
-  // Subscribe to mention events per channel with a diff-based manager: only
-  // subscribe newly-added channels and unsubscribe removed ones on each sync.
-  // The ref survives re-renders so churn-with-identical-IDs does zero work.
-  const mentionSubsRef = React.useRef(new Map<string, () => Promise<void>>());
-  const mentionSubsPubkeyRef = React.useRef<string | null>(null);
 
   React.useEffect(() => {
     if (!options.onLiveMention || normalizedCurrentPubkey.length === 0) {
+      // Deliberately not a teardown: subscriptions already open stay open
+      // until the identity changes (which re-keys them) or the hook unmounts.
       return;
     }
 
-    let isCancelled = false;
-    let retryTimeout: number | undefined;
-    let retryAttempt = 0;
+    if (mentionSubsRef.current === null) {
+      mentionSubsRef.current = createMentionSubscriptions(handleMentionEvent);
+    }
 
-    const syncSubs = async (): Promise<boolean> => {
-      const activeSubs = mentionSubsRef.current;
-
-      if (
-        mentionSubsPubkeyRef.current !== null &&
-        mentionSubsPubkeyRef.current !== normalizedCurrentPubkey
-      ) {
-        const stale = Array.from(activeSubs.values());
-        activeSubs.clear();
-        await Promise.allSettled(stale.map((dispose) => dispose()));
-        if (isCancelled) return true;
-      }
-      mentionSubsPubkeyRef.current = normalizedCurrentPubkey;
-
-      const targetIds = new Set(channelIdsKey ? channelIdsKey.split(",") : []);
-
-      for (const [channelId, dispose] of activeSubs) {
-        if (!targetIds.has(channelId)) {
-          activeSubs.delete(channelId);
-          void dispose().catch(() => {});
-        }
-      }
-
-      let anyFailed = false;
-      // Pass handleMentionEvent directly — it's a stable useEffectEvent
-      // callback. Do NOT wrap in an isCancelled check here: subs persist
-      // across effect runs (that's the point of the diff manager), so a
-      // stale isCancelled flag from a prior run would silently drop events
-      // on long-lived subs.
-      const additions = Array.from(targetIds)
-        .filter((channelId) => !activeSubs.has(channelId))
-        .map(async (channelId) => {
-          try {
-            const dispose = await relayClient.subscribeToChannelMentionEvents(
-              channelId,
-              normalizedCurrentPubkey,
-              handleMentionEvent,
-            );
-            if (isCancelled) {
-              void dispose().catch(() => {});
-              return;
-            }
-            activeSubs.set(channelId, dispose);
-          } catch (err) {
-            anyFailed = true;
-            console.error(
-              "Failed to subscribe to mention events",
-              channelId,
-              err,
-            );
-          }
-        });
-      await Promise.allSettled(additions);
-      return !anyFailed;
-    };
-
-    const runSync = async () => {
-      const ok = await syncSubs();
-      if (isCancelled) return;
-      if (ok) {
-        retryAttempt = 0;
-        return;
-      }
-      const delayMs = Math.min(
-        LIVE_SUBSCRIPTION_RETRY_BASE_MS * 2 ** retryAttempt,
-        LIVE_SUBSCRIPTION_RETRY_MAX_MS,
-      );
-      retryAttempt += 1;
-      retryTimeout = window.setTimeout(() => {
-        retryTimeout = undefined;
-        void runSync();
-      }, delayMs);
-    };
-
-    void runSync();
-
-    return () => {
-      isCancelled = true;
-      if (retryTimeout !== undefined) {
-        window.clearTimeout(retryTimeout);
-      }
-    };
+    mentionSubsRef.current.setKeys(
+      (channelIdsKey ? channelIdsKey.split(",") : []).map((channelId) =>
+        mentionSubscriptionKey(normalizedCurrentPubkey, channelId),
+      ),
+    );
   }, [channelIdsKey, normalizedCurrentPubkey, options.onLiveMention]);
 
   React.useEffect(() => {
     return () => {
       channelsInvalidateRef.current?.cancel();
 
-      for (const dispose of liveSubsRef.current.values()) {
-        void dispose().catch(() => {});
-      }
-      liveSubsRef.current.clear();
-
-      const subs = mentionSubsRef.current;
-      for (const dispose of subs.values()) {
-        void dispose().catch(() => {});
-      }
-      subs.clear();
-      mentionSubsPubkeyRef.current = null;
+      // Null the refs: a disposed set stays closed, so a remount (StrictMode
+      // simulates one) has to build a fresh pair rather than reuse these.
+      void liveChannelSubsRef.current?.dispose();
+      liveChannelSubsRef.current = null;
+      void mentionSubsRef.current?.dispose();
+      mentionSubsRef.current = null;
     };
   }, []);
 }
