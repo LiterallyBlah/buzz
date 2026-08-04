@@ -3803,6 +3803,7 @@ pub(crate) fn decide_project_event(
         root_state,
         addressing,
         lifecycle_authorised,
+        evidence.directed_at_another_party(),
     );
 
     let origin = match effect {
@@ -7135,6 +7136,39 @@ fn explicit_mention_present(content: &str, identity: &str) -> bool {
     false
 }
 
+/// Does `content` carry at least one explicit mention token, whoever it names?
+///
+/// Deliberately identity-blind: it answers "did the author address somebody by
+/// name here" and nothing else. Pairing it with the identity-aware checks is
+/// what separates *this comment names someone else* from *this comment names
+/// nobody* — the second is an ordinary continuation and must keep waking an
+/// active root.
+///
+/// A token is a prefix at a lexical boundary followed by at least one
+/// identifier character, so an email address, a lone `@`, or a decorative
+/// `nostr:` with nothing after it is not a mention.
+fn mention_token_present(content: &str) -> bool {
+    let lower = content.to_ascii_lowercase();
+
+    for prefix in MENTION_PREFIXES {
+        let mut from = 0usize;
+        while let Some(offset) = lower[from..].find(prefix) {
+            let start = from + offset;
+            let end = start + prefix.len();
+            let leading_ok = lower[..start]
+                .chars()
+                .next_back()
+                .is_none_or(|c| !is_identifier_char(c));
+            let names_something = lower[end..].chars().next().is_some_and(is_identifier_char);
+            if leading_ok && names_something {
+                return true;
+            }
+            from = start + prefix.len();
+        }
+    }
+    false
+}
+
 /// This agent's identity, in the forms mention detection needs.
 ///
 /// Constructed once from a `PublicKey` so hex and bech32 cannot disagree.
@@ -7142,6 +7176,7 @@ fn explicit_mention_present(content: &str, identity: &str) -> bool {
 pub(crate) struct AgentIdentity {
     hex: String,
     npub: String,
+    display_name: Option<String>,
 }
 
 impl AgentIdentity {
@@ -7150,7 +7185,22 @@ impl AgentIdentity {
         Ok(Self {
             hex: pubkey.to_hex(),
             npub: pubkey.to_bech32()?,
+            display_name: None,
         })
+    }
+
+    /// Attach the display name this agent is known by in Desktop.
+    ///
+    /// A display name is **never** on its own proof of address — it is neither
+    /// unique nor owned, which is why it does not feed `visible_mention`. It is
+    /// admitted for one narrow negative purpose: telling "this comment names
+    /// somebody, and that somebody is not me" apart from "this comment names
+    /// nobody". Blank and whitespace-only names are dropped rather than stored,
+    /// so an unset `BUZZ_ACP_DISPLAY_NAME` cannot match an empty needle.
+    pub(crate) fn with_display_name(mut self, name: &str) -> Self {
+        let trimmed = name.trim();
+        self.display_name = (!trimmed.is_empty()).then(|| trimmed.to_string());
+        self
     }
 
     pub(crate) fn hex(&self) -> &str {
@@ -7159,6 +7209,10 @@ impl AgentIdentity {
 
     pub(crate) fn npub(&self) -> &str {
         &self.npub
+    }
+
+    pub(crate) fn display_name(&self) -> Option<&str> {
+        self.display_name.as_deref()
     }
 }
 
@@ -7171,6 +7225,15 @@ impl AgentIdentity {
 pub(crate) struct AddressingEvidence {
     p_tag_present: bool,
     visible_mention: bool,
+    /// This agent's own display name, used as explicit mention syntax.
+    named_self: bool,
+    /// Somebody was named here, by any mention syntax.
+    named_anyone: bool,
+    /// The event `p`-tags at least one key that is not this agent.
+    p_tags_another: bool,
+    /// This agent knows the name it is called by, so absence of that name is
+    /// evidence rather than ignorance.
+    knows_own_name: bool,
 }
 
 impl AddressingEvidence {
@@ -7185,19 +7248,58 @@ impl AddressingEvidence {
     pub(crate) fn resolve(event: &VerifiedProjectEvent, agent: &AgentIdentity) -> Self {
         let hex = agent.hex().to_ascii_lowercase();
 
-        let p_tag_present = event.tag_vecs().iter().any(|t| {
-            t.first().map(String::as_str) == Some("p")
-                && t.get(1).is_some_and(|v| v.eq_ignore_ascii_case(&hex))
-        });
+        let mut p_tag_present = false;
+        let mut p_tags_another = false;
+        for tag in event.tag_vecs() {
+            if tag.first().map(String::as_str) != Some("p") {
+                continue;
+            }
+            match tag.get(1) {
+                Some(value) if value.eq_ignore_ascii_case(&hex) => p_tag_present = true,
+                Some(value) if !value.is_empty() => p_tags_another = true,
+                _ => {}
+            }
+        }
 
         let content = &event.event().content;
         let visible_mention = explicit_mention_present(content, agent.hex())
             || explicit_mention_present(content, agent.npub());
+        let named_self = visible_mention
+            || agent
+                .display_name()
+                .is_some_and(|name| explicit_mention_present(content, name));
 
         Self {
             p_tag_present,
             visible_mention,
+            named_self,
+            named_anyone: mention_token_present(content),
+            p_tags_another,
+            knows_own_name: agent.display_name().is_some(),
         }
+    }
+
+    /// Is this comment addressed to a named party that is not this agent?
+    ///
+    /// All three conditions are required, and each rules out a different way of
+    /// being wrong:
+    ///
+    /// - somebody is named — otherwise this is a bare follow-up, which an
+    ///   active root must still act on;
+    /// - that somebody is not us, by key *or* by display name — a comment that
+    ///   names us is ours no matter who else it also names;
+    /// - the event actually `p`-tags another key — this is what makes the name
+    ///   an address rather than prose. A display name with no matching `p`
+    ///   behind it names nobody the relay agreed to deliver to, so it must not
+    ///   silence a turn.
+    ///
+    /// An agent with no configured display name cannot satisfy the second
+    /// condition honestly: `@Its Own Name` would read as somebody else's, and
+    /// it would fall silent on exactly the comments meant for it. Not knowing
+    /// its own name means it has no opinion here, so it keeps the older, wider
+    /// behaviour and wakes.
+    pub(crate) fn directed_at_another_party(&self) -> bool {
+        self.knows_own_name && self.named_anyone && !self.named_self && self.p_tags_another
     }
 
     #[cfg(test)]
@@ -7205,6 +7307,10 @@ impl AddressingEvidence {
         Self {
             p_tag_present,
             visible_mention,
+            named_self: visible_mention,
+            named_anyone: visible_mention,
+            p_tags_another: false,
+            knows_own_name: false,
         }
     }
 }
@@ -7247,7 +7353,23 @@ pub(crate) fn resolve_addressing(
         return Some(Addressing::WatchedRoot);
     }
 
-    if evidence.visible_mention {
+    // Naming this agent, with this agent's own `p` behind it, is explicit —
+    // whichever spelling the name took.
+    //
+    // `named_self` widens `visible_mention` by one case: the configured display
+    // name in `@`-mention syntax. That case is the *ordinary* one, and treating
+    // it as weak evidence was the other half of the addressing failure. Desktop
+    // writes a mention as the visible name plus a `p` tag; it does not put hex
+    // or an npub in the body. So `visible_mention` is almost never true for a
+    // mention a person actually typed, and a genuine `@Claude` on a dormant
+    // root fell through to `InheritedParticipant` and stayed dormant.
+    //
+    // Note where this sits: past the `p_tag_present` gate above. The name alone
+    // never reaches here, which is what keeps a display name — neither unique
+    // nor owned — from being an address on its own. It is the conjunction the
+    // contract names: `@Display Name` *plus that agent's matching `p` tag*. A
+    // bare name in prose carries no `@` and is not a mention token at all.
+    if evidence.named_self {
         return Some(Addressing::ExplicitMention);
     }
 
@@ -7571,6 +7693,10 @@ pub(crate) fn classify_project_author(
 ///
 /// `kind_effect` is the outcome of [`classify_kind`]; `lifecycle_authorised`
 /// is [`lifecycle_actor_allowed`] for lifecycle events and ignored otherwise.
+///
+/// `directed_elsewhere` is [`AddressingEvidence::directed_at_another_party`].
+/// It only ever subtracts: it can stop an active root waking on a comment aimed
+/// at a different agent, and it can never create a turn or an enrolment.
 pub(crate) fn classify_project_event(
     kind_effect: KindEffect,
     author: ProjectAuthor,
@@ -7578,6 +7704,7 @@ pub(crate) fn classify_project_event(
     root_state: RootState,
     addressing: Addressing,
     lifecycle_authorised: bool,
+    directed_elsewhere: bool,
 ) -> ProjectEffect {
     // Self-authorship is suppressed per event class, in the `Root` and
     // `Comment` arms below — deliberately *not* as an early return.
@@ -7641,7 +7768,7 @@ pub(crate) fn classify_project_event(
                 // Only a trusted agent can return a result. From anyone else
                 // this is a forged correlation attempt.
                 CallMarker::Result => ProjectEffect::Ignore,
-                _ => wake_or_enrol(root_state, addressing),
+                _ => wake_or_enrol(root_state, addressing, directed_elsewhere),
             },
 
             // A trusted agent's bare `p` is never an invocation — that is the
@@ -7650,7 +7777,14 @@ pub(crate) fn classify_project_event(
                 CallMarker::Result => ProjectEffect::ResumeCall,
                 // An invocation envelope names its callee, so it is explicit
                 // addressing by construction and needs no separate re-tag.
-                CallMarker::Invocation => wake_or_enrol(root_state, Addressing::ExplicitMention),
+                // A NIP-PC envelope names *this agent* as its callee and was
+                // admitted as such upstream, so it is addressed to us by
+                // construction. Whoever else the prose happens to name cannot
+                // retract that, and `directed_elsewhere` is false here for the
+                // same reason the addressing is `ExplicitMention`.
+                CallMarker::Invocation => {
+                    wake_or_enrol(root_state, Addressing::ExplicitMention, false)
+                }
                 CallMarker::None => ProjectEffect::Ignore,
             },
         },
@@ -7668,12 +7802,26 @@ pub(crate) fn classify_project_event(
 /// | Root state | Explicit mention | Inherited / watched |
 /// |---|---|---|
 /// | `Unknown` | enrol and wake | ignore — nothing enrolled us |
-/// | `Active` | wake | wake — continuation needs no re-tag |
+/// | `Active` | wake | wake, unless the comment addresses another agent |
 /// | `Dormant` | reactivate and wake | ignore — stays dormant |
-fn wake_or_enrol(root_state: RootState, addressing: Addressing) -> ProjectEffect {
+///
+/// The active row is the one with a second condition on it. Continuation still
+/// needs no re-tag — a bare follow-up wakes, and that is the whole point of the
+/// row. But "no re-tag required" was being read as "no addressing considered at
+/// all", so an approved human writing `@Other Agent please take this` woke every
+/// agent that had ever been enrolled on the root, because Desktop copies prior
+/// participants into every later comment's `p` set. A comment that names
+/// somebody, names a `p`-tagged party, and does not name us is not our turn.
+fn wake_or_enrol(
+    root_state: RootState,
+    addressing: Addressing,
+    directed_elsewhere: bool,
+) -> ProjectEffect {
     match root_state {
         // An active root continues without re-tagging: this is the follow-up
-        // comment that the enrolment `#p` REQ alone could never deliver.
+        // comment that the enrolment `#p` REQ alone could never deliver — but a
+        // comment explicitly handed to another agent is not that follow-up.
+        RootState::Active if directed_elsewhere => ProjectEffect::Ignore,
         RootState::Active => ProjectEffect::Wake,
         RootState::Unknown | RootState::Dormant => match addressing {
             Addressing::ExplicitMention => ProjectEffect::EnrolAndWake,
@@ -8903,6 +9051,7 @@ mod tests {
             call,
             state,
             addressing,
+            false,
             false,
         )
     }
@@ -12898,6 +13047,286 @@ mod tests {
         AddressingEvidence::resolve(&verified, &agent_identity())
     }
 
+    // ── Comments aimed at another agent ──────────────────────────────────────
+
+    const AGENT_DISPLAY_NAME: &str = "Claude";
+
+    fn named_identity() -> AgentIdentity {
+        agent_identity().with_display_name(AGENT_DISPLAY_NAME)
+    }
+
+    /// Evidence from a comment whose `p` set and content are both controlled.
+    ///
+    /// Both are supplied because the failure this guards needs them to
+    /// disagree: the inherited `p` says "delivered to you", the content says
+    /// "for somebody else", and only reading them together tells the two apart.
+    async fn directed_evidence(content: &str, p_tags: &[&str]) -> AddressingEvidence {
+        let keys = Keys::generate();
+        let event = EventBuilder::new(Kind::Custom(KIND_TEXT_NOTE as u16), content)
+            .tags(
+                p_tags
+                    .iter()
+                    .map(|pk| nostr::Tag::parse(tag(&["p", pk])).unwrap()),
+            )
+            .sign_with_keys(&keys)
+            .expect("sign");
+        let verified = VerifiedProjectEvent::verify(event).await.expect("valid");
+        AddressingEvidence::resolve(&verified, &named_identity())
+    }
+
+    /// The demonstrated live failure: an approved human hands the work to a
+    /// different agent, and this agent — enrolled long ago, and carried along
+    /// in the copied `p` set ever since — takes it as its own turn.
+    #[tokio::test]
+    async fn an_active_root_ignores_a_comment_handed_to_another_agent() {
+        let evidence =
+            directed_evidence("@Hermes please take this one", &[AGENT_PK, THIRD_PARTY]).await;
+
+        assert!(evidence.p_tag_present, "the inherited `p` is still there");
+        assert!(
+            evidence.directed_at_another_party(),
+            "a named, p-tagged party that is not us is addressing somebody else"
+        );
+        assert_eq!(
+            classify_project_event(
+                classify_kind(KIND_TEXT_NOTE),
+                ProjectAuthor::AuthorisedHuman,
+                CallMarker::None,
+                RootState::Active,
+                Addressing::InheritedParticipant,
+                false,
+                evidence.directed_at_another_party(),
+            ),
+            ProjectEffect::Ignore,
+            "an enrolled agent must not wake on a comment aimed at another agent"
+        );
+    }
+
+    /// The property the fix must not cost: an ordinary follow-up names nobody,
+    /// and an active root still acts on it without any re-tag.
+    #[tokio::test]
+    async fn an_active_root_still_wakes_on_a_bare_follow_up() {
+        let evidence = directed_evidence("yes, go ahead with that", &[AGENT_PK]).await;
+
+        assert!(
+            !evidence.directed_at_another_party(),
+            "naming nobody is not naming somebody else"
+        );
+        assert_eq!(
+            classify_project_event(
+                classify_kind(KIND_TEXT_NOTE),
+                ProjectAuthor::AuthorisedHuman,
+                CallMarker::None,
+                RootState::Active,
+                Addressing::InheritedParticipant,
+                false,
+                evidence.directed_at_another_party(),
+            ),
+            ProjectEffect::Wake,
+            "continuation still needs no re-tag"
+        );
+    }
+
+    /// A comment is ours the moment it names us, whoever else it also names.
+    #[tokio::test]
+    async fn being_named_alongside_another_agent_is_still_our_turn() {
+        let evidence = directed_evidence(
+            "@Hermes and @Claude — please compare notes",
+            &[AGENT_PK, THIRD_PARTY],
+        )
+        .await;
+
+        assert!(
+            !evidence.directed_at_another_party(),
+            "our display name is present, so this is not somebody else's comment"
+        );
+    }
+
+    /// The display name is admitted only against a real `p`. Prose naming a
+    /// party the event never addressed must not silence a turn.
+    #[tokio::test]
+    async fn a_named_party_with_no_matching_p_tag_does_not_silence_a_turn() {
+        let evidence = directed_evidence("@Hermes wrote this originally", &[AGENT_PK]).await;
+
+        assert!(
+            !evidence.directed_at_another_party(),
+            "without another p-tagged key the name addresses nobody"
+        );
+    }
+
+    /// A display name is not *key* mention syntax, and on its own it addresses
+    /// nobody: without a matching `p` behind it, it cannot enrol an unknown
+    /// root or reanimate a dormant one.
+    ///
+    /// The conjunction — name plus this agent's own `p` — is explicit, and
+    /// `a_named_agent_with_its_own_p_tag_is_explicitly_addressed` covers that
+    /// side. What is asserted here is that the name alone buys nothing.
+    #[tokio::test]
+    async fn a_display_name_still_grants_no_enrolment_authority() {
+        let evidence = directed_evidence("@Claude please look", &[AGENT_PK]).await;
+
+        assert!(
+            !evidence.visible_mention,
+            "a display name is neither unique nor owned and must not read as key mention syntax"
+        );
+        for state in [RootState::Unknown, RootState::Dormant] {
+            assert_eq!(
+                classify_project_event(
+                    classify_kind(KIND_TEXT_NOTE),
+                    ProjectAuthor::AuthorisedHuman,
+                    CallMarker::None,
+                    state,
+                    Addressing::InheritedParticipant,
+                    false,
+                    evidence.directed_at_another_party(),
+                ),
+                ProjectEffect::Ignore,
+                "{state:?} must still refuse a display-name-only comment"
+            );
+        }
+    }
+
+    /// An agent with no configured name loses the discrimination and keeps the
+    /// old, wider behaviour rather than guessing.
+    #[tokio::test]
+    async fn an_unnamed_agent_falls_back_to_waking() {
+        let keys = Keys::generate();
+        let event = EventBuilder::new(
+            Kind::Custom(KIND_TEXT_NOTE as u16),
+            "@Hermes please take this one",
+        )
+        .tags([
+            nostr::Tag::parse(tag(&["p", AGENT_PK])).unwrap(),
+            nostr::Tag::parse(tag(&["p", THIRD_PARTY])).unwrap(),
+        ])
+        .sign_with_keys(&keys)
+        .expect("sign");
+        let verified = VerifiedProjectEvent::verify(event).await.expect("valid");
+
+        // Unnamed: absence of its own name proves nothing, so the agent must
+        // not read the comment as excluding it.
+        let evidence = AddressingEvidence::resolve(&verified, &agent_identity());
+        assert!(
+            !evidence.directed_at_another_party(),
+            "an agent that cannot recognise its own name must not infer it was excluded"
+        );
+        assert_eq!(
+            classify_project_event(
+                classify_kind(KIND_TEXT_NOTE),
+                ProjectAuthor::AuthorisedHuman,
+                CallMarker::None,
+                RootState::Active,
+                Addressing::InheritedParticipant,
+                false,
+                evidence.directed_at_another_party(),
+            ),
+            ProjectEffect::Wake,
+            "without a display name the agent keeps the older, wider behaviour"
+        );
+    }
+
+    /// Addressing resolution for an agent that knows the name it is called by.
+    async fn named_addressing(
+        content: &str,
+        p_tags: &[&str],
+        readiness: &RootHistoryReadiness,
+        facts: Option<&PriorRootFacts>,
+    ) -> Option<Addressing> {
+        let evidence = directed_evidence(content, p_tags).await;
+        resolve_addressing(
+            &watched(),
+            KindEffect::Comment,
+            &evidence,
+            readiness,
+            facts,
+            &named_identity(),
+        )
+    }
+
+    /// The other half of the addressing failure, and the ordinary case.
+    ///
+    /// Desktop writes a mention as the visible display name plus a `p` tag — it
+    /// never puts hex or an npub in the body. Read only as `visible_mention`,
+    /// a mention a person actually typed was invisible, so `@Claude` on a
+    /// dormant root resolved to `InheritedParticipant` and left it dormant.
+    #[tokio::test]
+    async fn a_named_agent_with_its_own_p_tag_is_explicitly_addressed() {
+        assert_eq!(
+            named_addressing(
+                "@Claude could you pick this up again?",
+                &[AGENT_PK],
+                // Incomplete history is the point: this is exactly the state in
+                // which a bare `p` is *not* trusted as explicit, so the mention
+                // is doing the work here and nothing else could be.
+                &RootHistoryReadiness::Unknown,
+                None,
+            )
+            .await,
+            Some(Addressing::ExplicitMention),
+        );
+
+        // And it reaches the effect the contract asks for, from both the states
+        // that a bare inherited `p` must never move.
+        for state in [RootState::Unknown, RootState::Dormant] {
+            assert_eq!(
+                classify_project_event(
+                    classify_kind(KIND_TEXT_NOTE),
+                    ProjectAuthor::AuthorisedHuman,
+                    CallMarker::None,
+                    state,
+                    Addressing::ExplicitMention,
+                    false,
+                    false,
+                ),
+                ProjectEffect::EnrolAndWake,
+                "{state:?} must answer a genuine mention"
+            );
+        }
+    }
+
+    /// The negative the contract names alongside it: a bare display name in
+    /// prose, carried by a `p` that was only inherited, is not an address.
+    #[tokio::test]
+    async fn a_bare_name_in_prose_with_an_inherited_p_is_not_explicit() {
+        assert_eq!(
+            named_addressing(
+                "Claude looked at this last week",
+                &[AGENT_PK],
+                &RootHistoryReadiness::Unknown,
+                None,
+            )
+            .await,
+            Some(Addressing::InheritedParticipant),
+            "no `@`, so no mention token — the `p` is all there is"
+        );
+    }
+
+    /// A name with no `p` behind it still addresses nobody the relay agreed to
+    /// deliver to, so it cannot enrol.
+    #[tokio::test]
+    async fn a_mention_without_a_matching_p_cannot_enrol() {
+        assert_eq!(
+            named_addressing(
+                "@Claude please look",
+                &[THIRD_PARTY],
+                &RootHistoryReadiness::Complete,
+                Some(&prior(false, THIRD_PARTY, OWNER)),
+            )
+            .await,
+            Some(Addressing::WatchedRoot),
+            "the `p_tag_present` gate is upstream of the mention check"
+        );
+    }
+
+    #[test]
+    fn a_mention_token_needs_something_after_the_prefix() {
+        assert!(mention_token_present("@Hermes please"));
+        assert!(mention_token_present("nostr:npub1abc"));
+        assert!(!mention_token_present("email me at foo@example.com"));
+        assert!(!mention_token_present("a bare @ sign"));
+        assert!(!mention_token_present("no names at all"));
+    }
+
     /// This agent's npub. Asserted against the derived form in
     /// `the_test_npub_matches_the_derived_identity`, so a stale literal cannot
     /// quietly make every mention test vacuous — the same failure mode as the
@@ -13475,6 +13904,7 @@ mod tests {
                 RootState::Active,
                 Addressing::ExplicitMention,
                 authorised,
+                false,
             );
             assert_ne!(out, ProjectEffect::ResumeCall);
             assert_eq!(
@@ -13497,6 +13927,7 @@ mod tests {
             RootState::Active,
             Addressing::ExplicitMention,
             false,
+            false,
         );
         assert_ne!(out, ProjectEffect::ResumeCall);
         assert_eq!(out, ProjectEffect::RefreshContext);
@@ -13512,6 +13943,7 @@ mod tests {
             RootState::Unknown,
             Addressing::ExplicitMention,
             false,
+            false,
         );
         assert_ne!(out, ProjectEffect::ResumeCall);
         assert_eq!(out, ProjectEffect::Ignore);
@@ -13526,6 +13958,7 @@ mod tests {
             RootState::Active,
             Addressing::ExplicitMention,
             true,
+            false,
         );
         assert_ne!(out, ProjectEffect::ResumeCall);
         assert_eq!(out, ProjectEffect::Ignore);
@@ -13541,6 +13974,7 @@ mod tests {
                 RootState::Unknown,
                 Addressing::ExplicitMention,
                 false,
+                false,
             ),
             ProjectEffect::EnrolAndWake
         );
@@ -13553,6 +13987,7 @@ mod tests {
                 CallMarker::None,
                 RootState::Unknown,
                 Addressing::WatchedRoot,
+                false,
                 false,
             ),
             ProjectEffect::Ignore
@@ -13705,6 +14140,7 @@ mod tests {
                 RootState::Active,
                 Addressing::WatchedRoot,
                 true,
+                false,
             ),
             ProjectEffect::ApplyLifecycle
         );
@@ -13957,6 +14393,7 @@ mod tests {
                     RootState::Active,
                     Addressing::ExplicitMention,
                     true,
+                    false,
                 );
                 assert!(
                     matches!(out, ProjectEffect::ApplyLifecycle | ProjectEffect::Ignore),
@@ -14005,6 +14442,7 @@ mod tests {
                 RootState::Active,
                 Addressing::ExplicitMention,
                 false,
+                false,
             ),
             ProjectEffect::RefreshContext
         );
@@ -14015,6 +14453,7 @@ mod tests {
                 CallMarker::None,
                 RootState::Active,
                 Addressing::ExplicitMention,
+                false,
                 false,
             ),
             ProjectEffect::UntrustedContext
@@ -14058,6 +14497,7 @@ mod tests {
                 RootState::Active,
                 Addressing::WatchedRoot,
                 false,
+                false,
             ),
             ProjectEffect::RefreshContext
         );
@@ -14076,6 +14516,7 @@ mod tests {
                         state,
                         addressing,
                         true,
+                        false,
                     ),
                     ProjectEffect::Ignore,
                     "root: {state:?} / {addressing:?}"
@@ -14114,6 +14555,7 @@ mod tests {
                         RootState::Active,
                         addressing,
                         true,
+                        false,
                     );
                     assert!(
                         !matches!(
@@ -14213,6 +14655,7 @@ mod tests {
                 RootState::Active,
                 Addressing::WatchedRoot,
                 false,
+                false,
             ),
             ProjectEffect::Ignore
         );
@@ -14228,6 +14671,7 @@ mod tests {
                 RootState::Active,
                 Addressing::ExplicitMention,
                 false,
+                false,
             ),
             ProjectEffect::Ignore
         );
@@ -14239,6 +14683,7 @@ mod tests {
                 RootState::Active,
                 Addressing::ExplicitMention,
                 true,
+                false,
             ),
             ProjectEffect::ApplyLifecycle
         );
@@ -14757,6 +15202,7 @@ mod tests {
             RootState::Unknown,
             Addressing::ExplicitMention,
             false,
+            false,
         );
         // Two separate assertions, per the falsifier: state is restored, and
         // no turn is produced.
@@ -14808,6 +15254,7 @@ mod tests {
             CallMarker::None,
             RootState::Active,
             Addressing::InheritedParticipant,
+            false,
             false,
         );
         assert_eq!(effect, ProjectEffect::Wake, "an active root continues");
@@ -15386,6 +15833,7 @@ mod tests {
                     state,
                     addressing,
                     false,
+                    false,
                 );
                 assert_eq!(effect, ProjectEffect::UntrustedContext);
                 assert!(!matches!(
@@ -15473,6 +15921,7 @@ mod tests {
                 CallMarker::None,
                 RootState::Unknown,
                 addressing,
+                false,
                 false,
             );
             assert_eq!(effect, ProjectEffect::UntrustedContext, "{addressing:?}");

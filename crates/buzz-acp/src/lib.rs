@@ -2132,8 +2132,14 @@ async fn tokio_main() -> Result<()> {
     // The agent's own identity, in both spellings, from one source — so the
     // `p`-tag check and visible-mention detection cannot end up pointed at
     // different keys.
+    // The display name comes from the same env var Desktop forwards to dev-mcp,
+    // so the name the agent answers to and the name it is called by are one
+    // string. Unset is the safe state: without it the agent simply cannot tell
+    // "names another agent" from "names nobody", and every comment on an active
+    // root wakes it exactly as before.
     let project_agent_identity = project::AgentIdentity::new(&config.keys.public_key())
-        .map_err(|e| anyhow::anyhow!("agent identity: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("agent identity: {e}"))?
+        .with_display_name(&std::env::var("BUZZ_ACP_DISPLAY_NAME").unwrap_or_default());
 
     // Project invocation authority is **not** inherited from channel config.
     // `RespondTo::Anyone` and an empty allow-list both mean "permissive" for
@@ -7670,9 +7676,9 @@ mod project_discovery_ingestion_tests {
     /// A comment *can* carry a `p` copied from an earlier participant list, and
     /// without complete history nothing can tell the difference — so it cannot
     /// bring an unwatched root into the active set. Note the scope: an
-    /// already-active root continues on any comment by design
-    /// (`wake_or_enrol`, `RootState::Active => Wake`), because that is the
-    /// follow-up the enrolment `#p` REQ alone could never deliver. What is
+    /// already-active root continues on any comment that is not addressed to a
+    /// different agent (`wake_or_enrol`, `RootState::Active`), because that is
+    /// the follow-up the enrolment `#p` REQ alone could never deliver. What is
     /// guarded here is *enrolment*, not delivery.
     #[tokio::test]
     async fn a_comment_p_tag_cannot_enrol_an_unwatched_root() {
