@@ -12022,6 +12022,9 @@ mod tests {
                     sibling: None,
                     ledger: &mut ledger,
                     resolved_candidate: None,
+                    // Likewise no bus: what is under test is the routing
+                    // decision, not what it announces on the issue.
+                    observer: None,
                 };
                 crate::handle_project_event(&mut d, $ev)
             }};
@@ -12232,6 +12235,9 @@ mod tests {
                     sibling: None,
                     ledger: &mut ledger,
                     resolved_candidate: None,
+                    // Likewise no bus: what is under test is the routing
+                    // decision, not what it announces on the issue.
+                    observer: None,
                 };
                 crate::handle_project_event(&mut d, $ev)
             }};
@@ -13001,6 +13007,11 @@ mod tests {
                                     sibling: None,
                                     ledger: &mut ledger,
                                     resolved_candidate: None,
+                                    // These scenarios are about subscription
+                                    // upkeep; nothing here reads the activity
+                                    // wire, so the bus is absent as it is in a
+                                    // runtime with neither feature on.
+                                    observer: None,
                                 },
                                 &mut seen,
                                 &subscriber,
@@ -14835,6 +14846,7 @@ for line in sys.stdin:
                     sibling: None,
                     ledger: &mut self.ledger,
                     resolved_candidate: None,
+                    observer: None,
                 },
                 &crate::project::ProjectEvent::Routed {
                     source,

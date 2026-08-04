@@ -476,10 +476,10 @@ pub async fn dispatch(command: AgentsCmd, client: &BuzzClient) -> Result<(), Cli
                     "ok": true,
                     "event_id": event_id,
                     "root": root.to_ascii_lowercase(),
-                    "state": match state {
-                        ProjectActivityState::Working => "working",
-                        ProjectActivityState::Idle => "idle",
-                    },
+                    // Read back off the state itself, not restated here: the
+                    // report and the event it reports must not be able to
+                    // disagree.
+                    "state": state.as_tag(),
                     "turn": turn,
                 })
             );

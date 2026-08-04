@@ -56,8 +56,94 @@ test("a working announcement puts the agent on its own root", () => {
   const live = liveProjectActivity(state, 1_000_000);
   assert.equal(live.length, 1);
   assert.equal(live[0].agent, AGENT);
+  assert.equal(live[0].state, "working");
   assert.equal(live[0].stage, "reading files");
   assert.equal(live[0].turnId, "turn-1");
+});
+
+test("a queued announcement puts the agent on the root before any turn", () => {
+  // The gap this closes: between the comment reaching the relay and the first
+  // `working`, an agent that had picked the comment up and an agent that was
+  // never addressed produced the identical wire — nothing.
+  const state = fold([
+    activityEvent({ state: "queued", turn: `queued:${"1".repeat(64)}` }),
+  ]);
+  const live = liveProjectActivity(state, 1_000_000);
+  assert.equal(live.length, 1);
+  assert.equal(live[0].state, "queued");
+  assert.equal(
+    live[0].stage,
+    null,
+    "nothing has started, so nothing to caption",
+  );
+});
+
+test("the turn that starts replaces the queued announcement", () => {
+  const state = fold([
+    activityEvent({ state: "queued", turn: `queued:${"1".repeat(64)}` }),
+    activityEvent({ createdAt: 1_001, stage: "starting", turn: "turn-1" }),
+  ]);
+  const live = liveProjectActivity(state, 1_001_000);
+  assert.equal(live.length, 1, "one agent on one root is one entry");
+  assert.equal(live[0].state, "working");
+  assert.equal(live[0].turnId, "turn-1");
+});
+
+test("a reordered queued frame does not walk a working agent backwards", () => {
+  // `created_at` is whole seconds and the queued frame and the turn's first
+  // `working` routinely share one, so the relay can deliver them either way
+  // round. The queued frame belongs to a different turn id, so the ordinary
+  // same-turn guard cannot see the pair at all.
+  const state = fold([
+    activityEvent({ createdAt: 1_000, stage: "editing files", turn: "turn-1" }),
+    activityEvent({
+      createdAt: 1_000,
+      state: "queued",
+      turn: `queued:${"1".repeat(64)}`,
+    }),
+  ]);
+  const live = liveProjectActivity(state, 1_000_000);
+  assert.equal(live[0].state, "working");
+  assert.equal(live[0].stage, "editing files");
+});
+
+test("an idle from the started turn clears a root that began as queued", () => {
+  const state = fold([
+    activityEvent({ state: "queued", turn: `queued:${"1".repeat(64)}` }),
+    activityEvent({ createdAt: 1_001, turn: "turn-1" }),
+    activityEvent({ createdAt: 1_002, state: "idle", turn: "turn-1" }),
+  ]);
+  assert.deepEqual(liveProjectActivity(state, 1_002_000), []);
+});
+
+test("a queued announcement expires on the same clock as a working one", () => {
+  // The runtime re-announces `queued` on the same 15-second cadence for as long
+  // as the comment is waiting, so an expired one means the runtime stopped
+  // talking — not that the comment stopped waiting.
+  const state = fold([
+    activityEvent({
+      createdAt: 1_000,
+      state: "queued",
+      turn: `queued:${"1".repeat(64)}`,
+    }),
+  ]);
+  assert.equal(
+    liveProjectActivity(state, 1_000 * 1_000 + PROJECT_ACTIVITY_STALE_MS - 1)
+      .length,
+    1,
+  );
+  assert.equal(
+    liveProjectActivity(state, 1_000 * 1_000 + PROJECT_ACTIVITY_STALE_MS)
+      .length,
+    0,
+  );
+});
+
+test("a state this build has never heard of is refused, not shown as working", () => {
+  assert.equal(
+    parseProjectActivity(activityEvent({ state: "deliberating" }), ROOT),
+    null,
+  );
 });
 
 test("activity for another root never reaches this one", () => {

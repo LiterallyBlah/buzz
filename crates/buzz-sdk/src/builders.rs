@@ -1202,9 +1202,25 @@ pub fn build_git_comment(
 
 // ── NIP-PA: project activity ──────────────────────────────────────────────────
 
-/// Whether an agent is working on a root, or has stopped.
+/// Whether an agent is working on a root, is about to, or has stopped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProjectActivityState {
+    /// This agent has accepted work on this root that has not started yet.
+    ///
+    /// The gap it fills is the one between "the comment reached the relay" and
+    /// `turn_started`: the runtime has decided the comment addresses it and has
+    /// queued it, but the pool may be busy for minutes. Without a state for
+    /// that interval the wire says nothing — and saying nothing is also what an
+    /// unaddressed comment produces, so the two are indistinguishable exactly
+    /// when a person is waiting to learn which one happened.
+    ///
+    /// It carries a `turn` tag like every other state, but the turn it names is
+    /// prospective: no turn id exists yet — a flush may fold several queued
+    /// events into one turn, and the id is minted there — so the publisher
+    /// names the event that caused the queueing instead. A consumer must not
+    /// expect a later frame to reuse it: the `working` that follows carries the
+    /// real turn id and supersedes this frame by *root*, not by turn.
+    Queued,
     /// A turn is running on this root as of `created_at`.
     Working,
     /// The named turn ended — completed, failed or cancelled.
@@ -1218,8 +1234,16 @@ pub enum ProjectActivityState {
 }
 
 impl ProjectActivityState {
-    fn as_tag(self) -> &'static str {
+    /// The `state` tag value, which is also the only spelling of this state
+    /// anywhere.
+    ///
+    /// Public so a caller reporting what it published — the CLI's JSON result,
+    /// say — derives the word from the wire rather than restating it. A second
+    /// table of the same strings is a table that can disagree with the event,
+    /// and it disagrees silently: the frame is correct and the report is not.
+    pub fn as_tag(self) -> &'static str {
         match self {
+            ProjectActivityState::Queued => "queued",
             ProjectActivityState::Working => "working",
             ProjectActivityState::Idle => "idle",
         }
@@ -3842,6 +3866,35 @@ mod tests {
                 && s.get(1).map(|v| v.as_str()) == Some(root.as_str())
                 && s.get(3).map(|v| v.as_str()) == Some("root")
         }));
+    }
+
+    /// Every state has exactly one spelling, and it is the one on the wire.
+    ///
+    /// Asserted against the built event rather than against `as_tag` alone: a
+    /// reader that trusted the accessor would still pass if the builder stopped
+    /// using it, and the state a consumer sees is the tag, not the enum.
+    #[test]
+    fn each_activity_state_spells_itself_the_same_way_on_the_wire() {
+        let repo = GitRepoCoord {
+            owner: "a".repeat(64),
+            id: "repo".to_string(),
+        };
+        let root = event_id().to_hex();
+        let agent = keys().public_key().to_hex();
+
+        for (state, spelling) in [
+            (ProjectActivityState::Queued, "queued"),
+            (ProjectActivityState::Working, "working"),
+            (ProjectActivityState::Idle, "idle"),
+        ] {
+            assert_eq!(state.as_tag(), spelling);
+            let ev =
+                sign(build_project_activity(&repo, &root, &agent, state, "turn-1", None).unwrap());
+            assert!(
+                has_tag(&ev, "state", spelling),
+                "{state:?} did not publish as {spelling}"
+            );
+        }
     }
 
     /// An idle without a turn cannot be published at all.

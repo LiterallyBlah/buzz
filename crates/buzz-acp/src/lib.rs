@@ -505,11 +505,50 @@ const PROJECT_ACTIVITY_REFRESH: std::time::Duration = std::time::Duration::from_
 /// every turn.
 const TURN_TERMINAL_KINDS: &[&str] = &["turn_completed", "turn_error"];
 
+/// The observer kind the dispatch gate emits when it queues a project event.
+///
+/// Synthetic — no ACP message corresponds to it, because what it reports
+/// happened before any agent process was involved: the harness read a comment,
+/// decided it was addressed, and put it in the queue. Until this existed the
+/// wire was silent from "comment posted" until `turn_started`, which on a busy
+/// pool is minutes, and silence is also what an unaddressed comment produces.
+///
+/// It travels on the observer bus rather than being published straight from the
+/// dispatch site, and that is the whole point of the seam. The bus is
+/// [`ProjectActivityPublisher`]'s single input; a second publisher would keep
+/// its own idea of which root is live, and the two would disagree the first
+/// time either missed a frame — which is the failure mode this file's other
+/// doc comments are already shaped around.
+pub(crate) const OBSERVER_PROJECT_QUEUED: &str = "project_event_queued";
+
+/// The `turn` tag a queued announcement carries.
+///
+/// NIP-PA requires exactly one `turn`, and at queue time there is no turn to
+/// name: the id is minted at flush, and one flush may fold every event pending
+/// on a root into a single turn. So the announcement is identified by the event
+/// that caused it, which is the one fact that exists and is already unique.
+///
+/// Prefixed rather than bare so it can never be read as a turn id: a real one
+/// is a UUID, this is `queued:<64-hex>`, and the two cannot collide even by
+/// accident. Nothing downstream ever has to match it against a turn — the
+/// `working` frame that follows supersedes it by root, and the only `idle` that
+/// ever names it is the one this publisher emits for the queued announcement
+/// itself.
+fn queued_turn_id(event_id: &str) -> String {
+    format!("queued:{event_id}")
+}
+
 /// What this agent is currently announcing on one project root.
 struct LiveProjectTurn {
     turn_id: String,
     coordinate: String,
     stage: Option<String>,
+    /// Which state is on the wire for this root right now.
+    ///
+    /// Stored rather than inferred because two rules need it: the refresh tick
+    /// re-announces *what is true* instead of assuming a turn is running, and a
+    /// queued announcement must never displace a live one.
+    state: buzz_sdk::builders::ProjectActivityState,
     announced_at: tokio::time::Instant,
 }
 
@@ -583,21 +622,76 @@ impl ProjectActivityPublisher {
             return Vec::new();
         };
 
-        if TURN_TERMINAL_KINDS.contains(&event.kind.as_str()) {
-            // Only the turn that is actually being shown may clear it. A late
-            // terminal frame from a turn that ended before this one started
-            // would otherwise blank an indicator for work still in progress.
-            match self.live.get(&route.root) {
-                Some(live) if live.turn_id == turn_id => {}
-                _ => return Vec::new(),
+        if event.kind == OBSERVER_PROJECT_QUEUED {
+            // A queued announcement never displaces what is already on the
+            // root, and the direction matters: `working` is a strictly stronger
+            // claim about the same root, made by the same agent, and a second
+            // comment arriving mid-turn would otherwise walk the indicator
+            // backwards from "working — editing files" to "queued" while the
+            // agent was demonstrably still editing files.
+            //
+            // A root already announcing `queued` says nothing new either. The
+            // rendered state is identical, so re-announcing under the newer
+            // event's id would buy a different `turn` tag and nothing else, at
+            // the cost of a relay publish per comment on a backlogged root.
+            if self.live.contains_key(&route.root) {
+                return Vec::new();
             }
+            self.live.insert(
+                route.root.clone(),
+                LiveProjectTurn {
+                    turn_id: turn_id.to_string(),
+                    coordinate: route.coordinate.clone(),
+                    // No stage: nothing is happening yet, and a caption here
+                    // would describe work that has not begun.
+                    stage: None,
+                    state: buzz_sdk::builders::ProjectActivityState::Queued,
+                    announced_at: now,
+                },
+            );
+            return build_project_activity_or_warn(
+                &repo,
+                &route.root,
+                &self.agent_hex,
+                buzz_sdk::builders::ProjectActivityState::Queued,
+                turn_id,
+                None,
+            )
+            .into_iter()
+            .collect();
+        }
+
+        if TURN_TERMINAL_KINDS.contains(&event.kind.as_str()) {
+            // Whatever is cleared is cleared under *its own* turn tag, because
+            // a consumer ignores an `idle` naming a turn it is not showing —
+            // that rule is the reason `idle` is safe at all.
+            let announced = match self.live.get(&route.root) {
+                // Only the turn that is actually being shown may clear it. A
+                // late terminal frame from a turn that ended before this one
+                // started would otherwise blank an indicator for work still in
+                // progress.
+                Some(live) if live.turn_id == turn_id => live.turn_id.clone(),
+                // A queued announcement holds no turn id a terminal frame could
+                // ever match, so the rule above would strand it. It must not:
+                // a turn ending on this root has drained that root's queue — a
+                // flush takes every event pending on the key at once — so work
+                // still announcing itself as queued after one has ended is
+                // stale by construction. This is also the only bound on a
+                // queued announcement that the refresh tick keeps alive
+                // indefinitely, so it is deliberately the widest safe rule
+                // rather than a turn-id match.
+                Some(live) if live.state == buzz_sdk::builders::ProjectActivityState::Queued => {
+                    live.turn_id.clone()
+                }
+                _ => return Vec::new(),
+            };
             self.live.remove(&route.root);
             return build_project_activity_or_warn(
                 &repo,
                 &route.root,
                 &self.agent_hex,
                 buzz_sdk::builders::ProjectActivityState::Idle,
-                turn_id,
+                &announced,
                 None,
             )
             .into_iter()
@@ -608,6 +702,11 @@ impl ProjectActivityPublisher {
         let announce = match self.live.get(&route.root) {
             // A different turn on the same root: announce immediately, so the
             // stale turn's id stops being the one an `idle` must match.
+            //
+            // This is also the queued→working transition, and it needs no rule
+            // of its own: a queued announcement is keyed to the event that
+            // caused it, never to a turn id, so the turn that starts is always
+            // "a different turn" and always replaces it at once.
             Some(live) if live.turn_id != turn_id => true,
             Some(live) => {
                 let moved_on = stage.is_some() && stage != live.stage;
@@ -634,6 +733,7 @@ impl ProjectActivityPublisher {
                 turn_id: turn_id.to_string(),
                 coordinate: route.coordinate.clone(),
                 stage: stage.clone(),
+                state: buzz_sdk::builders::ProjectActivityState::Working,
                 announced_at: now,
             },
         );
@@ -649,7 +749,20 @@ impl ProjectActivityPublisher {
         .collect()
     }
 
-    /// Re-announce every live turn whose last announcement has aged out.
+    /// Re-announce every live root whose last announcement has aged out.
+    ///
+    /// **`queued` refreshes exactly like `working`, and that is a decision.**
+    /// The alternative — announce it once and let the consumer's 45-second
+    /// expiry cap it — is cheaper on the wire and wrong for the only case the
+    /// state exists to cover: a comment waits precisely when the pool is busy,
+    /// which is routinely longer than 45 seconds. Letting it expire would put
+    /// the issue back into silence while the work was still genuinely pending,
+    /// re-creating the ambiguity ("was anyone addressed?") one refresh cycle
+    /// later instead of removing it.
+    ///
+    /// Expiry remains the terminator for a harness that dies, and the terminal
+    /// rule in [`Self::ingest`] is what stops a queued announcement outliving
+    /// the queue it describes.
     fn refresh(&mut self, now: tokio::time::Instant) -> Vec<nostr::EventBuilder> {
         let mut out = Vec::new();
         for (root, live) in self.live.iter_mut() {
@@ -664,7 +777,7 @@ impl ProjectActivityPublisher {
                 &repo,
                 root,
                 &self.agent_hex,
-                buzz_sdk::builders::ProjectActivityState::Working,
+                live.state,
                 &live.turn_id,
                 live.stage.as_deref(),
             ));
@@ -702,6 +815,51 @@ fn build_project_activity_or_warn(
             None
         }
     }
+}
+
+/// Say, on the observer bus, that a project event has been accepted for a turn
+/// that has not started.
+///
+/// This is the producing half of [`OBSERVER_PROJECT_QUEUED`], called from the
+/// dispatch gate the moment the queue accepts the event. It publishes nothing
+/// itself and holds no relay capability: it emits, and
+/// [`ProjectActivityPublisher`] decides whether that becomes a `20003`. Keeping
+/// the decision there is what lets one place — the publisher — answer "what is
+/// this root announcing", instead of the gate and the publisher each having an
+/// opinion.
+///
+/// `None` for the bus is the ordinary configuration in which neither project
+/// routing nor telemetry is on, and is silently nothing to do: an unannounceable
+/// queue insertion must still queue.
+///
+/// `agent_index` is `None` because no agent process is involved yet — that is
+/// the whole content of the signal.
+fn observe_project_event_queued(
+    observer: Option<&observer::ObserverHandle>,
+    origin: &project::ProjectOrigin,
+    event_id: &str,
+) {
+    let Some(observer) = observer else {
+        return;
+    };
+    observer.emit(
+        OBSERVER_PROJECT_QUEUED,
+        None,
+        &observer::ObserverContext {
+            channel_id: None,
+            project: Some(observer::ProjectRouteRef {
+                coordinate: origin.coordinate().to_string(),
+                root: origin.root().to_string(),
+            }),
+            session_id: None,
+            turn_id: Some(queued_turn_id(event_id)),
+            started_at: None,
+        },
+        serde_json::json!({
+            "eventId": event_id,
+            "class": origin.class_noun(),
+        }),
+    );
 }
 
 /// Drive [`ProjectActivityPublisher`] from the observer bus.
@@ -2512,6 +2670,7 @@ async fn tokio_main() -> Result<()> {
                                     seen: &mut project_seen_ids,
                                     agent_pubkey_hex: &pubkey_hex,
                                     startup_watermark,
+                                    observer: observer.as_ref(),
                                 },
                                 project_sibling,
                                 resolved_candidate,
@@ -3645,6 +3804,12 @@ pub(crate) struct ProjectArm<'a> {
     pub(crate) seen: &'a mut ProjectSeenIds,
     pub(crate) agent_pubkey_hex: &'a str,
     pub(crate) startup_watermark: u64,
+    /// The in-process observer bus, when this configuration has one.
+    ///
+    /// Passed down so the gate can say that it queued something —
+    /// [`observe_project_event_queued`]. `None` whenever neither project
+    /// routing nor telemetry is on, in which case nobody is listening.
+    pub(crate) observer: Option<&'a observer::ObserverHandle>,
 }
 
 /// One project event, from arrival to a running turn.
@@ -3740,6 +3905,7 @@ pub(crate) async fn dispatch_and_flush_project_event(
             sibling,
             ledger: arm.ledger,
             resolved_candidate: resolved_candidate.as_ref(),
+            observer: arm.observer,
         },
         arm.seen,
         subscriber,
@@ -4004,6 +4170,15 @@ struct ProjectDispatch<'a> {
     /// Separately fetched, signature-verified root evidence for a directing
     /// comment. It supplies the binding only; the comment remains the authority.
     resolved_candidate: Option<&'a project::EnrolmentCandidate>,
+    /// The in-process observer bus, when this configuration has one.
+    ///
+    /// **Emit-only, and still no relay capability.** The paragraph above holds:
+    /// this cannot open a subscription or send an event. What it can do is say
+    /// that something was queued, onto the same bus every other turn fact
+    /// travels on — which is why the queued signal reaches the wire through
+    /// [`ProjectActivityPublisher`] like every other state, rather than by
+    /// giving the gate a publisher of its own.
+    observer: Option<&'a observer::ObserverHandle>,
 }
 
 /// A NIP-OA lookup that already happened, in the shape [`project::SiblingResolver`]
@@ -4722,6 +4897,23 @@ fn handle_project_event(
                         queued,
                         "project event queued for a turn"
                     );
+                    // Tell the issue, not just the log.
+                    //
+                    // This line and the one above report the same moment, and
+                    // until now only the operator's terminal received it. On the
+                    // root, a comment that woke this agent and a comment that
+                    // addressed nobody looked identical — both were silence —
+                    // until the turn actually started, which on a busy pool is
+                    // minutes away.
+                    //
+                    // Gated on `queued` because the push is what decides:
+                    // `false` means the event was refused (a durable terminal
+                    // disposition, or drop-mode against an in-flight route), and
+                    // announcing work that will never run is a worse signal than
+                    // none. See `queue::EventQueue::push`.
+                    if queued {
+                        observe_project_event_queued(dispatch.observer, &origin, &event.id());
+                    }
                     ProjectDispatched::Queued {
                         key,
                         queued,
@@ -5770,6 +5962,11 @@ mod project_discovery_ingestion_tests {
             sibling: None,
             ledger,
             resolved_candidate: None,
+            // No bus: these cases are about what dispatch *decides*, and the
+            // queued announcement is a consequence of the decision rather than
+            // part of it. `a_queued_project_event_is_announced_on_its_root`
+            // drives the seam with a real bus.
+            observer: None,
         }
     }
 
@@ -5803,6 +6000,7 @@ mod project_discovery_ingestion_tests {
             sibling,
             ledger,
             resolved_candidate: None,
+            observer: None,
         }
     }
 
@@ -12261,6 +12459,9 @@ mod project_activity_tests {
 
     const ROOT: &str = "48be1cc2000000000000000000000000000000000000000000000000000000ab";
     const OTHER_ROOT: &str = "48be1cc2000000000000000000000000000000000000000000000000000000cd";
+    /// The comment event id a queued announcement is named after.
+    const COMMENT: &str = "9f3a0000000000000000000000000000000000000000000000000000000000ef";
+    const OTHER_COMMENT: &str = "9f3a000000000000000000000000000000000000000000000000000000000012";
 
     fn coordinate() -> String {
         format!("30617:{}:buzz", "a".repeat(64))
@@ -12283,6 +12484,23 @@ mod project_activity_tests {
             started_at: Some("2026-08-02T00:00:00Z".to_string()),
             payload: serde_json::json!({}),
         }
+    }
+
+    /// The frame the dispatch gate emits when it queues a comment.
+    ///
+    /// Built through [`observe_project_event_queued`] rather than by hand, so
+    /// these cases are driven by the production emitter: a queued frame that
+    /// stopped carrying its route, or its `queued:` turn id, would fail here
+    /// rather than pass against a fixture that still described the old shape.
+    fn queued_frame(root: &str, event_id: &str) -> observer::ObserverEvent {
+        let bus = observer::ObserverHandle::in_process();
+        let mut rx = bus.subscribe();
+        observe_project_event_queued(
+            Some(&bus),
+            &crate::project::ProjectOrigin::for_test(&coordinate(), root, false),
+            event_id,
+        );
+        rx.try_recv().expect("the gate emitted nothing")
     }
 
     /// A channel turn's frame: the control for every project assertion below.
@@ -12434,6 +12652,170 @@ mod project_activity_tests {
             "finishing one root must leave the other announcing"
         );
         assert_eq!(tag_of(&refreshed[0], "e").as_deref(), Some(OTHER_ROOT));
+    }
+
+    /// The gap this phase closes: a comment is accepted, and the issue says so
+    /// before any agent process exists.
+    ///
+    /// Until this frame, "an agent picked this up and is waiting for a slot"
+    /// and "nobody was addressed" produced the identical wire — nothing — so a
+    /// person could not tell them apart until a turn started, which on a busy
+    /// pool is minutes.
+    #[test]
+    fn a_queued_event_announces_queued_before_any_turn_exists() {
+        let (mut state, keys) = publisher();
+        let now = tokio::time::Instant::now();
+
+        let events = signed(&keys, state.ingest(&queued_frame(ROOT, COMMENT), now));
+        assert_eq!(events.len(), 1, "queueing must reach the root promptly");
+        let event = &events[0];
+
+        assert_eq!(
+            event.kind.as_u16(),
+            buzz_core::kind::KIND_PROJECT_ACTIVITY as u16
+        );
+        assert_eq!(tag_of(event, "state").as_deref(), Some("queued"));
+        assert_eq!(tag_of(event, "e").as_deref(), Some(ROOT));
+        assert_eq!(tag_of(event, "a").as_deref(), Some(coordinate().as_str()));
+        assert_eq!(
+            tag_of(event, "turn").as_deref(),
+            Some(queued_turn_id(COMMENT).as_str()),
+            "a queued frame names the comment that caused it: no turn exists yet"
+        );
+        assert_eq!(
+            tag_of(event, "stage"),
+            None,
+            "nothing is happening yet — a caption here would describe work that has not begun"
+        );
+        assert_eq!(tag_of(event, "h"), None, "an issue is still not a channel");
+    }
+
+    /// The turn that starts takes the root over, under its own turn id.
+    #[test]
+    fn a_started_turn_replaces_the_queued_announcement() {
+        let (mut state, keys) = publisher();
+        let now = tokio::time::Instant::now();
+        state.ingest(&queued_frame(ROOT, COMMENT), now);
+
+        let started = signed(
+            &keys,
+            state.ingest(&project_frame("turn_started", ROOT, "t1"), now),
+        );
+        assert_eq!(
+            started.len(),
+            1,
+            "the turn must supersede the queued frame at once, not on the next tick"
+        );
+        assert_eq!(tag_of(&started[0], "state").as_deref(), Some("working"));
+        assert_eq!(tag_of(&started[0], "turn").as_deref(), Some("t1"));
+
+        let refreshed = signed(&keys, state.refresh(now + PROJECT_ACTIVITY_REFRESH));
+        assert_eq!(
+            refreshed.len(),
+            1,
+            "one root announces one thing: the queued entry outlived the turn that replaced it"
+        );
+        assert_eq!(tag_of(&refreshed[0], "state").as_deref(), Some("working"));
+    }
+
+    /// A comment that arrives while the agent is already working says nothing.
+    ///
+    /// The root is already announcing something stronger and truer about the
+    /// same agent. Announcing `queued` over it would walk the indicator
+    /// backwards from "working — editing files" while it was demonstrably
+    /// editing files, and the comment is going into the same root's queue,
+    /// which the running turn's own completion will flush.
+    #[test]
+    fn a_comment_arriving_mid_turn_does_not_walk_the_indicator_back() {
+        let (mut state, _keys) = publisher();
+        let now = tokio::time::Instant::now();
+        state.ingest(&project_frame("turn_started", ROOT, "t1"), now);
+        state.ingest(&project_frame("acp_write", ROOT, "t1"), now);
+
+        assert!(
+            state.ingest(&queued_frame(ROOT, COMMENT), now).is_empty(),
+            "a second comment demoted a live turn to queued"
+        );
+    }
+
+    /// `queued` does not outlive the queue it describes.
+    ///
+    /// Two shapes, one rule. The ordinary one is queued → working → terminal,
+    /// where the turn's own id clears it. The other is a terminal for a turn
+    /// this publisher never saw start — a dropped frame on a lagged bus — where
+    /// the queued announcement holds no turn id the terminal could match. It
+    /// must still go: a turn ending on this root drained that root's queue, so
+    /// there is nothing left for the announcement to be about, and the refresh
+    /// tick would otherwise keep saying `queued` forever.
+    #[test]
+    fn a_queued_announcement_does_not_survive_a_terminal_frame() {
+        let (mut state, keys) = publisher();
+        let now = tokio::time::Instant::now();
+
+        state.ingest(&queued_frame(ROOT, COMMENT), now);
+        state.ingest(&project_frame("turn_started", ROOT, "t1"), now);
+        let cleared = signed(
+            &keys,
+            state.ingest(&project_frame("turn_completed", ROOT, "t1"), now),
+        );
+        assert_eq!(tag_of(&cleared[0], "state").as_deref(), Some("idle"));
+        assert!(state.refresh(now + PROJECT_ACTIVITY_REFRESH * 2).is_empty());
+
+        // The lagged-bus shape: queued, then a terminal for a turn whose start
+        // never reached this publisher.
+        let (mut state, keys) = publisher();
+        state.ingest(&queued_frame(ROOT, COMMENT), now);
+        let cleared = signed(
+            &keys,
+            state.ingest(&project_frame("turn_completed", ROOT, "t9"), now),
+        );
+        assert_eq!(cleared.len(), 1, "the queued announcement was stranded");
+        assert_eq!(tag_of(&cleared[0], "state").as_deref(), Some("idle"));
+        assert_eq!(
+            tag_of(&cleared[0], "turn").as_deref(),
+            Some(queued_turn_id(COMMENT).as_str()),
+            "an idle naming the terminal's turn is ignored by every consumer — \
+             it must name the announcement it is retiring"
+        );
+        assert!(
+            state.refresh(now + PROJECT_ACTIVITY_REFRESH * 2).is_empty(),
+            "a retired queued root came back on the next tick"
+        );
+    }
+
+    /// A comment still waiting for a slot keeps saying so.
+    ///
+    /// The alternative — announce once and let the consumer's 45-second expiry
+    /// cap it — fails the only case `queued` exists for: a comment waits
+    /// exactly when the pool is busy, which is routinely longer than that, and
+    /// the issue would fall back into the silence this state was added to break.
+    #[test]
+    fn a_waiting_root_keeps_announcing_queued() {
+        let (mut state, keys) = publisher();
+        let now = tokio::time::Instant::now();
+        state.ingest(&queued_frame(ROOT, COMMENT), now);
+
+        let refreshed = signed(&keys, state.refresh(now + PROJECT_ACTIVITY_REFRESH));
+        assert_eq!(refreshed.len(), 1);
+        assert_eq!(tag_of(&refreshed[0], "state").as_deref(), Some("queued"));
+        assert_eq!(
+            tag_of(&refreshed[0], "turn").as_deref(),
+            Some(queued_turn_id(COMMENT).as_str())
+        );
+    }
+
+    /// A second comment on a root already announcing `queued` is not a second
+    /// announcement. The rendered state is identical, so re-announcing would
+    /// buy a different `turn` tag and nothing else — at one relay publish per
+    /// comment on a root that is, by definition, backlogged.
+    #[test]
+    fn a_second_comment_on_a_queued_root_announces_nothing_new() {
+        let (mut state, _keys) = publisher();
+        let now = tokio::time::Instant::now();
+        assert_eq!(state.ingest(&queued_frame(ROOT, COMMENT), now).len(), 1);
+        assert!(state
+            .ingest(&queued_frame(ROOT, OTHER_COMMENT), now)
+            .is_empty());
     }
 
     /// Chatter does not become a stream of announcements, but a live turn does
@@ -13032,6 +13414,13 @@ for line in sys.stdin:
         ctx: Arc<PromptContext>,
         typing: HashMap<uuid::Uuid, crate::queue::ThreadTags>,
         subscriber: NoopSubscriber,
+        /// The observer bus, when a scenario wants to read what the arm said.
+        ///
+        /// `None` by default so every pre-existing case keeps driving the arm
+        /// with the bus absent — the configuration where neither project
+        /// routing nor telemetry is on — and nothing here starts depending on a
+        /// bus it never asked for.
+        observer: Option<observer::ObserverHandle>,
     }
 
     impl Runtime {
@@ -13074,6 +13463,7 @@ for line in sys.stdin:
                 ctx,
                 typing: HashMap::new(),
                 subscriber: NoopSubscriber,
+                observer: None,
             }
         }
 
@@ -13100,6 +13490,7 @@ for line in sys.stdin:
                     seen: &mut self.seen,
                     agent_pubkey_hex: &agent_hex,
                     startup_watermark: 0,
+                    observer: self.observer.as_ref(),
                 },
                 None,
                 candidate,
@@ -13190,6 +13581,84 @@ for line in sys.stdin:
             rt.typing.is_empty(),
             "a project route key names no channel — a typing frame would be h-tagged to nothing"
         );
+    }
+
+    /// The issue hears about the comment before the agent does.
+    ///
+    /// End-to-end through every joint of the new path: the dispatch gate queues
+    /// the event and says so on the observer bus, the activity publisher folds
+    /// that into NIP-PA, and a signed `20003` carrying `state=queued` reaches
+    /// the relay — all before any turn has started. Each part is proved on its
+    /// own elsewhere; what is only visible here is that they are *connected*,
+    /// which is exactly the class of defect this module exists for.
+    ///
+    /// The child is deliberately observer-less, so nothing but the gate can put
+    /// a frame on this bus: a `queued` that only appeared because a turn had
+    /// already begun would be no signal at all.
+    #[tokio::test]
+    async fn a_queued_project_event_is_announced_on_its_root_before_any_turn() {
+        let recorder = PromptRecorder::new();
+        let mut rt = Runtime::new(&recorder).await;
+        rt.discover("demo").await;
+
+        let bus = observer::ObserverHandle::in_process();
+        let rx = bus.subscribe();
+        rt.observer = Some(bus);
+        let agent_hex = rt.agent.public_key().to_hex().to_ascii_lowercase();
+        let (publisher, mut published) = relay::RelayEventPublisher::test_pair();
+        let task = tokio::spawn(run_project_activity_publisher(
+            rx,
+            publisher,
+            rt.agent.clone(),
+            agent_hex.clone(),
+        ));
+
+        let root = issue_root(&rt.owner, &rt.agent, "demo");
+        let root_id = root.id.to_hex();
+        let dispatched = rt
+            .drive(&routed(root, project::ProjectSubscription::Enrolment).await)
+            .await;
+        assert!(
+            matches!(dispatched, ProjectDispatched::Queued { queued: true, .. }),
+            "precondition: the event must be admitted — got {dispatched:?}"
+        );
+
+        let event = tokio::time::timeout(Duration::from_secs(5), published.recv())
+            .await
+            .expect("nothing reached the relay within 5s: the gap is still silent")
+            .expect("publisher channel closed");
+        task.abort();
+
+        let tag = |key: &str| {
+            event.tags.iter().find_map(|t| {
+                let s = t.as_slice();
+                (s.first().map(String::as_str) == Some(key))
+                    .then(|| s.get(1).cloned())
+                    .flatten()
+            })
+        };
+        assert_eq!(
+            event.kind.as_u16(),
+            buzz_core::kind::KIND_PROJECT_ACTIVITY as u16
+        );
+        assert_eq!(tag("state").as_deref(), Some("queued"));
+        assert_eq!(
+            tag("e").as_deref(),
+            Some(root_id.as_str()),
+            "the announcement must land on the root the comment is on"
+        );
+        assert_eq!(
+            tag("a").as_deref(),
+            Some(format!("30617:{}:demo", rt.owner.public_key().to_hex()).as_str()),
+            "the repository coordinate must travel with it"
+        );
+        assert_eq!(
+            tag("turn").as_deref(),
+            Some(queued_turn_id(&root_id).as_str()),
+            "no turn exists yet, so the frame is named after the event that queued"
+        );
+        assert_eq!(tag("agent").as_deref(), Some(agent_hex.as_str()));
+        assert_eq!(tag("h"), None, "a root is not a channel");
     }
 
     /// One root delivered on two subscriptions is one turn.

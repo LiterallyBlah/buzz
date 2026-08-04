@@ -59,7 +59,7 @@ Ephemeral (20000–29999): relays fan it out and never store it.
 | `a` | exactly 1 | `30617:<owner>:<identifier>` repository coordinate |
 | `e` | exactly 1 | issue/PR root event id, marked `root` |
 | `agent` | exactly 1 | the working agent's pubkey, 64 lowercase hex |
-| `state` | exactly 1 | `working` or `idle` |
+| `state` | exactly 1 | `queued`, `working` or `idle` |
 | `turn` | exactly 1 | opaque per-turn identifier |
 
 `stage` is optional: at most one, a short human-readable label for what the
@@ -80,14 +80,33 @@ finished ten seconds ago clears the indicator for the turn that started two
 seconds ago, and the agent appears idle while it is working.
 
 A consumer MUST therefore ignore an `idle` whose `turn` is not the turn it is
-currently showing as working.
+currently showing.
+
+A `queued` frame is the one state announced before any turn exists, so it has no
+turn id to carry. It names **the event that caused the queueing** instead, as
+`queued:<event_id>`. This is still opaque to a consumer and still unique; what
+it must not do is expect a later frame to reuse it. The `working` that follows
+carries the real turn id and supersedes the queued frame *by root*, not by turn.
 
 ### States
 
 | State | Meaning |
 |---|---|
+| `queued` | This agent has accepted work on this root that has not started. |
 | `working` | This agent is working on this root, as of `created_at`. |
-| `idle` | The named turn has ended — completed, failed or cancelled. |
+| `idle` | The named announcement has ended — completed, failed or cancelled. |
+
+`queued` exists because the alternative to it is not a smaller signal but an
+ambiguous one. Between the comment reaching the relay and the first `working`,
+an agent that had picked the comment up and an agent that was never addressed
+produced the identical wire — nothing — and that interval is as long as the pool
+is busy, routinely minutes. With `queued` published at dispatch, silence means
+one thing: nobody was addressed.
+
+It is a state rather than a `working` with a `stage` of "queued" because it is a
+different claim. `stage` is presentation — a label for work in progress — and
+nothing is in progress yet. A consumer that treated the two alike would show a
+progress indicator for an agent that has not started.
 
 `idle` is deliberately one state, not three. This event answers "is anything
 happening on this issue right now"; *what* happened is the business of the
@@ -95,16 +114,36 @@ comment the agent posts and of the owner-scoped telemetry in NIP-AO, both of
 which say it durably. Splitting the terminal state here would put a second,
 weaker account of the outcome on a wire that is not stored.
 
+A consumer MUST NOT let a `queued` displace a `working` from the same agent on
+the same root that is not older than it. The two belong to different `turn`s by
+construction, so the ordinary same-turn ordering check cannot pair them, and
+`created_at` is whole seconds — the queued frame and the turn's first `working`
+routinely share one. Delivered in the wrong order, an unguarded consumer walks
+the indicator backwards from "working" to "queued" for a full refresh cycle.
+
 ### Refresh and expiry
 
 The event is ephemeral, so a client that opens an issue mid-turn has missed
-every frame already sent. A working agent MUST therefore re-publish `working`
+every frame already sent. An agent MUST therefore re-publish its current state
 periodically — the reference implementation every 15 seconds — and a consumer
-MUST treat a `working` state older than **45 seconds** as expired.
+MUST treat any state older than **45 seconds** as expired.
+
+`queued` refreshes on the same cadence as `working`, and that is deliberate. The
+cheaper alternative — announce it once and let the 45-second expiry cap it —
+fails the only case the state exists for: a comment waits precisely when the
+pool is busy, which is routinely longer than 45 seconds, so the issue would fall
+back into silence while the work was still genuinely pending. That would move
+the ambiguity one refresh cycle later rather than remove it.
 
 The expiry is the real terminator. An `idle` is an optimisation that clears the
 indicator promptly; a harness that is killed mid-turn sends no `idle` at all,
 and a consumer that waited for one would show that agent as working forever.
+
+A publisher MUST NOT refresh `queued` for a root whose queue has drained. In the
+reference implementation any terminal frame on the root retires a still-`queued`
+announcement, under that announcement's own `turn` — an `idle` naming the
+turn that just ended would be ignored by every consumer, by the rule above.
+This is what bounds an indefinitely refreshed state.
 
 ## Consumers
 
@@ -147,5 +186,11 @@ rule.
 - Emission: `crates/buzz-acp/src/lib.rs` — the observer publisher projects a
   project-routed turn's lifecycle onto this wire; `crates/buzz-acp/src/pool.rs`
   binds the route from the flushed batch's project origin.
-- Consumer: `desktop/src/features/projects/projectActivityStore.ts` and
+- `queued`: also `crates/buzz-acp/src/lib.rs` — the dispatch gate emits a
+  synthetic `project_event_queued` frame onto the same in-process observer bus
+  the moment the queue accepts the event, so the publisher stays the single
+  authority on what a root is announcing. A gate with its own publisher would be
+  a second opinion about which root is live, and the two would disagree the
+  first time either missed a frame.
+- Consumer: `desktop/src/features/projects/projectAgentActivity.ts` and
   `desktop/src/shared/api/projectActivityRelay.ts`.
