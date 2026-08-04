@@ -61,18 +61,26 @@ pub fn build_imeta_tag(d: &BlobDescriptor) -> Vec<String> {
 }
 
 /// MIME types accepted for upload.
+///
+/// Narrower than the server on purpose: the relay's `/upload` route takes
+/// anything outside its XSS/executable denylist, and this list admits only
+/// what someone has actually needed to ship through the CLI. Archives are the
+/// sanctioned wrapper for binaries — a native installer is denied by the
+/// server as executable content, and zipped it is data the recipient must
+/// deliberately unpack.
 const ALLOWED_MIMES: &[&str] = &[
     "image/jpeg",
     "image/png",
     "image/gif",
     "image/webp",
     "video/mp4",
+    "application/zip",
 ];
 
 /// Maximum file size for image uploads (50 MB).
 const MAX_IMAGE_BYTES: u64 = 50 * 1024 * 1024;
 
-/// Maximum file size for video uploads (500 MB).
+/// Maximum file size for video and archive uploads (500 MB).
 const MAX_VIDEO_BYTES: u64 = 500 * 1024 * 1024;
 
 /// Sign a NIP-98 HTTP auth event (kind:27235) and return the Authorization header value.
@@ -1117,11 +1125,12 @@ impl BuzzClient {
             return Err(CliError::Usage(format!("unsupported file type: {mime}")));
         }
 
-        // 3. Size check
-        let max = if mime.starts_with("video/") {
-            MAX_VIDEO_BYTES
-        } else {
+        // 3. Size check — images keep the tight cap; video and archives share
+        // the large one, since both are legitimately tens-to-hundreds of MB.
+        let max = if mime.starts_with("image/") {
             MAX_IMAGE_BYTES
+        } else {
+            MAX_VIDEO_BYTES
         };
         if bytes.len() as u64 > max {
             return Err(CliError::Usage(format!(
@@ -1136,10 +1145,10 @@ impl BuzzClient {
 
         // 5. PUT request to the BUD-02 /upload endpoint with a generous timeout.
         // Auth is signed per attempt — matches the per-attempt signing pattern in download_media.
-        let upload_timeout = if mime.starts_with("video/") {
-            Duration::from_secs(600)
-        } else {
+        let upload_timeout = if mime.starts_with("image/") {
             Duration::from_secs(120)
+        } else {
+            Duration::from_secs(600)
         };
         let url = format!("{}/upload", self.relay_url);
         let upload_body = bytes::Bytes::from(bytes);
