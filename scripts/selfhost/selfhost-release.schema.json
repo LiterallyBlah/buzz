@@ -1,0 +1,130 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://buzz.xyz/schema/selfhost-release.json",
+  "title": "Buzz self-hosted release manifest",
+  "description": "Describes one candidate for the private Buzz deployment. Sibling of .release/desktop-candidate.json: same 'schema' integer discipline, same rule that the document is a statement of fact about artifacts that already exist, never a request to go build or fetch something. Prose lives in scripts/selfhost/release-manifest.md; policy lives in docs/selfhost-releases.md. The normative validator is scripts/selfhost/mint-manifest.py, which reads THIS file so the two can never drift.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "name",
+    "source_commit",
+    "components",
+    "deploy_order",
+    "migrations",
+    "promoted_by",
+    "notes"
+  ],
+  "properties": {
+    "schema": {
+      "const": 1,
+      "description": "Manifest format version. Bump only for incompatible changes; the deployer refuses anything it was not written against, because a deployer that guesses at an unknown field is a deployer that installs the wrong binary."
+    },
+    "name": {
+      "type": "string",
+      "pattern": "^[a-z0-9](?:[a-z0-9._-]{0,38}[a-z0-9])?$",
+      "description": "Release label. Deliberately narrow: this string becomes a Docker tag component, a backup directory name, an inbox directory name and part of a rollback binary's filename. Anything that could be read as a path separator, a shell metacharacter or a tag delimiter is rejected here rather than sanitised at four downstream call sites."
+    },
+    "source_commit": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$",
+      "description": "Full 40-hex commit the artifacts were built from. The deployer refuses to run unless the build repo's HEAD equals this, so a manifest can never be paired with a tree it does not describe."
+    },
+    "previous_commit": {
+      "type": ["string", "null"],
+      "pattern": "^[0-9a-f]{40}$",
+      "description": "Commit believed to be live when the manifest was minted. Advisory only: the deployer re-derives the live commit from the running BUZZ_IMAGE tag at preflight time, because the box is the authority on what the box is running."
+    },
+    "created_at": {
+      "type": "string",
+      "description": "UTC ISO-8601 mint time. Advisory; nothing gates on it."
+    },
+    "components": {
+      "type": "object",
+      "description": "What this release replaces. A subset: a relay-only or an agent-only release is a normal, encouraged shape, because the smallest change that fixes the problem is the safest change to ship.",
+      "minProperties": 1,
+      "additionalProperties": false,
+      "properties": {
+        "relay-image": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["image", "image_id"],
+          "properties": {
+            "image": {
+              "type": "string",
+              "pattern": "^buzz-local:[A-Za-z0-9._-]+$",
+              "description": "Tag written into /opt/buzz/relay/.env as BUZZ_IMAGE. Restricted to the buzz-local: namespace on purpose: a registry-qualified tag would invite the deployer to pull, and the deployer never reaches the network for artifacts."
+            },
+            "image_id": {
+              "type": "string",
+              "pattern": "^sha256:[0-9a-f]{64}$",
+              "description": "Docker's content id for that tag (docker image inspect --format '{{.Id}}'). A tag is a mutable pointer; this is the identity. The deployer refuses if the tag resolves to a different id than the one that was tested."
+            }
+          }
+        },
+        "acp": {
+          "$ref": "#/$defs/binaryComponent",
+          "description": "The buzz-acp agent binary, installed to /opt/buzz/bin/buzz-acp (root-owned) and picked up by buzz-claude.service and buzz-codex.service on restart."
+        },
+        "cli": {
+          "$ref": "#/$defs/binaryComponent",
+          "description": "The buzz CLI, installed to /opt/buzz/bin/buzz (hermes-owned). No service restart: the next invocation gets the new binary."
+        }
+      }
+    },
+    "deploy_order": {
+      "type": "array",
+      "description": "Exact order the deployer walks components. Must be a permutation of the keys of `components` — not a subset, not a superset. If relay-image is present it must come first: the relay is the leg every other component stands on, so it moves first and is proven healthy before anything else moves.",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "enum": ["relay-image", "acp", "cli"]
+      }
+    },
+    "migrations": {
+      "type": "string",
+      "enum": ["none", "backward-safe", "ack-required"],
+      "description": "Classification of the migrations/ delta between the live commit and source_commit. `none`: the delta is empty — the schema-neutral fast lane, and the only class an unattended inbox drop may carry. `backward-safe`: the delta is non-empty and every migration in it is expand-only, so the previous binary still runs against the new schema and a binary rollback is clean. `ack-required`: the delta is non-empty and contains at least one change the previous binary cannot tolerate — rollback will not restore service without a database restore. The classification is a human judgement about SQL; nothing auto-derives it, and the deployer only ever checks that the manifest does not UNDERSTATE what git actually shows."
+    },
+    "promoted_by": {
+      "type": ["object", "null"],
+      "description": "RESERVED — Phase 2 authorization slot. Must be null in Phase 1. A non-null value is rejected rather than ignored: a manifest that claims an approval nothing verifies is strictly worse than a manifest that claims nothing, because it reads like authority in an audit log. Phase 2 replaces the single gate_authorization() function in deploy.sh with real signature verification and this schema's `null` allowance is dropped in the same change. Anticipated shape: {\"kind\": \"owner-approval\", \"pubkey\": \"<64-hex>\", \"event\": \"<64-hex>\", \"sig\": \"<128-hex>\"}.",
+      "properties": {
+        "kind": { "type": "string" },
+        "pubkey": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "event": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "sig": { "type": "string", "pattern": "^[0-9a-f]{128}$" }
+      }
+    },
+    "notes": {
+      "type": "string",
+      "description": "Free text for the human reading the journal at 3am. What changed, what to watch, what to do if it goes wrong. May be empty, but an empty notes field on a migration-bearing release is a smell."
+    }
+  },
+  "$defs": {
+    "binaryComponent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["artifact", "sha256", "bytes"],
+      "properties": {
+        "artifact": {
+          "type": "string",
+          "description": "Path to the built binary, relative to the artifact root (which defaults to the directory holding the manifest). Relative and traversal-free by construction — see the pattern and the `not` clause. The deployer runs as root; an absolute path or a `..` here would let a manifest author choose which file root copies, which is the whole ballgame.",
+          "pattern": "^[A-Za-z0-9._][A-Za-z0-9._/-]*$",
+          "not": { "pattern": "(^|/)\\.\\.(/|$)" }
+        },
+        "sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$",
+          "description": "SHA-256 of the artifact. Verified at preflight and AGAIN immediately before install, because the interesting window is between those two moments."
+        },
+        "bytes": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Artifact size. Used for the free-space preflight and as a cheap mismatch tripwire before the expensive hash."
+        }
+      }
+    }
+  }
+}

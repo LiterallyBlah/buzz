@@ -1,0 +1,44 @@
+# buzz-deployer.path — the release inbox trigger.
+#
+# WHY A PATH UNIT AND NOT A TIMER
+#
+#   A deploy is an event, not a schedule. A timer would ask "is there anything
+#   to ship?" every N minutes and, worse, would happily re-ship on its own
+#   cadence if anything ever went wrong with the archive step. A path unit
+#   fires exactly once per arrival and stays quiet otherwise.
+#
+# HOW THE EDGE WORKS, AND WHY THE ARCHIVE STEP IS LOAD-BEARING
+#
+#   PathExistsGlob triggers the service when the glob matches, and will not
+#   trigger again until the glob stops matching. deploy.sh moves each release
+#   out of incoming/ into processed/ whether it succeeded or failed, which
+#   makes the glob go false and re-arms the trigger for the next drop. If the
+#   deployer ever failed to archive, this unit would go quiet rather than spin
+#   — deliberate: a stuck release should wait for a human, not retry forever
+#   against a box that is already unhappy.
+#
+#   deploy.sh takes the OLDEST release per run, so a burst of drops drains one
+#   at a time. That is the only way "relay first, prove it healthy, then
+#   agents" stays meaningful: two releases interleaving would violate it.
+#
+# THE DROP PROTOCOL (mint-manifest.py --stage implements it)
+#
+#   Assemble into /opt/buzz/releases/incoming/.staging-<name>/ and rename to
+#   /opt/buzz/releases/incoming/<name>/ when complete. rename(2) within one
+#   filesystem is atomic, so this glob never matches a half-copied release.
+#   Writing manifest.json first and then copying two 17 MB binaries beside it
+#   would wake the deployer up to a release that is not all there yet. (The
+#   hash checks would catch it and refuse — but refusing a release that was
+#   merely still arriving is a false alarm, and false alarms train people to
+#   ignore real ones.)
+#
+[Unit]
+Description=Watch the Buzz release inbox for a complete drop
+Documentation=file:/opt/buzz/scripts/selfhost/units/README.md
+
+[Path]
+PathExistsGlob=/opt/buzz/releases/incoming/*/manifest.json
+Unit=buzz-deployer.service
+
+[Install]
+WantedBy=multi-user.target
