@@ -34,5 +34,7 @@
 # you the truth.
 # =============================================================================
 
-project::tests::a_handle_that_only_starts_with_our_name_is_not_our_mention | buzz-acp mention tokenizer WIP: handle-prefix matching is mid-rewrite on this branch; the test encodes the target behaviour, the code has not landed it yet. Delete this line when the tokenizer rewrite lands. | 2026-08-04
-project::tests::a_hyphenated_handle_is_one_whole_mention_token | buzz-acp mention tokenizer WIP: hyphenated-handle tokenization is part of the same in-flight rewrite as the line above; both die together. | 2026-08-04
+# No waivers. The mention-tokenizer pair that lived here landed on 2026-08-04
+# and both tests are green, so the lines were deleted rather than left to be
+# reported STALE. Adding one back is a deliberate act: write the reason as the
+# work that will remove it again.

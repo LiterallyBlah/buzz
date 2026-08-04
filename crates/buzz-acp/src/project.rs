@@ -7092,26 +7092,86 @@ pub(crate) fn history_order_key(root: &str, event_id: &str, created_at: u64) -> 
 
 // ── Mention syntax ────────────────────────────────────────────────────────────
 
-/// Characters that can appear *inside* a mention token.
+/// Characters that are *unconditionally* part of a mention token.
 ///
-/// Unicode alphanumeric plus `_` and `-`. Deliberately not tied to either key
-/// alphabet: a token ends where the lexer says, not where the key's alphabet
-/// runs out. "Is the next character another hex digit" accepted
-/// `@<64-hex>garbage`.
+/// Unicode alphanumeric plus `_`. Deliberately not tied to either key alphabet:
+/// a token ends where the lexer says, not where the key's alphabet runs out.
+/// "Is the next character another hex digit" accepted `@<64-hex>garbage`.
 ///
-/// The hyphen is here because display handles are written with it, and it is
-/// the difference between reading `@hermes-gateway` as one address and reading
-/// it as `@hermes` followed by noise. That matters in both directions: an agent
-/// called `Claude` must not answer `@claude-bot`, and an agent called
-/// `hermes-gateway` must still be found by its whole name.
+/// The hyphen is **not** here, even though display handles are written with it,
+/// because whether a hyphen belongs to the token depends on what surrounds it.
+/// That judgement lives in [`mention_char_at`], which is what the boundary
+/// checks call. This predicate is the context-free half; anything holding a
+/// position should ask the contextual one.
 fn is_mention_char(c: char) -> bool {
     c.is_alphanumeric() || c == '_'
 }
 
+/// The character a hyphenated handle is written with.
+const MENTION_JOINER: char = '-';
+
+/// Is the character at byte offset `at` part of a mention token, *here*?
+///
+/// Everything [`is_mention_char`] accepts always is. The hyphen is admitted
+/// only when it **joins** — when the run of hyphens it belongs to has an
+/// ordinary mention character on both sides. That is what makes
+/// `@hermes-gateway` one address rather than `@hermes` followed by noise, and
+/// it matters in both directions: an agent called `Claude` must not answer
+/// `@claude-bot`, and an agent called `hermes-gateway` must still be found by
+/// its whole name.
+///
+/// A hyphen that joins nothing is prose, not part of a name: `@Claude - one
+/// more thing`, `@Claude--`, `@claude-` and a `- @Claude` bullet all still name
+/// `Claude`. The two halves of the rule fail in opposite directions, which is
+/// why the split is where it is. Swallowing a dangling dash into the token
+/// loses a mention somebody plainly typed — the agent stays silent when it was
+/// asked. Splitting a joining dash reads somebody else's handle as ours, which
+/// does not merely fail to suppress a turn: it *manufactures* one, on the exact
+/// comment that named the agent the work was for. So the dash is given to the
+/// token only when there is a name on the far side of it to join to.
+///
+/// Whole *runs* are judged, not single characters, so `@hermes--gateway` is one
+/// token as well. Judging one character at a time would let a doubled dash
+/// smuggle a prefix match past the rule a single dash is subject to.
+///
+/// `at` is a byte offset into `text` and must be a char boundary; every caller
+/// derives one from a `find` on an ASCII prefix or from a decoded char. An
+/// offset at the end of `text` is not a token character, which is what makes
+/// end-of-content a boundary.
+fn mention_char_at(text: &str, at: usize) -> bool {
+    let Some(c) = text[at..].chars().next() else {
+        return false;
+    };
+    if c != MENTION_JOINER {
+        return is_mention_char(c);
+    }
+    // Skip the rest of the run in both directions: what decides a joiner is the
+    // first ordinary character on each side, not the next dash along.
+    let after = text[at..].chars().find(|c| *c != MENTION_JOINER);
+    let before = text[..at].chars().rev().find(|c| *c != MENTION_JOINER);
+    before.is_some_and(is_mention_char) && after.is_some_and(is_mention_char)
+}
+
+/// Does a mention token run right up to byte offset `at`?
+///
+/// The leading-boundary half of [`mention_char_at`]: the same question, asked
+/// of the character immediately *before* `at` and judged in that character's
+/// own context. Start of content answers no, which is what makes it a boundary.
+fn mention_char_before(text: &str, at: usize) -> bool {
+    text[..at]
+        .chars()
+        .next_back()
+        .is_some_and(|c| mention_char_at(text, at - c.len_utf8()))
+}
+
 /// Characters a mention token may *begin* with.
 ///
-/// A token has to name something. `-` continues a handle but cannot open one,
-/// so a stray `@-` in prose is punctuation rather than an address.
+/// A token has to name something. A hyphen only ever joins two names
+/// ([`mention_char_at`]) and there is nothing to its left inside the token to
+/// join, so a stray `@-` in prose is punctuation rather than an address. Spelt
+/// out rather than delegated to [`is_mention_char`]: excluding the hyphen from
+/// token *starts* is its own decision and must not quietly follow whoever edits
+/// the interior alphabet next.
 fn opens_mention_token(c: char) -> bool {
     c.is_alphanumeric() || c == '_'
 }
@@ -7126,11 +7186,18 @@ const MENTION_PREFIXES: [&str; 2] = ["nostr:", "@"];
 /// scanned, so prose mentioning an identity followed by a genuine mention still
 /// resolves.
 ///
-/// Boundaries are [`is_mention_char`], so a display name that is a *prefix* of
+/// Boundaries are [`mention_char_at`], so a display name that is a *prefix* of
 /// somebody else's handle does not match it: an agent called `Claude` reads
 /// `@claude-bot` as a mention of `claude-bot`, which is not its name. Before
-/// the hyphen was admitted into the token, that comment named this agent and
-/// woke it.
+/// the hyphen could hold a token together, the trailing-boundary check landed
+/// on the `-`, found no reason to stop there, and that comment named this agent
+/// and woke it.
+///
+/// The identity is matched literally, so the same rule serves both alphabets:
+/// a display handle carries its own hyphens into the needle, and hex and bech32
+/// contain none, so for a key the hyphen only ever decides an *edge* —
+/// `@<key>-2` is a different token, `nostr:<key> - please look` is a dash in
+/// prose.
 fn explicit_mention_present(content: &str, identity: &str) -> bool {
     if identity.is_empty() {
         return false;
@@ -7144,14 +7211,8 @@ fn explicit_mention_present(content: &str, identity: &str) -> bool {
         while let Some(offset) = lower[from..].find(&needle) {
             let start = from + offset;
             let end = start + needle.len();
-            let leading_ok = lower[..start]
-                .chars()
-                .next_back()
-                .is_none_or(|c| !is_mention_char(c));
-            let trailing_ok = lower[end..]
-                .chars()
-                .next()
-                .is_none_or(|c| !is_mention_char(c));
+            let leading_ok = !mention_char_before(&lower, start);
+            let trailing_ok = !mention_char_at(&lower, end);
             if leading_ok && trailing_ok {
                 return true;
             }
@@ -7183,10 +7244,7 @@ fn mention_token_present(content: &str) -> bool {
         while let Some(offset) = lower[from..].find(prefix) {
             let start = from + offset;
             let end = start + prefix.len();
-            let leading_ok = lower[..start]
-                .chars()
-                .next_back()
-                .is_none_or(|c| !is_mention_char(c));
+            let leading_ok = !mention_char_before(&lower, start);
             let names_something = lower[end..].chars().next().is_some_and(opens_mention_token);
             if leading_ok && names_something {
                 return true;
@@ -13709,6 +13767,46 @@ mod tests {
         ));
     }
 
+    /// The other side of that boundary: a hyphen that joins nothing is prose.
+    ///
+    /// `mention_char_at` gives the dash to the token only when there is a name
+    /// on the far side of it. Every positive here is a mention somebody really
+    /// typed, and swallowing the dash would silence the agent on it; every
+    /// negative is a dash that does lead into another name — or one that opens
+    /// nothing at all — which is the direction that manufactures a turn. Runs
+    /// are judged whole, so `--` cannot buy what `-` cannot.
+    #[test]
+    fn a_hyphen_that_joins_nothing_is_not_part_of_the_handle() {
+        // Trailing: the token ends and the dash leads nowhere.
+        assert!(explicit_mention_present("@claude- please", "Claude"));
+        assert!(explicit_mention_present("@claude-", "Claude"));
+        // Hyphen as prose punctuation, one space clear of the name.
+        assert!(explicit_mention_present("@Claude - please do X", "Claude"));
+        // Doubled, and still leading nowhere.
+        assert!(explicit_mention_present("@claude-- please", "Claude"));
+        // …but a run that *does* join is one token, so a doubled dash cannot
+        // smuggle a prefix match past the rule the single dash is subject to.
+        assert!(!explicit_mention_present("@claude--bot please", "Claude"));
+        assert!(!explicit_mention_present("@claude-bot please", "Claude"));
+        // A handle keeps its own hyphens and is still terminated by a dangling
+        // one — the rule is about the dash's neighbours, not its position.
+        assert!(explicit_mention_present(
+            "@hermes-gateway- ok",
+            "hermes-gateway"
+        ));
+        // Leading: a hyphen cannot open a token, so `@-claude` names nobody at
+        // all — not this agent, and not anyone for `named_anyone` to defer to.
+        assert!(!mention_token_present("@-claude please"));
+        assert!(!explicit_mention_present("@-claude please", "claude"));
+        // And a bullet is not a handle: the dash before the `@` joins nothing,
+        // so a `- @Claude` list item still reaches this agent.
+        assert!(mention_token_present("- @Claude please"));
+        assert!(explicit_mention_present("- @Claude please", "Claude"));
+        // A dangling dash still names *somebody*, which is what keeps
+        // "names nobody" and "names someone else" apart upstream.
+        assert!(mention_token_present("@claude- please"));
+    }
+
     /// This agent's npub. Asserted against the derived form in
     /// `the_test_npub_matches_the_derived_identity`, so a stale literal cannot
     /// quietly make every mention test vacuous — the same failure mode as the
@@ -13774,6 +13872,37 @@ mod tests {
             assert!(
                 !evidence_for(&content).await.visible_mention,
                 "should NOT recognise: {content}"
+            );
+        }
+    }
+
+    /// The hyphen rule reaches key mentions too, because it is one lexer.
+    ///
+    /// `explicit_mention_present` is asked about the display name *and* about
+    /// hex and npub, so the grammar has to be right for all three. Neither key
+    /// alphabet contains a `-`, so for a key the hyphen only ever decides an
+    /// edge: `@<key>-2` is somebody else's token and must not read as this
+    /// agent, while a dash a person typed after the key must not lose the
+    /// mention. Same rule, same reasons as the display-name case.
+    #[tokio::test]
+    async fn the_hyphen_rule_reaches_key_mentions_too() {
+        for content in [
+            format!("@{AGENT_PK}-2"),
+            format!("nostr:{AGENT_NPUB}-suffix"),
+        ] {
+            assert!(
+                !evidence_for(&content).await.visible_mention,
+                "should NOT recognise: {content}"
+            );
+        }
+        for content in [
+            format!("nostr:{AGENT_NPUB} - please look"),
+            format!("@{AGENT_PK}- please look"),
+            format!("- nostr:{AGENT_NPUB} please look"),
+        ] {
+            assert!(
+                evidence_for(&content).await.visible_mention,
+                "should recognise: {content}"
             );
         }
     }
