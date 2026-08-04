@@ -185,6 +185,17 @@ run_pairing() {
 
   if [[ ${#failures[@]} -eq 0 ]]; then
     repo_id="gates-probe-$(date -u +%s)"
+
+    # Announce the repository BEFORE the agent boots. Boot-time discovery is
+    # the path every production agent actually takes (existing announcements
+    # are read at startup, and "enrolment history reconstruction complete" is
+    # only logged once there is something to reconstruct against) — the first
+    # live run proved a boot-then-announce ordering leaves the runtime with
+    # zero repositories, no reconstruction line, and a 90s marker stall that
+    # pushed every later step past its window.
+    workload_announce_repo "${cli}" "${agent_sec}" "${repo_id}" \
+      > "${dir}/repo-create.log" 2>&1 || failures+=("repo-announce")
+
     acp_pid="$(workload_start_acp "${acp_bin}" "${acp_log}" "${agent_sec}" "${dir}/state")" \
       || failures+=("acp-start")
 
@@ -192,13 +203,10 @@ run_pairing() {
       || failures+=("marker:connected")
     wait_for_marker "${acp_log}" "channel(s)" 60 \
       || failures+=("marker:discovered-channels")
-    wait_for_marker "${acp_log}" "enrolment history reconstruction complete" 90 \
-      || failures+=("marker:enrolment-history")
-
-    workload_announce_repo "${cli}" "${agent_sec}" "${repo_id}" \
-      > "${dir}/repo-create.log" 2>&1 || failures+=("repo-announce")
     wait_for_marker "${acp_log}" "discovered repository" 60 \
       || failures+=("marker:discovered-repository")
+    wait_for_marker "${acp_log}" "enrolment history reconstruction complete" 90 \
+      || failures+=("marker:enrolment-history")
 
     if root="$(workload_open_issue "${cli}" "${driver_sec}" "${agent_pub}" "${repo_id}")" \
        && [[ -n "${root}" ]]; then
