@@ -1,0 +1,13 @@
+{
+  "bundle": {
+    "createUpdaterArtifacts": true
+  },
+  "plugins": {
+    "updater": {
+      "endpoints": [
+        "https://hermes.tail81f3.ts.net:9443/desktop-updates/latest.json"
+      ],
+      "pubkey": "__BUZZ_UPDATER_PUBKEY__"
+    }
+  }
+}
