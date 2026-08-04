@@ -1,0 +1,38 @@
+# =============================================================================
+# waivers.txt — tests allowed to fail without blocking promotion.
+# =============================================================================
+#
+#   THE GOAL STATE OF THIS FILE IS EMPTY.
+#
+# Every non-comment line here is a test that is RED on the branch and is being
+# waved through anyway. That is a debt, not a configuration. The runner prints
+# a full-width banner naming every waiver it applies, on every run, and records
+# them in promote-stamp.json under `waivers.applied` — so a stamp produced with
+# waivers in force can never be mistaken for a clean one. The verdict downgrades
+# from `promotable` to `promotable_with_waivers`, and the deployer is expected
+# to have its own policy about whether it accepts that.
+#
+# FORMAT — one waiver per line, three pipe-separated fields:
+#
+#     <test-id> | <reason> | <YYYY-MM-DD added>
+#
+#   <test-id>  Either the bare test path exactly as cargo prints it under
+#              `failures:` (matches that test in ANY test binary), or
+#              `<binary>::<test path>` to scope it to one test binary, where
+#              <binary> is the target stem cargo reports on its `Running ...
+#              (target/<profile>/deps/<binary>-<hash>)` line — e.g. `buzz_acp`.
+#              For desktop (node --test) it is the test name from the
+#              `not ok N - <name>` line.
+#   <reason>   Why this is red and what makes it temporary. "flaky" is not a
+#              reason; name the work that will delete this line.
+#   <date>     When the waiver was added, so staleness is visible at a glance.
+#
+# A waiver that does NOT fire is reported as STALE — if the test is green again,
+# delete the line. The runner will not silently keep dead waivers alive.
+#
+# Removing a line is always safe: the worst case is the gate goes red and tells
+# you the truth.
+# =============================================================================
+
+project::tests::a_handle_that_only_starts_with_our_name_is_not_our_mention | buzz-acp mention tokenizer WIP: handle-prefix matching is mid-rewrite on this branch; the test encodes the target behaviour, the code has not landed it yet. Delete this line when the tokenizer rewrite lands. | 2026-08-04
+project::tests::a_hyphenated_handle_is_one_whole_mention_token | buzz-acp mention tokenizer WIP: hyphenated-handle tokenization is part of the same in-flight rewrite as the line above; both die together. | 2026-08-04

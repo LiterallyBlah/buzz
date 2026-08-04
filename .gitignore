@@ -72,3 +72,5 @@ identity.key
 
 # Helm dependency tarballs — regenerable from Chart.lock via `helm dependency build`
 deploy/charts/*/charts/*.tgz
+scripts/selfhost/gates/promote-stamp.json
+scripts/selfhost/gates/evidence/

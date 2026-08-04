@@ -1,0 +1,81 @@
+# =============================================================================
+# docker-compose.gates.yml — port overlay for the staging gate harness.
+# =============================================================================
+# Layered ON TOP of the repo's docker-compose.harness.yml:
+#
+#   docker compose -p buzz-gates \
+#     -f docker-compose.harness.yml \
+#     -f scripts/selfhost/gates/docker-compose.gates.yml up -d
+#
+# Why an overlay instead of a second stack definition: the gate harness must be
+# the SAME topology the repo already tests against (docker-compose.harness.yml),
+# or the gates prove something about a stack nobody ships. The only thing that
+# may differ is host port binding, because `buzz-harness` is frequently already
+# up on this box (its 5471/6471/9471/9472 are taken) and a promotion run must
+# never disturb another agent's harness.
+#
+# Named volumes need no overlay: Compose namespaces them by project, so
+# `harness-postgres-data` under -p buzz-gates becomes
+# `buzz-gates_harness-postgres-data` and cannot collide with buzz-harness.
+#
+# Ports are env-driven so run-gates.sh --project-name can be paired with a
+# fresh port block if two gate runs ever need to coexist.
+# =============================================================================
+services:
+  postgres:
+    # !override, not a plain list: Compose MERGES `ports` across layered files,
+    # so a plain list would ADD 5473 while keeping the harness file's 5471 and
+    # collide with the buzz-harness stack that is usually already up.
+    ports: !override
+      - "${GATES_PG_PORT:-5473}:5432"
+
+  redis:
+    ports: !override
+      - "${GATES_REDIS_PORT:-6473}:6379"
+
+  minio:
+    ports: !override
+      - "${GATES_MINIO_PORT:-9473}:9000"
+      - "${GATES_MINIO_CONSOLE_PORT:-9474}:9001"
+
+  # ---------------------------------------------------------------------------
+  # deployed-relay — the "@deployed" half of the skew matrix.
+  #
+  # Behind a compose profile so it starts ONLY when gate-skew.sh asks for it
+  # (`--profile deployed-relay`); the candidate-relay pairing runs the relay
+  # from source on the host instead and must not have this container competing
+  # for :3031.
+  #
+  # The image's entrypoint is /usr/local/bin/buzz-relay, so no command override
+  # is needed. It binds the same host port the from-source relay uses, so the
+  # seeded community host label (localhost:${GATES_RELAY_PORT}) resolves the
+  # same tenant for both pairings — that is the whole point: only the binary
+  # under test changes between pairings, never the topology.
+  # ---------------------------------------------------------------------------
+  deployed-relay:
+    image: "${GATES_DEPLOYED_IMAGE:-buzz-local:unified-13acbaf2}"
+    profiles: ["deployed-relay"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://buzz:buzz_dev@postgres:5432/buzz
+      REDIS_URL: redis://redis:6379
+      RELAY_URL: ws://localhost:${GATES_RELAY_PORT:-3031}
+      BUZZ_BIND_ADDR: 0.0.0.0:${GATES_RELAY_PORT:-3031}
+      BUZZ_HEALTH_PORT: "${GATES_RELAY_HEALTH_PORT:-8089}"
+      BUZZ_METRICS_PORT: "${GATES_RELAY_METRICS_PORT:-9203}"
+      BUZZ_S3_ENDPOINT: http://minio:9000
+      BUZZ_S3_ACCESS_KEY: buzz_dev
+      BUZZ_S3_SECRET_KEY: buzz_dev_secret
+      BUZZ_S3_BUCKET: buzz-media
+      BUZZ_REQUIRE_AUTH_TOKEN: "false"
+      BUZZ_RECONCILE_CHANNELS: "true"
+    ports:
+      - "${GATES_RELAY_PORT:-3031}:${GATES_RELAY_PORT:-3031}"
+      - "${GATES_RELAY_HEALTH_PORT:-8089}:${GATES_RELAY_HEALTH_PORT:-8089}"
+    restart: "no"
