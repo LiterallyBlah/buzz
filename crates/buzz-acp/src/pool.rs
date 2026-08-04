@@ -37,8 +37,10 @@ use crate::acp::{
 use crate::config::{compose_session_title, DedupMode, PermissionMode};
 use crate::observer;
 use crate::queue::{
-    CancelReason, ContextMessage, ConversationContext, FlushBatch, PromptChannelInfo,
-    PromptProfile, PromptProfileLookup, ThreadTags,
+    BoundedText, CancelReason, ContextMessage, ConversationContext, FlushBatch,
+    ProjectConversation, ProjectHistoryEntry, ProjectRootFacts, ProjectRootIdentity,
+    ProjectSituation, PromptChannelInfo, PromptProfile, PromptProfileLookup, ThreadTags,
+    PROJECT_DESCRIPTION_MAX_CHARS, PROJECT_HISTORY_CONTENT_MAX_CHARS, PROJECT_TITLE_MAX_CHARS,
 };
 use crate::relay::{ChannelInfo, RestClient};
 
@@ -568,7 +570,18 @@ pub struct PromptContext {
     /// Shared channel metadata for startup-known and dynamically joined channels.
     pub channel_info: ChannelInfoResolver,
     /// Max messages to include in thread/DM context. 0 = disabled.
+    ///
+    /// Also the window on a project root's conversation — one knob for "how
+    /// much prior talk may a prompt cost", because an operator lowering it to
+    /// protect a context window means it for both surfaces.
     pub context_message_limit: u32,
+    /// Sibling agents this deployment is configured with, as canonical hex,
+    /// with this agent's own key removed (see `prompt_peer_roster`).
+    ///
+    /// Rendered into project prompts as the `[Peer Agents]` roster. Held here
+    /// rather than read from `Config` at render time because the prompt path
+    /// runs in a spawned task holding an `Arc<PromptContext>` and nothing else.
+    pub peer_agents: Vec<String>,
     /// Max turns per session before proactive rotation. 0 = disabled.
     pub max_turns_per_session: u32,
     /// Permission mode to apply after session creation. `Default` = skip.
@@ -626,6 +639,7 @@ impl PromptContext {
             rest_client: dead(),
             channel_info: ChannelInfoResolver::new(std::collections::HashMap::new(), dead()),
             context_message_limit: 0,
+            peer_agents: Vec::new(),
             max_turns_per_session: 0,
             permission_mode: PermissionMode::Default,
             agent_keys: agent_keys.clone(),
@@ -1926,17 +1940,32 @@ pub async fn run_prompt_task(
             ctx.channel_info.resolve(b.channel_id).await
         };
 
-        // Conversation context is fetched by channel id for the same reason it
-        // cannot be fetched here: there is no channel to fetch it from. Project
-        // history belongs to the durability phase.
+        // Conversation context is fetched by channel id, which a project batch
+        // does not have — its key is a UUIDv5 of a root and names no channel.
+        // The project equivalent is fetched by root instead, below.
         let conversation_context = if ctx.context_message_limit > 0 && project_origin.is_none() {
             fetch_conversation_context(b, &channel_info, &ctx).await
         } else {
             None
         };
 
-        let profile_lookup =
-            fetch_prompt_profile_lookup(b, conversation_context.as_ref(), &ctx.rest_client).await;
+        // The root's own text, the recent conversation on it, and who else
+        // could be brought onto it. Fetched here, at prompt time, exactly as a
+        // channel turn fetches its thread — not deferred to the durability
+        // phase, because a turn that answers today needs it today. Every part
+        // of it degrades to a stated gap rather than to a failed turn.
+        let project_situation = match project_origin {
+            Some(origin) => Some(fetch_project_situation(b, origin, &ctx).await),
+            None => None,
+        };
+
+        let profile_lookup = fetch_prompt_profile_lookup(
+            b,
+            conversation_context.as_ref(),
+            project_situation.as_ref(),
+            &ctx.rest_client,
+        )
+        .await;
 
         let known_names: Vec<&str> = profile_lookup
             .iter()
@@ -1962,6 +1991,7 @@ pub async fn run_prompt_task(
                 conversation_context: conversation_context.as_ref(),
                 profile_lookup: profile_lookup.as_ref(),
                 project: project_origin,
+                project_situation: project_situation.as_ref(),
                 has_system_prompt_support: agent.has_system_prompt_support(),
                 base_prompt: ctx.base_prompt,
                 system_prompt: ctx.system_prompt.as_deref(),
@@ -2732,6 +2762,359 @@ async fn fetch_conversation_context(
     None
 }
 
+// ── The situation on a project root ──────────────────────────────────────────
+
+/// Fetch what a project turn needs to know about the root it is answering on.
+///
+/// One REST round trip carrying every filter this needs, for the same reason
+/// [`fetch_thread_context`] sends three at once: they are a single question
+/// asked of one relay at one instant, and splitting them would let the root and
+/// its conversation come from different moments — an agent reading a title that
+/// no longer matches the comments under it.
+///
+/// **This never fails the turn.** Every outcome that is not "the rows arrived"
+/// becomes a stated gap in the prompt: an unreadable root renders as
+/// [`ProjectRootIdentity::Unavailable`], an unreadable conversation as
+/// [`ProjectConversation::Unavailable`], and the peer roster — which needs no
+/// relay at all — is unaffected by either. An answered comment without its
+/// backstory beats a comment nobody answered.
+async fn fetch_project_situation(
+    batch: &FlushBatch,
+    project: &crate::project::ProjectOrigin,
+    ctx: &PromptContext,
+) -> ProjectSituation {
+    let root_id = project.root().to_string();
+    let limit = ctx.context_message_limit;
+    let peers = ctx.peer_agents.clone();
+
+    let unread = |conversation_asked: bool| ProjectSituation {
+        root: ProjectRootIdentity::Unavailable,
+        conversation: conversation_asked.then_some(ProjectConversation::Unavailable),
+        peers: peers.clone(),
+    };
+
+    let Some(filters) = project_situation_filters(project, limit) else {
+        // A `ProjectOrigin` is built only from a validated root id, so this is
+        // unreachable rather than defensive — and it degrades instead of
+        // panicking a prompt, because "unreachable" is a claim about today's
+        // constructors and a panic here would take a live turn with it.
+        tracing::warn!(
+            target: "pool::project",
+            root = %root_id,
+            "project root is not a usable event id — prompting without root context"
+        );
+        return unread(limit > 0);
+    };
+
+    let rest = &ctx.rest_client;
+    let fetched = fetch_with_retry(|| async {
+        match timeout(CONTEXT_FETCH_TIMEOUT, rest.query(&filters)).await {
+            // An empty array is an *answer* — a root nobody has commented on —
+            // and must not be retried as though it were a failure. Only the
+            // transport arms below return `None`, so the retry covers what a
+            // retry can fix.
+            Ok(Ok(json)) => Some(json),
+            Ok(Err(e)) => {
+                tracing::warn!(
+                    target: "pool::project",
+                    root = %root_id,
+                    "project context fetch failed: {e} — will retry"
+                );
+                None
+            }
+            Err(_) => {
+                tracing::warn!(
+                    target: "pool::project",
+                    root = %root_id,
+                    "project context fetch timed out — will retry"
+                );
+                None
+            }
+        }
+    })
+    .await;
+
+    let Some(json) = fetched else {
+        return unread(limit > 0);
+    };
+
+    // The events this turn is *about* are rendered in full further down the
+    // prompt, and the relay has them too — a comment published a second ago is
+    // on the root by the time this query runs. Excluded here rather than left
+    // to the agent to notice, because the conversation section says out loud
+    // that the triggering events are not repeated in it, and that sentence has
+    // to be true.
+    let already_shown: HashSet<String> = batch
+        .events
+        .iter()
+        .chain(batch.cancelled_events.iter())
+        .map(|be| be.event.id.to_hex().to_ascii_lowercase())
+        .collect();
+
+    let parsed = parse_project_situation(json, &root_id, limit, &already_shown);
+    if matches!(parsed.root, ProjectRootIdentity::Unavailable) {
+        tracing::warn!(
+            target: "pool::project",
+            root = %root_id,
+            "relay returned no root event — prompting without title and description"
+        );
+    }
+    ProjectSituation { peers, ..parsed }
+}
+
+/// The filters one project-situation fetch sends.
+///
+/// Three questions in one request:
+///
+/// 1. the root itself, by id and constrained to the two root kinds — a row with
+///    that id and another kind is not this root's identity, whatever it says;
+/// 2. the comment stream, by lowercase `#e`;
+/// 3. for a pull request, the revision stream, by uppercase `#E`.
+///
+/// The kinds and the tag spelling of (2) and (3) come from
+/// [`HistoryStream`] rather than from a list written here, so the prompt asks
+/// the same question the durability phase asks. A second copy of that list is
+/// how the prompt ends up quietly missing a class of event — status changes,
+/// say — that the reconstruction goes on reading, leaving a prompt that looks
+/// complete and an agent that never sees an issue being closed.
+///
+/// `None` when the root is not a usable event id, which no validated
+/// `ProjectOrigin` produces.
+fn project_situation_filters(
+    project: &crate::project::ProjectOrigin,
+    limit: u32,
+) -> Option<Vec<nostr::Filter>> {
+    use crate::project::HistoryStream;
+    use nostr::{Alphabet, SingleLetterTag};
+
+    let root_id = project.root();
+    let root_filter = nostr::Filter::new()
+        .id(nostr::EventId::from_hex(root_id).ok()?)
+        .kinds([
+            nostr::Kind::Custom(buzz_core::kind::KIND_GIT_ISSUE as u16),
+            nostr::Kind::Custom(buzz_core::kind::KIND_GIT_PULL_REQUEST as u16),
+        ])
+        .limit(1);
+    let mut filters = vec![root_filter];
+
+    if limit == 0 {
+        return Some(filters);
+    }
+
+    for stream in HistoryStream::required_for(project.is_pull_request()) {
+        // `#e` and `#E` are different questions and the tag mapping lives on
+        // the stream. Derived from `root_tag()` rather than re-stated: a PR
+        // revision is reachable only by the uppercase tag, so a second copy of
+        // the mapping that drifted would return an empty revision history that
+        // reads exactly like a PR nobody has revised.
+        let letter = stream.root_tag().strip_prefix('#')?.chars().next()?;
+        let tag = match letter {
+            'e' => SingleLetterTag::lowercase(Alphabet::E),
+            'E' => SingleLetterTag::uppercase(Alphabet::E),
+            _ => return None,
+        };
+        filters.push(
+            nostr::Filter::new()
+                .kinds(
+                    stream
+                        .kinds()
+                        .iter()
+                        .map(|k| nostr::Kind::Custom(*k as u16)),
+                )
+                .custom_tags(tag, [root_id])
+                // One more than the window, so "older events exist" is proven
+                // by a row that arrived rather than inferred from a full page.
+                // A page that is exactly `limit` long is ambiguous; a page of
+                // `limit + 1` is not.
+                .limit(limit.saturating_add(1) as usize),
+        );
+    }
+    Some(filters)
+}
+
+/// Split one project-situation response into the root and the conversation.
+///
+/// Pure, so the ordering, the cap and the root/comment split are testable
+/// without a relay. `limit == 0` means history was never asked for, and the
+/// conversation comes back `None` rather than empty — an operator who set the
+/// context knob to zero has not suffered a fetch failure.
+///
+/// `already_shown` are the events this prompt renders in full elsewhere — the
+/// batch being answered. They are dropped from the conversation rather than
+/// deduplicated later, because the same comment appearing twice under two
+/// different headers reads as two people saying the same thing.
+fn parse_project_situation(
+    json: serde_json::Value,
+    root_id: &str,
+    limit: u32,
+    already_shown: &HashSet<String>,
+) -> ProjectSituation {
+    let empty = Vec::new();
+    let events = json.as_array().unwrap_or(&empty);
+
+    let root = events
+        .iter()
+        .find(|ev| {
+            ev.get("id")
+                .and_then(|v| v.as_str())
+                .is_some_and(|id| id.eq_ignore_ascii_case(root_id))
+        })
+        .map(project_root_facts)
+        .map(ProjectRootIdentity::Known)
+        .unwrap_or(ProjectRootIdentity::Unavailable);
+
+    if limit == 0 {
+        return ProjectSituation {
+            root,
+            conversation: None,
+            peers: Vec::new(),
+        };
+    }
+
+    // Sorted by the relay's own timestamp and deduplicated by id: two filters
+    // can return the same row, and a relay is under no obligation to order
+    // anything. Ties break on id so a page of same-second comments renders the
+    // same way twice rather than shuffling between turns.
+    let mut rows: Vec<(u64, String, serde_json::Value)> = events
+        .iter()
+        .filter_map(|ev| {
+            let id = ev.get("id")?.as_str()?.to_ascii_lowercase();
+            if id.eq_ignore_ascii_case(root_id) || already_shown.contains(&id) {
+                return None;
+            }
+            let created_at = ev.get("created_at")?.as_u64()?;
+            Some((created_at, id, ev.clone()))
+        })
+        .collect();
+    rows.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    rows.dedup_by(|a, b| a.1 == b.1);
+
+    // The sentinel row proves there is more; it is not shown, because showing
+    // it would mean rendering `limit + 1` events under a `limit` the operator
+    // set.
+    let older_exist = rows.len() > limit as usize;
+    if older_exist {
+        let drop = rows.len() - limit as usize;
+        rows.drain(..drop);
+    }
+
+    let entries = rows
+        .iter()
+        .filter_map(|(_, _, ev)| project_history_entry(ev))
+        .collect();
+
+    ProjectSituation {
+        root,
+        conversation: Some(ProjectConversation::Fetched {
+            entries,
+            older_exist,
+        }),
+        peers: Vec::new(),
+    }
+}
+
+/// Read a root event's title and description.
+///
+/// The title is the `subject` tag, falling back to the first line of the body.
+/// Both halves are what the writers and readers actually do: the SDK builders
+/// emit `["subject", …]` on every `1621` and `1618`
+/// (`buzz-sdk/src/builders.rs:1136` and `:1553`), and Desktop reads
+/// `getTag(issue, "subject") || issue.content.split("\n")[0]`
+/// (`desktop/src/features/projects/projectIssues.mjs:151`, and the same shape
+/// in `projectPullRequests.mjs:407`). Desktop's third fallback — the literal
+/// string "Untitled issue" — is deliberately *not* copied: a placeholder is
+/// fine to render in a list and wrong to hand an agent, which may quote it back
+/// at the person who opened the issue.
+fn project_root_facts(event: &serde_json::Value) -> ProjectRootFacts {
+    let content = event
+        .get("content")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+
+    let subject = event
+        .get("tags")
+        .and_then(|t| t.as_array())
+        .and_then(|tags| {
+            tags.iter().find_map(|tag| {
+                let parts = tag.as_array()?;
+                (parts.first()?.as_str()? == "subject")
+                    .then(|| parts.get(1)?.as_str())
+                    .flatten()
+            })
+        })
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+
+    let title = subject
+        .or_else(|| {
+            content
+                .lines()
+                .next()
+                .map(str::trim)
+                .filter(|l| !l.is_empty())
+        })
+        .map(|t| BoundedText::bound(t, PROJECT_TITLE_MAX_CHARS));
+
+    ProjectRootFacts {
+        title,
+        description: BoundedText::bound(content, PROJECT_DESCRIPTION_MAX_CHARS),
+    }
+}
+
+/// Read one history row into a rendered entry.
+///
+/// `None` only when the row has no pubkey or kind to attribute it to — an
+/// unattributable line in a conversation is worse than a missing one. Empty
+/// content is kept: a status change usually has none, and it is still the most
+/// important event on many roots.
+fn project_history_entry(event: &serde_json::Value) -> Option<ProjectHistoryEntry> {
+    let pubkey = event.get("pubkey")?.as_str()?.to_string();
+    let kind = event.get("kind")?.as_u64()? as u32;
+    let content = event
+        .get("content")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    let timestamp = event
+        .get("created_at")
+        .and_then(|v| v.as_i64())
+        .and_then(|ts| chrono::DateTime::from_timestamp(ts, 0))
+        .map(|dt| dt.to_rfc3339())
+        .unwrap_or_else(|| "unknown".to_string());
+
+    Some(ProjectHistoryEntry {
+        pubkey,
+        timestamp,
+        kind,
+        content: BoundedText::bound(content, PROJECT_HISTORY_CONTENT_MAX_CHARS),
+    })
+}
+
+/// The peer roster a project prompt renders, from the configured pubkeys.
+///
+/// Canonicalised through the same validator the project arm's approval sets use
+/// (`project::canonical_root_id` — 64-char hex, lowercased), so a roster entry
+/// is a key the `--to` flag will actually accept rather than whatever an
+/// environment variable held.
+///
+/// **This agent is removed.** `BUZZ_ACP_PEER_AGENTS` is frequently the same
+/// list for every agent in a deployment, so the harness's own key is routinely
+/// in it; an agent told it may summon itself either does, or spends the turn
+/// working out that it must not.
+pub(crate) fn prompt_peer_roster<'a, I>(configured: I, agent_pubkey_hex: &str) -> Vec<String>
+where
+    I: IntoIterator<Item = &'a String>,
+{
+    let self_key = agent_pubkey_hex.trim().to_ascii_lowercase();
+    let mut peers: Vec<String> = configured
+        .into_iter()
+        .filter_map(|p| crate::project::canonical_root_id(p))
+        .filter(|p| *p != self_key)
+        .collect();
+    peers.sort();
+    peers.dedup();
+    peers
+}
+
 /// Normalize AND validate a pubkey for the batch profile API request.
 /// Returns `None` for malformed input — only valid 64-char hex passes.
 /// See also: `normalize_lookup_key` in queue.rs (normalize-only, no validation).
@@ -2744,9 +3127,18 @@ fn normalize_prompt_pubkey(pubkey: &str) -> Option<String> {
     }
 }
 
+/// Every pubkey the rendered prompt will want a name for.
+///
+/// The project situation is included for both of its own reasons. A history
+/// entry attributed to bare hex is a conversation the agent cannot follow —
+/// "who said that" is most of what earlier comments are for — and the peer
+/// roster is *only* useful resolved: an unnamed roster entry can still be
+/// mentioned by key, but the name is what a human wrote in the comment the
+/// agent is about to answer.
 fn collect_prompt_pubkeys(
     batch: &FlushBatch,
     conversation_context: Option<&ConversationContext>,
+    project_situation: Option<&ProjectSituation>,
 ) -> Vec<String> {
     let mut pubkeys = HashSet::new();
 
@@ -2770,6 +3162,22 @@ fn collect_prompt_pubkeys(
         for message in messages {
             if let Some(normalized) = normalize_prompt_pubkey(&message.pubkey) {
                 pubkeys.insert(normalized);
+            }
+        }
+    }
+
+    if let Some(situation) = project_situation {
+        for peer in &situation.peers {
+            if let Some(normalized) = normalize_prompt_pubkey(peer) {
+                pubkeys.insert(normalized);
+            }
+        }
+        if let Some(ProjectConversation::Fetched { entries, .. }) = situation.conversation.as_ref()
+        {
+            for entry in entries {
+                if let Some(normalized) = normalize_prompt_pubkey(&entry.pubkey) {
+                    pubkeys.insert(normalized);
+                }
             }
         }
     }
@@ -2842,9 +3250,10 @@ fn parse_kind0_profile_lookup(json: serde_json::Value) -> Option<PromptProfileLo
 async fn fetch_prompt_profile_lookup(
     batch: &FlushBatch,
     conversation_context: Option<&ConversationContext>,
+    project_situation: Option<&ProjectSituation>,
     rest: &RestClient,
 ) -> Option<PromptProfileLookup> {
-    let pubkeys = collect_prompt_pubkeys(batch, conversation_context);
+    let pubkeys = collect_prompt_pubkeys(batch, conversation_context, project_situation);
     if pubkeys.is_empty() {
         return None;
     }
@@ -5201,7 +5610,7 @@ mod tests {
             truncated: false,
         };
 
-        let pubkeys = collect_prompt_pubkeys(&batch, Some(&context));
+        let pubkeys = collect_prompt_pubkeys(&batch, Some(&context), None);
 
         let mut expected = vec![
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
@@ -6597,6 +7006,7 @@ mod tests {
                 },
             ),
             context_message_limit: 0,
+            peer_agents: Vec::new(),
             max_turns_per_session: 0,
             permission_mode: PermissionMode::Default,
             agent_keys: agent_keys.clone(),
@@ -7117,5 +7527,339 @@ mod tests {
             "one fetch_channel_info sequence (initial attempt + single retry)"
         );
         server.abort();
+    }
+}
+
+/// Reading a project root's situation off the wire.
+///
+/// Everything here is asserted against a **relay response**, not against a
+/// struct a test built: the failure these guard is a prompt that renders
+/// beautifully from facts nobody managed to fetch.
+#[cfg(test)]
+mod project_situation_tests {
+    use super::*;
+    use serde_json::json;
+
+    const ROOT: &str = "b000000000000000000000000000000000000000000000000000000000000001";
+    const ALICE: &str = "a000000000000000000000000000000000000000000000000000000000000001";
+    const BOB: &str = "c000000000000000000000000000000000000000000000000000000000000001";
+
+    fn root_row(subject: Option<&str>, content: &str) -> serde_json::Value {
+        let tags = match subject {
+            Some(s) => json!([["a", "30617:owner:repo"], ["subject", s]]),
+            None => json!([["a", "30617:owner:repo"]]),
+        };
+        json!({
+            "id": ROOT,
+            "pubkey": ALICE,
+            "kind": buzz_core::kind::KIND_GIT_ISSUE,
+            "created_at": 1_000,
+            "content": content,
+            "tags": tags,
+        })
+    }
+
+    fn comment(id_suffix: &str, pubkey: &str, created_at: u64, content: &str) -> serde_json::Value {
+        json!({
+            "id": format!("{}{id_suffix}", "d".repeat(62)),
+            "pubkey": pubkey,
+            "kind": buzz_core::kind::KIND_TEXT_NOTE,
+            "created_at": created_at,
+            "content": content,
+            "tags": [["e", ROOT, "", "root"]],
+        })
+    }
+
+    fn entries(situation: &ProjectSituation) -> Vec<ProjectHistoryEntry> {
+        match situation
+            .conversation
+            .as_ref()
+            .expect("history was asked for")
+        {
+            ProjectConversation::Fetched { entries, .. } => entries.clone(),
+            ProjectConversation::Unavailable => panic!("history was fetched, not lost"),
+        }
+    }
+
+    /// The title comes from the tag the writers actually emit.
+    ///
+    /// `subject` is what `build_git_issue` and `build_git_pull_request` write
+    /// (`buzz-sdk/src/builders.rs:1136`, `:1553`) and what Desktop reads back
+    /// (`projectIssues.mjs:151`). Asserting the fallback in the same test is
+    /// the point: a reader that only ever tried the first line would pass a
+    /// subject-less fixture and silently retitle every real issue with its
+    /// opening sentence.
+    #[test]
+    fn the_title_is_the_subject_tag_and_falls_back_to_the_first_line() {
+        let tagged = project_root_facts(&root_row(
+            Some("Reconnect drops the project subscription"),
+            "It happens on the second reconnect.\nEvery time.",
+        ));
+        assert_eq!(
+            tagged.title.as_ref().map(|t| t.shown.as_str()),
+            Some("Reconnect drops the project subscription")
+        );
+        assert_eq!(
+            tagged.description.shown, "It happens on the second reconnect.\nEvery time.",
+            "the description is the whole body, not the body minus its first line"
+        );
+
+        let untagged = project_root_facts(&root_row(None, "Reconnect drops it\n\ndetails follow"));
+        assert_eq!(
+            untagged.title.as_ref().map(|t| t.shown.as_str()),
+            Some("Reconnect drops it"),
+            "a root with no subject tag is titled by its first line"
+        );
+
+        let neither = project_root_facts(&root_row(None, ""));
+        assert!(
+            neither.title.is_none(),
+            "an untitled root must report no title rather than borrow a placeholder"
+        );
+        assert!(neither.description.is_blank());
+    }
+
+    /// A description longer than the bound is cut, and the cut is *stated*.
+    #[test]
+    fn a_long_description_is_bounded_and_says_so() {
+        let body = "x".repeat(PROJECT_DESCRIPTION_MAX_CHARS + 5_000);
+        let facts = project_root_facts(&root_row(Some("big"), &body));
+        assert_eq!(
+            facts.description.shown.chars().count(),
+            PROJECT_DESCRIPTION_MAX_CHARS
+        );
+        assert_eq!(facts.description.total_chars, body.chars().count());
+        assert!(facts.description.is_truncated());
+    }
+
+    /// Oldest-first, capped at the window, with the root kept out of it.
+    #[test]
+    fn history_is_ordered_capped_and_excludes_the_root() {
+        let situation = parse_project_situation(
+            json!([
+                comment("11", BOB, 30, "third"),
+                root_row(Some("t"), "body"),
+                comment("22", ALICE, 10, "first"),
+                comment("33", BOB, 20, "second"),
+            ]),
+            ROOT,
+            2,
+            &HashSet::new(),
+        );
+
+        let entries = entries(&situation);
+        assert_eq!(
+            entries
+                .iter()
+                .map(|e| e.content.shown.as_str())
+                .collect::<Vec<_>>(),
+            vec!["second", "third"],
+            "the window keeps the most recent events and renders them oldest-first"
+        );
+        assert!(
+            matches!(
+                situation.conversation.as_ref().expect("asked"),
+                ProjectConversation::Fetched {
+                    older_exist: true,
+                    ..
+                }
+            ),
+            "the dropped event must be reported as older history, not silently lost"
+        );
+        assert!(
+            matches!(situation.root, ProjectRootIdentity::Known(_)),
+            "the root row belongs to the identity, not to the conversation"
+        );
+    }
+
+    /// A response with no row for the root is `Unavailable`, not an empty issue.
+    #[test]
+    fn a_missing_root_row_is_unavailable_rather_than_untitled() {
+        let situation = parse_project_situation(
+            json!([comment("11", ALICE, 10, "hello")]),
+            ROOT,
+            5,
+            &HashSet::new(),
+        );
+        assert_eq!(situation.root, ProjectRootIdentity::Unavailable);
+        assert_eq!(entries(&situation).len(), 1, "the comment still arrives");
+    }
+
+    /// The events this turn is answering are not also part of its backstory.
+    ///
+    /// They are on the root by the time the query runs, so the relay returns
+    /// them. The conversation section tells the agent they are rendered further
+    /// down and not repeated here; this is what makes that sentence true rather
+    /// than aspirational.
+    #[test]
+    fn the_triggering_events_are_not_repeated_as_history() {
+        let triggering = comment("99", ALICE, 40, "does this still happen?");
+        let already_shown: HashSet<String> = [triggering["id"].as_str().expect("id").to_string()]
+            .into_iter()
+            .collect();
+
+        let situation = parse_project_situation(
+            json!([
+                root_row(Some("t"), "body"),
+                comment("11", BOB, 10, "earlier"),
+                triggering,
+            ]),
+            ROOT,
+            10,
+            &already_shown,
+        );
+
+        assert_eq!(
+            entries(&situation)
+                .iter()
+                .map(|e| e.content.shown.clone())
+                .collect::<Vec<_>>(),
+            vec!["earlier".to_string()],
+            "the comment being answered was rendered twice"
+        );
+    }
+
+    /// The count knob at zero asks for no history at all — which is not the
+    /// same as asking and being told nothing.
+    #[test]
+    fn a_zero_window_asks_for_no_history_and_reports_none() {
+        let situation = parse_project_situation(
+            json!([root_row(Some("t"), "body")]),
+            ROOT,
+            0,
+            &HashSet::new(),
+        );
+        assert!(
+            situation.conversation.is_none(),
+            "a disabled window must not render as a fetch failure"
+        );
+        assert!(matches!(situation.root, ProjectRootIdentity::Known(_)));
+    }
+
+    /// The filters ask the durability phase's question.
+    ///
+    /// Both halves matter and they fail differently: the wrong kind list drops
+    /// status changes out of a history that still looks complete, and the wrong
+    /// tag case returns an empty revision stream that reads exactly like a pull
+    /// request nobody has revised.
+    #[test]
+    fn the_filters_match_the_streams_the_durability_phase_reads() {
+        let issue = crate::project::ProjectOrigin::for_test("30617:o:r", ROOT, false);
+        let filters = project_situation_filters(&issue, 12).expect("a validated root filters");
+        let rendered: Vec<serde_json::Value> = filters
+            .iter()
+            .map(|f| serde_json::to_value(f).expect("filters serialise"))
+            .collect();
+
+        assert_eq!(
+            rendered.len(),
+            2,
+            "an issue asks for its root and its comments"
+        );
+        assert_eq!(rendered[0]["ids"], json!([ROOT]));
+        let root_kinds: Vec<u32> =
+            serde_json::from_value(rendered[0]["kinds"].clone()).expect("kinds");
+        assert!(
+            root_kinds.contains(&buzz_core::kind::KIND_GIT_ISSUE)
+                && root_kinds.contains(&buzz_core::kind::KIND_GIT_PULL_REQUEST)
+                && root_kinds.len() == 2,
+            "a row with the root's id and some other kind is not this root: {root_kinds:?}"
+        );
+        assert_eq!(rendered[1]["#e"], json!([ROOT]));
+        assert_eq!(
+            rendered[1]["limit"],
+            json!(13),
+            "one over the window, so `older_exist` is proven by a row rather than guessed"
+        );
+        let kinds: Vec<u32> = serde_json::from_value(rendered[1]["kinds"].clone()).expect("kinds");
+        for required in crate::project::HistoryStream::Comments.kinds() {
+            assert!(
+                kinds.contains(required),
+                "{required} missing from {kinds:?}"
+            );
+        }
+
+        let pull_request = crate::project::ProjectOrigin::for_test("30617:o:r", ROOT, true);
+        let pr_filters: Vec<serde_json::Value> = project_situation_filters(&pull_request, 12)
+            .expect("filters")
+            .iter()
+            .map(|f| serde_json::to_value(f).expect("serialise"))
+            .collect();
+        assert_eq!(
+            pr_filters.len(),
+            3,
+            "a pull request also asks for revisions"
+        );
+        assert_eq!(
+            pr_filters[2]["#E"],
+            json!([ROOT]),
+            "a revision points at its root with the uppercase tag and is invisible to `#e`"
+        );
+        assert!(pr_filters[2].get("#e").is_none());
+    }
+
+    /// The roster drops this agent and canonicalises what is left.
+    #[test]
+    fn the_peer_roster_excludes_this_agent() {
+        let me = ALICE.to_ascii_uppercase();
+        let configured = vec![
+            me.clone(),
+            BOB.to_string(),
+            "not-a-pubkey".to_string(),
+            BOB.to_ascii_uppercase(),
+        ];
+
+        let roster = prompt_peer_roster(configured.iter(), ALICE);
+
+        assert_eq!(
+            roster,
+            vec![BOB.to_string()],
+            "the agent's own key (in any case), duplicates and malformed entries are all out"
+        );
+    }
+
+    /// History authors and the roster are named in the profile query.
+    ///
+    /// Without this the conversation renders as bare hex talking to bare hex,
+    /// and the roster tells the agent to `@`-mention a key it has no name for.
+    #[test]
+    fn the_profile_query_covers_history_authors_and_peers() {
+        let keys = nostr::Keys::generate();
+        let event = nostr::EventBuilder::new(nostr::Kind::Custom(9), "hi")
+            .tags([])
+            .sign_with_keys(&keys)
+            .expect("sign");
+        let batch = FlushBatch {
+            channel_id: Uuid::new_v4(),
+            events: vec![crate::queue::BatchEvent {
+                event,
+                prompt_tag: "@mention".into(),
+                received_at: std::time::Instant::now(),
+                project: None,
+            }],
+            cancelled_events: vec![],
+            cancel_reason: None,
+        };
+        let situation = ProjectSituation {
+            root: ProjectRootIdentity::Unavailable,
+            conversation: Some(ProjectConversation::Fetched {
+                entries: vec![ProjectHistoryEntry {
+                    pubkey: ALICE.to_string(),
+                    timestamp: "2026-08-03T10:00:00+00:00".into(),
+                    kind: buzz_core::kind::KIND_TEXT_NOTE,
+                    content: BoundedText::bound("earlier", 100),
+                }],
+                older_exist: false,
+            }),
+            peers: vec![BOB.to_string()],
+        };
+
+        let pubkeys = collect_prompt_pubkeys(&batch, None, Some(&situation));
+
+        assert!(
+            pubkeys.contains(&ALICE.to_string()),
+            "history author missing"
+        );
+        assert!(pubkeys.contains(&BOB.to_string()), "peer agent missing");
     }
 }

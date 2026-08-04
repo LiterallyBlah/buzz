@@ -2399,6 +2399,15 @@ async fn tokio_main() -> Result<()> {
         rest_client: relay.rest_client(),
         channel_info: pool::ChannelInfoResolver::new(channel_info_map, relay.rest_client()),
         context_message_limit: config.context_message_limit,
+        // The `[Peer Agents]` roster a project prompt renders. Built from the
+        // same option the project arm's invocation authority is built from, so
+        // the agents an agent is *told about* are the agents it may actually
+        // exchange work with — a roster naming somebody the gate would refuse
+        // is an invitation to a turn that goes nowhere.
+        peer_agents: pool::prompt_peer_roster(
+            config.peer_agents.iter(),
+            &config.keys.public_key().to_hex(),
+        ),
         max_turns_per_session: config.max_turns_per_session,
         permission_mode: config.permission_mode,
         agent_keys: config.keys.clone(),
@@ -13968,6 +13977,20 @@ for line in sys.stdin:
     }
 
     fn test_ctx(agent_keys: &Keys, base_url: String) -> Arc<PromptContext> {
+        test_ctx_with(agent_keys, base_url, 0, Vec::new())
+    }
+
+    /// A prompt context with the two knobs a project turn's context reads.
+    ///
+    /// `context_message_limit` is the window on the root's conversation and
+    /// `peer_agents` is the roster; both default to off in [`test_ctx`], which
+    /// is the configuration every pre-existing scenario was written against.
+    fn test_ctx_with(
+        agent_keys: &Keys,
+        base_url: String,
+        context_message_limit: u32,
+        peer_agents: Vec<String>,
+    ) -> Arc<PromptContext> {
         let rest = || RestClient {
             http: reqwest::Client::new(),
             base_url: base_url.clone(),
@@ -13989,7 +14012,8 @@ for line in sys.stdin:
             cwd: ".".to_string(),
             rest_client: rest(),
             channel_info: ChannelInfoResolver::new(HashMap::new(), rest()),
-            context_message_limit: 0,
+            context_message_limit,
+            peer_agents,
             max_turns_per_session: 0,
             permission_mode: PermissionMode::Default,
             agent_keys: agent_keys.clone(),
@@ -14802,6 +14826,152 @@ for line in sys.stdin:
             prompts[0].contains("the pipeline drops frames after reconnect"),
             "the turn must carry the issue: {}",
             prompts[0]
+        );
+    }
+
+    /// A root carrying the `subject` tag every Buzz writer puts a title in.
+    fn titled_root(
+        author: &Keys,
+        agent: &Keys,
+        repo_id: &str,
+        subject: &str,
+        body: &str,
+    ) -> nostr::Event {
+        let agent_hex = agent.public_key().to_hex();
+        EventBuilder::new(
+            nostr::Kind::Custom(buzz_core::kind::KIND_GIT_ISSUE as u16),
+            body,
+        )
+        .tags([
+            nostr::Tag::parse(["a", &format!("30617:{agent_hex}:{repo_id}")]).unwrap(),
+            nostr::Tag::parse(["p", &agent_hex]).unwrap(),
+            nostr::Tag::parse(["subject", subject]).unwrap(),
+        ])
+        .sign_with_keys(author)
+        .expect("sign")
+    }
+
+    /// A relay that answers the project-situation read with `rows`.
+    ///
+    /// Profile lookups are answered empty and separately: they go to the same
+    /// endpoint, and handing a kind:0 query a pile of `1621`s would let a
+    /// profile parser's tolerance stand in for a situation fetch that never
+    /// happened.
+    async fn situation_relay(rows: Vec<serde_json::Value>) -> String {
+        use axum::{routing::post, Json, Router};
+
+        let app = Router::new()
+            .route(
+                "/query",
+                post(move |body: String| {
+                    let rows = rows.clone();
+                    async move {
+                        let wants_profiles = serde_json::from_str::<serde_json::Value>(&body)
+                            .ok()
+                            .and_then(|filters| {
+                                let filters = filters.as_array()?.clone();
+                                Some(filters.iter().any(|f| {
+                                    f["kinds"].as_array().is_some_and(|kinds| {
+                                        kinds.iter().any(|k| k.as_u64() == Some(0))
+                                    })
+                                }))
+                            })
+                            .unwrap_or(false);
+                        Json(if wants_profiles {
+                            serde_json::json!([])
+                        } else {
+                            serde_json::Value::Array(rows)
+                        })
+                    }
+                }),
+            )
+            .fallback(|| async { Json(serde_json::json!([])) });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move { axum::serve(listener, app).await.expect("serve") });
+        format!("http://{addr}")
+    }
+
+    /// **What the child is actually told about the issue it was named on.**
+    ///
+    /// The fetch, the parse and the render each have their own tests, and each
+    /// of them would stay green against a `run_prompt_task` that built the
+    /// situation and dropped it — leaving a `[Project]` section correct about
+    /// the coordinate and silent about everything the turn is for. This is the
+    /// one place all three run together, driven by the real dispatch path and
+    /// read back off the child's own stdin.
+    #[tokio::test]
+    async fn a_project_turn_carries_the_root_its_conversation_and_the_roster() {
+        let recorder = PromptRecorder::new();
+        let mut rt = Runtime::known_as(&recorder, DISPLAY_NAME).await;
+        let agent = rt.agent.clone();
+        rt.discover_announced_by(&agent, "situation").await;
+
+        let root = titled_root(
+            &rt.owner,
+            &agent,
+            "situation",
+            "Reconnect drops the project subscription",
+            &format!(
+                "@{DISPLAY_NAME} the agent stops receiving comments after the second reconnect."
+            ),
+        );
+        let earlier = desktop_comment(
+            &rt.owner,
+            &agent,
+            "situation",
+            &root,
+            "I can reproduce it on main.",
+        );
+        let peer = Keys::generate();
+        let peer_hex = peer.public_key().to_hex();
+
+        // Everything the turn is about to read, and the two knobs that decide
+        // how much of it is rendered.
+        rt.ctx = test_ctx_with(
+            &agent,
+            situation_relay(vec![
+                serde_json::to_value(&root).expect("serialise the root"),
+                serde_json::to_value(&earlier).expect("serialise the comment"),
+            ])
+            .await,
+            8,
+            vec![peer_hex.clone()],
+        );
+
+        let dispatched = rt
+            .drive(&routed(root.clone(), project::ProjectSubscription::Enrolment).await)
+            .await;
+        assert!(
+            matches!(dispatched, ProjectDispatched::Queued { queued: true, .. }),
+            "precondition: a root naming this agent must wake it — got {dispatched:?}"
+        );
+
+        let prompts = recorder.prompts(1).await;
+        assert_eq!(prompts.len(), 1, "exactly one turn: {prompts:?}");
+        let prompt = &prompts[0];
+
+        assert!(
+            prompt.contains("Title: Reconnect drops the project subscription"),
+            "the turn does not know what the issue is called: {prompt}"
+        );
+        assert!(
+            prompt.contains("I can reproduce it on main."),
+            "the turn does not carry the conversation on the root: {prompt}"
+        );
+        assert!(
+            !prompt.contains("history unavailable"),
+            "the situation fetch did not land: {prompt}"
+        );
+        assert!(
+            prompt.contains(&format!("--to {peer_hex}")),
+            "the configured peer is not on the roster: {prompt}"
+        );
+        assert!(
+            prompt.contains("This conversation is the issue itself"),
+            "the turn was not told this conversation is durable: {prompt}"
         );
     }
 

@@ -1524,11 +1524,269 @@ fn resolve_reply_anchor(
     )
 }
 
+// ── The situation on a project root ──────────────────────────────────────────
+//
+// A project turn used to arrive knowing the coordinate, the root id and the one
+// comment that woke it — which is enough to *reply* and not enough to have
+// anything to say. The three facts below are what a person opening the same
+// issue reads before typing: what it is called and what it is about, what has
+// been said on it since, and who else could be pulled in. They are fetched at
+// prompt time exactly as channel turns fetch their thread context, and every
+// one of them degrades to an honest note rather than to a missing turn.
+
+/// Bound on the root title rendered into a prompt.
+///
+/// The Buzz writers already cap a `subject` at 256 characters
+/// (`buzz-sdk/src/builders.rs`, `build_git_issue` and `build_git_pull_request`),
+/// so this only ever fires on a row no Buzz client wrote. It fires anyway: the
+/// title arrives from a relay, and "the writer validates it" is a property of
+/// the writer rather than of the bytes that turned up.
+pub(crate) const PROJECT_TITLE_MAX_CHARS: usize = 256;
+
+/// Bound on the root description rendered into a prompt.
+///
+/// A root body may be 64 KB (`check_content`, same builders). Spending that on
+/// the context window to answer a one-line comment is the failure this bound
+/// exists for; two thousand characters is about a screen of prose, which is
+/// enough to know what the issue is about. What is left out is *stated* — see
+/// `BoundedText::truncation_note` — because a description that stops mid
+/// sentence with no note is indistinguishable from an issue whose author
+/// stopped mid sentence.
+pub(crate) const PROJECT_DESCRIPTION_MAX_CHARS: usize = 2_000;
+
+/// Bound on one history event's content.
+///
+/// Multiplied by `context_message_limit` (12 by default) this is the worst case
+/// the conversation section can cost, so the two knobs together are the whole
+/// bound: ~10 KB of prompt, held by a count the operator sets and a per-event
+/// cut nobody has to think about. A comment long enough to hit it is one whose
+/// gist survives its first eight hundred characters.
+pub(crate) const PROJECT_HISTORY_CONTENT_MAX_CHARS: usize = 800;
+
+/// Text cut to a character bound, with the arithmetic it was cut by kept.
+///
+/// Characters rather than bytes, for two reasons: the bound is about how much
+/// prompt a section may spend and a multi-byte character costs one position of
+/// that either way, and slicing at a byte index would split a UTF-8 sequence
+/// and panic on the first non-ASCII issue title.
+///
+/// The counts are retained rather than a bare `truncated: bool` so the prompt
+/// can say *how much* it withheld. "Truncated" tells an agent something is
+/// missing; "2000 of 51234 characters" tells it whether going to fetch the rest
+/// is worth a tool call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BoundedText {
+    /// What the prompt shows — at most the bound's worth of the original.
+    pub shown: String,
+    /// How many characters the original had.
+    pub total_chars: usize,
+}
+
+impl BoundedText {
+    /// Cut `raw` to at most `max` characters.
+    pub fn bound(raw: &str, max: usize) -> Self {
+        let total_chars = raw.chars().count();
+        let shown = if total_chars <= max {
+            raw.to_string()
+        } else {
+            raw.chars().take(max).collect()
+        };
+        Self { shown, total_chars }
+    }
+
+    pub fn is_truncated(&self) -> bool {
+        self.total_chars > self.shown.chars().count()
+    }
+
+    /// Nothing worth rendering. Whitespace counts as nothing: a body of three
+    /// newlines is a root opened without a description, and "Description:"
+    /// followed by blank lines describes the harness rather than the issue.
+    pub fn is_blank(&self) -> bool {
+        self.shown.trim().is_empty()
+    }
+
+    /// The note a truncated body carries, or nothing when it is whole.
+    ///
+    /// Silent truncation is the failure this whole type exists to prevent, so
+    /// the note is generated from the same counts the cut was made with — it
+    /// cannot claim a truncation that did not happen or omit one that did.
+    fn truncation_note(&self, what: &str, recover_with: &str) -> Option<String> {
+        self.is_truncated().then(|| {
+            format!(
+                "[{what} truncated — {} of {} characters shown; the rest is on the relay, read it with `{recover_with}`]",
+                self.shown.chars().count(),
+                self.total_chars,
+            )
+        })
+    }
+}
+
+/// What the root event says it is about.
+///
+/// Both fields come from the root itself, which is fetched by id at prompt
+/// time. Neither is inferred from the triggering comment: a comment saying
+/// "same here" on an issue titled "reconnect drops the subscription" is a
+/// different turn from the same comment on "add a dark theme", and the batch
+/// alone cannot tell them apart.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectRootFacts {
+    /// The root's title.
+    ///
+    /// `None` when the root carries neither a `subject` tag nor a usable first
+    /// line — an untitled root is a real thing on the wire and saying so is
+    /// better than inventing "Untitled issue" and letting the agent quote it
+    /// back at somebody.
+    pub title: Option<BoundedText>,
+    /// The root's content — the description body — bounded.
+    pub description: BoundedText,
+}
+
+/// The root's own text, or the honest absence of it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProjectRootIdentity {
+    /// The root event was read this turn.
+    Known(ProjectRootFacts),
+    /// It was not — the read failed, timed out, or returned no such root.
+    ///
+    /// One variant for all three because the prompt says the same thing about
+    /// each of them: the agent is answering without the root's text, and it
+    /// should know that rather than assume the issue is empty.
+    Unavailable,
+}
+
+/// One earlier event on the root: a comment, a status change, or peer-call
+/// traffic that rode the same stream.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectHistoryEntry {
+    pub pubkey: String,
+    pub timestamp: String,
+    /// The event kind, kept rather than pre-rendered so the label stays one
+    /// decision (`project_event_label`) instead of one per fetch path.
+    pub kind: u32,
+    pub content: BoundedText,
+}
+
+/// Recent conversation on the root.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProjectConversation {
+    /// Read successfully. `entries` are oldest-first and already capped at
+    /// `context_message_limit`; `older_exist` is the sentinel's answer to
+    /// "was anything left out", never a guess.
+    Fetched {
+        entries: Vec<ProjectHistoryEntry>,
+        older_exist: bool,
+    },
+    /// The read failed. **The turn still runs.** An answered comment without
+    /// its backstory beats no answer at all, so this renders as a stated gap
+    /// and the agent decides what to do about it.
+    Unavailable,
+}
+
+/// Everything a project turn knows about its root beyond the batch itself.
+///
+/// Assembled by the pool before formatting (see `fetch_project_situation`) and
+/// handed to [`format_prompt`] whole, so the renderer stays a pure function of
+/// facts somebody else went and got.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectSituation {
+    pub root: ProjectRootIdentity,
+    /// `None` when history was never asked for — `context_message_limit` is 0,
+    /// the operator's own "do not spend prompt on history" switch. Distinct
+    /// from `Some(Unavailable)`, which means it *was* asked for and did not
+    /// arrive; a prompt that conflated them would report a fetch failure to an
+    /// operator who had simply turned the feature off.
+    pub conversation: Option<ProjectConversation>,
+    /// Sibling agents this harness is configured with, as lowercase hex, with
+    /// this agent already removed. Names are resolved at render time from the
+    /// same kind:0 lookup every other participant label uses.
+    pub peers: Vec<String>,
+}
+
+/// How an event of `kind` reads in the conversation section.
+///
+/// `None` for an ordinary comment: labelling the common case adds a bracket to
+/// every line and distinguishes nothing. Everything else is labelled because a
+/// status change with an empty body is otherwise a blank line attributed to
+/// somebody, and a peer call rendered as a comment invites the agent to answer
+/// a machine envelope in prose.
+fn project_event_label(kind: u32) -> Option<String> {
+    use buzz_core::kind::{
+        KIND_GIT_PR_UPDATE, KIND_GIT_STATUS_CLOSED, KIND_GIT_STATUS_DRAFT, KIND_GIT_STATUS_MERGED,
+        KIND_GIT_STATUS_OPEN, KIND_TEXT_NOTE,
+    };
+    use buzz_core::peer_call::{KIND_PEER_CALL, KIND_PEER_CALL_RESULT};
+
+    let label = match kind {
+        KIND_TEXT_NOTE => return None,
+        KIND_GIT_STATUS_OPEN => "status → open",
+        KIND_GIT_STATUS_MERGED => "status → merged",
+        KIND_GIT_STATUS_CLOSED => "status → closed",
+        KIND_GIT_STATUS_DRAFT => "status → draft",
+        KIND_PEER_CALL => "peer call",
+        KIND_PEER_CALL_RESULT => "peer call result",
+        KIND_GIT_PR_UPDATE => "pull-request revision",
+        // Not reachable from the kinds this harness asks for, and rendered
+        // rather than dropped if it ever is: an event the agent can see the
+        // number of is one it can ask about, where a silently omitted line is
+        // a hole nobody can point at.
+        other => return Some(format!("kind {other}")),
+    };
+    Some(label.to_string())
+}
+
+/// The root-identity lines of the `[Project]` section: title and description.
+///
+/// Every branch says something. A root that could not be read, a root with no
+/// title and a root with an empty body are three different situations, and an
+/// agent that sees nothing cannot tell them from a harness that forgot to look.
+fn format_root_identity(root: &ProjectRootIdentity, class: &str, root_id: &str) -> String {
+    let facts = match root {
+        ProjectRootIdentity::Known(facts) => facts,
+        ProjectRootIdentity::Unavailable => {
+            return format!(
+                "Title and description: unavailable — the root event could not be read this \
+                 turn. Everything else in this prompt still holds; only the {class}'s own \
+                 opening text is missing. Read it with `buzz projects root --event {root_id}` \
+                 if you need it."
+            )
+        }
+    };
+
+    let mut out = match facts.title {
+        Some(ref title) => format!("Title: {}", title.shown),
+        None => "Title: (none — this root carries no `subject` tag and its body opens with no \
+                 usable line)"
+            .to_string(),
+    };
+    if let Some(note) = facts
+        .title
+        .as_ref()
+        .and_then(|t| t.truncation_note("title", &format!("buzz projects root --event {root_id}")))
+    {
+        out.push_str(&format!("\n{note}"));
+    }
+
+    if facts.description.is_blank() {
+        out.push_str("\nDescription: (empty — this root was opened with a title and no body)");
+        return out;
+    }
+
+    out.push_str(&format!("\nDescription:\n{}", facts.description.shown));
+    if let Some(note) = facts.description.truncation_note(
+        "description",
+        &format!("buzz projects root --event {root_id}"),
+    ) {
+        out.push_str(&format!("\n{note}"));
+    }
+    out
+}
+
 /// Format the `[Project]` context section for a project-routed turn.
 ///
 /// Replaces the channel hints entirely. It names what the agent is actually
-/// looking at — repository coordinate, root, and whether it is an issue or a
-/// pull request — and gives the exact command that answers on that root.
+/// looking at — repository coordinate, root, whether it is an issue or a pull
+/// request, what that root is called and what it says — and gives the exact
+/// command that answers on it.
 ///
 /// **The reply command is spelled out rather than described.** An agent that
 /// knows it is on an issue but has to guess the command reaches for
@@ -1550,12 +1808,21 @@ fn resolve_reply_anchor(
 /// root — but the reply command does not: answering a call with
 /// `buzz issues comment` posts a comment and leaves the call outstanding
 /// forever. The command is therefore withheld here and the `[Peer Call]` section
-/// supplies the only one that closes the turn.
+/// supplies the only one that closes the turn. Everything the call turn's callee
+/// benefits from knowing — what the issue is called, what it says, that this
+/// conversation is durable — is *not* withheld: a callee working on an issue it
+/// cannot see is the same blindness this section exists to end.
+///
+/// `situation` carries the root's own text (see [`ProjectSituation`]). `None`
+/// means nothing was fetched — the channel-shaped call sites and the tests that
+/// predate the fetch — and the section renders exactly as it did before, minus
+/// the identity lines, rather than claiming an unavailable root.
 fn format_project_context(
     project: &crate::project::ProjectOrigin,
     triggering: &str,
     triggering_author: &str,
     owes_result: bool,
+    situation: Option<&ProjectSituation>,
 ) -> String {
     let coordinate = project.coordinate();
     let root = project.root();
@@ -1569,7 +1836,7 @@ fn format_project_context(
     let repo_owner = parts.next().unwrap_or_default();
     let repo_id = parts.next().unwrap_or_default();
 
-    let header = format!(
+    let mut header = format!(
         "[Project]\n\
          You are working on a git {class}, not a channel. This conversation \
          belongs to a repository root, and replies must be attached to that \
@@ -1579,6 +1846,30 @@ fn format_project_context(
          Triggering event: {triggering}\n\
          Asked by: {triggering_author}"
     );
+
+    // The root's own text, when somebody fetched it. It sits above the reply
+    // command because it is what the reply is *about*: an agent that reads the
+    // command first and the title second has already started composing.
+    if let Some(root_facts) = situation.map(|s| &s.root) {
+        header.push_str(&format!(
+            "\n\n{}",
+            format_root_identity(root_facts, class, root)
+        ));
+    }
+
+    // What kind of thing this is, stated once, for both the ordinary and the
+    // call turn. A channel message scrolls away and is read by whoever is
+    // present; a comment on a root is the record of the {class} and is read by
+    // whoever opens it next month. Agents that treat the two the same write
+    // chat into permanent project history — hedges, thinking-aloud, "let me
+    // check and get back to you" — which is not a formatting nit but the
+    // difference between a useful issue thread and an unreadable one.
+    header.push_str(&format!(
+        "\n\nThis conversation is the {class} itself, not a chat about it. \
+         Every comment on this root is durable, visible to everyone who can \
+         see the repository, and is what a person reads when they open this \
+         {class} later. Write for that reader."
+    ));
 
     if owes_result {
         return format!(
@@ -1612,6 +1903,174 @@ fn format_project_context(
          root. The ordinary channel-message command cannot be used here — it \
          requires a channel id, and this conversation has none."
     )
+}
+
+/// Format the `[Project Conversation]` section: what has been said on this root.
+///
+/// Its own block rather than more lines inside `[Project]` for the reason every
+/// other section is its own block — the observer's size trimmer elides an
+/// oversized body in place and leaves the `[Header]` at the head of its own
+/// leaf, so the desktop's prompt-context panel still counts a conversation it
+/// was too large to show. This is the section most likely to be that one.
+///
+/// Oldest-first, matching [`format_conversation_context`]: a reader who starts
+/// at the top reads the thread in the order it happened, and an agent asked to
+/// "do what we agreed above" resolves *above* the same way the human did.
+///
+/// The events that woke this turn are deliberately absent — they are rendered
+/// in full further down the prompt, and repeating them here would make the same
+/// comment look like two.
+fn format_project_conversation(
+    conversation: &ProjectConversation,
+    class: &str,
+    root_id: &str,
+    profile_lookup: Option<&PromptProfileLookup>,
+) -> String {
+    let (entries, older_exist) = match conversation {
+        ProjectConversation::Fetched {
+            entries,
+            older_exist,
+        } => (entries, *older_exist),
+        // The turn proceeds without history and says so. The alternative —
+        // failing the turn on a failed read — answers nobody; the alternative
+        // to *that* — saying nothing — leaves an agent to conclude from an
+        // empty section that nothing has been said, which is a lie the harness
+        // told rather than a gap the relay had.
+        ProjectConversation::Unavailable => {
+            return format!(
+                "[Project Conversation (history unavailable)]\n\
+                 The earlier conversation on this {class} could not be read this turn — the \
+                 relay request failed or timed out. This is a gap in what you were given, \
+                 not evidence that the {class} is empty: assume there is context you cannot \
+                 see, answer what was asked, and say so if the answer depends on what came \
+                 before. `buzz projects history --roots {root_id}` reads it directly."
+            )
+        }
+    };
+
+    if entries.is_empty() {
+        return format!(
+            "[Project Conversation (nothing before this turn)]\n\
+             Nothing has been said on this {class} since it was opened — the event(s) at \
+             the end of this prompt are the first."
+        );
+    }
+
+    let scope = if older_exist {
+        format!(
+            "{} most recent, oldest first; older events exist and are not shown",
+            entries.len()
+        )
+    } else {
+        format!("{} events, oldest first, complete", entries.len())
+    };
+    let mut s = format!(
+        "[Project Conversation ({scope})]\n\
+         What has already been said on this {class}. The event(s) that woke you are \
+         at the end of this prompt and are not repeated here."
+    );
+    for (i, entry) in entries.iter().enumerate() {
+        let label = match project_event_label(entry.kind) {
+            Some(label) => format!(" [{label}]"),
+            None => String::new(),
+        };
+        let body = if entry.content.shown.trim().is_empty() {
+            "(no message)".to_string()
+        } else {
+            entry.content.shown.clone()
+        };
+        s.push_str(&format!(
+            "\n[{}] {} ({}){}: {}",
+            i + 1,
+            format_prompt_actor(&entry.pubkey, profile_lookup),
+            entry.timestamp,
+            label,
+            body,
+        ));
+        if let Some(note) = entry.content.truncation_note(
+            "comment",
+            &format!("buzz projects history --roots {root_id}"),
+        ) {
+            s.push_str(&format!("\n    {note}"));
+        }
+    }
+    s
+}
+
+/// Format the `[Peer Agents]` section: who else exists, and how to reach them.
+///
+/// **The mechanism is spelled out because prose does not work and looks like it
+/// should.** A human wrote "work with the Claude agent" in an issue comment and
+/// nothing happened — correctly, and expensively. Nothing happened because
+/// addressing an agent on a root is two things at once: an `@name` mention
+/// token in the body, which is what
+/// `crate::project::AddressingEvidence::resolve` reads, and that agent's `p`
+/// tag on the event, which the relay delivers on and which
+/// `crate::project::resolve_addressing` requires before it will look at the
+/// name at all. A name in prose is neither. Half of the pair is still neither.
+///
+/// So the section names the roster, spells the mention token each entry answers
+/// to, and puts the `--to` flag that writes the `p` tag next to it — because an
+/// agent handed a list of colleagues and no mechanism invents the prose form,
+/// which is exactly the failure being documented.
+///
+/// `owes_result` withholds the mechanism the same way `[Peer Call]` withholds
+/// the reply command: a call turn publishes one correlated result and no
+/// comment, so there is no reply for an `@mention` to ride on. The roster
+/// itself stays — knowing who exists is context, and a callee may well need to
+/// say "ask Hermes" in its result.
+fn format_peer_roster(
+    peers: &[String],
+    owes_result: bool,
+    profile_lookup: Option<&PromptProfileLookup>,
+) -> String {
+    let mut s = String::from(
+        "[Peer Agents]\n\
+         Other agents this deployment is configured with. None of them is reading this \
+         conversation right now — an agent sees a comment only when that comment \
+         addresses it.\n",
+    );
+
+    for peer in peers {
+        // The mention token is the resolved name when there is one, and the key
+        // otherwise. `@<hex>` is a real address — mention detection matches the
+        // hex and npub spellings as well as the display name — so a peer with
+        // no published profile is reachable rather than merely listed.
+        match resolve_prompt_label(peer, profile_lookup) {
+            Some(name) => s.push_str(&format!(
+                "\n- {name} — write `@{name}` in the body, and pass `--to {peer}`"
+            )),
+            None => s.push_str(&format!(
+                "\n- {peer} (no published profile name) — write `@{peer}` in the body, and \
+                 pass `--to {peer}`"
+            )),
+        }
+    }
+
+    if owes_result {
+        s.push_str(
+            "\n\nThis turn owes a correlated result rather than a comment (see [Peer Call]), \
+             so there is no reply here for a mention to ride on. The roster is above so you \
+             know who exists, not so this turn addresses one of them.",
+        );
+        return s;
+    }
+
+    s.push_str(
+        "\n\nBringing one onto this root takes BOTH halves of the same comment:\n\
+         1. the `@name` written in the body, exactly as spelled above; and\n\
+         2. `--to <their pubkey>` on the reply command, which is what puts their `p` tag \
+         on the event.\n\
+         The `p` tag is what the relay delivers on and what the other agent's addressing \
+         gate requires before it will even consider the name; the `@name` is what tells it \
+         the comment is *for* it rather than *about* it. Either half on its own reaches \
+         nobody.\n\
+         Naming an agent in prose — \"let's get the Claude agent to look at this\" — is not \
+         a mention. No `@`, no `p` tag, nothing happens, and that is the system working as \
+         intended rather than a bug to route around. Names come from each agent's published \
+         profile; if a name goes unanswered, `@<their pubkey>` addresses them unambiguously.",
+    );
+    s
 }
 
 /// Format a `[Context]` hints section based on event scope.
@@ -1763,6 +2222,14 @@ pub struct FormatPromptArgs<'a> {
     /// the agent the reply command — without it the agent has a conversation
     /// and no way to answer on the thing it is about.
     pub project: Option<&'a crate::project::ProjectOrigin>,
+    /// What was fetched about that root before this prompt was built.
+    ///
+    /// Drives the root's title and description inside `[Project]`, and the
+    /// `[Project Conversation]` and `[Peer Agents]` sections. Ignored entirely
+    /// when `project` is `None`: a channel turn has no root to describe, no
+    /// project conversation to summarise, and no comment for an `@mention` to
+    /// ride on, so none of the three may appear there.
+    pub project_situation: Option<&'a ProjectSituation>,
     /// Rendered `[Channel Canvas]` metadata section for legacy agents.
     ///
     /// For modern agents (protocol_version >= 2) the section is delivered via
@@ -1787,7 +2254,13 @@ pub(crate) fn base_section(base_prompt: &str) -> String {
 /// 0. `[Base]` — base prompt (only for legacy agents without systemPrompt support)
 /// 1. `[System]` — system prompt (only for legacy agents without systemPrompt support)
 /// 2. `[Agent Memory — core]` — if agent core memory is set
-/// 3. `[Context]` — scope, channel name, and contextual hints for the agent
+/// 3. `[Context]` — scope, channel name, and contextual hints for the agent —
+///    **or**, for a project-routed turn, `[Project]` (repository, root, title,
+///    description, reply command) followed by `[Project Conversation]` and
+///    `[Peer Agents]` when a [`ProjectSituation`] was fetched. The two families
+///    are alternatives: a project turn has no channel and a channel turn has no
+///    root, so emitting both would hand the agent a working instruction and a
+///    broken one and let it choose.
 /// 4. `[Thread Context]` or `[Conversation Context]` — if fetched
 /// 5. `[Event]` / `[Buzz events]` — the triggering event(s)
 ///
@@ -1907,7 +2380,34 @@ pub fn format_prompt(batch: &FlushBatch, args: &FormatPromptArgs<'_>) -> Vec<Str
             &last_event.event.id.to_hex(),
             &sender_pubkey,
             call_directive.is_some(),
+            args.project_situation,
         ));
+        // The situation's other two halves, each as its own block so an
+        // oversized one is elided in place rather than taking the sections
+        // around it with it. Both are project-only: they are gated here rather
+        // than inside their formatters so a channel turn cannot acquire one by
+        // some future caller populating `project_situation` without `project`.
+        if let Some(situation) = args.project_situation {
+            if let Some(conversation) = situation.conversation.as_ref() {
+                sections.push(format_project_conversation(
+                    conversation,
+                    project.class_noun(),
+                    project.root(),
+                    args.profile_lookup,
+                ));
+            }
+            // An empty roster renders nothing. "No peer agents are configured"
+            // is a fact about this deployment's environment variables, not
+            // about the issue, and a section saying it would be one more thing
+            // to read on every single project turn.
+            if !situation.peers.is_empty() {
+                sections.push(format_peer_roster(
+                    &situation.peers,
+                    call_directive.is_some(),
+                    args.profile_lookup,
+                ));
+            }
+        }
     } else {
         sections.push(format_context_hints(
             batch.channel_id,
@@ -2303,6 +2803,530 @@ mod peer_call_prompt_tests {
         let event = signed_call(&caller, &callee.public_key().to_hex(), &route);
         let prompt = prompt_for(event, "@call-result", None);
         assert!(!prompt.contains("[Peer Call]"));
+    }
+}
+
+/// What a project turn is told about the root it is answering on.
+///
+/// Every assertion is on the rendered prompt string, because that is the only
+/// artefact the agent ever sees. A test that checked a struct was populated
+/// would pass just as happily against a formatter that dropped it.
+#[cfg(test)]
+mod project_context_tests {
+    use super::*;
+    use nostr::{EventBuilder, Keys, Kind};
+
+    const ROOT: &str = "b000000000000000000000000000000000000000000000000000000000000001";
+    const OWNER: &str = "a000000000000000000000000000000000000000000000000000000000000002";
+    const ALICE: &str = "c000000000000000000000000000000000000000000000000000000000000003";
+    const HERMES: &str = "e000000000000000000000000000000000000000000000000000000000000005";
+
+    fn coordinate() -> String {
+        format!("30617:{OWNER}:my-repo")
+    }
+
+    fn origin(is_pull_request: bool) -> crate::project::ProjectOrigin {
+        crate::project::ProjectOrigin::for_test(&coordinate(), ROOT, is_pull_request)
+    }
+
+    fn named(pubkey: &str, name: &str) -> (String, PromptProfile) {
+        (
+            pubkey.to_string(),
+            PromptProfile {
+                display_name: Some(name.to_string()),
+                nip05_handle: None,
+                is_agent: true,
+            },
+        )
+    }
+
+    fn facts(title: Option<&str>, description: &str) -> ProjectRootIdentity {
+        ProjectRootIdentity::Known(ProjectRootFacts {
+            title: title.map(|t| BoundedText::bound(t, PROJECT_TITLE_MAX_CHARS)),
+            description: BoundedText::bound(description, PROJECT_DESCRIPTION_MAX_CHARS),
+        })
+    }
+
+    fn entry(pubkey: &str, at: &str, kind: u32, content: &str) -> ProjectHistoryEntry {
+        ProjectHistoryEntry {
+            pubkey: pubkey.to_string(),
+            timestamp: at.to_string(),
+            kind,
+            content: BoundedText::bound(content, PROJECT_HISTORY_CONTENT_MAX_CHARS),
+        }
+    }
+
+    fn situation(
+        root: ProjectRootIdentity,
+        conversation: Option<ProjectConversation>,
+        peers: &[&str],
+    ) -> ProjectSituation {
+        ProjectSituation {
+            root,
+            conversation,
+            peers: peers.iter().map(|p| (*p).to_string()).collect(),
+        }
+    }
+
+    /// Render a project turn the way a flush does.
+    fn render(
+        is_pull_request: bool,
+        prompt_tag: &str,
+        situation: Option<&ProjectSituation>,
+        lookup: Option<&PromptProfileLookup>,
+    ) -> Vec<String> {
+        let event = EventBuilder::new(Kind::TextNote, "does this still happen?")
+            .tags([])
+            .sign_with_keys(&Keys::generate())
+            .expect("sign");
+        let batch = FlushBatch {
+            channel_id: Uuid::new_v4(),
+            events: vec![BatchEvent {
+                event,
+                prompt_tag: prompt_tag.into(),
+                received_at: Instant::now(),
+                project: Some(origin(is_pull_request)),
+            }],
+            cancelled_events: vec![],
+            cancel_reason: None,
+        };
+        format_prompt(
+            &batch,
+            &FormatPromptArgs {
+                project: batch.project_origin(),
+                project_situation: situation,
+                profile_lookup: lookup,
+                ..Default::default()
+            },
+        )
+    }
+
+    fn section<'a>(sections: &'a [String], header: &str) -> &'a str {
+        sections
+            .iter()
+            .find(|s| s.starts_with(header))
+            .unwrap_or_else(|| panic!("no section starting {header:?} in {sections:#?}"))
+    }
+
+    /// The turn knows what the issue is called and what it says.
+    ///
+    /// The reply command is asserted in the same test on purpose: the identity
+    /// lines are an addition to the section, and a change that rendered them by
+    /// replacing the command would leave an agent that knows exactly what the
+    /// issue is about and cannot answer it.
+    #[test]
+    fn the_project_section_carries_the_root_title_and_description() {
+        let sections = render(
+            false,
+            "@mention",
+            Some(&situation(
+                facts(
+                    Some("Reconnect drops the project subscription"),
+                    "It happens on the second reconnect, every time.",
+                ),
+                None,
+                &[],
+            )),
+            None,
+        );
+        let project = section(&sections, "[Project]");
+
+        assert!(
+            project.contains("Title: Reconnect drops the project subscription"),
+            "the root's title is missing: {project}"
+        );
+        assert!(
+            project.contains("It happens on the second reconnect, every time."),
+            "the root's description is missing: {project}"
+        );
+        assert!(
+            project.contains("buzz issues comment"),
+            "the reply command was displaced by the identity lines"
+        );
+        assert!(
+            project.contains("This conversation is the issue itself"),
+            "the durability framing is missing: {project}"
+        );
+        assert!(
+            project.contains("visible to everyone who can see the repository"),
+            "the framing does not say who reads this"
+        );
+    }
+
+    /// A 50 KB description does not eat the context window, and does not
+    /// pretend to be the whole description either.
+    #[test]
+    fn an_oversized_description_is_bounded_and_the_cut_is_stated() {
+        let body = "y".repeat(50_000);
+        let sections = render(
+            false,
+            "@mention",
+            Some(&situation(facts(Some("big"), &body), None, &[])),
+            None,
+        );
+        let project = section(&sections, "[Project]");
+
+        assert!(
+            project.len() < 6_000,
+            "an oversized description was rendered whole ({} bytes)",
+            project.len()
+        );
+        assert!(
+            project.contains(&format!(
+                "[description truncated — {PROJECT_DESCRIPTION_MAX_CHARS} of 50000 characters shown"
+            )),
+            "the truncation is silent, which is the one thing it must never be: {project}"
+        );
+        assert!(
+            project.contains("buzz projects root --event"),
+            "a truncated description must say where the rest is"
+        );
+    }
+
+    /// A root nobody could read says so, rather than reading as an empty issue.
+    #[test]
+    fn an_unreadable_root_is_a_stated_gap_not_an_empty_issue() {
+        let sections = render(
+            false,
+            "@mention",
+            Some(&situation(ProjectRootIdentity::Unavailable, None, &[])),
+            None,
+        );
+        let project = section(&sections, "[Project]");
+
+        assert!(
+            project.contains("Title and description: unavailable"),
+            "a failed root read rendered as nothing at all: {project}"
+        );
+        assert!(
+            project.contains("buzz issues comment"),
+            "a failed root read must not cost the turn its reply command"
+        );
+    }
+
+    /// A root with no title and no body says which, rather than nothing.
+    #[test]
+    fn an_untitled_empty_root_names_both_absences() {
+        let sections = render(
+            false,
+            "@mention",
+            Some(&situation(facts(None, ""), None, &[])),
+            None,
+        );
+        let project = section(&sections, "[Project]");
+
+        assert!(project.contains("Title: (none"), "{project}");
+        assert!(project.contains("Description: (empty"), "{project}");
+    }
+
+    /// The conversation is ordered, attributed, labelled and capped.
+    #[test]
+    fn the_conversation_is_ordered_attributed_and_bounded() {
+        let lookup: PromptProfileLookup = [named(ALICE, "Alice"), named(HERMES, "Hermes")]
+            .into_iter()
+            .collect();
+        let long = "z".repeat(PROJECT_HISTORY_CONTENT_MAX_CHARS + 100);
+        let sections = render(
+            false,
+            "@mention",
+            Some(&situation(
+                facts(Some("t"), "b"),
+                Some(ProjectConversation::Fetched {
+                    entries: vec![
+                        entry(
+                            ALICE,
+                            "2026-08-03T10:00:00+00:00",
+                            buzz_core::kind::KIND_TEXT_NOTE,
+                            "I can reproduce it on main.",
+                        ),
+                        entry(
+                            HERMES,
+                            "2026-08-03T11:00:00+00:00",
+                            buzz_core::kind::KIND_TEXT_NOTE,
+                            &long,
+                        ),
+                        entry(
+                            ALICE,
+                            "2026-08-03T12:00:00+00:00",
+                            buzz_core::kind::KIND_GIT_STATUS_CLOSED,
+                            "",
+                        ),
+                    ],
+                    older_exist: true,
+                }),
+                &[],
+            )),
+            Some(&lookup),
+        );
+        let conversation = section(&sections, "[Project Conversation");
+
+        let alice = conversation
+            .find("Alice")
+            .expect("the conversation is unattributed");
+        let hermes = conversation.find("Hermes").expect("second speaker missing");
+        assert!(alice < hermes, "the conversation is not oldest-first");
+        assert!(
+            conversation.contains(&format!("Alice ({ALICE})")),
+            "an attribution must carry the key as well as the name"
+        );
+        assert!(
+            conversation.contains("older events exist and are not shown"),
+            "a capped window that does not say so reads as the whole issue: {conversation}"
+        );
+        assert!(
+            conversation.contains("[status → closed]"),
+            "a status change rendered as an ordinary comment"
+        );
+        assert!(
+            conversation.contains("(no message)"),
+            "an empty status body rendered as a blank line attributed to somebody"
+        );
+        assert!(
+            conversation.contains(&format!(
+                "[comment truncated — {PROJECT_HISTORY_CONTENT_MAX_CHARS} of {} characters shown",
+                long.chars().count()
+            )),
+            "a long comment was cut without saying so: {conversation}"
+        );
+    }
+
+    /// A failed history read costs the turn its backstory, not its answer.
+    #[test]
+    fn a_failed_history_read_degrades_to_a_stated_gap() {
+        let sections = render(
+            false,
+            "@mention",
+            Some(&situation(
+                facts(Some("t"), "b"),
+                Some(ProjectConversation::Unavailable),
+                &[],
+            )),
+            None,
+        );
+
+        let conversation = section(&sections, "[Project Conversation (history unavailable)]");
+        assert!(
+            conversation.contains("not evidence that the issue is empty"),
+            "an unavailable history must not read as an empty one: {conversation}"
+        );
+        assert!(
+            section(&sections, "[Project]").contains("buzz issues comment"),
+            "a failed history read must not cost the turn its reply command"
+        );
+    }
+
+    /// The window switched off renders no conversation section at all.
+    #[test]
+    fn a_disabled_window_renders_no_conversation_section() {
+        let sections = render(
+            false,
+            "@mention",
+            Some(&situation(facts(Some("t"), "b"), None, &[])),
+            None,
+        );
+        assert!(
+            !sections
+                .iter()
+                .any(|s| s.starts_with("[Project Conversation")),
+            "a disabled context window rendered a section anyway"
+        );
+    }
+
+    /// The roster names who exists and spells out the two-part mechanism.
+    ///
+    /// The prose warning is asserted by name because it is the whole reason the
+    /// section exists: a human wrote "work with the Claude agent" in a comment,
+    /// nothing happened, and a debugging session went looking for the bug in
+    /// the delivery path rather than in the sentence.
+    #[test]
+    fn the_roster_names_peers_and_spells_the_mechanism() {
+        let lookup: PromptProfileLookup = [named(HERMES, "Hermes")].into_iter().collect();
+        let sections = render(
+            false,
+            "@mention",
+            Some(&situation(facts(Some("t"), "b"), None, &[HERMES, ALICE])),
+            Some(&lookup),
+        );
+        let roster = section(&sections, "[Peer Agents]");
+
+        assert!(
+            roster.contains("@Hermes"),
+            "a resolved peer must be shown in the mention syntax that addresses it"
+        );
+        assert!(
+            roster.contains(&format!("--to {HERMES}")),
+            "the roster names no way to write the `p` tag: {roster}"
+        );
+        assert!(
+            roster.contains(&format!("@{ALICE}")),
+            "an unresolved peer must still be addressable, by key"
+        );
+        assert!(
+            roster.contains("BOTH halves"),
+            "the mechanism is described as one step: {roster}"
+        );
+        assert!(
+            roster.contains("is not a mention"),
+            "the prose failure is not called out: {roster}"
+        );
+    }
+
+    /// No configured peers, no section.
+    #[test]
+    fn an_empty_roster_renders_nothing() {
+        let sections = render(
+            false,
+            "@mention",
+            Some(&situation(facts(Some("t"), "b"), None, &[])),
+            None,
+        );
+        assert!(!sections.iter().any(|s| s.starts_with("[Peer Agents]")));
+    }
+
+    /// A call turn keeps the situation and loses only the reply command.
+    ///
+    /// A callee working an issue it cannot see is the blindness this whole
+    /// section exists to end; a callee handed both a correlated result command
+    /// and an ordinary comment command is the failure `[Peer Call]` exists to
+    /// prevent. Both, in one turn.
+    #[test]
+    fn a_peer_call_turn_keeps_the_context_and_withholds_the_reply_command() {
+        use buzz_core::peer_call::{onward_context, PeerCallRoute};
+        use buzz_sdk::builders::{build_peer_call, PeerCallMeta};
+
+        let caller = Keys::generate();
+        let callee = Keys::generate();
+        let caller_hex = caller.public_key().to_hex().to_ascii_lowercase();
+        let (hop, visited) = onward_context(&[], &caller_hex);
+        let call = build_peer_call(
+            &caller_hex,
+            "summarise the open questions",
+            &PeerCallMeta {
+                callee: callee.public_key().to_hex(),
+                route: PeerCallRoute::Project {
+                    coordinate: coordinate(),
+                    root: ROOT.to_string(),
+                },
+                nonce: "0123456789abcdef0123456789abcdef".into(),
+                hop,
+                visited,
+            },
+        )
+        .expect("well-formed call")
+        .sign_with_keys(&caller)
+        .expect("sign");
+
+        let situation = situation(
+            facts(Some("Reconnect drops the subscription"), "the body"),
+            Some(ProjectConversation::Fetched {
+                entries: vec![entry(
+                    ALICE,
+                    "2026-08-03T10:00:00+00:00",
+                    buzz_core::kind::KIND_TEXT_NOTE,
+                    "I can reproduce it on main.",
+                )],
+                older_exist: false,
+            }),
+            &[HERMES],
+        );
+        let batch = FlushBatch {
+            channel_id: Uuid::new_v4(),
+            events: vec![BatchEvent {
+                event: call,
+                prompt_tag: PEER_CALL_PROMPT_TAG.into(),
+                received_at: Instant::now(),
+                project: Some(origin(false)),
+            }],
+            cancelled_events: vec![],
+            cancel_reason: None,
+        };
+        let sections = format_prompt(
+            &batch,
+            &FormatPromptArgs {
+                project: batch.project_origin(),
+                project_situation: Some(&situation),
+                ..Default::default()
+            },
+        );
+        let joined = sections.join("\n\n");
+
+        assert!(joined.contains("[Peer Call]"), "not framed as a call");
+        assert!(
+            joined.contains("Title: Reconnect drops the subscription"),
+            "a callee was left blind to the issue it was called about"
+        );
+        assert!(
+            joined.contains("I can reproduce it on main."),
+            "a callee was left without the conversation on the root"
+        );
+        let roster = section(&sections, "[Peer Agents]");
+        assert!(
+            roster.contains(HERMES),
+            "a callee was not told who else exists: {roster}"
+        );
+        assert!(
+            roster.contains("no reply here for a mention to ride on"),
+            "the roster does not say why the mechanism is withheld: {roster}"
+        );
+        assert!(
+            !roster.contains("BOTH halves"),
+            "a call turn was handed a mention mechanism it has no reply to use it in: {roster}"
+        );
+        assert!(
+            !joined.contains("buzz issues comment"),
+            "a call turn kept the comment command, which leaves the call open forever"
+        );
+    }
+
+    /// A channel turn cannot acquire any of it.
+    #[test]
+    fn a_channel_turn_renders_no_project_situation() {
+        let situation = situation(
+            facts(Some("a title"), "a description"),
+            Some(ProjectConversation::Fetched {
+                entries: vec![entry(
+                    ALICE,
+                    "2026-08-03T10:00:00+00:00",
+                    buzz_core::kind::KIND_TEXT_NOTE,
+                    "earlier",
+                )],
+                older_exist: false,
+            }),
+            &[HERMES],
+        );
+        let batch = FlushBatch {
+            channel_id: Uuid::new_v4(),
+            events: vec![BatchEvent {
+                event: EventBuilder::new(Kind::Custom(9), "ordinary channel message")
+                    .tags([])
+                    .sign_with_keys(&Keys::generate())
+                    .expect("sign"),
+                prompt_tag: "@mention".into(),
+                received_at: Instant::now(),
+                project: None,
+            }],
+            cancelled_events: vec![],
+            cancel_reason: None,
+        };
+
+        let prompt = format_prompt(
+            &batch,
+            &FormatPromptArgs {
+                project: None,
+                project_situation: Some(&situation),
+                ..Default::default()
+            },
+        )
+        .join("\n\n");
+
+        assert!(prompt.contains("[Context]"), "channel hints were lost");
+        assert!(!prompt.contains("[Project]"));
+        assert!(!prompt.contains("[Project Conversation"));
+        assert!(!prompt.contains("[Peer Agents]"));
+        assert!(
+            !prompt.contains("a title"),
+            "a channel turn described a root"
+        );
     }
 }
 
