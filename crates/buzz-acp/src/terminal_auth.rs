@@ -368,44 +368,133 @@ fn data_carries_auth_token(data: &serde_json::Value) -> bool {
 
 /// Exact prose the Claude CLI emits when an OAuth session cannot be refreshed.
 ///
-/// Observed verbatim in the field. Matched as a substring because the adapter
-/// wraps it in its own framing (`API Error: …`, `Internal error: …`), but the
-/// phrase itself is matched in full — no partial word ever fires this.
+/// Observed verbatim in the field, and compared as a *whole message* — after
+/// the adapter's own framing has been peeled off, and never at an arbitrary
+/// offset inside somebody else's sentence.
 const CLAUDE_OAUTH_UNREFRESHABLE: &str = "OAuth session expired and could not be refreshed";
 
 /// Exact prose the Claude CLI emits when its OAuth access token has expired.
 ///
-/// Matched in full. A bare `Re-authenticate` substring is not enough and must
-/// never be used: adapters relay *other* services' login prompts through the
-/// same channel — `GitHub integration unavailable. Re-authenticate GitHub to
-/// continue.` is an ordinary tool failure, and classifying it as terminal
-/// would durably tombstone the user's request over a GitHub token.
+/// Compared as a whole message. Neither a bare `Re-authenticate` substring nor
+/// this complete sentence found somewhere inside a longer one is enough:
+/// adapters relay *other* services' login prompts through the same channel, and
+/// `GitHub OAuth access token has expired. Re-authenticate to continue.` is an
+/// ordinary tool failure. Classifying it as terminal would durably tombstone
+/// the user's request over a GitHub token.
 const CLAUDE_ACCESS_TOKEN_EXPIRED: &str =
     "OAuth access token has expired. Re-authenticate to continue.";
 
-/// The HTTP-401 form Claude surfaces through the adapter.
+/// The HTTP-401 form Claude surfaces through the adapter, framing included.
+///
+/// Unlike the two sentences above, this one *is* the adapter's framing: the
+/// status code is the whole signal, and the provider's own response body
+/// follows it (`… 401 unauthorized`, `… 401 {"type":"error",…}`). So it is
+/// matched as an anchored prefix with a boundary rather than by equality — see
+/// [`claude_api_unauthorized`].
 const CLAUDE_API_UNAUTHORIZED: &str = "API Error: 401";
+
+/// The closed set of framings the adapter is known to put in front of a Claude
+/// message.
+///
+/// Anchored at the start and stripped literally, trailing space included. A
+/// service, tool or provider prefix — `GitHub `, `Jira `, `MCP server: ` — is
+/// deliberately absent: those name a *different* system's failure, and peeling
+/// them off is exactly how an unrelated error becomes a Claude credential
+/// diagnosis.
+const ADAPTER_WRAPPER_PREFIXES: &[&str] = &["API Error: ", "Internal error: "];
+
+/// How many framings may be peeled off before we stop looking.
+///
+/// The deepest observed nesting is two (`Internal error: API Error: …`). A
+/// bound is what keeps this a normalisation of known framing rather than a
+/// search through arbitrary prose.
+const MAX_WRAPPER_DEPTH: usize = 2;
 
 /// Recognise the three legacy Claude authentication prose forms.
 ///
-/// Scoped to [`AdapterFamily::Claude`] by the caller. Ordered most-specific
-/// first so the recorded signal names the strongest evidence present.
+/// Scoped to [`AdapterFamily::Claude`] by the caller.
 ///
-/// Every form here is matched as a *complete observed phrase*. Each one is
-/// permitted to be wrapped in the adapter's own framing (`API Error: …`,
-/// `Internal error: …`), which is why these are substring tests rather than
-/// equality — but no individual word of any phrase can fire on its own.
+/// The message is compared against the authorised forms as-is, then again after
+/// each known framing prefix is removed — at most [`MAX_WRAPPER_DEPTH`] of
+/// them, always anchored at the start — and, at each step, once more without
+/// the adapter's single trailing detail group. Nothing is ever matched at an
+/// arbitrary offset, so no amount of surrounding prose from another service can
+/// put one of these forms in front of the classifier.
 fn claude_legacy_signal(message: &str) -> Option<AuthSignal> {
-    if message.contains(CLAUDE_OAUTH_UNREFRESHABLE) {
+    let mut rest = message.trim();
+    for _ in 0..=MAX_WRAPPER_DEPTH {
+        if let Some(signal) = authorized_claude_form(rest) {
+            return Some(signal);
+        }
+        match strip_adapter_wrapper(rest) {
+            Some(inner) => rest = inner,
+            None => break,
+        }
+    }
+    None
+}
+
+/// Remove one known adapter framing from the front of `message`.
+fn strip_adapter_wrapper(message: &str) -> Option<&str> {
+    ADAPTER_WRAPPER_PREFIXES
+        .iter()
+        .find_map(|prefix| message.strip_prefix(prefix))
+}
+
+/// Match an unwrapped message against the authorised Claude forms, allowing
+/// the adapter's one trailing detail group.
+fn authorized_claude_form(message: &str) -> Option<AuthSignal> {
+    if let Some(signal) = exact_claude_form(message) {
+        return Some(signal);
+    }
+    strip_trailing_detail(message).and_then(exact_claude_form)
+}
+
+/// Remove the adapter's trailing detail group, when the message ends in one.
+///
+/// The observed shape is the provider's own detail parenthesised at the very
+/// end — `… could not be refreshed (token …)`. Bounded on both sides: the
+/// group has to be the *last* thing in the message, and exactly one is
+/// removed. Nothing is ever removed from the front, which is the direction that
+/// would let another service's prose introduce a Claude sentence.
+fn strip_trailing_detail(message: &str) -> Option<&str> {
+    let inner = message.strip_suffix(')')?;
+    let opened_at = inner.rfind(" (")?;
+    Some(&inner[..opened_at])
+}
+
+/// Match a fully normalised message against the authorised Claude forms.
+///
+/// Ordered most-specific first so the recorded signal names the strongest
+/// evidence present.
+fn exact_claude_form(message: &str) -> Option<AuthSignal> {
+    if message == CLAUDE_OAUTH_UNREFRESHABLE {
         return Some(AuthSignal::ClaudeOauthUnrefreshable);
     }
-    if message.contains(CLAUDE_ACCESS_TOKEN_EXPIRED) {
+    if message == CLAUDE_ACCESS_TOKEN_EXPIRED {
         return Some(AuthSignal::ClaudeReauthenticate);
     }
-    if message.contains(CLAUDE_API_UNAUTHORIZED) {
+    if claude_api_unauthorized(message) {
         return Some(AuthSignal::ClaudeApiUnauthorized);
     }
     None
+}
+
+/// Whether `message` *is* Claude's HTTP-401 report.
+///
+/// The status code must sit at the very start, immediately behind the adapter's
+/// `API Error: ` framing, and must end there: anything continuing the number
+/// (`4010`, `4011`) is a different status and must not be read as a 401. What
+/// follows the boundary is the provider's own response body, which we neither
+/// parse nor retain.
+fn claude_api_unauthorized(message: &str) -> bool {
+    match message.strip_prefix(CLAUDE_API_UNAUTHORIZED) {
+        Some(tail) => tail
+            .chars()
+            .next()
+            .is_none_or(|next| !next.is_ascii_alphanumeric()),
+        None => false,
+    }
 }
 
 // ── Entry point ──────────────────────────────────────────────────────────────
@@ -555,6 +644,131 @@ mod tests {
                 .unwrap_or_else(|| panic!("must classify: {message}"));
             assert_eq!(classified.signal, expected);
             assert_eq!(classified.adapter, AdapterFamily::Claude);
+        }
+    }
+
+    #[test]
+    fn every_bare_and_wrapped_claude_form_classifies() {
+        // The bare observed sentences, and each of them behind every framing
+        // the adapter is known to add — including the two-deep nesting.
+        let cases = [
+            (
+                "OAuth session expired and could not be refreshed",
+                AuthSignal::ClaudeOauthUnrefreshable,
+            ),
+            (
+                "Internal error: OAuth session expired and could not be refreshed",
+                AuthSignal::ClaudeOauthUnrefreshable,
+            ),
+            (
+                "Internal error: API Error: OAuth session expired and could not be refreshed",
+                AuthSignal::ClaudeOauthUnrefreshable,
+            ),
+            (
+                "OAuth access token has expired. Re-authenticate to continue.",
+                AuthSignal::ClaudeReauthenticate,
+            ),
+            (
+                "Internal error: OAuth access token has expired. Re-authenticate to continue.",
+                AuthSignal::ClaudeReauthenticate,
+            ),
+            (
+                "Internal error: API Error: OAuth access token has expired. Re-authenticate to continue.",
+                AuthSignal::ClaudeReauthenticate,
+            ),
+            ("API Error: 401", AuthSignal::ClaudeApiUnauthorized),
+            (
+                "API Error: 401 unauthorized",
+                AuthSignal::ClaudeApiUnauthorized,
+            ),
+            (
+                r#"API Error: 401 {"type":"error","error":{"type":"authentication_error"}}"#,
+                AuthSignal::ClaudeApiUnauthorized,
+            ),
+            (
+                "Internal error: API Error: 401",
+                AuthSignal::ClaudeApiUnauthorized,
+            ),
+            // Surrounding whitespace is framing too, and the adapter adds it.
+            (
+                "  API Error: 401 unauthorized\n",
+                AuthSignal::ClaudeApiUnauthorized,
+            ),
+            // The provider's own detail, parenthesised at the very end — the
+            // shape the redaction fixtures use.
+            (
+                "API Error: OAuth session expired and could not be refreshed (token abc123)",
+                AuthSignal::ClaudeOauthUnrefreshable,
+            ),
+            (
+                "OAuth access token has expired. Re-authenticate to continue. (request req_1)",
+                AuthSignal::ClaudeReauthenticate,
+            ),
+        ];
+        for (message, expected) in cases {
+            let error = json!({"code": -32000, "message": message});
+            let classified = classify_jsonrpc_error(&error, &claude(), AuthStage::Prompt)
+                .unwrap_or_else(|| panic!("must classify: {message}"));
+            assert_eq!(classified.signal, expected, "{message}");
+        }
+    }
+
+    #[test]
+    fn unrelated_service_using_the_complete_phrase_stays_retryable() {
+        // The candidate-2 defect: an unrestricted substring search found the
+        // whole Claude sentence at an arbitrary offset inside another
+        // service's prose, so a GitHub token expiring durably tombstoned the
+        // user's request. A prefix naming a different system is not framing we
+        // are allowed to peel off.
+        let messages = [
+            "GitHub OAuth access token has expired. Re-authenticate to continue.",
+            "GitHub OAuth session expired and could not be refreshed",
+            "GitHub API Error: 401",
+            "Jira OAuth access token has expired. Re-authenticate to continue.",
+            "Jira OAuth session expired and could not be refreshed",
+            "Jira API Error: 401 unauthorized",
+            "MCP server: OAuth access token has expired. Re-authenticate to continue.",
+            "MCP server: OAuth session expired and could not be refreshed",
+            "MCP server: API Error: 401",
+            "tool 'linear' failed: API Error: 401 unauthorized",
+            "Fetching the repository failed. OAuth access token has expired. Re-authenticate to continue.",
+        ];
+        for message in messages {
+            let error = json!({"code": -32000, "message": message});
+            assert!(
+                classify_jsonrpc_error(&error, &claude(), AuthStage::Prompt).is_none(),
+                "another service's failure must stay retryable: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn wrapper_stripping_is_bounded_and_the_status_code_is_exact() {
+        let messages = [
+            // Deeper than the observed framing: at that point we are searching
+            // prose, not normalising a known wrapper.
+            "API Error: API Error: API Error: OAuth session expired and could not be refreshed",
+            // A different status that merely starts with the same digits.
+            "API Error: 4010 bad gateway",
+            "API Error: 4011",
+            // The framing is required — a bare status code is not the form.
+            "401 unauthorized",
+            // Trailing prose does not complete a partial sentence.
+            "OAuth access token has expired. Re-authenticate to GitHub to continue.",
+            // The detail group has to be the last thing in the message, and
+            // only one of them is ever removed.
+            "API Error: OAuth session expired and could not be refreshed (token abc) — retrying",
+            "API Error: OAuth session expired and could not be refreshed (a) (b)",
+            // And it is a suffix rule only: it can never uncover a sentence
+            // that another service's prefix introduced.
+            "GitHub OAuth session expired and could not be refreshed (token abc)",
+        ];
+        for message in messages {
+            let error = json!({"code": -32000, "message": message});
+            assert!(
+                classify_jsonrpc_error(&error, &claude(), AuthStage::Prompt).is_none(),
+                "must stay retryable: {message}"
+            );
         }
     }
 

@@ -1039,9 +1039,11 @@ fn spawn_augmented_path() -> Option<String> {
 ///
 /// Called twice per start: once by [`prepare_provider_preflight`] with no locks
 /// held, and once by [`spawn_agent_child`] under the caller's locks. The two
-/// derivations are independent, and their agreement is *checked* by fingerprint
-/// rather than assumed — that check is what stops a spawn proceeding on a
-/// verdict about a descriptor that has since moved.
+/// derivations are independent, and their agreement is *checked* rather than
+/// assumed — by capability fingerprint for the adapter descriptor, and by the
+/// gate's own sidecar identity for the runtime that took the verdict. Together
+/// they stop a spawn proceeding on a verdict about a descriptor, or through a
+/// sidecar, that has since moved.
 fn provider_gate_inputs(
     record: &ManagedAgentRecord,
     descriptor: &crate::managed_agents::readiness::EffectiveHarnessDescriptor,
@@ -1073,6 +1075,8 @@ fn provider_gate_inputs(
     let invocation = provider_probe::ProbeInvocation {
         // Deliberately not a fingerprint input, so an unresolvable sidecar
         // still yields a well-defined fingerprint for the fail-closed verdict.
+        // The exact sidecar identity is carried by `gate` instead, and `verify`
+        // compares it there.
         acp_binary: acp_binary
             .unwrap_or_else(|| std::path::PathBuf::from(record.acp_command.clone())),
         agent_command: agent_command.clone(),
@@ -1099,9 +1103,9 @@ fn provider_gate_inputs(
 ///
 /// The record it reads is an optimistic snapshot. Nothing is decided here:
 /// [`spawn_agent_child`] re-resolves the descriptor authoritatively under the
-/// caller's locks and refuses any verdict whose fingerprint no longer matches,
-/// so a configuration that moved while we were probing cannot be started on the
-/// old answer.
+/// caller's locks and refuses any verdict whose fingerprint or sidecar identity
+/// no longer matches, so a configuration — or a runtime sidecar — that moved
+/// while we were probing cannot be started on the old answer.
 ///
 /// `freshness` decides whether a cached verdict may be reused. A user-initiated
 /// start — manual restart, the setup card's Retry, an auth-completion bounce, a

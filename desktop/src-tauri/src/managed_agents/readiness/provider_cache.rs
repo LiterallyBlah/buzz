@@ -22,7 +22,7 @@
 //! The fingerprint is never persisted and never displayed.
 
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -297,13 +297,51 @@ pub(crate) struct ProviderPreflight {
     pub fingerprint: CapabilityFingerprint,
 }
 
+/// The exact sidecar a prepared verdict was produced through.
+///
+/// Deliberately *not* the capability fingerprint. The fingerprint answers "will
+/// the provider accept a turn for this descriptor", and which copy of our own
+/// sidecar asked has no bearing on that — so it is excluded there on purpose,
+/// otherwise a dev build path would churn the cache for every developer. But
+/// spawn *authorisation* is a different question: the verdict may only
+/// authorise the runtime it was actually taken through. This token carries that
+/// identity, is closed, and is compared exactly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SidecarIdentity {
+    /// The gate did not apply, so no sidecar was involved.
+    NotApplicable,
+    /// The gate applied but no sidecar could be resolved.
+    Unavailable,
+    /// The gate applied through exactly this resolved sidecar.
+    Probe { acp_binary: PathBuf },
+}
+
+impl SidecarIdentity {
+    /// The identity of the gate a verdict was prepared from — or re-derived
+    /// from the authoritative record under the caller's locks.
+    pub(crate) fn of(gate: &ProviderGate) -> Self {
+        match gate {
+            ProviderGate::NotApplicable => Self::NotApplicable,
+            ProviderGate::Unavailable => Self::Unavailable,
+            ProviderGate::Probe { acp_binary } => Self::Probe {
+                acp_binary: acp_binary.clone(),
+            },
+        }
+    }
+}
+
 /// A verdict computed with no lifecycle lock held.
 #[derive(Debug, Clone)]
 pub(crate) enum PreparedPreflight {
     /// The gate did not apply to the descriptor the caller snapshotted.
     NotApplicable,
-    /// A verdict, valid only for the fingerprint it carries.
-    Verdict(ProviderPreflight),
+    /// A verdict, valid only for the fingerprint *and* the sidecar it carries.
+    Verdict {
+        /// The verdict itself, as it would be stamped on the generation.
+        preflight: ProviderPreflight,
+        /// The exact sidecar the gate resolved to when this was prepared.
+        sidecar: SidecarIdentity,
+    },
 }
 
 /// Returned by [`verify`] when the descriptor resolved under the caller's locks
@@ -329,18 +367,24 @@ pub(crate) fn prepare(
         // The gate applies but cannot be run. Fail closed with a verdict, not
         // by disappearing: an adapter problem is exactly what an unresolvable
         // sidecar is, and it routes the user to the same repair affordance.
-        ProviderGate::Unavailable => PreparedPreflight::Verdict(ProviderPreflight {
-            capability: ProviderCapability::AdapterProblem,
-            fingerprint: fingerprint(invocation),
-        }),
+        ProviderGate::Unavailable => PreparedPreflight::Verdict {
+            preflight: ProviderPreflight {
+                capability: ProviderCapability::AdapterProblem,
+                fingerprint: fingerprint(invocation),
+            },
+            sidecar: SidecarIdentity::of(gate),
+        },
         ProviderGate::Probe { .. } => {
             let fingerprint = fingerprint(invocation);
             let capability =
                 cache.resolve(&fingerprint, freshness, || run_provider_probe(invocation));
-            PreparedPreflight::Verdict(ProviderPreflight {
-                capability,
-                fingerprint,
-            })
+            PreparedPreflight::Verdict {
+                preflight: ProviderPreflight {
+                    capability,
+                    fingerprint,
+                },
+                sidecar: SidecarIdentity::of(gate),
+            }
         }
     }
 }
@@ -350,8 +394,15 @@ pub(crate) fn prepare(
 ///
 /// `Ok(None)` means the gate does not apply and the caller proceeds exactly as
 /// it did before this phase existed. `Err` means the descriptor moved while we
-/// were probing — a persona edit, a credential change, an adapter upgrade —
-/// and the old answer says nothing about the new configuration.
+/// were probing — a persona edit, a credential change, an adapter upgrade, a
+/// sidecar that now resolves somewhere else — and the old answer says nothing
+/// about the new configuration.
+///
+/// Two independent identities have to agree, because they answer different
+/// questions. The fingerprint says the verdict is about *this* adapter
+/// descriptor; the sidecar token says the verdict was taken through *this*
+/// runtime. A verdict that satisfies only the first would let a probe through
+/// sidecar A authorise a spawn through sidecar B.
 pub(crate) fn verify(
     prepared: &PreparedPreflight,
     gate: &ProviderGate,
@@ -360,15 +411,19 @@ pub(crate) fn verify(
     if matches!(gate, ProviderGate::NotApplicable) {
         return Ok(None);
     }
+    let authoritative_sidecar = SidecarIdentity::of(gate);
     match prepared {
         // The caller's snapshot said the gate did not apply, but the
         // authoritative descriptor says it does. That disagreement is itself
         // the staleness.
         PreparedPreflight::NotApplicable => Err(STALE_PROVIDER_PREFLIGHT),
-        PreparedPreflight::Verdict(verdict) if verdict.fingerprint == fingerprint(invocation) => {
-            Ok(Some(verdict.clone()))
+        PreparedPreflight::Verdict { preflight, sidecar }
+            if *sidecar == authoritative_sidecar
+                && preflight.fingerprint == fingerprint(invocation) =>
+        {
+            Ok(Some(preflight.clone()))
         }
-        PreparedPreflight::Verdict(_) => Err(STALE_PROVIDER_PREFLIGHT),
+        PreparedPreflight::Verdict { .. } => Err(STALE_PROVIDER_PREFLIGHT),
     }
 }
 
@@ -783,10 +838,11 @@ mod tests {
             &invocation(),
             ProbeFreshness::ForceRefresh,
         );
-        let PreparedPreflight::Verdict(verdict) = &prepared else {
+        let PreparedPreflight::Verdict { preflight, sidecar } = &prepared else {
             panic!("an unavailable gate must still produce a verdict");
         };
-        assert_eq!(verdict.capability, ProviderCapability::AdapterProblem);
+        assert_eq!(preflight.capability, ProviderCapability::AdapterProblem);
+        assert_eq!(*sidecar, SidecarIdentity::Unavailable);
         assert_eq!(cache.len(), 0, "nothing was probed");
         // And it survives verification, so the caller enters setup mode rather
         // than starting unproven.
@@ -822,6 +878,150 @@ mod tests {
         assert_eq!(
             verify(&PreparedPreflight::NotApplicable, &gate, &invocation()),
             Err(STALE_PROVIDER_PREFLIGHT)
+        );
+    }
+
+    /// The bundled sidecar and a developer build of the same binary — the two
+    /// paths `record.acp_command` realistically moves between.
+    const SIDECAR_A: &str = "/opt/Buzz.app/Contents/MacOS/buzz-acp";
+    const SIDECAR_B: &str = "/home/user/buzz/target/debug/buzz-acp";
+
+    fn gate_through(sidecar: &str) -> ProviderGate {
+        ProviderGate::Probe {
+            acp_binary: PathBuf::from(sidecar),
+        }
+    }
+
+    fn invocation_through(sidecar: &str) -> ProbeInvocation {
+        let mut invocation = invocation();
+        invocation.acp_binary = PathBuf::from(sidecar);
+        invocation
+    }
+
+    #[test]
+    fn changed_runtime_sidecar_must_invalidate_prepared_verdict() {
+        // The probe runs with no lifecycle lock held, so `record.acp_command`
+        // can move under it. A verdict taken through sidecar A proves nothing
+        // about a spawn through sidecar B, and the capability fingerprint
+        // cannot notice: the sidecar is excluded from it on purpose.
+        let cache = ProviderReadinessCache::new();
+        assert_eq!(
+            fingerprint(&invocation_through(SIDECAR_A)),
+            fingerprint(&invocation_through(SIDECAR_B)),
+            "the sidecar is not a capability input — the fingerprint alone cannot catch this"
+        );
+
+        let prepared = prepare(
+            &cache,
+            &gate_through(SIDECAR_A),
+            &invocation_through(SIDECAR_A),
+            ProbeFreshness::Cached,
+        );
+
+        assert_eq!(
+            verify(
+                &prepared,
+                &gate_through(SIDECAR_B),
+                &invocation_through(SIDECAR_B)
+            ),
+            Err(STALE_PROVIDER_PREFLIGHT),
+            "a verdict from one sidecar must not authorise a spawn through another"
+        );
+        assert!(
+            verify(
+                &prepared,
+                &gate_through(SIDECAR_A),
+                &invocation_through(SIDECAR_A)
+            )
+            .is_ok(),
+            "the sidecar that produced the verdict still authorises its own spawn"
+        );
+    }
+
+    #[test]
+    fn a_resolved_and_an_unresolved_sidecar_never_authorise_each_other() {
+        let cache = ProviderReadinessCache::new();
+
+        // Unresolved while probing, resolved by the time we spawn.
+        let unresolved = prepare(
+            &cache,
+            &ProviderGate::Unavailable,
+            &invocation_through(SIDECAR_A),
+            ProbeFreshness::Cached,
+        );
+        assert_eq!(
+            verify(
+                &unresolved,
+                &gate_through(SIDECAR_A),
+                &invocation_through(SIDECAR_A)
+            ),
+            Err(STALE_PROVIDER_PREFLIGHT),
+            "a fail-closed verdict must not be reused once a sidecar appears"
+        );
+
+        // Resolved while probing, unresolvable by the time we spawn.
+        let resolved = prepare(
+            &cache,
+            &gate_through(SIDECAR_A),
+            &invocation_through(SIDECAR_A),
+            ProbeFreshness::Cached,
+        );
+        assert_eq!(
+            verify(
+                &resolved,
+                &ProviderGate::Unavailable,
+                &invocation_through(SIDECAR_A)
+            ),
+            Err(STALE_PROVIDER_PREFLIGHT),
+            "a probed verdict must not survive the sidecar disappearing"
+        );
+    }
+
+    #[test]
+    fn binding_the_sidecar_does_not_fragment_the_capability_cache() {
+        // The two identities stay separate: the verdict is bound to its exact
+        // sidecar, while the capability slot — which is about the provider, not
+        // about which copy of our own binary asked — is still shared.
+        let cache = ProviderReadinessCache::new();
+        let first = prepare(
+            &cache,
+            &gate_through(SIDECAR_A),
+            &invocation_through(SIDECAR_A),
+            ProbeFreshness::Cached,
+        );
+        let second = prepare(
+            &cache,
+            &gate_through(SIDECAR_B),
+            &invocation_through(SIDECAR_B),
+            ProbeFreshness::Cached,
+        );
+        assert_eq!(
+            cache.len(),
+            1,
+            "one descriptor keeps one capability slot regardless of sidecar"
+        );
+
+        let PreparedPreflight::Verdict {
+            preflight: first_preflight,
+            sidecar: first_sidecar,
+        } = &first
+        else {
+            panic!("a probe gate must produce a verdict");
+        };
+        let PreparedPreflight::Verdict {
+            preflight: second_preflight,
+            sidecar: second_sidecar,
+        } = &second
+        else {
+            panic!("a probe gate must produce a verdict");
+        };
+        assert_eq!(
+            first_preflight, second_preflight,
+            "the cached capability answer is reused"
+        );
+        assert_ne!(
+            first_sidecar, second_sidecar,
+            "but each verdict is bound to the sidecar that produced it"
         );
     }
 
@@ -895,10 +1095,13 @@ mod tests {
 
             // The locked half of the gate is pure comparison, so it is safe
             // here — and it must not block.
-            let prepared = PreparedPreflight::Verdict(ProviderPreflight {
-                capability: ProviderCapability::Ready,
-                fingerprint: fp.clone(),
-            });
+            let prepared = PreparedPreflight::Verdict {
+                preflight: ProviderPreflight {
+                    capability: ProviderCapability::Ready,
+                    fingerprint: fp.clone(),
+                },
+                sidecar: SidecarIdentity::of(&gate),
+            };
             assert!(verify(&prepared, &gate, &invocation()).is_ok());
         }
 
