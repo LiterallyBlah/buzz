@@ -162,6 +162,48 @@ test("isAgentIdentityInManagedList: keeps people and only current managed agent 
   );
 });
 
+test("isAgentIdentityInManagedList: an invocable relay-resident agent passes without a managed entry", () => {
+  const managedAgentPubkeys = new Set([PUB_A]);
+  const invocableAgentPubkeys = new Set([PUB_B]);
+
+  // Attributed + invocable, managed nowhere: the deployment this exists for.
+  assert.equal(
+    isAgentIdentityInManagedList(
+      { isAgent: true, pubkey: PUB_B },
+      managedAgentPubkeys,
+      invocableAgentPubkeys,
+    ),
+    true,
+  );
+  // Case-insensitive like the managed check.
+  assert.equal(
+    isAgentIdentityInManagedList(
+      { isAgent: true, pubkey: PUB_B.toUpperCase() },
+      managedAgentPubkeys,
+      invocableAgentPubkeys,
+    ),
+    true,
+  );
+  // A directory ghost with no invocability signal stays hidden.
+  assert.equal(
+    isAgentIdentityInManagedList(
+      { isAgent: true, pubkey: PUB_C },
+      managedAgentPubkeys,
+      invocableAgentPubkeys,
+    ),
+    false,
+  );
+  // People are never gated, with or without the set.
+  assert.equal(
+    isAgentIdentityInManagedList(
+      { isAgent: false, pubkey: PUB_C },
+      managedAgentPubkeys,
+      invocableAgentPubkeys,
+    ),
+    true,
+  );
+});
+
 test("shouldHideAgentFromMentions: never hides non-agents", () => {
   assert.equal(
     shouldHideAgentFromMentions({

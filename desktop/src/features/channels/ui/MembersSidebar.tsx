@@ -5,10 +5,13 @@ import {
   invalidateChannelState,
   useAddChannelMembersMutation,
   useChannelMembersQuery,
+  useChannelsQuery,
 } from "@/features/channels/hooks";
 import { attachManagedAgentToChannel } from "@/features/agents/channelAgents";
 import {
   coalesceAgentAutocompleteCandidates,
+  getMentionableAgentPubkeys,
+  getSharedChannelIds,
   isAgentIdentityInManagedList,
 } from "@/features/agents/lib/agentAutocompleteEligibility";
 import { useIsArchivedPredicate } from "@/features/identity-archive/hooks";
@@ -154,6 +157,7 @@ export function MembersSidebar({
     ReadonlySet<string>
   >(() => new Set());
   const identityQuery = useIdentityQuery();
+  const channelsQuery = useChannelsQuery();
   const membersQuery = useChannelMembersQuery(channelId, open);
   const addMembersMutation = useAddChannelMembersMutation(channelId);
   const changeRoleMutation = useMutation({
@@ -272,6 +276,15 @@ export function MembersSidebar({
         .filter((label): label is string => Boolean(label)),
     );
     const managedAgentPubkeys = new Set(managedAgentsByPubkey.keys());
+    // Same invocability escape hatch the mention picker uses: a relay-resident
+    // agent that would answer this user is addable even though no desktop
+    // manages it.
+    const invocableAgentPubkeys = getMentionableAgentPubkeys({
+      currentPubkey,
+      managedAgentPubkeys,
+      relayAgents: relayAgentsQuery.data,
+      sharedChannelIds: getSharedChannelIds(channelsQuery.data),
+    });
 
     const addCandidate = (candidate: AddMemberSearchCandidate) => {
       const pubkey = normalizePubkey(candidate.pubkey);
@@ -282,7 +295,11 @@ export function MembersSidebar({
           )) ||
         memberPubkeys.has(pubkey) ||
         isArchivedDiscovery(pubkey) ||
-        !isAgentIdentityInManagedList(candidate, managedAgentPubkeys)
+        !isAgentIdentityInManagedList(
+          candidate,
+          managedAgentPubkeys,
+          invocableAgentPubkeys,
+        )
       ) {
         return;
       }
@@ -361,6 +378,7 @@ export function MembersSidebar({
     });
   }, [
     canAddMembers,
+    channelsQuery.data,
     isArchivedDiscovery,
     currentPubkey,
     managedAgentsQuery.data,
