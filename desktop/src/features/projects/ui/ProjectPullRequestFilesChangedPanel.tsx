@@ -75,6 +75,9 @@ type InlineCommentControls = {
     decision?: "request-changes",
   ) => Promise<unknown>;
   profiles?: UserProfileLookup;
+  project: Project;
+  /** Pull request the line comments belong to — their deletion route. */
+  rootId: string;
 };
 
 type FileTreeNode = {
@@ -593,6 +596,8 @@ function DiffPreview({
                   )
                 }
                 profiles={inlineComments.profiles}
+                project={inlineComments.project}
+                rootId={inlineComments.rootId}
               />
             ) : null}
           </React.Fragment>
@@ -744,6 +749,8 @@ export function ProjectPullRequestFilesChangedPanel({
               onStart: setActiveAnchor,
               onSubmit: handleSubmit,
               profiles,
+              project,
+              rootId: pullRequest.id,
             }
           : undefined
       }

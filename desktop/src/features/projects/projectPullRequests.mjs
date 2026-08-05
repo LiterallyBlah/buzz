@@ -4,11 +4,13 @@ import {
   getImetaTags,
   getTag,
   PROJECT_ROOT_STATUS_KINDS,
+  projectDeletionRemoves,
   referencesProjectRoot,
 } from "./projectIssues.mjs";
 
 const PROJECT_ROOT_STATUS_KIND_SET = new Set(PROJECT_ROOT_STATUS_KINDS);
 const KIND_COMMENT = 1;
+const KIND_DELETION = 5;
 const KIND_PR_UPDATE = 1619;
 
 /**
@@ -494,6 +496,46 @@ function pullRequestWithComment(pullRequest, event) {
   };
 }
 
+/**
+ * The pull request's `updatedAt`, recomputed the way
+ * `eventToProjectPullRequest` derives it, so a list merged after a deletion
+ * and a list refetched afterwards agree on order.
+ */
+function pullRequestUpdatedAt(pullRequest, comments) {
+  return (
+    [
+      ...pullRequest.updates.map((update) => update.createdAt),
+      ...comments.map((comment) => comment.createdAt),
+      ...(pullRequest.statusCreatedAt === null
+        ? []
+        : [pullRequest.statusCreatedAt]),
+    ].sort((left, right) => right - left)[0] ?? pullRequest.createdAt
+  );
+}
+
+function pullRequestWithoutComment(pullRequest, event) {
+  const parsedComments = pullRequest.comments.filter(
+    (comment) => !projectDeletionRemoves(event, comment),
+  );
+  if (parsedComments.length === pullRequest.comments.length) {
+    return pullRequest;
+  }
+
+  return {
+    ...pullRequest,
+    // A deleted approval or change request is no longer a review decision, and
+    // a deleted review request no longer names a reviewer, so the whole review
+    // surface is re-derived from what is left rather than patched in place.
+    ...projectPullRequestReviewState(
+      pullRequest,
+      parsedComments,
+      pullRequest.initialCommit,
+      pullRequest.commit,
+    ),
+    updatedAt: pullRequestUpdatedAt(pullRequest, parsedComments),
+  };
+}
+
 function pullRequestWithUpdate(pullRequest, event) {
   if (getTag(event, "E") !== pullRequest.id) return pullRequest;
   if (
@@ -579,6 +621,9 @@ export function mergeProjectPullRequestEvent(pullRequest, event) {
   if (event.kind === KIND_COMMENT) {
     return pullRequestWithComment(pullRequest, event);
   }
+  if (event.kind === KIND_DELETION) {
+    return pullRequestWithoutComment(pullRequest, event);
+  }
   if (PROJECT_ROOT_STATUS_KIND_SET.has(event.kind)) {
     return pullRequestWithStatus(pullRequest, event);
   }
@@ -589,10 +634,17 @@ export function mergeProjectPullRequestEvent(pullRequest, event) {
  * The list form. Re-sorts on the key
  * `projectPullRequestEventsToPullRequests` sorts on so a merged list and a
  * refetched list agree on order.
+ *
+ * Deleting the pull request itself is filtered here rather than merged:
+ * `mergeProjectPullRequestEvent` can return a different pull request, never
+ * no pull request.
  */
 export function mergeProjectPullRequestsEvent(pullRequests, event) {
-  let changed = false;
-  const merged = pullRequests.map((pullRequest) => {
+  const kept = pullRequests.filter(
+    (pullRequest) => !projectDeletionRemoves(event, pullRequest),
+  );
+  let changed = kept.length !== pullRequests.length;
+  const merged = kept.map((pullRequest) => {
     const next = mergeProjectPullRequestEvent(pullRequest, event);
     if (next !== pullRequest) changed = true;
     return next;

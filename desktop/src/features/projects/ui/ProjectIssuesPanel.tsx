@@ -36,6 +36,7 @@ import {
   ProjectFeedRowCluster,
   ProjectFeedRowMonoCell,
 } from "./ProjectFeedRow";
+import { ProjectItemDeleteMenu } from "./ProjectItemDeleteMenu";
 import { OverviewRailSection } from "./ProjectOverviewPanel";
 import { ProfileIdentityButton } from "./ProjectProfileIdentity";
 import { ProjectActivityIndicator } from "./ProjectActivityIndicator";
@@ -109,10 +110,12 @@ function IssueRow({
   issue,
   onOpen,
   profiles,
+  project,
 }: {
   issue: ProjectIssue;
   onOpen: () => void;
   profiles?: UserProfileLookup;
+  project: Project;
 }) {
   const authorProfile = profiles?.[normalizePubkey(issue.author)];
   const authorLabel = resolveUserLabel({ profiles, pubkey: issue.author });
@@ -168,6 +171,16 @@ function IssueRow({
               title="View issue"
             />
           </ProjectFeedRowCluster>
+          <ProjectItemDeleteMenu
+            author={issue.author}
+            label={`More options for ${issue.title}`}
+            project={project}
+            rootId={issue.id}
+            subject="issue"
+            targetId={issue.id}
+            testId={`issue-${issue.id}`}
+            title={issue.title}
+          />
         </>
       }
     />
@@ -355,11 +368,20 @@ export function ProjectIssueDetail({
             <div className="space-y-3">
               {issue.comments.map((item) => (
                 <article key={item.id}>
-                  <div className="mb-2">
+                  <div className="mb-2 flex min-w-0 items-center justify-between gap-2">
                     <AuthorIdentity
                       profiles={profiles}
                       pubkey={item.author}
                       role={relativeTime(item.createdAt)}
+                    />
+                    <ProjectItemDeleteMenu
+                      author={item.author}
+                      label="More options for this comment"
+                      project={project}
+                      rootId={issue.id}
+                      subject="comment"
+                      targetId={item.id}
+                      testId={`comment-${item.id}`}
                     />
                   </div>
                   <ProjectRichContent content={item.content} tags={item.tags} />
@@ -480,6 +502,17 @@ export function ProjectIssuesPanel({
   const selectedIssue =
     issues.find((issue) => issue.id === selectedIssueId) ?? null;
 
+  // An issue that is gone — deleted here or by its author elsewhere — must not
+  // leave the surrounding view pointing at it, or the Issues tab stays selected
+  // on a detail nothing can render. Gated on loaded data so a refetch in flight
+  // does not drop a selection that is about to come back.
+  React.useEffect(() => {
+    if (!selectedIssueId || !issuesQuery.data) return;
+    if (!issuesQuery.data.some((issue) => issue.id === selectedIssueId)) {
+      onSelectedIssueIdChange(null);
+    }
+  }, [issuesQuery.data, onSelectedIssueIdChange, selectedIssueId]);
+
   if (issuesQuery.isLoading) {
     return <p className="p-4 text-sm text-muted-foreground">Loading issues…</p>;
   }
@@ -512,6 +545,7 @@ export function ProjectIssuesPanel({
           key={issue.id}
           onOpen={() => onSelectedIssueIdChange(issue.id)}
           profiles={profiles}
+          project={project}
         />
       ))}
     </div>

@@ -1026,3 +1026,94 @@ test("merging a list re-sorts it the way a refetch would order it", () => {
     "an event for no cached pull request leaves the list identical",
   );
 });
+
+function deletionEvent({ pubkey, rootId = PR_ID, targetId }) {
+  return {
+    id: `deletion-${targetId}`,
+    kind: 5,
+    pubkey,
+    created_at: 900,
+    content: "Delete comment",
+    sig: "",
+    tags: [
+      ["e", targetId],
+      ["E", rootId],
+    ],
+  };
+}
+
+test("deleting an approval re-derives the review state it created", () => {
+  const root = pullRequestEvent({
+    tags: [
+      ["a", REPO_ADDRESS],
+      ["subject", "Add feature"],
+      ["c", "1111111111111111111111111111111111111111"],
+      ["p", REVIEWER],
+    ],
+  });
+  const approval = commentEvent({
+    pubkey: REVIEWER,
+    createdAt: 300,
+    content: "LGTM",
+    labels: ["approval"],
+    commit: "1111111111111111111111111111111111111111",
+  });
+  const pullRequest = eventToProjectPullRequest(root, [], [approval]);
+  assert.equal(pullRequest.approvals.length, 1);
+
+  const merged = mergeProjectPullRequestEvent(
+    pullRequest,
+    deletionEvent({ pubkey: REVIEWER, targetId: approval.id }),
+  );
+
+  // A deleted approval is not merely a hidden row: it must stop counting as a
+  // review decision, which is what a refetch without it would report.
+  assert.deepEqual(merged, eventToProjectPullRequest(root));
+  assert.deepEqual(merged.approvals, []);
+  assert.deepEqual(merged.comments, []);
+});
+
+test("a comment tombstone from anyone but its author changes nothing", () => {
+  const comment = commentEvent({ pubkey: OWNER, createdAt: 200 });
+  const pullRequest = eventToProjectPullRequest(
+    pullRequestEvent(),
+    [],
+    [comment],
+  );
+
+  assert.equal(
+    mergeProjectPullRequestEvent(
+      pullRequest,
+      deletionEvent({ pubkey: ATTACKER, targetId: comment.id }),
+    ),
+    pullRequest,
+  );
+});
+
+test("deleting the pull request drops it from the list, not its neighbour", () => {
+  const otherRoot = pullRequestEvent({
+    id: `${"a".repeat(63)}1`,
+    created_at: 500,
+    content: "Another pull request",
+  });
+  const pullRequests = projectPullRequestEventsToPullRequests([
+    pullRequestEvent(),
+    otherRoot,
+  ]);
+
+  assert.deepEqual(
+    mergeProjectPullRequestsEvent(
+      pullRequests,
+      deletionEvent({ pubkey: AUTHOR, targetId: PR_ID }),
+    ).map((pullRequest) => pullRequest.id),
+    [otherRoot.id],
+  );
+  assert.equal(
+    mergeProjectPullRequestsEvent(
+      pullRequests,
+      deletionEvent({ pubkey: ATTACKER, targetId: PR_ID }),
+    ),
+    pullRequests,
+    "an untrusted tombstone leaves the list identical",
+  );
+});

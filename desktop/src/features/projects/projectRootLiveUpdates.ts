@@ -3,6 +3,7 @@ import type { QueryClient } from "@tanstack/react-query";
 import type { RelaySubscriptionFilter } from "@/shared/api/relayClientShared";
 import type { RelayEvent } from "@/shared/api/types";
 import {
+  KIND_DELETION,
   KIND_GIT_PR_UPDATE,
   KIND_GIT_STATUS_CLOSED,
   KIND_GIT_STATUS_DRAFT,
@@ -14,6 +15,8 @@ import type { ProjectIssue } from "./projectIssues.mjs";
 import {
   mergeProjectIssueEvent,
   mergeProjectIssuesEvent,
+  projectDeletionRemoves,
+  projectDeletionTargets,
   referencesProjectRoot,
 } from "./projectIssues.mjs";
 import type { ProjectPullRequest } from "./projectPullRequests.mjs";
@@ -45,7 +48,11 @@ const PROJECT_ROOT_STATUS_KIND_SET = new Set(PROJECT_ROOT_STATUS_KINDS);
 const PROJECT_ROOT_LIVE_OVERLAP_SECS = 30;
 
 /** What a live event does to a root, or null when it is not about this root. */
-export type ProjectRootEventRole = "comment" | "revision" | "status";
+export type ProjectRootEventRole =
+  | "comment"
+  | "deletion"
+  | "revision"
+  | "status";
 
 /**
  * Which of this root's surfaces an event belongs to.
@@ -67,6 +74,13 @@ export function projectRootEventRole(
       ? "revision"
       : null;
   }
+  if (event.kind === KIND_DELETION) {
+    // A tombstone is routed by its `E`, never by its `e`: the `e` names a
+    // comment this panel may not even hold, while a root deletion has the two
+    // equal. Requiring `E` to be the subscribed root is what stops a tombstone
+    // for another issue's comment from being applied to this one's caches.
+    return projectDeletionTargets(event)?.rootId === rootId ? "deletion" : null;
+  }
   if (event.kind === KIND_TEXT_NOTE) {
     return referencesProjectRoot(event, rootId) ? "comment" : null;
   }
@@ -79,10 +93,15 @@ export function projectRootEventRole(
 /**
  * The live filters for one issue or pull request.
  *
- * Two of them, because a relay filter cannot express "either tag case" and
+ * Three of them, because a relay filter cannot express "either tag case" and
  * `subscribeLive` takes a single filter. Splitting by tag case rather than
  * merging into one loose filter also keeps each REQ narrow: everything the
  * relay sends is something this root can actually use.
+ *
+ * Deletions get their own filter rather than joining the revision one even
+ * though both key on `#E`: a kind:5 for a comment carries a lowercase `e` for
+ * some other event id, so it can only be found by the route tag, and keeping it
+ * separate leaves each filter's kinds and limit sized for its own traffic.
  */
 export function projectRootLiveFilters(
   rootId: string,
@@ -103,6 +122,12 @@ export function projectRootLiveFilters(
       limit: 50,
       since,
     },
+    {
+      kinds: [KIND_DELETION],
+      "#E": [rootId],
+      limit: 50,
+      since,
+    },
   ];
 }
 
@@ -110,13 +135,27 @@ type WorkItems = ProjectsWorkItemsResult<{ repoAddress: string }>;
 
 function mergeWorkItems(current: WorkItems, event: RelayEvent): WorkItems {
   let changed = false;
-  const issues = current.issues.items.map((item) => {
+  // A deleted root leaves the inbox entirely, so it is filtered out before the
+  // per-item merge — the same split the two list merges make.
+  const keptIssues = current.issues.items.filter(
+    (item) => !projectDeletionRemoves(event, item.issue),
+  );
+  const keptPullRequests = current.pullRequests.items.filter(
+    (item) => !projectDeletionRemoves(event, item.pullRequest),
+  );
+  if (
+    keptIssues.length !== current.issues.items.length ||
+    keptPullRequests.length !== current.pullRequests.items.length
+  ) {
+    changed = true;
+  }
+  const issues = keptIssues.map((item) => {
     const issue = mergeProjectIssueEvent(item.issue, event);
     if (issue === item.issue) return item;
     changed = true;
     return { ...item, issue };
   });
-  const pullRequests = current.pullRequests.items.map((item) => {
+  const pullRequests = keptPullRequests.map((item) => {
     const pullRequest = mergeProjectPullRequestEvent(item.pullRequest, event);
     if (pullRequest === item.pullRequest) return item;
     changed = true;
@@ -155,7 +194,9 @@ function mergeWorkItems(current: WorkItems, event: RelayEvent): WorkItems {
  *
  * Merging beats invalidating here because the event already contains the whole
  * change: a comment is a comment, and a refetch would spend a relay round trip
- * to learn the same thing, on a query whose fan-out is four filters wide.
+ * to learn the same thing, on a query whose fan-out is four filters wide. The
+ * same holds for a tombstone — it names what left, so the caches can drop it
+ * without asking the relay what is still there.
  */
 export function applyProjectRootEvent(
   queryClient: QueryClient,

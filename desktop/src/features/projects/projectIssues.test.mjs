@@ -441,3 +441,92 @@ test("merging a list re-sorts it the way a refetch would order it", () => {
     "an event for no cached issue leaves the list identical",
   );
 });
+
+function deletionEvent({ pubkey, rootId = ISSUE_ID, targetId }) {
+  return {
+    id: `deletion-${targetId}`,
+    kind: 5,
+    pubkey,
+    created_at: 900,
+    content: "Delete comment",
+    sig: "",
+    tags: [
+      ["e", targetId],
+      ["E", rootId],
+    ],
+  };
+}
+
+test("deleting a comment leaves the issue exactly as a refetch would", () => {
+  const kept = commentEvent({ id: "comment-1", createdAt: 200 });
+  const removed = commentEvent({ id: "comment-2", createdAt: 400 });
+  const issue = eventToProjectIssue(issueEvent(), [], [kept, removed]);
+  assert.equal(issue.updatedAt, 400);
+
+  const merged = mergeProjectIssueEvent(
+    issue,
+    deletionEvent({ pubkey: OWNER, targetId: "comment-2" }),
+  );
+
+  // Including `updatedAt`: a merged list that outranked a refetched one would
+  // silently re-sort the issue under the reader on the next fetch.
+  assert.deepEqual(merged, eventToProjectIssue(issueEvent(), [], [kept]));
+  assert.equal(merged.updatedAt, 200);
+});
+
+test("removing the last comment falls back to the issue's own timestamps", () => {
+  const comment = commentEvent({ id: "comment-1", createdAt: 400 });
+  const merged = mergeProjectIssueEvent(
+    eventToProjectIssue(issueEvent(), [], [comment]),
+    deletionEvent({ pubkey: OWNER, targetId: "comment-1" }),
+  );
+
+  assert.deepEqual(merged.comments, []);
+  assert.equal(merged.updatedAt, 100);
+});
+
+test("a tombstone only counts from the signer of what it names", () => {
+  const comment = commentEvent({ id: "comment-1", createdAt: 200 });
+  const issue = eventToProjectIssue(issueEvent(), [], [comment]);
+
+  assert.equal(
+    mergeProjectIssueEvent(
+      issue,
+      deletionEvent({ pubkey: ATTACKER, targetId: "comment-1" }),
+    ),
+    issue,
+  );
+  assert.equal(
+    mergeProjectIssueEvent(
+      issue,
+      deletionEvent({ pubkey: OWNER, targetId: "comment-missing" }),
+    ),
+    issue,
+    "a tombstone for a comment this issue does not hold changes nothing",
+  );
+});
+
+test("deleting an issue drops it from the list, not its neighbour", () => {
+  const otherRoot = issueEvent({
+    id: "d".repeat(64),
+    created_at: 500,
+    content: "Another issue",
+  });
+  const issues = projectIssueEventsToIssues([issueEvent(), otherRoot]);
+
+  assert.deepEqual(
+    mergeProjectIssuesEvent(
+      issues,
+      deletionEvent({ pubkey: AUTHOR, targetId: ISSUE_ID }),
+    ).map((issue) => issue.id),
+    [otherRoot.id],
+  );
+  assert.equal(
+    mergeProjectIssuesEvent(
+      issues,
+      deletionEvent({ pubkey: ATTACKER, targetId: ISSUE_ID }),
+    ),
+    issues,
+    "an untrusted tombstone leaves the list identical",
+  );
+});

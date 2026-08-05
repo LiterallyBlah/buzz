@@ -59,6 +59,15 @@ export function referencesProjectRoot(
   rootId: string,
   allowUppercase?: boolean,
 ): boolean;
+/** The `e` target and `E` route of a project tombstone, or null. */
+export function projectDeletionTargets(
+  event: RelayEvent,
+): { rootId: string; targetId: string } | null;
+/** Whether a tombstone deletes an item, checked against the item's author. */
+export function projectDeletionRemoves(
+  event: RelayEvent,
+  item: { id: string; author: string },
+): boolean;
 export function mergeProjectIssueEvent(
   issue: ProjectIssue,
   event: RelayEvent,

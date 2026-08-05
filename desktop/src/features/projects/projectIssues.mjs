@@ -75,6 +75,50 @@ function lifecycleActors(authorPubkey, repoAddress) {
 export const PROJECT_ROOT_STATUS_KINDS = [1630, 1631, 1632, 1633];
 const PROJECT_ROOT_STATUS_KIND_SET = new Set(PROJECT_ROOT_STATUS_KINDS);
 const KIND_COMMENT = 1;
+const KIND_DELETION = 5;
+
+/**
+ * The two ids a project tombstone carries: what it deletes, and where it goes.
+ *
+ * NIP-09 names its target with a lowercase `e`, and the relay rejects a kind:5
+ * that names anything but exactly one `e`-or-`a` target — so the target tag is
+ * both the protocol's and the only one this client writes. The uppercase `E`
+ * is the routing tag: a comment's tombstone has to reach the issue or pull
+ * request the comment lives under, because that root is the only subscription a
+ * panel holds. Returning null unless both are present exactly once is what
+ * keeps a tombstone this client did not write from being attributed to a root.
+ */
+export function projectDeletionTargets(event) {
+  if (event.kind !== KIND_DELETION) return null;
+  const targets = event.tags.filter(
+    (tag) => tag[0] === "e" && isNonEmptyString(tag[1]),
+  );
+  const roots = event.tags.filter(
+    (tag) => tag[0] === "E" && isNonEmptyString(tag[1]),
+  );
+  if (targets.length !== 1 || roots.length !== 1) return null;
+  return { rootId: roots[0][1], targetId: targets[0][1] };
+}
+
+/**
+ * Does this tombstone delete `item` — a root or one of its comments?
+ *
+ * The author check is the rule `isDeletedByA` already applies to repositories:
+ * a NIP-09 deletion counts only from the signer of the event it names, so a
+ * relay that over-delivers can never make somebody else's comment vanish from
+ * a panel. The relay additionally honours a NIP-OA owner deleting their agent's
+ * event; this reader deliberately does not, so that deletion surfaces on the
+ * next fetch (which omits soft-deleted events) rather than through the live
+ * path — the conservative direction, and the one this slice's UI never writes.
+ */
+export function projectDeletionRemoves(event, item) {
+  const targets = projectDeletionTargets(event);
+  return (
+    targets !== null &&
+    targets.targetId === item.id &&
+    event.pubkey.toLowerCase() === String(item.author ?? "").toLowerCase()
+  );
+}
 
 /**
  * Does an event address this root?
@@ -203,6 +247,29 @@ function issueWithComment(issue, event) {
   };
 }
 
+/**
+ * The issue's `updatedAt`, recomputed exactly as `eventToProjectIssue` derives
+ * it. Removing a comment can only move it backwards, and a merged list that
+ * disagreed with a refetched one would silently re-sort under the reader.
+ */
+function issueUpdatedAt(issue, comments) {
+  return (
+    [
+      ...comments.map((comment) => comment.createdAt),
+      ...(issue.statusCreatedAt === null ? [] : [issue.statusCreatedAt]),
+    ].sort((left, right) => right - left)[0] ?? issue.createdAt
+  );
+}
+
+function issueWithoutComment(issue, event) {
+  const comments = issue.comments.filter(
+    (comment) => !projectDeletionRemoves(event, comment),
+  );
+  if (comments.length === issue.comments.length) return issue;
+
+  return { ...issue, comments, updatedAt: issueUpdatedAt(issue, comments) };
+}
+
 function issueWithStatus(issue, event) {
   if (!referencesProjectRoot(event, issue.id, false)) return issue;
   if (!allowedActorsForProjectRoot(issue).has(event.pubkey.toLowerCase())) {
@@ -240,6 +307,7 @@ function issueWithStatus(issue, event) {
  */
 export function mergeProjectIssueEvent(issue, event) {
   if (event.kind === KIND_COMMENT) return issueWithComment(issue, event);
+  if (event.kind === KIND_DELETION) return issueWithoutComment(issue, event);
   if (PROJECT_ROOT_STATUS_KIND_SET.has(event.kind)) {
     return issueWithStatus(issue, event);
   }
@@ -250,10 +318,15 @@ export function mergeProjectIssueEvent(issue, event) {
  * The list form. Re-sorts on the same key `projectIssueEventsToIssues` sorts
  * on so a merged list and a refetched list agree on order — otherwise a live
  * comment would move an issue in the list only after the next fetch.
+ *
+ * Deleting the issue itself is a list-level change, not a per-issue merge:
+ * `mergeProjectIssueEvent` can only return a different issue, never no issue,
+ * so the tombstone for a root is filtered here before the per-issue pass runs.
  */
 export function mergeProjectIssuesEvent(issues, event) {
-  let changed = false;
-  const merged = issues.map((issue) => {
+  const kept = issues.filter((issue) => !projectDeletionRemoves(event, issue));
+  let changed = kept.length !== issues.length;
+  const merged = kept.map((issue) => {
     const next = mergeProjectIssueEvent(issue, event);
     if (next !== issue) changed = true;
     return next;
