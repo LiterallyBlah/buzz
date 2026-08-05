@@ -5,8 +5,10 @@ import {
   getAgentObserverSnapshot,
   getAgentTranscript,
   getArchivedChannelEvents,
+  getUnattributedAgentFrames,
   ingestArchivedObserverEvents,
   subscribeAgentObserverStore,
+  type UnattributedAgentFrames,
 } from "@/features/agents/observerRelayStore";
 import {
   listSaveSubscriptions,
@@ -49,6 +51,26 @@ export function useObserverEvents(
   }, [enabled, agentPubkey]);
 
   return snapshot;
+}
+
+/**
+ * Reactively read whether observer frames addressed to this identity are being
+ * dropped for `agentPubkey` because it is not in the trusted agent set.
+ *
+ * Returns `null` in the ordinary case — including a genuinely idle agent,
+ * which publishes nothing to drop. A non-null value is positive evidence that
+ * the agent *is* publishing telemetry we are refusing, which is what lets the
+ * panel distinguish an unattributed agent from a quiet one.
+ */
+export function useUnattributedAgentFrames(
+  agentPubkey?: string | null,
+): UnattributedAgentFrames | null {
+  const getSnapshot = React.useCallback(
+    () => getUnattributedAgentFrames(agentPubkey),
+    [agentPubkey],
+  );
+
+  return React.useSyncExternalStore(subscribeToStore, getSnapshot);
 }
 
 export function useAgentTranscript(

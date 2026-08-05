@@ -1,7 +1,7 @@
 use buzz_core::kind::KIND_MANAGED_AGENT;
 use nostr::PublicKey;
 
-use crate::client::{extract_d_tag, normalize_write_response, BuzzClient};
+use crate::client::{extract_d_tag, normalize_write_response, AttestationSource, BuzzClient};
 use crate::error::CliError;
 use crate::validate::validate_hex64;
 
@@ -369,8 +369,50 @@ pub async fn cmd_set_profile(
         ));
     }
 
-    // Read-merge-write: fetch current profile, merge in the new fields, then sign.
-    let current = fetch_current_profile(client).await?;
+    // Read-merge-write: fetch the current profile event, merge in the new
+    // fields *and* the attestation it carries, then sign.
+    let current_event = fetch_current_profile_event(client).await?;
+    let (event, attestation) = build_profile_revision(
+        client,
+        current_event.as_ref(),
+        display_name,
+        avatar_url,
+        about,
+        nip05_handle,
+    )?;
+
+    if let AttestationSource::Unverifiable { reason } = &attestation {
+        eprintln!(
+            "warning: the current profile carries an owner attestation that does not verify \
+             against this identity ({reason}); it was not carried into this revision"
+        );
+    }
+
+    let resp = client.submit_event(event).await?;
+    println!("{}", normalize_write_response(&resp));
+    Ok(())
+}
+
+/// Build the signed kind:0 revision for [`cmd_set_profile`] from the profile
+/// event currently published by this identity.
+///
+/// Split out from the command so the whole merge — content fields *and* the
+/// NIP-OA owner attestation — is exercised without a relay. Caller-supplied
+/// fields win; absent ones fall back to the current profile. The attestation
+/// is resolved by [`BuzzClient::sign_event_preserving_attestation`], so a
+/// profile write from a process with no `BUZZ_AUTH_TAG` cannot strip an
+/// attestation the previous revision already proved.
+fn build_profile_revision(
+    client: &BuzzClient,
+    current_event: Option<&serde_json::Value>,
+    display_name: Option<&str>,
+    avatar_url: Option<&str>,
+    about: Option<&str>,
+    nip05_handle: Option<&str>,
+) -> Result<(nostr::Event, AttestationSource), CliError> {
+    let current = current_event
+        .map(profile_content_fields)
+        .unwrap_or_default();
 
     // Merge: caller-supplied fields win; fall back to current profile values.
     let merged_name = display_name
@@ -415,18 +457,28 @@ pub async fn cmd_set_profile(
     )
     .map_err(|e| CliError::Other(format!("build_profile failed: {e}")))?;
 
-    let event = client.sign_event(builder)?;
-
-    let resp = client.submit_event(event).await?;
-    println!("{}", normalize_write_response(&resp));
-    Ok(())
+    client.sign_event_preserving_attestation(builder, current_event)
 }
 
-/// Fetch the current user's profile metadata via POST /query (kind:0).
-/// Returns the parsed content JSON object, or an empty object if no profile exists.
-async fn fetch_current_profile(
+/// Parse the profile fields out of a raw kind:0 event's JSON string content.
+/// Returns an empty map when the content is absent or not a JSON object.
+fn profile_content_fields(event: &serde_json::Value) -> serde_json::Map<String, serde_json::Value> {
+    let content_str = event
+        .get("content")
+        .and_then(|c| c.as_str())
+        .unwrap_or("{}");
+    let content: serde_json::Value = serde_json::from_str(content_str).unwrap_or_default();
+    content.as_object().cloned().unwrap_or_default()
+}
+
+/// Fetch the current user's profile event via POST /query (kind:0).
+///
+/// Returns the whole raw event rather than only its parsed content: a rewrite
+/// has to merge the tags the current revision carries — specifically its
+/// NIP-OA `auth` tag — as well as its content fields.
+async fn fetch_current_profile_event(
     client: &BuzzClient,
-) -> Result<serde_json::Map<String, serde_json::Value>, CliError> {
+) -> Result<Option<serde_json::Value>, CliError> {
     let my_pk = client.keys().public_key().to_hex();
     let filter = serde_json::json!({
         "kinds": [0],
@@ -438,18 +490,9 @@ async fn fetch_current_profile(
         .map_err(|e| CliError::Other(format!("failed to parse profile query: {e}")))?;
 
     let Some(arr) = events.as_array() else {
-        return Ok(serde_json::Map::new());
+        return Ok(None);
     };
-    let Some(event) = arr.first() else {
-        return Ok(serde_json::Map::new());
-    };
-    // kind:0 content is a JSON string containing the profile fields
-    let content_str = event
-        .get("content")
-        .and_then(|c| c.as_str())
-        .unwrap_or("{}");
-    let content: serde_json::Value = serde_json::from_str(content_str).unwrap_or_default();
-    Ok(content.as_object().cloned().unwrap_or_default())
+    Ok(arr.first().cloned())
 }
 
 /// Get presence status for users — query kind:40902 presence snapshot events.
@@ -574,11 +617,81 @@ pub async fn dispatch(
 #[cfg(test)]
 mod tests {
     use super::{
-        owned_agent_pubkeys_from_events, owner_scoped_profiles, owner_verification,
-        presence_subject,
+        build_profile_revision, owned_agent_pubkeys_from_events, owner_scoped_profiles,
+        owner_verification, presence_subject, AttestationSource, BuzzClient,
     };
     use nostr::Keys;
     use serde_json::json;
+
+    /// A profile rewrite from a CLI process with no `BUZZ_AUTH_TAG` must merge
+    /// the published revision's owner attestation, not only its content
+    /// fields. Dropping the attestation de-attributes the agent from its owner
+    /// — which switches off its `isAgent` flag, its sibling status, and (via
+    /// the desktop's `knownAgentPubkeys` gate) its whole ACP Activity pane.
+    #[test]
+    fn profile_rewrite_from_unauthenticated_cli_keeps_owner_attestation() {
+        let owner_keys = Keys::generate();
+        let agent_keys = Keys::generate();
+        let attestation: serde_json::Value = serde_json::from_str(
+            &buzz_sdk::nip_oa::compute_auth_tag(&owner_keys, &agent_keys.public_key(), "kind=0")
+                .unwrap(),
+        )
+        .unwrap();
+        let published = json!({
+            "pubkey": agent_keys.public_key().to_hex(),
+            "kind": 0,
+            "created_at": 100,
+            "content": r#"{"display_name":"Hermes","picture":"https://example.test/h.png"}"#,
+            "tags": [attestation.clone()],
+        });
+        // No auth tag configured — exactly the environment that stripped it.
+        let client =
+            BuzzClient::new("https://test.relay".into(), agent_keys.clone(), None, None).unwrap();
+
+        let (event, source) = build_profile_revision(
+            &client,
+            Some(&published),
+            None,
+            None,
+            Some("Primary Hermes gateway"),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            source,
+            AttestationSource::Preserved {
+                owner_pubkey: owner_keys.public_key().to_hex(),
+            }
+        );
+
+        // The attestation survived, verbatim and verifiable.
+        let auth_tags: Vec<_> = event
+            .tags
+            .iter()
+            .filter(|t| t.as_slice().first().map(|s| s.as_str()) == Some("auth"))
+            .collect();
+        assert_eq!(auth_tags.len(), 1, "expected exactly one auth tag");
+        assert_eq!(
+            serde_json::to_value(auth_tags[0].as_slice()).unwrap(),
+            attestation
+        );
+        assert_eq!(
+            buzz_sdk::nip_oa::verify_auth_tag(
+                &serde_json::to_string(auth_tags[0].as_slice()).unwrap(),
+                &agent_keys.public_key(),
+            )
+            .unwrap(),
+            owner_keys.public_key(),
+        );
+
+        // ...and the content merge still behaves: --about applied, the fields
+        // the caller did not name carried over from the published revision.
+        let content: serde_json::Value = serde_json::from_str(&event.content).unwrap();
+        assert_eq!(content["about"], json!("Primary Hermes gateway"));
+        assert_eq!(content["display_name"], json!("Hermes"));
+        assert_eq!(content["picture"], json!("https://example.test/h.png"));
+    }
 
     #[test]
     fn owned_agent_lookup_matches_exact_name_case_insensitively() {

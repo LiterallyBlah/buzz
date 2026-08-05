@@ -36,6 +36,7 @@ import { shorten } from "./agentSessionUtils";
 import {
   useObserverEvents,
   useArchivedChannelEvents,
+  useUnattributedAgentFrames,
 } from "./useObserverEvents";
 import { buildTranscriptState } from "./agentSessionTranscript";
 
@@ -112,6 +113,12 @@ export function ManagedAgentSessionPanel({
   );
   const hasObserver = managedRuntimeActive || combinedEvents.length > 0;
 
+  // This agent's frames are reaching us and being refused before decryption
+  // because it is not attributed to this account. Without this the pane is
+  // indistinguishable from an idle agent, and the absence of events reads as
+  // "nothing has happened" rather than "we are throwing your telemetry away".
+  const unattributed = useUnattributedAgentFrames(agent.pubkey);
+
   // Derive transcript once from the combined raw window. When transcriptOverride
   // is set (e.g. E2E snapshot specs), bypass both — the caller supplies the full
   // transcript directly.
@@ -168,6 +175,7 @@ export function ManagedAgentSessionPanel({
         transcript={displayTranscript}
         transcriptContentClassName={transcriptContentClassName}
         transcriptVariant={transcriptVariant}
+        unattributedFrames={unattributed?.droppedFrames ?? 0}
       />
     </section>
   );
@@ -227,6 +235,7 @@ function SessionBody({
   transcript,
   transcriptContentClassName,
   transcriptVariant,
+  unattributedFrames,
 }: {
   agentAvatarUrl: string | null;
   agentName: string;
@@ -246,12 +255,14 @@ function SessionBody({
   transcript: TranscriptItem[];
   transcriptContentClassName?: string;
   transcriptVariant: AgentSessionTranscriptVariant;
+  unattributedFrames: number;
 }) {
   const rawRail = resolveRawRailLayout(showRaw, rawLayout);
 
   if (rawRail.mode === "exclusive") {
     return (
       <>
+        <UnattributedAgentNotice droppedFrames={unattributedFrames} />
         <RawEventRail events={events} />
 
         {errorMessage ? (
@@ -266,6 +277,8 @@ function SessionBody({
 
   return (
     <>
+      <UnattributedAgentNotice droppedFrames={unattributedFrames} />
+
       {!hasObserver &&
       !hasTranscriptOverride &&
       transcript.length === 0 &&
@@ -365,6 +378,39 @@ function ObserverStatusBadge({ state }: { state: ConnectionState }) {
       )}
       {display.label}
     </Badge>
+  );
+}
+
+/**
+ * The observer feed for this agent is empty *because we are discarding it*.
+ *
+ * Silence is a rendered state, never an empty void — and this particular
+ * silence is not idleness. The frames reached this app addressed to our own
+ * identity and were refused before decryption because the agent is not in the
+ * trusted set, which for an externally-supervised agent means its kind:0
+ * carries no owner attestation naming this account.
+ *
+ * Rendered above the transcript rather than in place of it, and in every raw
+ * rail layout, because the states this has to displace are not all empty
+ * states: an agent the relay reports as `deployed` makes `hasObserver` true,
+ * so the transcript's own "mention this agent to see its work" copy is what
+ * the user is otherwise left reading.
+ */
+function UnattributedAgentNotice({ droppedFrames }: { droppedFrames: number }) {
+  if (droppedFrames <= 0) {
+    return null;
+  }
+
+  return (
+    <p className="mt-4 flex items-start gap-2 rounded-lg border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm text-destructive">
+      <CircleAlert aria-hidden className="mt-0.5 h-4 w-4 shrink-0" />
+      <span>
+        This agent is publishing activity, but {droppedFrames} frame
+        {droppedFrames === 1 ? "" : "s"} {droppedFrames === 1 ? "was" : "were"}{" "}
+        discarded: it is not attributed to your account. Re-publish the
+        agent&rsquo;s profile with its owner attestation to restore this feed.
+      </span>
+    </p>
   );
 }
 
