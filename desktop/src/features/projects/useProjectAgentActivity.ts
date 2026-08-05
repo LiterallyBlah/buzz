@@ -7,6 +7,7 @@ import {
   type ProjectActivityState,
   type ProjectAgentActivity,
 } from "@/features/projects/projectAgentActivity";
+import { recordProjectSeenAgents } from "@/features/projects/projectSeenAgents";
 import { subscribeToProjectActivity } from "@/shared/api/projectActivityRelay";
 import { useLivenessSweep } from "@/shared/lib/useLivenessSweep";
 
@@ -79,5 +80,31 @@ export function useProjectAgentActivity(
     setNow(Date.now()),
   );
 
-  return React.useMemo(() => liveProjectActivity(state, now), [state, now]);
+  const live = React.useMemo(
+    () => liveProjectActivity(state, now),
+    [state, now],
+  );
+
+  // Every consumer of live activity feeds the durable memory, and this is the
+  // only place that can be true. Kind 20003 is never stored by the relay, so
+  // the frames are seen once, by whoever happened to be subscribed at the
+  // time — put the recording in a component and a root whose indicator was not
+  // mounted (the pull-request "Files" tab, say) silently forgets every agent
+  // that worked while it was open.
+  //
+  // Keyed on the pubkeys rather than the array: `liveProjectActivity` rebuilds
+  // its result on each two-second staleness tick, and the set of agents is the
+  // only part of it this record cares about. Repeat sightings are a no-op
+  // inside the store's refresh window anyway; the key just avoids waking the
+  // effect to discover that.
+  const agentsKey = live
+    .map((entry) => entry.agent)
+    .sort()
+    .join(",");
+  React.useEffect(() => {
+    if (!rootEventId || !agentsKey) return;
+    recordProjectSeenAgents(rootEventId, agentsKey.split(","));
+  }, [agentsKey, rootEventId]);
+
+  return live;
 }

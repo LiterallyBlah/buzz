@@ -41,6 +41,7 @@ import { OverviewRailSection } from "./ProjectOverviewPanel";
 import { ProfileIdentityButton } from "./ProjectProfileIdentity";
 import { ProjectActivityIndicator } from "./ProjectActivityIndicator";
 import { ProjectRichContent } from "./ProjectRichContent";
+import { ProjectRootAgentsSection } from "./ProjectRootAgentsSection";
 
 export function issueStatusClassName(status: ProjectIssue["status"]) {
   if (status === "Done") return "text-purple-400";
@@ -452,6 +453,14 @@ function IssueMetaRail({
           pubkey={issue.author}
         />
       </OverviewRailSection>
+      {/* Above Labels and Activity, below Author: the rail runs from "who owns
+          this" to "what has happened to it", and who has been working on it
+          belongs on the people side of that line. */}
+      <ProjectRootAgentsSection
+        commentAuthors={issue.comments}
+        profiles={profiles}
+        rootEventId={issue.id}
+      />
       {issue.labels.length > 0 ? (
         <OverviewRailSection title="Labels">
           <div className="flex flex-wrap gap-1.5">

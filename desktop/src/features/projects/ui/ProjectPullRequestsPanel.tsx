@@ -48,6 +48,7 @@ import {
 import { ProjectActivityIndicator } from "./ProjectActivityIndicator";
 import { PullRequestReviewTimeline } from "./ProjectPullRequestReviewTimeline";
 import { ProjectRichContent } from "./ProjectRichContent";
+import { ProjectRootAgentsSection } from "./ProjectRootAgentsSection";
 import { PullRequestReviewersRow } from "./PullRequestReviewersRow";
 
 function pluralize(count: number, singular: string, plural = `${singular}s`) {
@@ -453,6 +454,15 @@ export function PullRequestMetaRail({
           pubkey={pullRequest.author}
         />
       </OverviewRailSection>
+      {/* Between Author and Branches: the rail's people-facing half. The
+          comment list is the only relay-durable evidence of an agent having
+          worked here, so it is passed in even though most of those authors are
+          human — the union filters them out. */}
+      <ProjectRootAgentsSection
+        commentAuthors={pullRequest.comments}
+        profiles={profiles}
+        rootEventId={pullRequest.id}
+      />
       <OverviewRailSection title="Branches">
         <div className="space-y-1.5 text-xs text-muted-foreground">
           <p>Merges {pluralize(commitCount, "commit")}</p>
