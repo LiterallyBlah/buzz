@@ -16,7 +16,7 @@ import { Button } from "@/shared/ui/button";
 import { Card } from "@/shared/ui/card";
 import { DropdownMenuItem } from "@/shared/ui/dropdown-menu";
 import { ProjectEventTypeIcon } from "./ProjectEventTypeIcon";
-import { ProjectListRowMenu } from "./ProjectListRowMenu";
+import { ProjectItemDeleteMenu } from "./ProjectItemDeleteMenu";
 import { ProjectsWorkItemsLoadNotice } from "./ProjectsWorkItemsLoadNotice";
 import {
   PROJECT_LIST_CONTAINER_CLASS,
@@ -121,6 +121,16 @@ function PullRequestGridCard({
           >
             {nextStepLabel(pullRequest.status)}
           </Button>
+          <ProjectItemDeleteMenu
+            author={pullRequest.author}
+            label={`More options for ${pullRequest.title}`}
+            project={project}
+            rootId={pullRequest.id}
+            subject="pull request"
+            targetId={pullRequest.id}
+            testId={`pull-request-card-${pullRequest.id}`}
+            title={pullRequest.title}
+          />
         </div>
 
         {pullRequest.content ? (
@@ -230,12 +240,21 @@ function PullRequestListRow({
           >
             {relativeTime(pullRequest.createdAt)}
           </span>
-          <ProjectListRowMenu label={`More options for ${pullRequest.title}`}>
+          <ProjectItemDeleteMenu
+            author={pullRequest.author}
+            label={`More options for ${pullRequest.title}`}
+            project={project}
+            rootId={pullRequest.id}
+            subject="pull request"
+            targetId={pullRequest.id}
+            testId={`pull-request-${pullRequest.id}`}
+            title={pullRequest.title}
+          >
             <DropdownMenuItem onSelect={() => onOpen(project, pullRequest)}>
               <GitPullRequest className="h-4 w-4" />
               {nextStepLabel(pullRequest.status)}
             </DropdownMenuItem>
-          </ProjectListRowMenu>
+          </ProjectItemDeleteMenu>
         </div>
       </div>
     </div>

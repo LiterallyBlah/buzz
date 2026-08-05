@@ -1,6 +1,7 @@
 import { FileCode2, MessageSquareText } from "lucide-react";
 
 import { ForumComposer } from "@/features/forum/ui/ForumComposer";
+import type { Project } from "@/features/projects/hooks";
 import type {
   ProjectPullRequestComment,
   ProjectPullRequestCommentAnchor,
@@ -8,6 +9,7 @@ import type {
 import { relativeTime } from "@/features/projects/lib/projectsViewHelpers";
 import type { UserProfileLookup } from "@/features/profile/lib/identity";
 import { normalizePubkey, truncatePubkey } from "@/shared/lib/pubkey";
+import { ProjectItemDeleteMenu } from "./ProjectItemDeleteMenu";
 import { ProjectRichContent } from "./ProjectRichContent";
 
 function commentAuthor(
@@ -30,6 +32,8 @@ export function ProjectPullRequestInlineCommentThread({
   onCancel,
   onSubmit,
   profiles,
+  project,
+  rootId,
 }: {
   activeAnchor: ProjectPullRequestCommentAnchor | null;
   canRequestChanges: boolean;
@@ -43,6 +47,9 @@ export function ProjectPullRequestInlineCommentThread({
     decision?: "request-changes",
   ) => Promise<unknown>;
   profiles?: UserProfileLookup;
+  project: Project;
+  /** Pull request these line comments hang off — the deletion route. */
+  rootId: string;
 }) {
   if (comments.length === 0 && !activeAnchor) return null;
 
@@ -67,6 +74,15 @@ export function ProjectPullRequestInlineCommentThread({
                 <span className="shrink-0 text-muted-foreground">
                   {relativeTime(comment.createdAt)}
                 </span>
+                <ProjectItemDeleteMenu
+                  author={comment.author}
+                  label="More options for this comment"
+                  project={project}
+                  rootId={rootId}
+                  subject="comment"
+                  targetId={comment.id}
+                  testId={`comment-${comment.id}`}
+                />
               </div>
               <ProjectRichContent
                 content={comment.content}

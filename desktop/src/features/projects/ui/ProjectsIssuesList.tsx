@@ -16,7 +16,7 @@ import { Button } from "@/shared/ui/button";
 import { Card } from "@/shared/ui/card";
 import { DropdownMenuItem } from "@/shared/ui/dropdown-menu";
 import { ProjectEventTypeIcon } from "./ProjectEventTypeIcon";
-import { ProjectListRowMenu } from "./ProjectListRowMenu";
+import { ProjectItemDeleteMenu } from "./ProjectItemDeleteMenu";
 import { ProjectsWorkItemsLoadNotice } from "./ProjectsWorkItemsLoadNotice";
 import {
   PROJECT_LIST_CONTAINER_CLASS,
@@ -130,6 +130,16 @@ function IssueGridCard({
           >
             {nextStepLabel(issue.status)}
           </Button>
+          <ProjectItemDeleteMenu
+            author={issue.author}
+            label={`More options for ${issue.title}`}
+            project={project}
+            rootId={issue.id}
+            subject="issue"
+            targetId={issue.id}
+            testId={`issue-card-${issue.id}`}
+            title={issue.title}
+          />
         </div>
 
         {issue.content ? (
@@ -204,12 +214,21 @@ function IssueListRow({
           >
             {relativeTime(issue.createdAt)}
           </span>
-          <ProjectListRowMenu label={`More options for ${issue.title}`}>
+          <ProjectItemDeleteMenu
+            author={issue.author}
+            label={`More options for ${issue.title}`}
+            project={project}
+            rootId={issue.id}
+            subject="issue"
+            targetId={issue.id}
+            testId={`issue-${issue.id}`}
+            title={issue.title}
+          >
             <DropdownMenuItem onSelect={() => onOpen(project, issue)}>
               <Eye className="h-4 w-4" />
               {nextStepLabel(issue.status)}
             </DropdownMenuItem>
-          </ProjectListRowMenu>
+          </ProjectItemDeleteMenu>
         </div>
       </div>
     </div>
