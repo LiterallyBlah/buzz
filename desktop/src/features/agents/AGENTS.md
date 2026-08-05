@@ -153,6 +153,23 @@ with a TypeScript lookup table or an id comparison in a component.
    themselves. Never synthesize a run location a surface doesn't have. Don't
    expose `respond-to`, `allowlist`, Nostr, or harness jargon in primary UI
    copy.
+12. **The Agents tab shows agents the owner owns, never the community
+    directory.** PR #2290 deleted `RelayDirectorySection` because an unscoped
+    kind:10100 listing is mostly other people's stale agents — do not bring one
+    back. Relay-registered agents reach the tab only through
+    `lib/ownedRelayAgents.ts`, whose sole ownership input is the verified
+    NIP-OA `ownerPubkey` on a users-batch profile summary (kind:0 `auth` tag,
+    signature-checked in `profile_valid_oa_owner_pubkey`). A kind:10100 entry's
+    name, capabilities or mere presence prove nothing and must never widen the
+    scope. `selectOwnedRelayAgents` is the single producer for both that
+    listing and `useAgentObserverIngestion` — an agent the tab calls yours whose
+    observer frames are not ingested is a lie in one of the two places, so
+    derive both rather than re-implementing the predicate. These agents are not
+    `ManagedAgent`s: this desktop holds no key, no local record and no process
+    for them, and the tree has no owner-signed relay lifecycle command, so the
+    card carries no Start/Stop/Deploy/Edit/Delete affordance and opens the
+    existing read-only profile Runtime view instead. Adding a control here
+    means adding the relay protocol that backs it first.
 
 ## The tests that enforce this
 
@@ -170,6 +187,12 @@ with a TypeScript lookup table or an id comparison in a component.
 - `ui/respondToFieldContract.test.mjs` — plain-language mode labels, the
   persistent warning contract for shared agent access, and its two render
   positions (after the people picker for `allowlist`).
+- `lib/ownedRelayAgents.test.mjs` — the verified-owner index and the owned /
+  foreign / unowned / locally-managed cases of `selectOwnedRelayAgents`.
+- `desktop/tests/e2e/agents-managed-elsewhere.spec.ts` — the Agents tab
+  acceptance gate: an owned relay agent is listed, a foreign one never is, a
+  locally managed duplicate appears once, the card paints no lifecycle control,
+  and it opens the read-only profile Runtime view.
 - `lib/agentAccessWarning.test.mjs` — every mode × run-location copy variant
   plus both resolvers, including unknown-reads-as-local and
   blank-`runOn`-is-not-a-provider.

@@ -238,6 +238,7 @@ export function AgentsView() {
               onStartPersona={(persona) => {
                 void agents.handleStartPersona(persona);
               }}
+              ownedRelayAgents={agents.ownedRelayAgents}
               // Persona props
               personas={personas.libraryPersonas}
               personasError={

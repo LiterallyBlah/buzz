@@ -15,6 +15,8 @@ import {
 import { useGlobalAgentConfig } from "@/features/agents/useGlobalAgentConfig";
 import { useChannelsQuery } from "@/features/channels/hooks";
 import { usePresenceQuery } from "@/features/presence/hooks";
+import { useUsersBatchQuery } from "@/features/profile/hooks";
+import { useIdentityQuery } from "@/shared/api/hooks";
 import type {
   AgentPersona,
   Channel,
@@ -35,9 +37,15 @@ import {
   buildInstanceInputForDefinition,
   resolveStartRuntimeForDefinition,
 } from "../lib/instanceInputForDefinition";
+import {
+  buildVerifiedAgentOwnerIndex,
+  selectOwnedRelayAgents,
+} from "../lib/ownedRelayAgents";
 
 export function useManagedAgentActions() {
   const { globalConfig } = useGlobalAgentConfig();
+  const identityQuery = useIdentityQuery();
+  const currentPubkey = identityQuery.data?.pubkey;
   const relayAgentsQuery = useRelayAgentsQuery();
   const managedAgentsQuery = useManagedAgentsQuery();
   const [shouldLoadChannels, setShouldLoadChannels] = React.useState(false);
@@ -101,6 +109,39 @@ export function useManagedAgentActions() {
   );
 
   const managedPresenceQuery = usePresenceQuery(managedPubkeyList);
+
+  const relayAgentPubkeys = React.useMemo(
+    () => (relayAgentsQuery.data ?? []).map((agent) => agent.pubkey),
+    [relayAgentsQuery.data],
+  );
+  // Same query key as the app-level observer ingestion's batch, so this is a
+  // React Query cache hit rather than a second relay round trip.
+  const relayAgentProfilesQuery = useUsersBatchQuery(relayAgentPubkeys, {
+    enabled: Boolean(currentPubkey) && relayAgentPubkeys.length > 0,
+  });
+
+  /**
+   * Agents that exist on the relay under this identity's verified NIP-OA
+   * ownership but have no local managed-agent record — the server-hosted
+   * agents the Agents tab would otherwise never show. Deliberately NOT the
+   * whole kind:10100 community directory (PR #2290 removed that because it was
+   * mostly other people's stale agents); ownership is the scope.
+   */
+  const ownedRelayAgents = React.useMemo(
+    () =>
+      selectOwnedRelayAgents(
+        relayAgentsQuery.data,
+        managedAgents,
+        buildVerifiedAgentOwnerIndex(relayAgentProfilesQuery.data?.profiles),
+        currentPubkey,
+      ).sort((left, right) => left.name.localeCompare(right.name)),
+    [
+      currentPubkey,
+      managedAgents,
+      relayAgentProfilesQuery.data,
+      relayAgentsQuery.data,
+    ],
+  );
 
   const channelsByPubkey = React.useMemo(() => {
     const map: Record<string, { id: string; name: string }[]> = {};
@@ -404,6 +445,7 @@ export function useManagedAgentActions() {
     managedPresenceQuery,
     managedAgents,
     managedPubkeys,
+    ownedRelayAgents,
     channelIdToName,
     channelsByPubkey,
     isPending,

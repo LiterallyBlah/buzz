@@ -10,7 +10,11 @@ import { resolveAgentCardModelLabel } from "@/features/agents/lib/agentCardModel
 import { friendlyAgentLastError } from "@/features/agents/lib/friendlyAgentLastError";
 import { isManagedAgentActive } from "@/features/agents/lib/managedAgentControlActions";
 import { useUserProfileQuery } from "@/features/profile/hooks";
-import type { AgentPersona, ManagedAgent } from "@/shared/api/types";
+import type {
+  AgentPersona,
+  ManagedAgent,
+  RelayAgent,
+} from "@/shared/api/types";
 import type { ProfilePanelOpenOptions } from "@/shared/context/ProfilePanelContext";
 import { useFeedbackToasts } from "@/shared/hooks/useToastEffect";
 import { useFileImportZone } from "@/shared/hooks/useFileImportZone";
@@ -45,6 +49,11 @@ type UnifiedAgentsSectionProps = {
   onOpenPersonaProfile: (persona: AgentPersona) => void;
   onStartAgent: (pubkey: string) => void;
   onStartPersona: (persona: AgentPersona) => void;
+  /**
+   * Relay agents this identity owns (verified NIP-OA) with no local managed
+   * record. Read-only: this desktop holds no key or process for them.
+   */
+  ownedRelayAgents: RelayAgent[];
   personas: AgentPersona[];
   personasError: Error | null;
   personaFeedbackErrorMessage: string | null;
@@ -85,6 +94,7 @@ export function UnifiedAgentsSection(props: UnifiedAgentsSectionProps) {
     onOpenPersonaProfile,
     onStartAgent,
     onStartPersona,
+    ownedRelayAgents,
     personas,
     personasError,
     personaFeedbackErrorMessage,
@@ -220,6 +230,14 @@ export function UnifiedAgentsSection(props: UnifiedAgentsSectionProps) {
               onToggle={toggle}
               onOpenAgentProfile={onOpenAgentProfile}
               onStartAgent={onStartAgent}
+            />
+          ) : null}
+          {ownedRelayAgents.length > 0 ? (
+            <OwnedRelayAgentGroup
+              agents={ownedRelayAgents}
+              collapsed={collapsed}
+              onToggle={toggle}
+              onOpenAgentProfile={onOpenAgentProfile}
             />
           ) : null}
         </div>
@@ -551,5 +569,91 @@ function CollapsibleAgentGroup({
         </div>
       ) : null}
     </div>
+  );
+}
+
+/**
+ * Agents the current identity owns on the relay but does not manage here.
+ *
+ * Kept as its own group rather than folded into "Custom agents" because the
+ * affordances differ: this desktop holds no private key, no local record and
+ * no process for these, so there is nothing to start, stop, edit or delete.
+ * The card is a way in to the read-only profile and nothing more.
+ */
+function OwnedRelayAgentGroup({
+  agents,
+  collapsed,
+  onToggle,
+  onOpenAgentProfile,
+}: {
+  agents: RelayAgent[];
+  collapsed: ReadonlySet<string>;
+  onToggle: (key: string) => void;
+  onOpenAgentProfile: (
+    pubkey: string,
+    options?: ProfilePanelOpenOptions,
+  ) => void;
+}) {
+  const groupKey = "__owned-relay__";
+  const isCollapsed = collapsed.has(groupKey);
+  return (
+    <div
+      className={`${AGENT_CARD_COLUMN_CLASS} space-y-2`}
+      data-testid="owned-relay-agents-group"
+    >
+      <button
+        className="group flex items-center gap-2 rounded-md px-1 py-1 text-left transition-colors hover:bg-muted/50"
+        onClick={() => onToggle(groupKey)}
+        type="button"
+      >
+        {isCollapsed ? (
+          <ChevronRight className="h-4 w-4 shrink-0 text-muted-foreground transition-transform group-hover:translate-x-0.5" />
+        ) : (
+          <ChevronDown className="h-4 w-4 shrink-0 text-muted-foreground" />
+        )}
+        <span className="text-sm font-medium">Managed elsewhere</span>
+        <span className="text-xs text-muted-foreground">({agents.length})</span>
+      </button>
+      {!isCollapsed ? (
+        <div className={IDENTITY_CARD_GRID_CLASS}>
+          {agents.map((agent) => (
+            <OwnedRelayAgentCard
+              agent={agent}
+              key={agent.pubkey}
+              onOpenAgentProfile={onOpenAgentProfile}
+            />
+          ))}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+function OwnedRelayAgentCard({
+  agent,
+  onOpenAgentProfile,
+}: {
+  agent: RelayAgent;
+  onOpenAgentProfile: (
+    pubkey: string,
+    options?: ProfilePanelOpenOptions,
+  ) => void;
+}) {
+  const profileQuery = useUserProfileQuery(agent.pubkey);
+
+  return (
+    <AgentIdentityCard
+      ariaLabel={`${agent.name} agent profile`}
+      avatarUrl={profileQuery.data?.avatarUrl}
+      dataTestId={`owned-relay-agent-${agent.pubkey}`}
+      label={agent.name}
+      // Says exactly what we know and why there are no controls. Do not
+      // upgrade this to "runs on your server" — the relay directory records
+      // that the agent is registered, never which host it runs on.
+      modelLabel="Not on this computer"
+      onClick={() => {
+        onOpenAgentProfile(agent.pubkey, { tab: "runtime" });
+      }}
+    />
   );
 }
