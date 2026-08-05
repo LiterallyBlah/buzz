@@ -231,6 +231,19 @@ pub struct AgentPool {
     result_rx: mpsc::UnboundedReceiver<PromptResult>,
     pub join_set: JoinSet<()>,
     task_map: HashMap<tokio::task::Id, TaskMeta>,
+    /// Whether this harness is currently locked out of its provider, and what
+    /// it has already said about it.
+    ///
+    /// Lives on the pool rather than on an [`OwnedAgent`] because the thing
+    /// that expired is not any one agent process: every slot in the pool runs
+    /// the same adapter against the same operator credential, so an outage is
+    /// one fact about the harness. Held per-agent, a pool of four would
+    /// announce the same outage four times — once per slot that happened to
+    /// take a turn — and a respawn would forget it had announced at all.
+    ///
+    /// See [`crate::AuthEpisode`], where the episode rules and the deferred
+    /// re-authentication flow are documented.
+    auth_episode: crate::AuthEpisode,
 }
 
 /// Result returned by a completed prompt task.
@@ -666,7 +679,13 @@ impl AgentPool {
             result_rx,
             join_set: JoinSet::new(),
             task_map: HashMap::new(),
+            auth_episode: crate::AuthEpisode::default(),
         }
+    }
+
+    /// The harness's authentication-outage state, for the turn-error path.
+    pub(crate) fn auth_episode_mut(&mut self) -> &mut crate::AuthEpisode {
+        &mut self.auth_episode
     }
 
     /// Try to claim an idle agent for the given channel (or heartbeat if `None`).
