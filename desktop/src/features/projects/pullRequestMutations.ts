@@ -13,6 +13,11 @@ import {
 } from "@/shared/constants/kinds";
 import { normalizePubkey } from "@/shared/lib/pubkey";
 import type { Project, ProjectPullRequest } from "./hooks";
+import {
+  pullRequestRepoOwner,
+  pullRequestTargetCloneUrl,
+  resolvePullRequestRepoContext,
+} from "./lib/pullRequestRepoContext";
 import { nextProjectPullRequestStatusCreatedAt } from "./projectPullRequests.mjs";
 import { useProjectPullRequestWriteInvalidation } from "./pullRequestReviews";
 
@@ -173,13 +178,10 @@ export async function publishProjectPullRequestUpdate({
 }
 
 export async function publishProjectPullRequestMerged(
-  project: Project,
+  targetOwner: string,
   statusEvent: string,
 ) {
-  await publishProjectPullRequestMergedStatus({
-    targetOwner: project.owner,
-    statusEvent,
-  });
+  await publishProjectPullRequestMergedStatus({ targetOwner, statusEvent });
 }
 
 export function useCreateProjectPullRequestMutation(
@@ -232,22 +234,31 @@ export function useMergeProjectPullRequestMutation(
     }: {
       pullRequest: ProjectPullRequest;
     }) => {
-      if (!project?.cloneUrls[0]) throw new Error("No project selected.");
+      // The PR names its own repository, so merging never needed a workspace
+      // selection — and demanding one made a PR opened directly (from a
+      // notification, or a CLI-authored release-train PR) unmergeable. It also
+      // conflated "no selection" with "the selection advertised no clone URL",
+      // which is the far more common failure. See lib/pullRequestRepoContext.
+      const resolved = resolvePullRequestRepoContext(project, pullRequest);
+      if (!resolved.ok) throw new Error(resolved.error);
+      const { context } = resolved;
+      const target = pullRequestTargetCloneUrl(context);
+      if (!target.ok) throw new Error(target.error);
       if (!pullRequest.branchName || !pullRequest.commit) {
         throw new Error("Pull request branch information is incomplete.");
       }
       const result = await mergeProjectPullRequest({
-        targetCloneUrl: project.cloneUrls[0],
-        sourceCloneUrl: pullRequest.cloneUrls[0] ?? project.cloneUrls[0],
-        targetOwner: project.owner,
-        repoAddress: project.repoAddress,
+        targetCloneUrl: target.cloneUrl,
+        sourceCloneUrl: pullRequest.cloneUrls[0] ?? target.cloneUrl,
+        targetOwner: context.owner,
+        repoAddress: context.repoAddress,
         pullRequestId: pullRequest.id,
         pullRequestAuthor: pullRequest.author,
         statusCreatedAt: nextProjectPullRequestStatusCreatedAt(
           pullRequest,
           Math.floor(Date.now() / 1_000),
         ),
-        targetBranch: pullRequest.targetBranch ?? project.defaultBranch,
+        targetBranch: pullRequest.targetBranch ?? context.defaultBranch,
         sourceBranch: pullRequest.branchName,
         expectedCommit: pullRequest.commit,
       });
@@ -257,14 +268,27 @@ export function useMergeProjectPullRequestMutation(
   });
 }
 
+/**
+ * Republishes a merged status the merge itself produced but could not publish.
+ *
+ * Takes the pull request so the repo owner — the only fact this needs — can
+ * come from the PR's own coordinate. Retrying a merge's unpublished status
+ * must not be the one step that still demands a workspace selection.
+ */
 export function usePublishProjectPullRequestMergedMutation(
   project: Project | null | undefined,
+  pullRequest?: ProjectPullRequest | null,
 ) {
   const invalidate = useProjectPullRequestWriteInvalidation(project);
   return useMutation({
     mutationFn: ({ statusEvent }: { statusEvent: string }) => {
-      if (!project) throw new Error("No project selected.");
-      return publishProjectPullRequestMerged(project, statusEvent);
+      const targetOwner = pullRequest
+        ? pullRequestRepoOwner(project, pullRequest)
+        : (project?.owner ?? null);
+      if (!targetOwner) {
+        throw new Error("This pull request does not name a repository.");
+      }
+      return publishProjectPullRequestMerged(targetOwner, statusEvent);
     },
     onSuccess: invalidate,
   });

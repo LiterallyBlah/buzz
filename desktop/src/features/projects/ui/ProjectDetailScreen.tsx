@@ -737,10 +737,20 @@ export function ProjectDetailScreen(props: ProjectDetailScreenProps) {
       sourceBranch: string;
       sourceCloneUrl: string;
       targetBranch: string;
+      targetCloneUrl: string | null;
     }) => {
-      const targetCloneUrl = project?.cloneUrls[0];
+      // The selection's own clone URL first; the button-resolved fallback
+      // (from the PR's tags, gated on it naming this repo) covers the cold
+      // deep-link whose relay-origin race froze cloneUrls empty. When both
+      // are missing the failure is the repo's reachability, and the error
+      // says so instead of blaming a selection that exists.
+      const targetCloneUrl = project?.cloneUrls[0] ?? input.targetCloneUrl;
       if (!project || !targetCloneUrl) {
-        throw new Error("No project selected.");
+        throw new Error(
+          project
+            ? "This project has no clone URL. Add a clone URL to the repository announcement, or reconnect to the relay that hosts it."
+            : "No project selected.",
+        );
       }
       return openProjectMergeRecoveryTerminal({
         ...input,

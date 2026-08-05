@@ -16,6 +16,11 @@ import {
 } from "@/shared/constants/kinds";
 import type { Project } from "./hooks";
 import {
+  pullRequestRepoOwner,
+  resolvePullRequestRepoContext,
+  type PullRequestRepoContext,
+} from "./lib/pullRequestRepoContext";
+import {
   nextProjectPullRequestStatusCreatedAt,
   type ProjectPullRequest,
 } from "./projectPullRequests.mjs";
@@ -42,12 +47,12 @@ const PR_STATUS_KIND_BY_LIFECYCLE: Record<
 // repo `a` tag, and `p` tags for the repo owner + PR author. Only the PR
 // author or repo owner are trusted for status changes (allowedActorsForRoot).
 async function updateProjectPullRequestStatus({
-  project,
+  repo,
   pullRequest,
   signAsManagedOwner,
   status,
 }: {
-  project: Project;
+  repo: PullRequestRepoContext;
   pullRequest: ProjectPullRequest;
   signAsManagedOwner: boolean;
   status: ProjectPullRequestLifecycleStatus;
@@ -58,8 +63,8 @@ async function updateProjectPullRequestStatus({
   );
   if (signAsManagedOwner) {
     await signProjectPullRequestStatus({
-      targetOwner: project.owner,
-      repoAddress: project.repoAddress,
+      targetOwner: repo.owner,
+      repoAddress: repo.repoAddress,
       pullRequestId: pullRequest.id,
       pullRequestAuthor: pullRequest.author,
       status,
@@ -68,7 +73,7 @@ async function updateProjectPullRequestStatus({
     return;
   }
   const recipients = new Set([
-    project.owner.toLowerCase(),
+    repo.owner.toLowerCase(),
     pullRequest.author.toLowerCase(),
   ]);
   const event = await signRelayEvent({
@@ -77,7 +82,7 @@ async function updateProjectPullRequestStatus({
     createdAt,
     tags: [
       ["e", pullRequest.id, "", "root"],
-      ["a", project.repoAddress],
+      ["a", repo.repoAddress],
       ...[...recipients].map((recipient) => ["p", recipient]),
     ],
   });
@@ -95,13 +100,13 @@ async function updateProjectPullRequestStatus({
 // requested reviewers; parsing only trusts requests signed by the PR author
 // or repo owner.
 async function requestProjectPullRequestReview({
-  project,
+  repo,
   pullRequest,
   reviewers,
   reviewerLabel,
   signAsManagedOwner,
 }: {
-  project: Project;
+  repo: PullRequestRepoContext;
   pullRequest: ProjectPullRequest;
   reviewers: string[];
   reviewerLabel: string;
@@ -115,8 +120,8 @@ async function requestProjectPullRequestReview({
   ];
   if (signAsManagedOwner) {
     await signProjectPullRequestReviewRequest({
-      targetOwner: project.owner,
-      repoAddress: project.repoAddress,
+      targetOwner: repo.owner,
+      repoAddress: repo.repoAddress,
       pullRequestId: pullRequest.id,
       reviewers: reviewerPubkeys,
       reviewerLabel,
@@ -128,7 +133,7 @@ async function requestProjectPullRequestReview({
     content: `Requested a review from ${reviewerLabel}`,
     tags: [
       ["e", pullRequest.id, "", "root"],
-      ["a", project.repoAddress],
+      ["a", repo.repoAddress],
       ...reviewerPubkeys.map((pubkey) => ["p", pubkey]),
       ["t", PR_REVIEW_REQUEST_LABEL],
     ],
@@ -143,9 +148,16 @@ async function requestProjectPullRequestReview({
 
 type ProjectPullRequestReviewDecision = "approve" | "request-changes";
 
-/** Whether a viewer may submit a review decision for this pull request. */
+/**
+ * Whether a viewer may submit a review decision for this pull request.
+ *
+ * `project` is optional: the repo owner — the only thing it was consulted for
+ * — is also recoverable from the PR's own coordinate, so a PR rendered without
+ * a workspace selection still shows its review controls instead of silently
+ * hiding them.
+ */
 export function canReviewProjectPullRequest(
-  project: Project,
+  project: Pick<Project, "owner"> | null | undefined,
   pullRequest: ProjectPullRequest,
   viewerPubkey: string | null | undefined,
 ) {
@@ -158,8 +170,9 @@ export function canReviewProjectPullRequest(
   }
   const viewer = normalizePubkey(viewerPubkey);
   if (viewer === normalizePubkey(pullRequest.author)) return false;
+  const owner = pullRequestRepoOwner(project, pullRequest);
   return (
-    viewer === normalizePubkey(project.owner) ||
+    (owner !== null && viewer === normalizePubkey(owner)) ||
     pullRequest.reviewers.some(
       (reviewer) => normalizePubkey(reviewer) === viewer,
     )
@@ -193,13 +206,13 @@ async function submitProjectPullRequestReview({
   content,
   createdAt,
   decision,
-  project,
+  repo,
   pullRequest,
 }: {
   content?: string;
   createdAt: number;
   decision: ProjectPullRequestReviewDecision;
-  project: Project;
+  repo: PullRequestRepoContext;
   pullRequest: ProjectPullRequest;
 }): Promise<void> {
   if (!pullRequest.commit) {
@@ -207,7 +220,7 @@ async function submitProjectPullRequestReview({
   }
   const details = REVIEW_DECISION_DETAILS[decision];
   const recipients = new Set([
-    project.owner.toLowerCase(),
+    repo.owner.toLowerCase(),
     pullRequest.author.toLowerCase(),
   ]);
   const event = await signRelayEvent({
@@ -216,7 +229,7 @@ async function submitProjectPullRequestReview({
     createdAt,
     tags: [
       ["e", pullRequest.id, "", "root"],
-      ["a", project.repoAddress],
+      ["a", repo.repoAddress],
       ...[...recipients].map((recipient) => ["p", recipient]),
       ["t", details.label],
       ["c", pullRequest.commit],
@@ -262,9 +275,13 @@ export function useUpdateProjectPullRequestStatusMutation(
       signAsManagedOwner?: boolean;
       status: ProjectPullRequestLifecycleStatus;
     }) => {
-      if (!project) throw new Error("No project selected.");
+      // A status change writes the repo's `a` tag and addresses its owner —
+      // both of which the PR root already names. Requiring a selection on top
+      // blocked the flow for PRs opened directly.
+      const resolved = resolvePullRequestRepoContext(project, pullRequest);
+      if (!resolved.ok) throw new Error(resolved.error);
       return updateProjectPullRequestStatus({
-        project,
+        repo: resolved.context,
         pullRequest,
         signAsManagedOwner,
         status,
@@ -291,9 +308,10 @@ export function useRequestProjectPullRequestReviewMutation(
       reviewerLabel: string;
       signAsManagedOwner: boolean;
     }) => {
-      if (!project) throw new Error("No project selected.");
+      const resolved = resolvePullRequestRepoContext(project, pullRequest);
+      if (!resolved.ok) throw new Error(resolved.error);
       return requestProjectPullRequestReview({
-        project,
+        repo: resolved.context,
         pullRequest,
         reviewers,
         reviewerLabel,
@@ -320,12 +338,13 @@ function useProjectPullRequestReviewDecisionMutation(
       createdAt: number;
       pullRequest: ProjectPullRequest;
     }) => {
-      if (!project) throw new Error("No project selected.");
+      const resolved = resolvePullRequestRepoContext(project, pullRequest);
+      if (!resolved.ok) throw new Error(resolved.error);
       return submitProjectPullRequestReview({
         content,
         createdAt,
         decision,
-        project,
+        repo: resolved.context,
         pullRequest,
       });
     },

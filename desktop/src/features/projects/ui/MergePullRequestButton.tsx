@@ -3,6 +3,7 @@ import * as React from "react";
 import { toast } from "sonner";
 
 import type { Project, ProjectPullRequest } from "@/features/projects/hooks";
+import { projectCheckoutCloneUrl } from "@/features/projects/lib/pullRequestRepoContext";
 import { projectPullRequestConflictCommands } from "@/features/projects/projectPullRequestConflictRecovery";
 import {
   useMergeProjectPullRequestMutation,
@@ -30,6 +31,16 @@ export type OpenMergeRecoveryTerminal = (input: {
   sourceBranch: string;
   sourceCloneUrl: string;
   targetBranch: string;
+  /**
+   * Where the target repo can be fetched, resolved HERE because this button
+   * holds both the selection and the pull request. The screen handler that
+   * opens the terminal sees only a `Project` whose `cloneUrls` may have been
+   * frozen empty by a cold deep-link (the relay-origin cache races project
+   * resolution — see pullRequestRepoContext.ts), so a recovery started from
+   * a directly-opened PR needs the same PR-tag fallback the merge itself
+   * uses, gated on the PR naming the selection's repo.
+   */
+  targetCloneUrl: string | null;
 }) => Promise<{ recoveryRef: string; targetRef: string }>;
 
 export function MergePullRequestButton({
@@ -57,8 +68,10 @@ export function MergePullRequestButton({
     targetRef: string;
   } | null>(null);
   const mergeMutation = useMergeProjectPullRequestMutation(project);
-  const publishMergedMutation =
-    usePublishProjectPullRequestMergedMutation(project);
+  const publishMergedMutation = usePublishProjectPullRequestMergedMutation(
+    project,
+    pullRequest,
+  );
   const targetBranch = pullRequest.targetBranch ?? project.defaultBranch;
   const conflictRecovery =
     conflictRecoveryState?.pullRequestId === pullRequest.id
@@ -131,6 +144,7 @@ export function MergePullRequestButton({
         sourceBranch: conflictRecovery.sourceBranch,
         sourceCloneUrl,
         targetBranch: conflictRecovery.targetBranch,
+        targetCloneUrl: projectCheckoutCloneUrl(project, pullRequest),
       });
       if (!result) return;
       setPreparedRecoveryState({
