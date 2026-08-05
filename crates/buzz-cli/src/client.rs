@@ -1079,15 +1079,25 @@ impl BuzzClient {
     /// `buzz_ws_client::publish_event` which handles connect, NIP-42 auth,
     /// EVENT send, OK wait, and graceful close.
     pub async fn publish_ephemeral_event(&self, event: nostr::Event) -> Result<String, CliError> {
+        self.publish_ephemeral_event_with_auth(event, None).await
+    }
+
+    /// Publish an ephemeral event while supplying a verified NIP-OA auth tag
+    /// recovered from the agent's signed profile.
+    pub async fn publish_ephemeral_event_with_auth(
+        &self,
+        event: nostr::Event,
+        auth_tag: Option<&nostr::Tag>,
+    ) -> Result<String, CliError> {
         let ws_url = to_ws_url(&self.relay_url);
         // Hard cap — inner wait ceilings sum to 70 s; connect time and network RTT are
         // additional overhead absorbed by this budget.
         // See buzz_ws_client::{AUTH_CHALLENGE_TIMEOUT_SECS, AUTH_OK_TIMEOUT_SECS,
         // PUBLISH_OK_TIMEOUT_SECS} for the inner ceilings.
-        let ok =
-            buzz_ws_client::publish_event(&ws_url, event, &self.keys, self.auth_tag.as_ref(), 75)
-                .await
-                .map_err(|e| CliError::Other(e.to_string()))?;
+        let auth_tag = auth_tag.or(self.auth_tag.as_ref());
+        let ok = buzz_ws_client::publish_event(&ws_url, event, &self.keys, auth_tag, 75)
+            .await
+            .map_err(|e| CliError::Other(e.to_string()))?;
 
         if !ok.accepted {
             return Err(CliError::Relay {

@@ -1,4 +1,5 @@
 use buzz_core::kind::KIND_IA_ARCHIVED_LIST;
+use buzz_core::observer::{encrypt_observer_payload, OBSERVER_FRAME_TELEMETRY};
 use buzz_core::peer_call::{
     derive_call_id, onward_context, PeerCallRoute, CALL_WINDOW_SECS, KIND_PEER_CALL,
     KIND_PEER_CALL_RESULT, MAX_FANOUT,
@@ -7,7 +8,7 @@ use buzz_sdk::builders::{
     build_archive_identity_request, build_peer_call, build_peer_call_result,
     build_project_activity, build_unarchive_identity_request, PeerCallMeta, ProjectActivityState,
 };
-use nostr::PublicKey;
+use nostr::{Kind, PublicKey, Tag};
 use serde_json::json;
 use uuid::Uuid;
 
@@ -54,6 +55,167 @@ fn resolve_route(
             "give exactly one route: --channel [--thread], or --project --root".into(),
         )),
     }
+}
+
+/// Validate the structural part of one NIP-AO telemetry payload.
+///
+/// The CLI deliberately does not reinterpret ACP payloads: `payload` remains
+/// protocol data, and unknown `kind` values remain forward-compatible as NIP-AO
+/// requires. It does enforce the routing and correlation fields that would make
+/// a frame impossible to place or dangerously ambiguous.
+fn validate_observer_event(event: &serde_json::Value) -> Result<(), CliError> {
+    let object = event
+        .as_object()
+        .ok_or_else(|| CliError::Usage("--event must be one JSON object".into()))?;
+
+    object
+        .get("seq")
+        .and_then(serde_json::Value::as_u64)
+        .filter(|seq| *seq > 0)
+        .ok_or_else(|| CliError::Usage("observer event seq must be a positive integer".into()))?;
+
+    let timestamp = object
+        .get("timestamp")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| CliError::Usage("observer event timestamp must be RFC3339 text".into()))?;
+    chrono::DateTime::parse_from_rfc3339(timestamp)
+        .map_err(|_| CliError::Usage("observer event timestamp must be RFC3339 text".into()))?;
+
+    let kind = object
+        .get("kind")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|kind| !kind.is_empty() && kind.len() <= 64)
+        .ok_or_else(|| CliError::Usage("observer event kind must be 1 to 64 characters".into()))?;
+    if kind.chars().any(char::is_control) {
+        return Err(CliError::Usage(
+            "observer event kind must not contain control characters".into(),
+        ));
+    }
+
+    if !object
+        .get("payload")
+        .is_some_and(serde_json::Value::is_object)
+    {
+        return Err(CliError::Usage(
+            "observer event payload must be a JSON object".into(),
+        ));
+    }
+
+    let channel = object.get("channelId").filter(|value| !value.is_null());
+    if let Some(channel) = channel {
+        let channel = channel.as_str().ok_or_else(|| {
+            CliError::Usage("observer event channelId must be a UUID or null".into())
+        })?;
+        validate_uuid(channel)?;
+    }
+
+    let project = object.get("project").filter(|value| !value.is_null());
+    if channel.is_some() && project.is_some() {
+        return Err(CliError::Usage(
+            "observer event cannot name both channelId and project".into(),
+        ));
+    }
+    if let Some(project) = project {
+        let project = project.as_object().ok_or_else(|| {
+            CliError::Usage("observer event project must be an object or null".into())
+        })?;
+        let coordinate = project
+            .get("coordinate")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| CliError::Usage("observer project.coordinate is required".into()))?;
+        buzz_sdk::GitRepoCoord::from_a_tag_value(coordinate).ok_or_else(|| {
+            CliError::Usage("observer project.coordinate must be 30617:<owner>:<identifier>".into())
+        })?;
+        let root = project
+            .get("root")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| CliError::Usage("observer project.root is required".into()))?;
+        validate_hex64(root)?;
+    }
+
+    for name in ["sessionId", "turnId"] {
+        if let Some(value) = object.get(name).filter(|value| !value.is_null()) {
+            let value = value.as_str().ok_or_else(|| {
+                CliError::Usage(format!("observer event {name} must be text or null"))
+            })?;
+            if value.trim().is_empty() || value.len() > 256 {
+                return Err(CliError::Usage(format!(
+                    "observer event {name} must be 1 to 256 characters"
+                )));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn verified_profile_owner(event: &nostr::Event, agent: &PublicKey) -> Option<(PublicKey, Tag)> {
+    if event.pubkey != *agent || event.kind != Kind::Metadata || event.verify().is_err() {
+        return None;
+    }
+    let auth_tags: Vec<&Tag> = event
+        .tags
+        .iter()
+        .filter(|tag| tag.as_slice().first().is_some_and(|value| value == "auth"))
+        .collect();
+    if auth_tags.len() != 1 {
+        return None;
+    }
+    let auth_json = serde_json::to_string(auth_tags[0]).ok()?;
+    let owner = buzz_sdk::nip_oa::verify_auth_tag(&auth_json, agent).ok()?;
+    Some((owner, auth_tags[0].clone()))
+}
+
+async fn resolve_observer_owner(
+    client: &BuzzClient,
+    explicit: Option<&str>,
+) -> Result<(PublicKey, Option<Tag>), CliError> {
+    let explicit = explicit
+        .map(PublicKey::parse)
+        .transpose()
+        .map_err(|e| CliError::Usage(format!("--owner must be a pubkey or npub: {e}")))?;
+
+    // An explicit owner is only a routing hint: the relay's authoritative
+    // agent_owner_pubkey mapping still rejects a mismatched recipient. This is
+    // the path for externally managed agents that do not hold the owner's
+    // NIP-OA attestation locally.
+    if let Some(owner) = explicit {
+        return Ok((owner, None));
+    }
+
+    if let Some(owner) = client.auth_tag_owner_hex() {
+        let owner = PublicKey::parse(&owner)
+            .map_err(|e| CliError::Usage(format!("BUZZ_AUTH_TAG names an invalid owner: {e}")))?;
+        return Ok((owner, None));
+    }
+
+    let agent = client.keys().public_key();
+    let events = client
+        .query_all(serde_json::json!({
+            "kinds": [0],
+            "authors": [agent.to_hex()],
+            "limit": 10,
+        }))
+        .await?;
+    let latest = events
+        .into_iter()
+        .filter_map(|value| serde_json::from_value::<nostr::Event>(value).ok())
+        .filter(|event| {
+            event.pubkey == agent && event.kind == Kind::Metadata && event.verify().is_ok()
+        })
+        .max_by_key(|event| event.created_at);
+
+    let (owner, auth_tag) = latest
+        .as_ref()
+        .and_then(|event| verified_profile_owner(event, &agent))
+        .ok_or_else(|| {
+            CliError::Usage(
+                "agents observe could not verify one owner: configure BUZZ_AUTH_TAG or publish a signed kind-0 profile with exactly one valid NIP-OA auth tag"
+                    .into(),
+            )
+        })?;
+    Ok((owner, Some(auth_tag)))
 }
 
 // ── NIP-PC issuing gate ───────────────────────────────────────────────────────
@@ -482,6 +644,44 @@ pub async fn dispatch(command: AgentsCmd, client: &BuzzClient) -> Result<(), Cli
                     // disagree.
                     "state": state.as_tag(),
                     "turn": turn,
+                })
+            );
+            Ok(())
+        }
+
+        AgentsCmd::Observe { event, owner } => {
+            let (owner, observer_auth) = resolve_observer_owner(client, owner.as_deref()).await?;
+            let owner_hex = owner.to_hex();
+            let event: serde_json::Value = serde_json::from_str(&read_or_stdin(&event)?)
+                .map_err(|e| CliError::Usage(format!("--event is not valid JSON: {e}")))?;
+            validate_observer_event(&event)?;
+
+            let encrypted = encrypt_observer_payload(client.keys(), &owner, &event)
+                .map_err(|e| CliError::Usage(format!("invalid observer event: {e}")))?;
+            let agent = client.keys().public_key().to_hex().to_ascii_lowercase();
+            let builder = buzz_sdk::build_agent_observer_frame(
+                &owner_hex.to_ascii_lowercase(),
+                &agent,
+                OBSERVER_FRAME_TELEMETRY,
+                &encrypted,
+            )
+            .map_err(|e| CliError::Usage(format!("invalid observer frame: {e}")))?;
+            // NIP-AO kind 24200 is ephemeral. The relay refuses it over the
+            // stored-event HTTP door, and its WS authorisation needs the same
+            // verified NIP-OA attestation that established the recipient.
+            let signed = client.sign_event_unchecked(builder)?;
+            let event_id = signed.id.to_hex();
+            client
+                .publish_ephemeral_event_with_auth(signed, observer_auth.as_ref())
+                .await?;
+            println!(
+                "{}",
+                json!({
+                    "ok": true,
+                    "event_id": event_id,
+                    "agent": agent,
+                    "owner": owner_hex.to_ascii_lowercase(),
+                    "frame": OBSERVER_FRAME_TELEMETRY,
                 })
             );
             Ok(())
@@ -1575,8 +1775,10 @@ mod activity_tests {
     use std::net::SocketAddr;
     use std::sync::{Arc, Mutex};
 
+    use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
     use axum::extract::State;
-    use axum::routing::post;
+    use axum::response::Response;
+    use axum::routing::{any, post};
     use axum::{Json, Router};
     use buzz_sdk::nip_oa::compute_auth_tag;
     use nostr::Keys;
@@ -1595,8 +1797,8 @@ mod activity_tests {
         published: Arc<Mutex<Vec<Value>>>,
     }
 
-    /// A relay that answers `/query` from a fixed history and keeps every event
-    /// submitted to `/events`.
+    /// A relay that answers `/query` from a fixed history, keeps stored events,
+    /// and accepts ephemeral observer frames over its WebSocket root.
     async fn relay_with(stored: Vec<Value>) -> (String, Arc<Mutex<Vec<Value>>>) {
         let published = Arc::new(Mutex::new(Vec::new()));
         let state = Relay {
@@ -1604,6 +1806,16 @@ mod activity_tests {
             published: published.clone(),
         };
         let app = Router::new()
+            .route(
+                "/",
+                any(
+                    |State(s): State<Relay>, upgrade: WebSocketUpgrade| async move {
+                        let response: Response =
+                            upgrade.on_upgrade(move |socket| serve_observer(socket, s.published));
+                        response
+                    },
+                ),
+            )
             .route(
                 "/query",
                 post(|State(s): State<Relay>, _body: String| async move {
@@ -1624,6 +1836,35 @@ mod activity_tests {
         let addr: SocketAddr = listener.local_addr().expect("addr");
         tokio::spawn(async move { axum::serve(listener, app).await.expect("serve") });
         (format!("http://{addr}"), published)
+    }
+
+    async fn serve_observer(mut socket: WebSocket, published: Arc<Mutex<Vec<Value>>>) {
+        let _ = socket
+            .send(Message::Text(r#"["AUTH","deadbeef"]"#.into()))
+            .await;
+        while let Some(Ok(message)) = socket.recv().await {
+            let Message::Text(text) = message else {
+                continue;
+            };
+            let Ok(frame) = serde_json::from_str::<Vec<Value>>(&text) else {
+                continue;
+            };
+            let verb = frame.first().and_then(Value::as_str).unwrap_or_default();
+            let Some(event) = frame.get(1) else { continue };
+            let id = event
+                .get("id")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            if verb == "EVENT" {
+                published.lock().expect("lock").push(event.clone());
+            }
+            let _ = socket
+                .send(Message::Text(
+                    serde_json::json!(["OK", id, true, ""]).to_string().into(),
+                ))
+                .await;
+        }
     }
 
     fn coordinate(owner: &Keys) -> String {
@@ -1760,6 +2001,157 @@ mod activity_tests {
                 .await
                 .expect_err("a malformed activity must be refused");
         }
+        assert!(published.lock().expect("lock").is_empty());
+    }
+
+    fn observer_event(owner: &Keys) -> Value {
+        serde_json::json!({
+            "seq": 7,
+            "timestamp": "2026-08-05T12:00:00.125Z",
+            "kind": "acp_read",
+            "agentIndex": null,
+            "channelId": null,
+            "project": {
+                "coordinate": coordinate(owner),
+                "root": ROOT,
+            },
+            "sessionId": "session-7",
+            "turnId": TURN,
+            "payload": {
+                "jsonrpc": "2.0",
+                "method": "session/update",
+                "params": {
+                    "sessionId": "session-7",
+                    "update": {
+                        "sessionUpdate": "tool_call",
+                        "toolCallId": "tool-7",
+                        "title": "reading files",
+                        "status": "in_progress",
+                        "kind": "read",
+                    }
+                }
+            }
+        })
+    }
+
+    fn client_with_owner(url: String, agent: &Keys, owner: &Keys) -> BuzzClient {
+        let auth_json = compute_auth_tag(owner, &agent.public_key(), "").expect("attestation");
+        let auth = buzz_sdk::nip_oa::parse_auth_tag(&auth_json).expect("auth tag");
+        BuzzClient::new(url, agent.clone(), Some(auth), Some(auth_json)).expect("client")
+    }
+
+    #[tokio::test]
+    async fn observe_encrypts_one_structured_frame_to_the_relay_vetted_owner() {
+        let agent = Keys::generate();
+        let owner = Keys::generate();
+        let (url, published) = relay_with(vec![]).await;
+        let client = BuzzClient::new(url, agent.clone(), None, None).expect("client");
+        let expected = observer_event(&owner);
+
+        dispatch(
+            AgentsCmd::Observe {
+                event: expected.to_string(),
+                owner: Some(owner.public_key().to_hex()),
+            },
+            &client,
+        )
+        .await
+        .expect("publishes encrypted telemetry");
+
+        let published = published.lock().expect("lock");
+        assert_eq!(published.len(), 1);
+        let raw = &published[0];
+        assert_eq!(raw["kind"], serde_json::json!(24200));
+        assert_eq!(
+            tag_values(raw, "p"),
+            vec![owner.public_key().to_hex()],
+            "the recipient is explicit, encrypted, and remains subject to the relay's owner map"
+        );
+        assert_eq!(tag_values(raw, "agent"), vec![agent.public_key().to_hex()]);
+        assert_eq!(tag_values(raw, "frame"), vec!["telemetry".to_string()]);
+        assert!(tag_values(raw, "auth").is_empty());
+
+        let wire: nostr::Event = serde_json::from_value(raw.clone()).expect("wire event");
+        let decrypted: Value =
+            buzz_core::observer::decrypt_observer_payload(&owner, &wire).expect("owner decrypts");
+        assert_eq!(decrypted, expected);
+    }
+
+    #[tokio::test]
+    async fn observe_resolves_owner_from_the_latest_signed_agent_profile() {
+        let agent = Keys::generate();
+        let owner = Keys::generate();
+        let auth_json = compute_auth_tag(&owner, &agent.public_key(), "").expect("attestation");
+        let auth = buzz_sdk::nip_oa::parse_auth_tag(&auth_json).expect("auth tag");
+        let profile = nostr::EventBuilder::new(Kind::Metadata, "{}")
+            .tags([auth])
+            .sign_with_keys(&agent)
+            .expect("signed profile");
+        let (url, published) =
+            relay_with(vec![serde_json::to_value(profile).expect("profile json")]).await;
+        let client = BuzzClient::new(url, agent, None, None).expect("client");
+
+        dispatch(
+            AgentsCmd::Observe {
+                event: observer_event(&owner).to_string(),
+                owner: None,
+            },
+            &client,
+        )
+        .await
+        .expect("observe");
+
+        let events = published.lock().expect("lock");
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0]["tags"],
+            serde_json::json!([
+                ["p", owner.public_key().to_hex()],
+                ["agent", client.keys().public_key().to_hex()],
+                ["frame", "telemetry"]
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn observe_without_an_attested_owner_publishes_nothing() {
+        let agent = Keys::generate();
+        let owner = Keys::generate();
+        let (url, published) = relay_with(vec![]).await;
+        let client = BuzzClient::new(url, agent, None, None).expect("client");
+
+        let error = dispatch(
+            AgentsCmd::Observe {
+                event: observer_event(&owner).to_string(),
+                owner: None,
+            },
+            &client,
+        )
+        .await
+        .expect_err("ownerless observer telemetry must fail closed");
+        assert!(error.to_string().contains("BUZZ_AUTH_TAG"));
+        assert!(published.lock().expect("lock").is_empty());
+    }
+
+    #[tokio::test]
+    async fn observe_refuses_a_frame_that_claims_a_channel_and_a_project() {
+        let agent = Keys::generate();
+        let owner = Keys::generate();
+        let (url, published) = relay_with(vec![]).await;
+        let client = client_with_owner(url, &agent, &owner);
+        let mut event = observer_event(&owner);
+        event["channelId"] = Value::String("52a85618-0f8f-4542-94ec-599e6e1c6f2e".into());
+
+        let error = dispatch(
+            AgentsCmd::Observe {
+                event: event.to_string(),
+                owner: None,
+            },
+            &client,
+        )
+        .await
+        .expect_err("ambiguous route must be refused");
+        assert!(error.to_string().contains("both channelId and project"));
         assert!(published.lock().expect("lock").is_empty());
     }
 
