@@ -110,10 +110,11 @@ Unknown `kind` values MUST be ignored.
 | `acp_write`        | Outbound ACP protocol frame (harness → model)            |
 | `turn_started`     | A new agent turn has begun                               |
 | `session_resolved` | Session completed or terminated                          |
+| `control_result`   | Outcome of a control frame the agent honoured            |
 
 ### Control (`frame=control`)
 
-The `content` field decrypts to:
+The `content` field decrypts to an object whose `type` names the command:
 
 ```json
 {
@@ -122,8 +123,49 @@ The `content` field decrypts to:
 }
 ```
 
-The only defined control type is `cancel_turn`. Implementations MUST ignore
-events with unrecognized `type` values.
+| `type`         | Additional fields          | Effect                                                        |
+|----------------|----------------------------|---------------------------------------------------------------|
+| `cancel_turn`  | `channelId`                | Abandon the turn in flight on that channel                     |
+| `switch_model` | `channelId`, `modelId`     | Apply a model override to the live or next session             |
+| `drain`        | `reason` (OPTIONAL)        | Stop admitting work, finish what is in hand, then exit cleanly |
+
+Implementations MUST ignore events with unrecognized `type` values. That
+tolerance is load-bearing: it is what lets a command be added while a fleet is
+part-way through a rollout, since an agent that predates the command declines
+it and keeps serving rather than failing.
+
+A control frame MUST be signed by the agent's owner — the pubkey the agent
+itself resolved from its NIP-OA attestation. Agents MUST verify the signature
+and that authorship independently of the relay, and MUST reject frames whose
+`created_at` is outside a bounded freshness window (300 s in the reference
+implementation). Relay membership, a channel role, or a matching display name
+are NOT authority.
+
+`drain` is idempotent: a repeat frame inside the freshness window MUST NOT
+extend the deadline the first one set, which is what makes replay within the
+window harmless without a nonce.
+
+### Control acknowledgement
+
+An agent that honours a control frame SHOULD answer with a `control_result`
+telemetry frame, encrypted to the owner as any other telemetry:
+
+```json
+{
+  "type":   "drain",
+  "status": "draining"
+}
+```
+
+`type` echoes the command. `status` is command-specific; `drain` answers
+`draining` on the transition and `already_draining` for a repeat.
+
+An acknowledgement means the agent *accepted the instruction*, never that a
+process ended: a draining agent keeps running until the work it already held
+is finished. Owners MUST NOT present an acknowledgement as evidence of an
+exit. Acknowledgement is also best-effort — an agent with owner telemetry
+disabled honours the command and emits nothing — so a consumer that hears
+nothing MUST NOT infer that the command was refused.
 
 ## Ephemerality Contract
 

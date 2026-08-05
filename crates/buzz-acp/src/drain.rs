@@ -53,6 +53,20 @@
 //! sender; no CLI subcommand is required, because a correctly built and signed
 //! `24200` from any Nostr tool is indistinguishable from one.
 //!
+//! Two senders in this repo build it today, and neither is privileged over the
+//! other — the check below is the same for both:
+//!
+//! - `buzz-cli`'s `agent_drain.rs`, for a deployer swapping a binary;
+//! - Buzz Desktop's Agents tab, where the owner of a relay-hosted agent drains
+//!   it from the `Managed elsewhere` card (`desktop/src/shared/api/agentControl.ts`,
+//!   signed in the `build_observer_control_event` Tauri command).
+//!
+//! The Desktop sender is why the `control_result` acknowledgement below is
+//! load-bearing rather than a convenience: a deployer polls `systemctl` for
+//! its answer, but a desktop half a world away from the host has only the
+//! agent's own reply. What that reply may be read to mean is bounded — see
+//! "What the acknowledgement does not say" below.
+//!
 //! ## Skew safety
 //!
 //! A runtime that predates this module reaches the `_ =>` arm of the payload
@@ -85,6 +99,25 @@
 //! The observable difference between one drain frame and ten is a second
 //! `control_result` acknowledgement per frame. That is the intended answer to
 //! "did it arrive", not a state change.
+//!
+//! ## What the acknowledgement does not say
+//!
+//! [`handle_drain_control`](crate::handle_drain_control) emits `control_result`
+//! the moment admission closes — before the in-flight turn finishes and long
+//! before the run loop leaves. So the ack means *the instruction was accepted*,
+//! and a sender that renders it as "stopped" is asserting an exit that has not
+//! happened and that this frame could not have reported. The strongest true
+//! reading is "draining"; Desktop's `describeDrainRequest` is held to exactly
+//! that by its own tests.
+//!
+//! The exit does have a signal — the `drained` runtime lifecycle frame emitted
+//! just before the run loop breaks — but it is not the ack, it arrives an
+//! unbounded turn later, and a consumer correlating it to a specific drain
+//! request needs the `startNonce` to tell it from a previous process's exit.
+//!
+//! Silence is not a refusal either: `observer` is an `Option` at the emit site,
+//! so an agent with owner telemetry disabled honours a drain and acknowledges
+//! nothing.
 
 use std::time::Duration;
 

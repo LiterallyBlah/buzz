@@ -7,6 +7,7 @@ import {
 } from "lucide-react";
 
 import { resolveAgentCardModelLabel } from "@/features/agents/lib/agentCardModelLabel";
+import { describeDrainRequest } from "@/features/agents/lib/drainOutcome";
 import { friendlyAgentLastError } from "@/features/agents/lib/friendlyAgentLastError";
 import { isManagedAgentActive } from "@/features/agents/lib/managedAgentControlActions";
 import { useUserProfileQuery } from "@/features/profile/hooks";
@@ -29,6 +30,11 @@ import { IdentityCardSkeleton } from "@/shared/ui/identity-card-skeleton";
 import { AgentIdentityCard } from "./AgentIdentityCard";
 import { AgentRuntimeAvatarControl } from "./AgentRuntimeAvatarControl";
 import { CreateIdentityCard } from "./CreateIdentityCard";
+import {
+  OwnedRelayAgentDrainBadge,
+  OwnedRelayAgentDrainButton,
+  useAgentDrainRequest,
+} from "./OwnedRelayAgentDrainControl";
 import { PersonaActionsMenu } from "./PersonaActionsMenu";
 import { buildUnifiedGroups, pickProfileAgent } from "./unifiedAgentGroups";
 
@@ -640,20 +646,30 @@ function OwnedRelayAgentCard({
   ) => void;
 }) {
   const profileQuery = useUserProfileQuery(agent.pubkey);
+  const { request, send } = useAgentDrainRequest(agent.pubkey);
+  const { busy } = describeDrainRequest(request);
 
   return (
     <AgentIdentityCard
+      actions={
+        <OwnedRelayAgentDrainButton
+          agentName={agent.name}
+          busy={busy}
+          onConfirm={send}
+        />
+      }
       ariaLabel={`${agent.name} agent profile`}
       avatarUrl={profileQuery.data?.avatarUrl}
       dataTestId={`owned-relay-agent-${agent.pubkey}`}
       label={agent.name}
-      // Says exactly what we know and why there are no controls. Do not
-      // upgrade this to "runs on your server" — the relay directory records
-      // that the agent is registered, never which host it runs on.
+      // Says exactly what we know. Do not upgrade this to "runs on your
+      // server" — the relay directory records that the agent is registered,
+      // never which host it runs on.
       modelLabel="Not on this computer"
       onClick={() => {
         onOpenAgentProfile(agent.pubkey, { tab: "runtime" });
       }}
+      statusBadge={<OwnedRelayAgentDrainBadge request={request} />}
     />
   );
 }

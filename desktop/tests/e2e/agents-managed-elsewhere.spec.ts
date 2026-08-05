@@ -84,29 +84,178 @@ test("an owned agent that is also managed locally appears exactly once", async (
   await expect(page.getByTestId(`owned-relay-agent-${SCOUT}`)).toHaveCount(0);
 });
 
-test("a remote card exposes no local lifecycle controls", async ({ page }) => {
+test("a remote card exposes only the control the agent can execute", async ({
+  page,
+}) => {
   await openAgentsView(page);
 
   const group = page.getByTestId("owned-relay-agents-group");
   await expect(group).toBeVisible({ timeout: 10_000 });
 
-  // This desktop holds no private key, no local record and no process for the
-  // agent, and the tree has no owner-signed relay command to drive it, so no
-  // control may be painted that would need one.
+  // Drain is here because the *running agent* receives, verifies and answers
+  // the frame itself.
+  const card = page.getByTestId(`owned-relay-agent-${NADIA}`);
+  await expect(card.getByRole("button", { name: "Drain" })).toBeVisible();
+
+  // Everything else is absent, and stays absent: a stopped process receives no
+  // frame, and this tree has no always-running host controller that could act
+  // for it. A Start button here could only ever fail.
   await expect(group.getByTestId(`agent-runtime-start-${NADIA}`)).toHaveCount(
     0,
   );
   await expect(
-    group.getByRole("button", { name: /Start|Stop|Deploy|Shutdown|Delete/ }),
+    group.getByRole("button", { name: /Start|Restart|Deploy|Edit|Delete/ }),
   ).toHaveCount(0);
   await expect(
     group.getByRole("button", { name: "Agent actions" }),
   ).toHaveCount(0);
 
-  // The card itself is the only affordance: one button, opening the profile.
-  await expect(
-    page.getByTestId(`owned-relay-agent-${NADIA}`).getByRole("button"),
-  ).toHaveCount(1);
+  // The card affords exactly two things: open the profile, and drain.
+  await expect(card.getByRole("button")).toHaveCount(2);
+});
+
+test("a relay agent owned by somebody else offers no drain control", async ({
+  page,
+}) => {
+  await openAgentsView(page);
+
+  await expect(page.getByTestId("owned-relay-agents-group")).toBeVisible({
+    timeout: 10_000,
+  });
+
+  // The authority for a drain is verified NIP-OA ownership, and REX has
+  // somebody else's. The agent would refuse a frame we signed anyway
+  // (`a_drain_frame_from_a_non_owner_is_dropped` in buzz-acp), so a control
+  // here would be an affordance whose only outcome is a silent refusal.
+  await expect(page.getByTestId(`owned-relay-agent-${REX}`)).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "Drain rex" })).toHaveCount(0);
+});
+
+/** Seed the agent's `control_result` answer to a drain, as the runtime emits it. */
+async function emitDrainAcknowledgement(
+  page: import("@playwright/test").Page,
+  agentPubkey: string,
+  status: string,
+) {
+  await page.evaluate(
+    ([pubkey, ackStatus]) => {
+      window.__BUZZ_E2E_SEED_OBSERVER_EVENTS__?.({
+        agentPubkey: pubkey,
+        events: [
+          {
+            seq: 1,
+            timestamp: new Date().toISOString(),
+            kind: "control_result",
+            agentIndex: null,
+            channelId: null,
+            sessionId: null,
+            turnId: null,
+            payload: { type: "drain", status: ackStatus, reason: "" },
+          },
+        ],
+      });
+    },
+    [agentPubkey, status] as const,
+  );
+}
+
+async function confirmDrain(page: import("@playwright/test").Page) {
+  const card = page.getByTestId(`owned-relay-agent-${NADIA}`);
+  await card.getByRole("button", { name: "Drain" }).click();
+
+  const dialog = page.getByRole("alertdialog");
+  await expect(dialog).toBeVisible();
+  // The consequence is named before the owner commits: nothing here can start
+  // it again.
+  await expect(dialog).toContainText("cannot start it again");
+  await dialog.getByRole("button", { name: "Drain" }).click();
+}
+
+test("draining sends an owner-signed drain frame for that agent", async ({
+  page,
+}) => {
+  await openAgentsView(page);
+  await confirmDrain(page);
+
+  const frames = await page.evaluate(async () => {
+    // The publish is asynchronous; give the mock relay a turn to receive it.
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    return window.__BUZZ_E2E_OBSERVER_CONTROL_FRAMES__ ?? [];
+  });
+
+  expect(frames).toHaveLength(1);
+  const [frame] = frames;
+  expect(frame.kind).toBe(24_200);
+  // Signed by the owner, not by the agent — this is the whole authority check
+  // on the receiving side.
+  expect(frame.pubkey).toBe(ME);
+  expect(frame.tags).toContainEqual(["p", NADIA]);
+  expect(frame.tags).toContainEqual(["agent", NADIA]);
+  expect(frame.tags).toContainEqual(["frame", "control"]);
+  expect(JSON.parse(frame.content)).toEqual({ type: "drain" });
+});
+
+test("an acknowledged drain reports draining, never stopped", async ({
+  page,
+}) => {
+  await openAgentsView(page);
+  await confirmDrain(page);
+
+  const card = page.getByTestId(`owned-relay-agent-${NADIA}`);
+  await expect(card).toContainText("Sending drain…");
+
+  await emitDrainAcknowledgement(page, NADIA, "draining");
+
+  await expect(card).toContainText("Draining — finishing current work");
+  // The ack means admission closed. The process is still finishing its turn,
+  // so nothing here may say it stopped.
+  await expect(card).not.toContainText("Stopped");
+});
+
+test("a repeat drain is reported as already draining", async ({ page }) => {
+  await openAgentsView(page);
+  await confirmDrain(page);
+  await emitDrainAcknowledgement(page, NADIA, "already_draining");
+
+  await expect(page.getByTestId(`owned-relay-agent-${NADIA}`)).toContainText(
+    "Already draining",
+  );
+});
+
+test("a drain the agent never answers is reported as unanswered", async ({
+  page,
+}) => {
+  await openAgentsView(page);
+  await confirmDrain(page);
+
+  const card = page.getByTestId(`owned-relay-agent-${NADIA}`);
+  await expect(card).toContainText("Sending drain…");
+
+  // No `control_result` is ever seeded. After the fallback window the card
+  // says what we know — we heard nothing — and does not guess that the drain
+  // failed: a running agent with owner telemetry switched off never acks.
+  await expect(card).toContainText("Sent — no reply from the agent", {
+    timeout: 15_000,
+  });
+  await expect(card).not.toContainText("Draining — finishing");
+});
+
+test("a drain the relay refuses is reported as a send failure", async ({
+  page,
+}) => {
+  await openAgentsView(page);
+  await page.evaluate(() => {
+    window.__BUZZ_E2E_OBSERVER_CONTROL_ERRORS__ = [
+      "relay refused the control frame",
+    ];
+  });
+  await confirmDrain(page);
+
+  // Distinct from silence: the frame never landed, so retrying may work.
+  await expect(page.getByTestId(`owned-relay-agent-${NADIA}`)).toContainText(
+    "Could not send drain",
+    { timeout: 15_000 },
+  );
 });
 
 test("a remote card opens the existing read-only profile Runtime view", async ({

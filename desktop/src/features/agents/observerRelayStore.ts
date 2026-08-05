@@ -718,6 +718,14 @@ export function injectObserverEventsForE2E(
 ) {
   for (const event of events) {
     appendAgentEvent(agentPubkey, event);
+    // Mirror `handleRelayObserverEvent`: a `control_result` is not merely
+    // stored, it is delivered to whoever is waiting on it. Without this a
+    // seeded drain acknowledgement would sit in the event log while the
+    // requester timed out, and an E2E test would be exercising a store write
+    // rather than the acknowledgement path the product depends on.
+    if (event.kind === "control_result") {
+      dispatchControlResult(agentPubkey, event.payload);
+    }
   }
   notifyListeners();
 }

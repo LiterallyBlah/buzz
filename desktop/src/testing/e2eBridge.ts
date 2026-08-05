@@ -1134,6 +1134,20 @@ declare global {
       kind: number;
       tags: string[][];
     }>;
+    /**
+     * Owner-signed agent control frames (kind 24200) the mock relay received,
+     * in order. Specs read `pubkey`, `tags` and the JSON `content` to assert
+     * who signed a drain and what it asked for.
+     */
+    __BUZZ_E2E_OBSERVER_CONTROL_FRAMES__?: RelayEvent[];
+    /**
+     * Relay messages that reject successive control-frame publishes, in order,
+     * then resume. Set at runtime rather than through the bridge config so a
+     * spec can arm it after the page is up, without a second
+     * `installMockBridge`. Drives the "could not send" branch of a drain,
+     * which is a different fact from an unacknowledged one.
+     */
+    __BUZZ_E2E_OBSERVER_CONTROL_ERRORS__?: string[];
     /** Project event kinds rejected once, in order, to exercise retry flows. */
     __BUZZ_E2E_REJECT_PROJECT_EVENT_KINDS__?: number[];
     /** Structured merge error returned by the mock native merge command. */
@@ -9628,6 +9642,22 @@ function sendToMockSocket(args: {
       return;
     }
 
+    // Owner-signed agent control frames. Recorded rather than stored: a spec
+    // asserting that Drain sent the right thing needs the frame the *relay*
+    // received, which is evidence the whole sign-and-publish path ran, not
+    // just that a builder was called.
+    if (event.kind === KIND_AGENT_OBSERVER_FRAME) {
+      window.__BUZZ_E2E_OBSERVER_CONTROL_FRAMES__?.push(event);
+      const controlError = window.__BUZZ_E2E_OBSERVER_CONTROL_ERRORS__?.shift();
+      sendWsText(socket.handler, [
+        "OK",
+        event.id,
+        !controlError,
+        controlError ?? "",
+      ]);
+      return;
+    }
+
     if (event.kind === 9033) {
       sendWsText(socket.handler, ["OK", event.id, true, ""]);
       return;
@@ -9819,6 +9849,7 @@ export function maybeInstallE2eTauriMocks() {
   window.__BUZZ_E2E_EMIT_MOCK_HUDDLE_TTS_SPEAKER__ = (payload) =>
     emit("huddle-tts-speaker-level", payload);
   window.__BUZZ_E2E_SIGNED_EVENTS__ = [];
+  window.__BUZZ_E2E_OBSERVER_CONTROL_FRAMES__ = [];
   window.__BUZZ_E2E_WEBVIEW_ZOOM__ = 1;
   window.__BUZZ_E2E_SET_MOCK_HUDDLE_SNAPSHOT__ = async ({
     members,
@@ -12351,6 +12382,33 @@ export function maybeInstallE2eTauriMocks() {
           payload as Parameters<typeof handleGetEvent>[0],
           activeConfig,
         );
+      // The owner-signed observer control envelope (kind 24200,
+      // `frame=control`) that carries `cancel_turn`, `switch_model` and
+      // `drain`. The real command NIP-44-encrypts the payload to the agent;
+      // here it travels as plaintext JSON, because the mock relay is
+      // in-process and nothing in the app reads a control frame back. What the
+      // mock must preserve is the part specs assert on: the signer is the
+      // current identity (the owner), and both pubkey tags name the agent.
+      case "build_observer_control_event": {
+        const { agentPubkey, payload: controlPayload } = payload as {
+          agentPubkey: string;
+          payload: unknown;
+        };
+        const template = {
+          kind: KIND_AGENT_OBSERVER_FRAME,
+          content: JSON.stringify(controlPayload),
+          tags: [
+            ["p", agentPubkey],
+            ["agent", agentPubkey],
+            ["frame", "control"],
+          ],
+        };
+        return JSON.stringify(
+          identity
+            ? await signWithIdentity(identity, template)
+            : createMockEvent(template.kind, template.content, template.tags),
+        );
+      }
       case "sign_event":
         window.__BUZZ_E2E_SIGNED_EVENTS__?.push({
           content: (payload as { content: string }).content,

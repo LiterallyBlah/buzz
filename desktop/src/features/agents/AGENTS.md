@@ -166,10 +166,33 @@ with a TypeScript lookup table or an id comparison in a component.
     observer frames are not ingested is a lie in one of the two places, so
     derive both rather than re-implementing the predicate. These agents are not
     `ManagedAgent`s: this desktop holds no key, no local record and no process
-    for them, and the tree has no owner-signed relay lifecycle command, so the
-    card carries no Start/Stop/Deploy/Edit/Delete affordance and opens the
-    existing read-only profile Runtime view instead. Adding a control here
-    means adding the relay protocol that backs it first.
+    for them, so the card opens the read-only profile Runtime view rather than
+    a local editor.
+13. **A remote control exists only if the running agent can execute *and*
+    acknowledge it.** The `Managed elsewhere` card carries exactly one:
+    **Drain**, which rides the owner-signed kind:24200 control frame normatively
+    specified in `crates/buzz-acp/src/drain.rs` and NIP-AO. The agent verifies
+    the signature and that the author is the owner *it* resolved from its own
+    NIP-OA attestation, checks freshness, and answers with a `control_result`.
+    Authority is decided there, not here — this desktop deliberately makes no
+    second owner check before sending, for the same reason
+    `crates/buzz-cli/src/agent_drain.rs` makes none: which pubkey is the owner
+    is the agent's belief, and a rival opinion can only be wrong in the
+    direction of refusing a frame the agent would have honoured.
+    **Start, Restart, Deploy, Edit and Delete stay unpainted, and adding the
+    protocol will not be enough to change that.** A stopped process receives no
+    frame, so those need an always-running host controller that this tree does
+    not have; a Start button here could only ever fail. Do not add one on the
+    strength of a relay round trip.
+    **No state may say the agent stopped.** An ack means admission closed; the
+    runtime keeps working until the turn it already held finishes, and this
+    desktop never observes the exit. All drain copy comes from
+    `describeDrainRequest` in `lib/drainOutcome.ts`, whose tests fail on
+    "stopped", "offline", "terminated" and friends — put new copy there, not in
+    a component. Silence is reported as silence (`Sent — no reply from the
+    agent`), never as failure: an agent with owner telemetry disabled drains
+    correctly and acknowledges nothing. A relay rejection is a separate,
+    retryable state and must not be collapsed into it.
 
 ## The tests that enforce this
 
@@ -189,10 +212,16 @@ with a TypeScript lookup table or an id comparison in a component.
   positions (after the people picker for `allowlist`).
 - `lib/ownedRelayAgents.test.mjs` — the verified-owner index and the owned /
   foreign / unowned / locally-managed cases of `selectOwnedRelayAgents`.
+- `lib/drainOutcome.test.mjs` — the drain acknowledgement state machine
+  (ack, repeat, pre-send race, silence, other commands' results, unknown
+  status, cleanup, send failure) and every word `describeDrainRequest`
+  renders. The "never claims the agent stopped" case is the one to read first.
 - `desktop/tests/e2e/agents-managed-elsewhere.spec.ts` — the Agents tab
-  acceptance gate: an owned relay agent is listed, a foreign one never is, a
-  locally managed duplicate appears once, the card paints no lifecycle control,
-  and it opens the read-only profile Runtime view.
+  acceptance gate: an owned relay agent is listed, a foreign one never is (and
+  gets no Drain), a locally managed duplicate appears once, the card carries
+  Drain and nothing else, the drain frame is owner-signed and correctly
+  addressed, and acknowledged / repeat / unanswered / relay-refused all read
+  back distinctly.
 - `lib/agentAccessWarning.test.mjs` — every mode × run-location copy variant
   plus both resolvers, including unknown-reads-as-local and
   blank-`runOn`-is-not-a-provider.
