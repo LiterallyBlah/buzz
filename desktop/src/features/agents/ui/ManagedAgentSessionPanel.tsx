@@ -76,13 +76,15 @@ export function ManagedAgentSessionPanel({
   rawEventsOverride,
   transcriptOverride,
 }: ManagedAgentSessionPanelProps) {
-  const hasObserver = isManagedAgentActive(agent);
-  // Always read from the store — archived frames are ingested regardless of
-  // live status and must be renderable for idle agents with channel history.
-  // The `hasObserver` flag still gates the relay subscription (via the
-  // useEffect in useObserverEvents) and the empty-state message below.
+  const managedRuntimeActive = isManagedAgentActive(agent);
+  // An owned agent need not be launched by this Desktop's managed-agent
+  // service. Hermes gateway is externally supervised but publishes the same
+  // owner-scoped NIP-AO frames as a local ACP process. Listen unconditionally
+  // for the selected agent so its first ephemeral frame can prove that an
+  // observer exists; gating the subscription on local process state makes that
+  // proof impossible.
   const { connectionState, errorMessage, events } = useObserverEvents(
-    hasObserver,
+    Boolean(agent.pubkey),
     agent.pubkey,
   );
 
@@ -108,6 +110,7 @@ export function ManagedAgentSessionPanel({
     () => mergeObserverEventWindows(scopedLiveEvents, archivedChannelEvents),
     [scopedLiveEvents, archivedChannelEvents],
   );
+  const hasObserver = managedRuntimeActive || combinedEvents.length > 0;
 
   // Derive transcript once from the combined raw window. When transcriptOverride
   // is set (e.g. E2E snapshot specs), bypass both — the caller supplies the full

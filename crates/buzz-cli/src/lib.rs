@@ -447,6 +447,26 @@ buzz agents activity --project 30617:<OWNER>:buzz --root <EVENT_ID> \
         #[arg(long)]
         stage: Option<String>,
     },
+    /// Publish one encrypted owner-scoped ACP observer frame (NIP-AO, kind 24200)
+    #[command(
+        after_help = "The event is encrypted to the owner named by BUZZ_AUTH_TAG and signed by \
+this agent. It is ephemeral: Buzz Desktop must already be subscribed to see it.\n\n\
+--event is one ObserverEvent JSON object. Use '-' to read it from stdin. Project \
+turns set channelId to null and carry project.coordinate plus project.root; \
+channel turns do the inverse. The command refuses a frame that claims both.\n\n\
+Example:\n  \
+printf '%s' '{\"seq\":1,\"timestamp\":\"2026-08-05T12:00:00Z\",\"kind\":\"turn_started\",\"agentIndex\":null,\"channelId\":null,\"sessionId\":\"session-1\",\"turnId\":\"turn-1\",\"payload\":{}}' | \
+buzz agents observe --event -"
+    )]
+    Observe {
+        /// ObserverEvent JSON; use '-' to read from stdin
+        #[arg(long)]
+        event: String,
+        /// Owner recipient pubkey/npub. Omit to verify it from this agent's
+        /// NIP-OA auth tag or latest signed kind-0 profile.
+        #[arg(long)]
+        owner: Option<String>,
+    },
     /// Ask whether other agents share your NIP-OA owner (kind 0 `auth` tag)
     #[command(
         after_help = "Answers the one question a peer call has to ask before it may invoke \
@@ -2513,6 +2533,7 @@ mod tests {
                 "draft-create",
                 "draft-update",
                 "drain",
+                "observe",
                 "siblings",
                 "unarchive"
             ]
@@ -2747,7 +2768,7 @@ mod tests {
     #[test]
     fn subcommand_counts_are_stable() {
         let expected: Vec<(&str, usize)> = vec![
-            ("agents", 10),
+            ("agents", 11),
             ("canvas", 2),
             ("channels", 16),
             ("dms", 4),
