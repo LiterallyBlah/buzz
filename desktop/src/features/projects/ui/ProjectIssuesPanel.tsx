@@ -51,6 +51,7 @@ import { OverviewRailSection } from "./ProjectOverviewPanel";
 import { ProfileIdentityButton } from "./ProjectProfileIdentity";
 import { ProjectRichContent } from "./ProjectRichContent";
 import { ProjectRootAgentsSection } from "./ProjectRootAgentsSection";
+import { ProjectWorkItemDescription } from "./ProjectWorkItemDescription";
 import { useProjectThreadPin } from "./useProjectThreadPin";
 
 export function issueStatusClassName(status: ProjectIssue["status"]) {
@@ -384,7 +385,7 @@ function IssueBody({ issue }: { issue: ProjectIssue }) {
   if (!issue.content) return null;
 
   return (
-    <div className="space-y-1.5 px-4 pb-4">
+    <ProjectWorkItemDescription>
       <div className={cn(!expanded && ISSUE_BODY_CLAMP_CLASS)} ref={bodyRef}>
         <ProjectRichContent content={issue.content} tags={issue.tags} />
       </div>
@@ -398,7 +399,7 @@ function IssueBody({ issue }: { issue: ProjectIssue }) {
           {expanded ? "Show less" : "Show more"}
         </button>
       ) : null}
-    </div>
+    </ProjectWorkItemDescription>
   );
 }
 
@@ -679,6 +680,21 @@ export function ProjectIssueDetail({
                 material where the newest comment should be. Status stays
                 reachable from the sticky header instead. */}
             {isNarrow ? rail : null}
+            {/* Where the document ends and the conversation starts. The rule
+                is dropped when the rail is above us, because the rail already
+                closes with a border and two of them stack into a double line
+                for the same one boundary. */}
+            <div
+              className={cn(
+                "px-4 pt-3",
+                !isNarrow && "border-t border-border/50",
+              )}
+            >
+              <h4 className="flex items-center gap-1.5 text-sm font-semibold text-foreground">
+                <MessageSquare className="h-3.5 w-3.5" />
+                Conversation
+              </h4>
+            </div>
             <IssueComments
               issue={issue}
               padded

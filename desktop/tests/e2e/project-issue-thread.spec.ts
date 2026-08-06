@@ -112,6 +112,67 @@ async function threadMetrics(page: Page) {
 }
 
 /**
+ * The description has to read as the issue document, not the first comment.
+ *
+ * The three assertions are the three things a reader's eye actually uses, and
+ * each one was absent before: clear air under the sticky header instead of the
+ * first line touching its border; a container the description sits inside and
+ * comments do not; and something between the end of it and the first reply.
+ *
+ * Deliberately not a screenshot comparison — what matters is that the two kinds
+ * of prose are told apart by structure, and a pixel diff would also fail on
+ * every unrelated restyle of the surrounding surface.
+ */
+test("the issue description is presented as a document, not as a comment", async ({
+  page,
+}) => {
+  await enableProjectsFeature(page);
+  await installMockBridge(page);
+  await page.setViewportSize({ width: 1440, height: 620 });
+
+  const issueId = await openFirstIssue(page);
+  await pushComment(page, issueId, "A reply that is definitely a comment.");
+
+  const description = page.getByTestId("project-work-item-description");
+  await expect(description).toBeVisible();
+
+  // 1. It is not flush against the sticky header's bottom border. Measured
+  //    from the first thing that is actually drawn — the section's own box
+  //    abuts the header because the new spacing is padding *inside* it, so
+  //    measuring the section would report zero air while the reader sees 12px.
+  const headerBox = await page
+    .getByTestId("project-issue-thread-header")
+    .boundingBox();
+  const labelBox = await description
+    .getByText("Description", { exact: true })
+    .boundingBox();
+  expect(
+    (labelBox?.y ?? 0) - ((headerBox?.y ?? 0) + (headerBox?.height ?? 0)),
+  ).toBeGreaterThanOrEqual(8);
+  const descriptionBox = await description.boundingBox();
+
+  // 2. The description is inside a container; the comment is not inside it.
+  //    This is the distinction itself, so it is asserted as containment rather
+  //    than as a class name that a restyle would rename.
+  await expect(description).toContainText("Description");
+  await expect(
+    description.getByText("A reply that is definitely a comment."),
+  ).toHaveCount(0);
+
+  // 3. Something separates the end of the description from the first reply.
+  const conversation = page.getByRole("heading", { name: "Conversation" });
+  await expect(conversation).toBeVisible();
+  const conversationBox = await conversation.boundingBox();
+  expect(conversationBox?.y ?? 0).toBeGreaterThan(
+    (descriptionBox?.y ?? 0) + (descriptionBox?.height ?? 0) - 1,
+  );
+
+  // And the description carries no byline — attribution is what would make it
+  // read as a message again, and the header already names the author.
+  await expect(description.getByRole("img")).toHaveCount(0);
+});
+
+/**
  * The complaint this layout answers: with an agent replying every few seconds
  * you had to be at the bottom of the page to see the reply and at the top to
  * see that the agent was working, and the composer was below every comment.

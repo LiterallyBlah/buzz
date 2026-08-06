@@ -48,6 +48,7 @@ import {
 import { PullRequestReviewTimeline } from "./ProjectPullRequestReviewTimeline";
 import { ProjectRichContent } from "./ProjectRichContent";
 import { ProjectRootAgentsSection } from "./ProjectRootAgentsSection";
+import { ProjectWorkItemDescription } from "./ProjectWorkItemDescription";
 import { PullRequestReviewersRow } from "./PullRequestReviewersRow";
 
 function pluralize(count: number, singular: string, plural = `${singular}s`) {
@@ -624,12 +625,12 @@ export function ProjectPullRequestDetail({
   return (
     <div>
       {pullRequest.content ? (
-        <header className="p-4">
+        <ProjectWorkItemDescription>
           <ProjectRichContent
             content={pullRequest.content}
             tags={pullRequest.tags}
           />
-        </header>
+        </ProjectWorkItemDescription>
       ) : null}
 
       {/* No inline activity strip. Live agent state for a work item is
