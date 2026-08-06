@@ -1,7 +1,6 @@
 import {
   ArrowLeft,
   ChevronRight,
-  ExternalLink,
   FolderGit2,
   MessageSquare,
 } from "lucide-react";
@@ -89,6 +88,7 @@ import {
 } from "./useOpenProjectTerminal";
 import type { CreateIssueDialogInput } from "./CreateIssueDialog";
 import { ProjectBranchActionDialogs } from "./ProjectBranchActionDialogs";
+import { ProjectDetailHero } from "./ProjectDetailHero";
 import {
   PROJECT_TAB_CRUMB_LABELS,
   projectPeople,
@@ -821,6 +821,10 @@ export function ProjectDetailScreen(props: ProjectDetailScreenProps) {
     null;
   const selectedIssue =
     issuesQuery.data?.find((item) => item.id === selectedIssueId) ?? null;
+  // Issues only, for now. A pull request detail is still a tall document —
+  // review timeline, commits, files changed — that needs the page to scroll,
+  // and folding it onto the same shell is the second phase of this work.
+  const issueOwnsScroll = Boolean(selectedIssue) && !selectedPullRequest;
   const displayedSnapshotCommits =
     repoSource === "local"
       ? (localRepoSnapshotQuery.data?.snapshot.commits ?? [])
@@ -979,39 +983,32 @@ export function ProjectDetailScreen(props: ProjectDetailScreenProps) {
               </div>
             </div>
 
-            <div className="flex min-h-0 min-w-0 flex-1 flex-col overflow-y-auto px-4 pb-4">
-              <div className="w-full space-y-3 pt-[calc(var(--buzz-channel-content-top-padding,5.75rem)_+_1px)]">
-                <section className="space-y-3">
-                  <div className="flex min-w-0 items-start justify-between gap-3">
-                    <div className="min-w-0 flex-1 space-y-0.5">
-                      <div className="flex min-w-0 items-center gap-1.5">
-                        <h2 className="truncate text-xl font-semibold tracking-tight">
-                          {project.name}
-                        </h2>
-                        {safeWebUrl ? (
-                          <Button
-                            asChild
-                            aria-label="Open project web page"
-                            className="h-6 w-6 shrink-0 text-muted-foreground hover:text-foreground"
-                            size="icon-xs"
-                            variant="ghost"
-                          >
-                            <a
-                              href={safeWebUrl}
-                              rel="noopener noreferrer"
-                              target="_blank"
-                            >
-                              <ExternalLink className="h-3.5 w-3.5" />
-                            </a>
-                          </Button>
-                        ) : null}
-                      </div>
-                    </div>
-                  </div>
-                </section>
+            <div
+              className={cn(
+                "flex min-h-0 min-w-0 flex-1 flex-col px-4 pb-4",
+                // With an issue open the thread owns the scroll region, so the
+                // page must stop being one. Two nested scrollers here is what
+                // produced the original complaint: the conversation could only
+                // be reached by scrolling a page whose header, hero and tab
+                // strip were all above it.
+                issueOwnsScroll ? "overflow-hidden" : "overflow-y-auto",
+              )}
+            >
+              <div
+                className={cn(
+                  "w-full pt-[calc(var(--buzz-channel-content-top-padding,5.75rem)_+_1px)]",
+                  issueOwnsScroll
+                    ? "flex min-h-0 flex-1 flex-col gap-3"
+                    : "space-y-3",
+                )}
+              >
+                {issueOwnsScroll ? null : (
+                  <ProjectDetailHero name={project.name} webUrl={safeWebUrl} />
+                )}
 
                 <WorkspaceTabs
                   key={`${project.id}:${tabsResetKey}`}
+                  fillHeight={issueOwnsScroll}
                   commitDiff={commitDiffQuery.data}
                   commitDiffError={commitDiffQuery.error}
                   commitDiffLoading={commitDiffQuery.isLoading}

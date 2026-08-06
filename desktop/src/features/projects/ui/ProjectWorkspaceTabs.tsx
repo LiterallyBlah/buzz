@@ -22,6 +22,7 @@ import {
   type ViewerGitIdentity,
 } from "@/features/projects/lib/projectContributorMatching";
 import type { UserProfileLookup } from "@/features/profile/lib/identity";
+import { cn } from "@/shared/lib/cn";
 import { Button } from "@/shared/ui/button";
 import { Tabs, TabsContent } from "@/shared/ui/tabs";
 import { findReadmeFile } from "./ProjectReadmePanel";
@@ -109,6 +110,7 @@ export function WorkspaceTabs({
   commitDiff,
   commitDiffError,
   commitDiffLoading,
+  fillHeight = false,
   createIssueAction,
   createPullRequestAction,
   updatePullRequestAction,
@@ -145,6 +147,14 @@ export function WorkspaceTabs({
   commitDiff: ProjectRepoDiff | null | undefined;
   commitDiffError: unknown;
   commitDiffLoading: boolean;
+  /**
+   * Fill the height the screen gives instead of growing the page.
+   *
+   * Set while an issue is open, which is when the tab strip stops being a
+   * page header and starts being chrome above a live conversation that owns
+   * its own scrolling.
+   */
+  fillHeight?: boolean;
   createIssueAction: CreateIssueAction;
   createPullRequestAction?: CreatePullRequestAction;
   updatePullRequestAction?: UpdatePullRequestAction;
@@ -274,11 +284,11 @@ export function WorkspaceTabs({
 
   return (
     <Tabs
-      className="space-y-3"
+      className={cn("space-y-3", fillHeight && "flex min-h-0 flex-1 flex-col")}
       onValueChange={handleTabChange}
       value={selectedTab}
     >
-      <div className="flex h-10 min-w-0 items-center gap-1">
+      <div className="flex h-10 min-w-0 shrink-0 items-center gap-1">
         <ProjectTabsList prsActive={isPullRequestSelected} />
         {onOpenTerminal ? (
           <Button
@@ -442,18 +452,29 @@ export function WorkspaceTabs({
       </TabsContent>
 
       <TabsContent
-        className={`m-0 ${PROJECT_DETAIL_PANEL_CLASS}`}
+        className={cn(
+          "m-0",
+          PROJECT_DETAIL_PANEL_CLASS,
+          fillHeight && "flex min-h-0 flex-1 flex-col",
+        )}
         data-project-detail-panel
         value="issues"
       >
-        <WorkItemListHeader
-          actionDisabled={createIssueAction.pending}
-          actionLabel="Issues"
-          icon={CircleDot}
-          onAction={() => setCreateIssueOpen(true)}
-          title="Issues"
-        />
+        {/* The list header is chrome for the list. With an issue open it is a
+            second title bar above the issue's own sticky header, and the
+            breadcrumb already offers the way back — so it costs 3.5rem at the
+            top of exactly the view this phase is trying to make shorter. */}
+        {fillHeight ? null : (
+          <WorkItemListHeader
+            actionDisabled={createIssueAction.pending}
+            actionLabel="Issues"
+            icon={CircleDot}
+            onAction={() => setCreateIssueOpen(true)}
+            title="Issues"
+          />
+        )}
         <ProjectIssuesPanel
+          fillHeight={fillHeight}
           onSelectedIssueIdChange={onSelectedIssueIdChange}
           profiles={profiles}
           project={project}

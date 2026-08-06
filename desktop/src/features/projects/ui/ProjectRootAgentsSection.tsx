@@ -17,6 +17,32 @@ import { normalizePubkey } from "@/shared/lib/pubkey";
 import { UserAvatar } from "@/shared/ui/UserAvatar";
 import { OverviewRailSection } from "./ProjectOverviewPanel";
 
+/**
+ * What a working agent is doing, under the name it belongs to.
+ *
+ * The stage is the only thing the removed inline strip said that this section
+ * did not, and it is the half worth keeping: "working" answers a question a
+ * reader did not have to ask, "reading files" answers the one they did. It
+ * hangs off its own agent's row rather than sitting under the list as a
+ * sentence, because with two agents live a single caption is a statement about
+ * both that is wrong about one.
+ *
+ * Rendered only for `working`. A caption beside `queued` would describe a turn
+ * that has not started.
+ */
+function AgentStageCaption({ stage }: { stage: string | null }) {
+  if (!stage) return null;
+  return (
+    <p
+      className="truncate pl-7 text-2xs text-muted-foreground"
+      data-testid="project-root-agent-stage"
+      title={stage}
+    >
+      {stage}
+    </p>
+  );
+}
+
 /** The badge for an agent that is live right now, or nothing for one that is
  * only remembered. "Remembered" gets no badge on purpose: a grey "was here"
  * chip on every row would turn the common case into visual noise, and the
@@ -39,9 +65,14 @@ function AgentStateBadge({ state }: { state: ProjectRootAgent["state"] }) {
 /**
  * "Agents" for one issue or pull request, in the detail rail.
  *
+ * Since the inline activity strip was removed this is the *only* live agent
+ * surface on a work item, which is the point: two places reporting one fact
+ * drift, and the reader was being made to choose which end of a long page to
+ * stand at to watch them.
+ *
  * Answers a question the rest of the surface cannot: *who has worked on this*.
- * The conversation shows whoever wrote something, and the live indicator shows
- * whoever is typing right now, but an agent enrolled in the background by a
+ * The conversation shows whoever wrote something, and the state badge shows
+ * whoever is running right now, but an agent enrolled in the background by a
  * peer call — hermes handing an issue to Claude — appears in neither. It
  * announces NIP-PA activity for the length of its turn, leaves no comment, and
  * then, because kind 20003 is ephemeral, becomes unfindable. This section is
@@ -97,6 +128,19 @@ export function ProjectRootAgentsSection({
     [commentAuthors, knownAgents, live, profiles, seen],
   );
 
+  // The stage is read here rather than carried on `ProjectRootAgent`: it is
+  // the one field on the live entry that is purely presentational, it has no
+  // meaning for a remembered agent, and threading it through the merge would
+  // give every rule in `buildProjectRootAgents` a value to decide about.
+  const stageFor = React.useCallback(
+    (pubkey: string) =>
+      live.find(
+        (entry) =>
+          entry.state === "working" && normalizePubkey(entry.agent) === pubkey,
+      )?.stage ?? null,
+    [live],
+  );
+
   if (agents.length === 0) return null;
 
   return (
@@ -106,23 +150,26 @@ export function ProjectRootAgentsSection({
           const profile = profiles?.[agent.pubkey];
           const label = resolveUserLabel({ profiles, pubkey: agent.pubkey });
           return (
-            <li className="flex min-w-0 items-center gap-2" key={agent.pubkey}>
-              <UserAvatar
-                accent
-                avatarUrl={profile?.avatarUrl ?? null}
-                displayName={label}
-                size="xs"
-              />
-              <button
-                className="min-w-0 flex-1 truncate rounded-sm text-left text-xs font-medium text-foreground hover:underline focus-visible:outline-hidden focus-visible:ring-1 focus-visible:ring-ring"
-                data-testid={`project-root-agent-${agent.pubkey}`}
-                onClick={() => openAgentActivity(agent.pubkey)}
-                title={`View ${label}'s activity`}
-                type="button"
-              >
-                {label}
-              </button>
-              <AgentStateBadge state={agent.state} />
+            <li className="min-w-0 space-y-1" key={agent.pubkey}>
+              <div className="flex min-w-0 items-center gap-2">
+                <UserAvatar
+                  accent
+                  avatarUrl={profile?.avatarUrl ?? null}
+                  displayName={label}
+                  size="xs"
+                />
+                <button
+                  className="min-w-0 flex-1 truncate rounded-sm text-left text-xs font-medium text-foreground hover:underline focus-visible:outline-hidden focus-visible:ring-1 focus-visible:ring-ring"
+                  data-testid={`project-root-agent-${agent.pubkey}`}
+                  onClick={() => openAgentActivity(agent.pubkey)}
+                  title={`View ${label}'s activity`}
+                  type="button"
+                >
+                  {label}
+                </button>
+                <AgentStateBadge state={agent.state} />
+              </div>
+              <AgentStageCaption stage={stageFor(agent.pubkey)} />
             </li>
           );
         })}
