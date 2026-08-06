@@ -1500,6 +1500,7 @@ fn handle_relay_observer_control_event(
     keys: &nostr::Keys,
     event: nostr::Event,
     pool: &mut AgentPool,
+    queue: &mut EventQueue,
     observer: Option<&observer::ObserverHandle>,
     owner_pubkey_hex: &str,
     drain: &mut drain::DrainState,
@@ -1553,6 +1554,10 @@ fn handle_relay_observer_control_event(
             handle_cancel_turn_control(&payload, pool, observer);
             None
         }
+        Some("cancel_all") => {
+            handle_cancel_all_control(pool, queue, observer);
+            None
+        }
         Some("switch_model") => {
             handle_switch_model_control(&payload, pool, observer);
             None
@@ -1575,6 +1580,116 @@ fn handle_relay_observer_control_event(
             None
         }
     }
+}
+
+fn emit_cancelled_queued_project_announcements(
+    discarded: &[FlushBatch],
+    observer: Option<&observer::ObserverHandle>,
+) {
+    let Some(observer) = observer else { return };
+    for batch in discarded {
+        let Some(origin) = batch.project_origin() else {
+            continue;
+        };
+        let Some(first) = batch
+            .events
+            .first()
+            .or_else(|| batch.cancelled_events.first())
+        else {
+            continue;
+        };
+        observer.emit(
+            "turn_error",
+            None,
+            &observer::ObserverContext {
+                channel_id: None,
+                project: Some(observer::ProjectRouteRef {
+                    coordinate: origin.coordinate().to_string(),
+                    root: origin.root().to_string(),
+                }),
+                session_id: None,
+                turn_id: Some(queued_turn_id(&first.event.id.to_hex())),
+                started_at: None,
+            },
+            serde_json::json!({
+                "error": "cancelled_by_owner",
+                "detail": "the owner cancelled this queued work before it started",
+            }),
+        );
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CancelAllOutcome {
+    active_turns: usize,
+    signalled_turns: usize,
+    queued_batches: usize,
+    queued_events: usize,
+}
+
+impl CancelAllOutcome {
+    fn status(self) -> &'static str {
+        if self.active_turns == 0 && self.queued_batches == 0 {
+            "no_work"
+        } else {
+            "accepted"
+        }
+    }
+}
+
+/// Establish a no-requeue cutoff for every active channel turn, request
+/// cancellation where possible, and discard all work already buffered.
+/// Admission remains open, so genuinely new work is still accepted.
+fn handle_cancel_all_control(
+    pool: &mut AgentPool,
+    queue: &mut EventQueue,
+    observer: Option<&observer::ObserverHandle>,
+) -> CancelAllOutcome {
+    let (active_turns, signalled_turns) = apply_cancel_all_cutoff(pool);
+    let discarded = queue.discard_all_pending_batches();
+    let queued_events = discarded
+        .iter()
+        .map(|batch| batch.events.len() + batch.cancelled_events.len())
+        .sum();
+    emit_cancelled_queued_project_announcements(&discarded, observer);
+    let outcome = CancelAllOutcome {
+        active_turns,
+        signalled_turns,
+        queued_batches: discarded.len(),
+        queued_events,
+    };
+
+    tracing::warn!(
+        active_turns = outcome.active_turns,
+        signalled_turns = outcome.signalled_turns,
+        queued_batches = outcome.queued_batches,
+        queued_events = outcome.queued_events,
+        "owner accepted cancel-all cutoff"
+    );
+
+    if let Some(observer) = observer {
+        observer.emit(
+            "control_result",
+            None,
+            &observer::ObserverContext {
+                project: None,
+                channel_id: None,
+                session_id: None,
+                turn_id: None,
+                started_at: None,
+            },
+            serde_json::json!({
+                "type": "cancel_all",
+                "status": outcome.status(),
+                "activeTurns": outcome.active_turns,
+                "signalledTurns": outcome.signalled_turns,
+                "queuedBatches": outcome.queued_batches,
+                "queuedEvents": outcome.queued_events,
+            }),
+        );
+    }
+
+    outcome
 }
 
 /// Handle a `drain` control frame: close admission, and say so loudly.
@@ -2995,6 +3110,7 @@ async fn tokio_main() -> Result<()> {
                                     &config.keys,
                                     event,
                                     &mut pool,
+                                    &mut queue,
                                     observer.as_ref(),
                                     owner_hex,
                                     &mut drain,
@@ -5568,6 +5684,44 @@ fn signal_in_flight_task(
     false
 }
 
+/// Mark every active channel task as pre-cutoff work, then request cancellation
+/// wherever its one-shot control receiver is still available. The marker is
+/// authoritative even when an earlier control already consumed the sender.
+fn apply_cancel_all_cutoff(pool: &mut AgentPool) -> (usize, usize) {
+    let task_ids: Vec<_> = pool
+        .task_map()
+        .iter()
+        .filter(|(_, meta)| meta.channel_id.is_some())
+        .map(|(task_id, _)| task_id.clone())
+        .collect();
+
+    for task_id in &task_ids {
+        pool.mark_cancel_all_cutoff(task_id.clone());
+    }
+
+    let mut signalled = 0;
+    for task_id in &task_ids {
+        let meta = pool
+            .task_map_mut()
+            .get_mut(task_id)
+            .expect("cutoff task remains registered");
+        meta.recoverable_batch = None;
+        if let Some(tx) = meta.control_tx.take() {
+            if tx.send(ControlSignal::Cancel).is_ok() {
+                signalled += 1;
+            }
+        }
+    }
+    if !task_ids.is_empty() {
+        tracing::info!(
+            active_turns = task_ids.len(),
+            signalled_turns = signalled,
+            "cancel-all cutoff applied to active channel tasks"
+        );
+    }
+    (task_ids.len(), signalled)
+}
+
 /// Attempt the non-cancelling (ACP) steer for a freshly-queued event.
 ///
 /// Caller invariants:
@@ -5896,9 +6050,24 @@ fn handle_prompt_result(
 ) -> LoopAction {
     let before = pool.task_map().len();
     let agent_index = result.agent.index;
-    pool.task_map_mut()
-        .retain(|_, meta| meta.agent_index != agent_index);
+    let task_id = pool
+        .task_map()
+        .iter()
+        .find_map(|(task_id, meta)| (meta.agent_index == agent_index).then(|| task_id.clone()))
+        .expect("prompt result has registered task metadata");
+    pool.task_map_mut().remove(&task_id);
+    let cancel_all_cutoff = pool.take_cancel_all_cutoff(task_id);
     debug_assert_eq!(before, pool.task_map().len() + 1);
+
+    if cancel_all_cutoff {
+        if let Some(batch) = result.batch.take() {
+            tracing::warn!(
+                channel_id = %batch.channel_id,
+                events = batch.events.len() + batch.cancelled_events.len(),
+                "discarding pre-cancel-all result batch"
+            );
+        }
+    }
 
     // The hard-timeout death_message (below) must describe the batch's
     // *actual* fate, not just the `recently_active` eligibility flag — a
@@ -6289,21 +6458,24 @@ fn recover_panicked_agent(
         tracing::error!("panic for unknown task {task_id:?} — bug");
         return;
     };
+    let cancel_all_cutoff = pool.take_cancel_all_cutoff(task_id);
     let i = meta.agent_index;
 
     // Requeue BEFORE mark_complete (same rationale as handle_prompt_result).
-    if let Some(batch) = meta.recoverable_batch {
-        if let Some(ch) = meta.channel_id {
-            if !removed_channels.contains(&ch) {
-                // Dead-letter on exhaustion is logged inside requeue(); a
-                // panic path has no outcome to report, so no notice here.
-                let _ = queue.requeue(batch);
-                tracing::warn!("requeued batch for panicked agent {i}");
-            } else {
-                tracing::debug!(
-                    channel_id = %ch,
-                    "dropping panicked batch for removed channel"
-                );
+    if !cancel_all_cutoff {
+        if let Some(batch) = meta.recoverable_batch {
+            if let Some(ch) = meta.channel_id {
+                if !removed_channels.contains(&ch) {
+                    // Dead-letter on exhaustion is logged inside requeue(); a
+                    // panic path has no outcome to report, so no notice here.
+                    let _ = queue.requeue(batch);
+                    tracing::warn!("requeued batch for panicked agent {i}");
+                } else {
+                    tracing::debug!(
+                        channel_id = %ch,
+                        "dropping panicked batch for removed channel"
+                    );
+                }
             }
         }
     }
@@ -9859,7 +10031,10 @@ mod drain_control_tests {
         drain: &mut drain::DrainState,
     ) -> Option<drain::DrainOnset> {
         let mut pool = AgentPool::from_slots(vec![]);
-        handle_relay_observer_control_event(agent, event, &mut pool, None, owner_hex, drain, BOUND)
+        let mut queue = EventQueue::new(DedupMode::Queue);
+        handle_relay_observer_control_event(
+            agent, event, &mut pool, &mut queue, None, owner_hex, drain, BOUND,
+        )
     }
 
     #[tokio::test(start_paused = true)]
@@ -10038,6 +10213,174 @@ mod drain_control_tests {
 
         assert_eq!(onset, None);
         assert!(drain.admits_new_work());
+    }
+
+    #[tokio::test]
+    async fn cancel_all_marks_every_active_turn_discards_pending_and_keeps_admission_open() {
+        let bus = observer::ObserverHandle::in_process();
+        let mut rx = bus.subscribe();
+        let mut pool = AgentPool::from_slots(vec![]);
+        let mut receivers = Vec::new();
+        for channel_id in [Uuid::new_v4(), Uuid::new_v4()] {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let abort = pool.join_set.spawn(async {});
+            pool.task_map_mut().insert(
+                abort.id(),
+                pool::TaskMeta {
+                    agent_index: 0,
+                    channel_id: Some(channel_id),
+                    turn_id: Uuid::new_v4().to_string(),
+                    recoverable_batch: None,
+                    control_tx: Some(tx),
+                    steer_tx: None,
+                },
+            );
+            receivers.push(rx);
+        }
+
+        let owner = Keys::generate();
+        let mut queue = EventQueue::new(DedupMode::Queue);
+        for channel_id in [Uuid::new_v4(), Uuid::new_v4()] {
+            assert!(queue.push(QueuedEvent {
+                channel_id,
+                event: nostr::EventBuilder::new(nostr::Kind::Custom(9), "pending")
+                    .sign_with_keys(&owner)
+                    .expect("sign"),
+                received_at: std::time::Instant::now(),
+                prompt_tag: "".into(),
+                project: None,
+            }));
+        }
+
+        let outcome = handle_cancel_all_control(&mut pool, &mut queue, Some(&bus));
+        assert_eq!(outcome.active_turns, 2);
+        assert_eq!(outcome.signalled_turns, 2);
+        assert_eq!(outcome.queued_batches, 2);
+        assert_eq!(outcome.queued_events, 2);
+        for receiver in receivers {
+            assert_eq!(
+                receiver.await.expect("cancel signal"),
+                ControlSignal::Cancel
+            );
+        }
+        assert!(!queue.has_undrained_work());
+
+        let future_channel = Uuid::new_v4();
+        assert!(queue.push(QueuedEvent {
+            channel_id: future_channel,
+            event: nostr::EventBuilder::new(nostr::Kind::Custom(9), "future")
+                .sign_with_keys(&owner)
+                .expect("sign"),
+            received_at: std::time::Instant::now(),
+            prompt_tag: "".into(),
+            project: None,
+        }));
+        assert_eq!(queue.queued_event_count(&future_channel), 1);
+
+        let ack = rx.try_recv().expect("cancel_all acknowledgement");
+        assert_eq!(ack.payload["type"], "cancel_all");
+        assert_eq!(ack.payload["status"], "accepted");
+        assert_eq!(ack.payload["activeTurns"], 2);
+        assert_eq!(ack.payload["signalledTurns"], 2);
+        assert_eq!(ack.payload["queuedEvents"], 2);
+    }
+
+    #[test]
+    fn cancel_all_with_no_work_acknowledges_no_work() {
+        let bus = observer::ObserverHandle::in_process();
+        let mut rx = bus.subscribe();
+        let mut pool = AgentPool::from_slots(vec![]);
+        let mut queue = EventQueue::new(DedupMode::Queue);
+
+        let outcome = handle_cancel_all_control(&mut pool, &mut queue, Some(&bus));
+        assert_eq!(outcome.status(), "no_work");
+        let ack = rx.try_recv().expect("no-work acknowledgement");
+        assert_eq!(ack.payload["status"], "no_work");
+        assert_eq!(ack.payload["activeTurns"], 0);
+        assert_eq!(ack.payload["queuedEvents"], 0);
+    }
+
+    #[test]
+    fn cancel_all_uses_the_same_owner_and_freshness_gate() {
+        let owner = Keys::generate();
+        let stranger = Keys::generate();
+        let agent = Keys::generate();
+        let bus = observer::ObserverHandle::in_process();
+        let mut rx = bus.subscribe();
+        let mut pool = AgentPool::from_slots(vec![]);
+        let mut queue = EventQueue::new(DedupMode::Queue);
+        let mut drain = drain::DrainState::open();
+        let stale = nostr::Timestamp::from(
+            (chrono::Utc::now().timestamp() - OBSERVER_CONTROL_FRESHNESS_SECS - 60) as u64,
+        );
+
+        for frame in [
+            control_frame(
+                &stranger,
+                &agent,
+                serde_json::json!({"type": "cancel_all"}),
+                None,
+            ),
+            control_frame(
+                &owner,
+                &agent,
+                serde_json::json!({"type": "cancel_all"}),
+                Some(stale),
+            ),
+        ] {
+            assert_eq!(
+                handle_relay_observer_control_event(
+                    &agent,
+                    frame,
+                    &mut pool,
+                    &mut queue,
+                    Some(&bus),
+                    &owner.public_key().to_hex(),
+                    &mut drain,
+                    BOUND,
+                ),
+                None
+            );
+        }
+        assert!(
+            rx.try_recv().is_err(),
+            "rejected controls must not acknowledge"
+        );
+        assert!(drain.admits_new_work());
+    }
+
+    #[test]
+    fn owner_cancel_all_is_routed_and_acknowledged() {
+        let owner = Keys::generate();
+        let agent = Keys::generate();
+        let bus = observer::ObserverHandle::in_process();
+        let mut rx = bus.subscribe();
+        let mut pool = AgentPool::from_slots(vec![]);
+        let mut queue = EventQueue::new(DedupMode::Queue);
+        let mut drain = drain::DrainState::open();
+
+        assert_eq!(
+            handle_relay_observer_control_event(
+                &agent,
+                control_frame(
+                    &owner,
+                    &agent,
+                    serde_json::json!({"type": "cancel_all"}),
+                    None
+                ),
+                &mut pool,
+                &mut queue,
+                Some(&bus),
+                &owner.public_key().to_hex(),
+                &mut drain,
+                BOUND,
+            ),
+            None
+        );
+        let ack = rx.try_recv().expect("owner cancel_all acknowledgement");
+        assert_eq!(ack.payload["type"], "cancel_all");
+        assert_eq!(ack.payload["status"], "no_work");
+        assert!(drain.admits_new_work(), "cancel_all must not drain or exit");
     }
 
     /// The owner is acknowledged on the observer bus, so a deployer can see the
@@ -11048,6 +11391,97 @@ mod error_outcome_emission_tests {
             "turn_error must retain the completed turn id"
         );
         turn_errors.len()
+    }
+
+    #[tokio::test]
+    async fn cancel_all_cutoff_suppresses_consumed_control_result_requeue() {
+        let owner = Keys::generate();
+        let channel_id = Uuid::new_v4();
+        let mut queue = EventQueue::new(config::DedupMode::Queue);
+        assert!(queue.push(QueuedEvent {
+            channel_id,
+            event: EventBuilder::new(Kind::Custom(9), "accepted before cutoff")
+                .sign_with_keys(&owner)
+                .unwrap(),
+            received_at: std::time::Instant::now(),
+            prompt_tag: "test".into(),
+            project: None,
+        }));
+        let batch = queue.flush_next().expect("in-flight batch");
+
+        let agent = dummy_agent(0).await;
+        let mut pool = AgentPool::from_slots(vec![None]);
+        let task_id = pool.join_set.spawn(async {}).id();
+        pool.task_map_mut().insert(
+            task_id,
+            crate::pool::TaskMeta {
+                agent_index: 0,
+                channel_id: Some(channel_id),
+                turn_id: "cutoff-turn".into(),
+                recoverable_batch: Some(batch.clone()),
+                control_tx: None,
+                steer_tx: None,
+            },
+        );
+
+        let outcome = handle_cancel_all_control(&mut pool, &mut queue, None);
+        assert_eq!(outcome.status(), "accepted");
+        assert_eq!(outcome.active_turns, 1);
+        assert_eq!(outcome.signalled_turns, 0);
+        assert!(
+            pool.task_map()
+                .get(&task_id)
+                .expect("cutoff task metadata")
+                .recoverable_batch
+                .is_none(),
+            "panic recovery must not retain a pre-cutoff batch"
+        );
+
+        let mut heartbeat_in_flight = false;
+        let removed_channels = HashSet::new();
+        let mut crash_history = vec![SlotCircuit {
+            crash_times: Vec::new(),
+            open_until: None,
+            respawn_in_flight: false,
+        }];
+        let (respawn_tx, _respawn_rx) = mpsc::channel(8);
+        let mut respawn_tasks = tokio::task::JoinSet::new();
+        let result = PromptResult {
+            agent,
+            source: PromptSource::Channel(channel_id),
+            turn_id: "cutoff-turn".into(),
+            outcome: PromptOutcome::Cancelled,
+            batch: Some(batch),
+        };
+        assert!(matches!(
+            handle_prompt_result(
+                &mut pool,
+                &mut queue,
+                &test_config(),
+                result,
+                &mut heartbeat_in_flight,
+                &removed_channels,
+                &mut crash_history,
+                &respawn_tx,
+                &mut respawn_tasks,
+                None,
+                None,
+            ),
+            LoopAction::Continue
+        ));
+        assert!(!queue.has_undrained_work());
+        assert_eq!(queue.queued_event_count(&channel_id), 0);
+
+        assert!(queue.push(QueuedEvent {
+            channel_id,
+            event: EventBuilder::new(Kind::Custom(9), "new after cutoff")
+                .sign_with_keys(&owner)
+                .unwrap(),
+            received_at: std::time::Instant::now(),
+            prompt_tag: "test".into(),
+            project: None,
+        }));
+        assert_eq!(queue.queued_event_count(&channel_id), 1);
     }
 
     #[tokio::test]
@@ -15843,7 +16277,7 @@ for line in sys.stdin:
         let author = rt.owner.clone();
         let queued = move |content: &str| QueuedEvent {
             channel_id,
-            event: EventBuilder::new(nostr::Kind::Custom(9), content)
+            event: nostr::EventBuilder::new(nostr::Kind::Custom(9), content)
                 .sign_with_keys(&author)
                 .expect("sign"),
             received_at: std::time::Instant::now(),
@@ -16002,7 +16436,7 @@ for line in sys.stdin:
         let channel_id = uuid::Uuid::new_v4();
         rt.queue.push(QueuedEvent {
             channel_id,
-            event: EventBuilder::new(nostr::Kind::Custom(9), "never runs")
+            event: nostr::EventBuilder::new(nostr::Kind::Custom(9), "never runs")
                 .sign_with_keys(&rt.owner)
                 .expect("sign"),
             received_at: std::time::Instant::now(),

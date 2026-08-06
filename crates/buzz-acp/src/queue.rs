@@ -316,21 +316,35 @@ impl EventQueue {
     /// In-flight channels are skipped: those batches belong to a running
     /// prompt task and return through the ordinary result path.
     pub fn drain_all_pending_batches(&mut self) -> Vec<FlushBatch> {
+        self.drain_pending_batches(true)
+    }
+
+    /// Remove and return every buffered batch, including work queued behind an
+    /// in-flight turn. The in-flight batch remains owned by its prompt task.
+    pub fn discard_all_pending_batches(&mut self) -> Vec<FlushBatch> {
+        self.drain_pending_batches(false)
+    }
+
+    fn drain_pending_batches(&mut self, skip_in_flight: bool) -> Vec<FlushBatch> {
         let mut channel_ids: Vec<Uuid> = self
             .queues
             .iter()
-            .filter(|(id, q)| !q.is_empty() && !self.in_flight_channels.contains(id))
+            .filter(|(id, q)| {
+                !q.is_empty() && (!skip_in_flight || !self.in_flight_channels.contains(id))
+            })
             .map(|(id, _)| *id)
             .chain(
                 self.cancelled_batches
                     .keys()
-                    .filter(|id| !self.in_flight_channels.contains(id))
+                    .filter(|id| !skip_in_flight || !self.in_flight_channels.contains(id))
                     .copied(),
             )
             .chain(
                 self.withheld_native_steer
                     .iter()
-                    .filter(|(id, e)| !e.is_empty() && !self.in_flight_channels.contains(id))
+                    .filter(|(id, e)| {
+                        !e.is_empty() && (!skip_in_flight || !self.in_flight_channels.contains(id))
+                    })
                     .map(|(id, _)| *id),
             )
             .collect();
@@ -3660,7 +3674,7 @@ mod tests {
     }
 
     #[test]
-    fn drain_all_pending_batches_leaves_in_flight_channels_alone() {
+    fn discard_all_pending_batches_removes_work_queued_behind_in_flight_turns() {
         let temp = tempfile::tempdir().expect("temp dir");
         let mut queue = queue_with_store(&temp, DedupMode::Queue);
         let channel_id = Uuid::new_v4();
@@ -3668,11 +3682,16 @@ mod tests {
         let _in_flight = queue.flush_next().expect("batch");
         queue.push(make_queued(channel_id, "queued behind"));
 
+        let discarded = queue.discard_all_pending_batches();
+        assert_eq!(discarded.len(), 1);
+        assert_eq!(discarded[0].events.len(), 1);
+        assert_eq!(pending_count(&queue), 0);
         assert!(
-            queue.drain_all_pending_batches().is_empty(),
-            "an in-flight channel's work returns through the result path, not here"
+            queue.has_undrained_work(),
+            "the active turn still owns its in-flight marker"
         );
-        assert_eq!(pending_count(&queue), 1);
+        queue.mark_complete(channel_id);
+        assert!(!queue.has_undrained_work());
     }
 
     /// An empty queue is holding nothing, and a drain on top of it may leave.

@@ -231,6 +231,9 @@ pub struct AgentPool {
     result_rx: mpsc::UnboundedReceiver<PromptResult>,
     pub join_set: JoinSet<()>,
     task_map: HashMap<tokio::task::Id, TaskMeta>,
+    /// Channel tasks whose pre-control work must never be requeued after an
+    /// owner `cancel_all` cutoff, even if their control sender was consumed.
+    cancel_all_cutoff_tasks: HashSet<tokio::task::Id>,
 }
 
 /// Result returned by a completed prompt task.
@@ -666,6 +669,7 @@ impl AgentPool {
             result_rx,
             join_set: JoinSet::new(),
             task_map: HashMap::new(),
+            cancel_all_cutoff_tasks: HashSet::new(),
         }
     }
 
@@ -739,6 +743,14 @@ impl AgentPool {
 
     pub fn task_map_mut(&mut self) -> &mut HashMap<tokio::task::Id, TaskMeta> {
         &mut self.task_map
+    }
+
+    pub fn mark_cancel_all_cutoff(&mut self, task_id: tokio::task::Id) {
+        self.cancel_all_cutoff_tasks.insert(task_id);
+    }
+
+    pub fn take_cancel_all_cutoff(&mut self, task_id: tokio::task::Id) -> bool {
+        self.cancel_all_cutoff_tasks.remove(&task_id)
     }
 
     /// Try to send a goose-native steer request to the in-flight task for

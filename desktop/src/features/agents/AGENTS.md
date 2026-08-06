@@ -169,8 +169,8 @@ with a TypeScript lookup table or an id comparison in a component.
     for them, so the card opens the read-only profile Runtime view rather than
     a local editor.
 13. **A remote control exists only if the running agent can execute *and*
-    acknowledge it.** The `Managed elsewhere` card carries exactly one:
-    **Drain**, which rides the owner-signed kind:24200 control frame normatively
+    acknowledge it.** The `Remote Agents` card carries exactly two process controls:
+    **Stop current work** and **Finish work and shut down**, which ride the owner-signed kind:24200 control frame normatively
     specified in `crates/buzz-acp/src/drain.rs` and NIP-AO. The agent verifies
     the signature and that the author is the owner *it* resolved from its own
     NIP-OA attestation, checks freshness, and answers with a `control_result`.

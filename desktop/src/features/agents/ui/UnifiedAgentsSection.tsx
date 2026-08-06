@@ -7,7 +7,6 @@ import {
 } from "lucide-react";
 
 import { resolveAgentCardModelLabel } from "@/features/agents/lib/agentCardModelLabel";
-import { describeDrainRequest } from "@/features/agents/lib/drainOutcome";
 import { friendlyAgentLastError } from "@/features/agents/lib/friendlyAgentLastError";
 import { isManagedAgentActive } from "@/features/agents/lib/managedAgentControlActions";
 import { useUserProfileQuery } from "@/features/profile/hooks";
@@ -31,10 +30,10 @@ import { AgentIdentityCard } from "./AgentIdentityCard";
 import { AgentRuntimeAvatarControl } from "./AgentRuntimeAvatarControl";
 import { CreateIdentityCard } from "./CreateIdentityCard";
 import {
-  OwnedRelayAgentDrainBadge,
-  OwnedRelayAgentDrainButton,
-  useAgentDrainRequest,
-} from "./OwnedRelayAgentDrainControl";
+  OwnedRelayAgentActionBadge,
+  OwnedRelayAgentActionsMenu,
+  useOwnedRelayAgentActions,
+} from "./OwnedRelayAgentActionsMenu";
 import { PersonaActionsMenu } from "./PersonaActionsMenu";
 import { buildUnifiedGroups, pickProfileAgent } from "./unifiedAgentGroups";
 
@@ -582,9 +581,10 @@ function CollapsibleAgentGroup({
  * Agents the current identity owns on the relay but does not manage here.
  *
  * Kept as its own group rather than folded into "Custom agents" because the
- * affordances differ: this desktop holds no private key, no local record and
- * no process for these, so there is nothing to start, stop, edit or delete.
- * The card is a way in to the read-only profile and nothing more.
+ * affordances differ: this desktop holds no private key, local record, or host
+ * process for these. It can request owner-authorised observer controls and,
+ * when the viewer can moderate, apply community restrictions; it still cannot
+ * start, edit, or delete the remote host process.
  */
 function OwnedRelayAgentGroup({
   agents,
@@ -617,7 +617,7 @@ function OwnedRelayAgentGroup({
         ) : (
           <ChevronDown className="h-4 w-4 shrink-0 text-muted-foreground" />
         )}
-        <span className="text-sm font-medium">Managed elsewhere</span>
+        <span className="text-sm font-medium">Remote Agents</span>
         <span className="text-xs text-muted-foreground">({agents.length})</span>
       </button>
       {!isCollapsed ? (
@@ -646,16 +646,20 @@ function OwnedRelayAgentCard({
   ) => void;
 }) {
   const profileQuery = useUserProfileQuery(agent.pubkey);
-  const { request, send } = useAgentDrainRequest(agent.pubkey);
-  const { busy } = describeDrainRequest(request);
+  const { cancel, drain, latestControl } = useOwnedRelayAgentActions(
+    agent.pubkey,
+  );
 
   return (
     <AgentIdentityCard
       actions={
-        <OwnedRelayAgentDrainButton
+        <OwnedRelayAgentActionsMenu
           agentName={agent.name}
-          busy={busy}
-          onConfirm={send}
+          agentPubkey={agent.pubkey}
+          cancelRequest={cancel.request}
+          drainRequest={drain.request}
+          onCancelAll={cancel.send}
+          onDrain={drain.send}
         />
       }
       ariaLabel={`${agent.name} agent profile`}
@@ -669,7 +673,13 @@ function OwnedRelayAgentCard({
       onClick={() => {
         onOpenAgentProfile(agent.pubkey, { tab: "runtime" });
       }}
-      statusBadge={<OwnedRelayAgentDrainBadge request={request} />}
+      statusBadge={
+        <OwnedRelayAgentActionBadge
+          cancelRequest={cancel.request}
+          drainRequest={drain.request}
+          latestControl={latestControl}
+        />
+      }
     />
   );
 }

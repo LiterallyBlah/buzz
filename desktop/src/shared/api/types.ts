@@ -475,9 +475,13 @@ export type SwitchManagedAgentModelStatus =
   | "no_active_turn";
 
 export type ControlResultFrame = {
-  type: "cancel_turn" | "switch_model" | "drain";
+  type: "cancel_turn" | "cancel_all" | "switch_model" | "drain";
   status: string;
   modelId?: string;
+  activeTurns?: number;
+  signalledTurns?: number;
+  queuedBatches?: number;
+  queuedEvents?: number;
 };
 
 export type GitBashPrerequisite = {

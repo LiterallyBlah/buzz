@@ -12,6 +12,11 @@ export async function cancelManagedAgentTurn(
   return { status: "sent" };
 }
 
+/** Ask the running agent to cancel every active turn and discard all work already queued. */
+export async function cancelAllAgentWork(pubkey: string): Promise<void> {
+  await sendAgentObserverControl(pubkey, { type: "cancel_all" });
+}
+
 /**
  * Send a live model-switch control frame to a running agent. The switch rides
  * the harness's cancel-switch-requeue path (busy turn) or invalidate-and-reapply

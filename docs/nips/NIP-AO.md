@@ -126,6 +126,7 @@ The `content` field decrypts to an object whose `type` names the command:
 | `type`         | Additional fields          | Effect                                                        |
 |----------------|----------------------------|---------------------------------------------------------------|
 | `cancel_turn`  | `channelId`                | Abandon the turn in flight on that channel                     |
+| `cancel_all`   | none                       | Set a cutoff for active turns and discard already buffered work |
 | `switch_model` | `channelId`, `modelId`     | Apply a model override to the live or next session             |
 | `drain`        | `reason` (OPTIONAL)        | Stop admitting work, finish what is in hand, then exit cleanly |
 
@@ -158,7 +159,16 @@ telemetry frame, encrypted to the owner as any other telemetry:
 ```
 
 `type` echoes the command. `status` is command-specific; `drain` answers
-`draining` on the transition and `already_draining` for a repeat.
+`draining` on the transition and `already_draining` for a repeat. `cancel_all` answers `accepted` when it established a cutoff for active channel
+tasks or discarded queued work, and `no_work` only when neither existed.
+`accepted` reports acceptance, not completed cancellation. The reference
+acknowledgement includes non-negative `activeTurns`, `signalledTurns`,
+`queuedBatches`, and `queuedEvents` counts: `activeTurns` names every channel
+task covered by the cutoff, `signalledTurns` is the subset whose cancellation
+receiver accepted a new signal, and queued counts describe work definitely
+discarded. `cancel_all`
+MUST NOT enter drain state or close admission: work received after the control is
+honoured remains admissible.
 
 An acknowledgement means the agent *accepted the instruction*, never that a
 process ended: a draining agent keeps running until the work it already held

@@ -51,7 +51,7 @@ test("an owned relay agent with no local record is listed", async ({
 
   const group = page.getByTestId("owned-relay-agents-group");
   await expect(group).toBeVisible({ timeout: 10_000 });
-  await expect(group).toContainText("Managed elsewhere");
+  await expect(group).toContainText("Remote Agents");
   await expect(page.getByTestId(`owned-relay-agent-${NADIA}`)).toBeVisible();
   await expect(page.getByTestId(`owned-relay-agent-${NADIA}`)).toContainText(
     "nadia",
@@ -84,33 +84,31 @@ test("an owned agent that is also managed locally appears exactly once", async (
   await expect(page.getByTestId(`owned-relay-agent-${SCOUT}`)).toHaveCount(0);
 });
 
-test("a remote card exposes only the control the agent can execute", async ({
+test("a remote card exposes only applicable remote controls", async ({
   page,
 }) => {
   await openAgentsView(page);
-
   const group = page.getByTestId("owned-relay-agents-group");
-  await expect(group).toBeVisible({ timeout: 10_000 });
-
-  // Drain is here because the *running agent* receives, verifies and answers
-  // the frame itself.
   const card = page.getByTestId(`owned-relay-agent-${NADIA}`);
-  await expect(card.getByRole("button", { name: "Drain" })).toBeVisible();
-
-  // Everything else is absent, and stays absent: a stopped process receives no
-  // frame, and this tree has no always-running host controller that could act
-  // for it. A Start button here could only ever fail.
+  await card.getByRole("button", { name: "Open actions for nadia" }).click();
+  await expect(
+    page.getByRole("menuitem", { name: "Stop current work" }),
+  ).toBeVisible();
+  await expect(
+    page.getByRole("menuitem", { name: "Finish work and shut down" }),
+  ).toBeVisible();
+  // The default smoke identity is a member, so moderation remains role-gated.
+  await expect(
+    page.getByRole("menuitem", { name: /Ban from this community|Lift ban/ }),
+  ).toHaveCount(0);
+  await expect(
+    page.getByRole("menuitem", {
+      name: /Start|Restart|Pause|Edit|Duplicate|Share|Delete/,
+    }),
+  ).toHaveCount(0);
   await expect(group.getByTestId(`agent-runtime-start-${NADIA}`)).toHaveCount(
     0,
   );
-  await expect(
-    group.getByRole("button", { name: /Start|Restart|Deploy|Edit|Delete/ }),
-  ).toHaveCount(0);
-  await expect(
-    group.getByRole("button", { name: "Agent actions" }),
-  ).toHaveCount(0);
-
-  // The card affords exactly two things: open the profile, and drain.
   await expect(card.getByRole("button")).toHaveCount(2);
 });
 
@@ -159,16 +157,47 @@ async function emitDrainAcknowledgement(
   );
 }
 
+async function confirmCancelAll(page: import("@playwright/test").Page) {
+  const card = page.getByTestId(`owned-relay-agent-${NADIA}`);
+  await card.getByRole("button", { name: "Open actions for nadia" }).click();
+  await page.getByRole("menuitem", { name: "Stop current work" }).click();
+  const dialog = page.getByRole("alertdialog");
+  await expect(dialog).toContainText(
+    "stay online and can accept new work afterwards",
+  );
+  await dialog.getByRole("button", { name: "Stop current work" }).click();
+}
+
+test("stopping current work sends one whole-agent cancel_all frame", async ({
+  page,
+}) => {
+  await openAgentsView(page);
+  await confirmCancelAll(page);
+  const frames = await page.evaluate(async () => {
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    return window.__BUZZ_E2E_OBSERVER_CONTROL_FRAMES__ ?? [];
+  });
+  expect(frames).toHaveLength(1);
+  expect(JSON.parse(frames[0]?.content ?? "{}")).toEqual({
+    type: "cancel_all",
+  });
+});
+
 async function confirmDrain(page: import("@playwright/test").Page) {
   const card = page.getByTestId(`owned-relay-agent-${NADIA}`);
-  await card.getByRole("button", { name: "Drain" }).click();
+  await card.getByRole("button", { name: "Open actions for nadia" }).click();
+  await page
+    .getByRole("menuitem", { name: "Finish work and shut down" })
+    .click();
 
   const dialog = page.getByRole("alertdialog");
   await expect(dialog).toBeVisible();
   // The consequence is named before the owner commits: nothing here can start
   // it again.
   await expect(dialog).toContainText("cannot start it again");
-  await dialog.getByRole("button", { name: "Drain" }).click();
+  await dialog
+    .getByRole("button", { name: "Finish work and shut down" })
+    .click();
 }
 
 test("draining sends an owner-signed drain frame for that agent", async ({
