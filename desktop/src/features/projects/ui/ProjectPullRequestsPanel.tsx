@@ -45,9 +45,10 @@ import {
   ProfileAuthorName,
   ProfileIdentityButton,
 } from "./ProjectProfileIdentity";
-import { ProjectActivityIndicator } from "./ProjectActivityIndicator";
 import { PullRequestReviewTimeline } from "./ProjectPullRequestReviewTimeline";
 import { ProjectRichContent } from "./ProjectRichContent";
+import { ProjectRootAgentsSection } from "./ProjectRootAgentsSection";
+import { ProjectWorkItemDescription } from "./ProjectWorkItemDescription";
 import { PullRequestReviewersRow } from "./PullRequestReviewersRow";
 
 function pluralize(count: number, singular: string, plural = `${singular}s`) {
@@ -453,6 +454,15 @@ export function PullRequestMetaRail({
           pubkey={pullRequest.author}
         />
       </OverviewRailSection>
+      {/* Between Author and Branches: the rail's people-facing half. The
+          comment list is the only relay-durable evidence of an agent having
+          worked here, so it is passed in even though most of those authors are
+          human — the union filters them out. */}
+      <ProjectRootAgentsSection
+        commentAuthors={pullRequest.comments}
+        profiles={profiles}
+        rootEventId={pullRequest.id}
+      />
       <OverviewRailSection title="Branches">
         <div className="space-y-1.5 text-xs text-muted-foreground">
           <p>Merges {pluralize(commitCount, "commit")}</p>
@@ -615,18 +625,20 @@ export function ProjectPullRequestDetail({
   return (
     <div>
       {pullRequest.content ? (
-        <header className="p-4">
+        <ProjectWorkItemDescription>
           <ProjectRichContent
             content={pullRequest.content}
             tags={pullRequest.tags}
           />
-        </header>
+        </ProjectWorkItemDescription>
       ) : null}
 
-      <ProjectActivityIndicator
-        profiles={profiles}
-        rootEventId={pullRequest.id}
-      />
+      {/* No inline activity strip. Live agent state for a work item is
+          reported once, in the detail rail's Agents section, which carries the
+          stage caption this strip used to be the only source of. Two surfaces
+          reporting one fact drift, and the one at a fixed scroll position is
+          the one a reader has to travel to. The shared thread shell is still
+          phase 2; this is only the duplicate. */}
 
       {pullRequest.updates.length > 0 ? (
         <section className="space-y-3 border-border/50 border-t p-4">

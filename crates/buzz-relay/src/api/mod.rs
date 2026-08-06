@@ -75,6 +75,21 @@ pub mod relay_members {
             .await
             .map_err(|e| format!("relay membership check failed: {e}"))?;
         if is_member {
+            // A direct member presenting a valid NIP-OA tag is still an
+            // agent, and everything downstream of this decision keys off the
+            // owner: rate-limit class (agent vs human quota), the auth
+            // context's agent_owner_pubkey, and the users-table backfill that
+            // authorizes observer control frames. Answering plain `Member`
+            // here made direct-member agents indistinguishable from people on
+            // closed relays — the open-relay path already extracts the owner
+            // opportunistically for exactly these consumers. The tag is
+            // cryptographically self-proving, so membership does not weaken
+            // it; membership just stops being a reason to ignore it.
+            if state.config.allow_nip_oa_auth {
+                if let Some(owner_pubkey) = extract_nip_oa_owner(pubkey_bytes, auth_tag_header) {
+                    return Ok(MembershipDecision::ViaOwner(owner_pubkey));
+                }
+            }
             return Ok(MembershipDecision::Member);
         }
 

@@ -2071,18 +2071,21 @@ fn format_peer_roster(
     }
 
     s.push_str(
-        "\n\nBringing one onto this root takes BOTH halves of the same comment:\n\
-         1. the `@name` written in the body, exactly as spelled above; and\n\
-         2. `--to <their pubkey>` on the reply command, which is what puts their `p` tag \
-         on the event.\n\
-         The `p` tag is what the relay delivers on and what the other agent's addressing \
-         gate requires before it will even consider the name; the `@name` is what tells it \
-         the comment is *for* it rather than *about* it. Either half on its own reaches \
-         nobody.\n\
-         Naming an agent in prose — \"let's get the Claude agent to look at this\" — is not \
-         a mention. No `@`, no `p` tag, nothing happens, and that is the system working as \
-         intended rather than a bug to route around. Names come from each agent's published \
-         profile; if a name goes unanswered, `@<their pubkey>` addresses them unambiguously.",
+        "\n\nTo make a peer agent ACT on this root, a comment is not enough — no matter how \
+         it is addressed. You are an agent, and a peer's addressing gate ignores a plain \
+         mention from another agent by design: two agents whose mentions woke each other \
+         would reply forever, so an agent-authored comment can inform, but never direct. \
+         Direction travels only as a peer call:\n\
+         `buzz agents call --to <their pubkey> --task '<one bounded task>' \
+         --project <this coordinate> --root <this root id>`\n\
+         The result returns to this root, correlated to your call.\n\
+         Mentions still matter for the record and for people: `@name` in the body plus \
+         `--to <pubkey>` on the reply command puts their `p` tag on the event — that pair \
+         is how a HUMAN participant is addressed, and how your comment shows readers who \
+         it concerns. Either half on its own reaches nobody, and naming an agent in prose \
+         — \"let's get the Claude agent to look at this\" — is neither half. Names come \
+         from each agent's published profile; if a name goes unanswered, `@<their pubkey>` \
+         addresses them unambiguously.",
     );
     s
 }
@@ -3176,11 +3179,15 @@ mod project_context_tests {
             "an unresolved peer must still be addressable, by key"
         );
         assert!(
-            roster.contains("BOTH halves"),
-            "the mechanism is described as one step: {roster}"
+            roster.contains("buzz agents call --to"),
+            "the roster must spell the only mechanism that makes a peer act: {roster}"
         );
         assert!(
-            roster.contains("is not a mention"),
+            roster.contains("ignores a plain mention from another agent"),
+            "the agent-mention trap must be called out — the reader IS an agent: {roster}"
+        );
+        assert!(
+            roster.contains("is neither half"),
             "the prose failure is not called out: {roster}"
         );
     }

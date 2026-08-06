@@ -4,6 +4,7 @@ import { describe, it } from "node:test";
 import {
   isChannelOpenable,
   resolveOpenableActivityChannelId,
+  resolveUnavailableActivityMessage,
 } from "./useOpenAgentActivity.ts";
 
 describe("isChannelOpenable", () => {
@@ -80,5 +81,38 @@ describe("resolveOpenableActivityChannelId", () => {
       }),
       null,
     );
+  });
+});
+
+describe("resolveUnavailableActivityMessage", () => {
+  it("blames access when the agent is working in rooms the viewer can't open", () => {
+    const message = resolveUnavailableActivityMessage({
+      hasWorkingChannels: true,
+    });
+
+    assert.match(message, /haven't joined/);
+  });
+
+  it("does not invent a room when the agent has no working channels", () => {
+    // The regression this pins: a project-turn agent is working, but against
+    // an issue root rather than a channel. Telling that viewer to join a
+    // channel names a room that has nothing to do with the failure.
+    const message = resolveUnavailableActivityMessage({
+      hasWorkingChannels: false,
+    });
+
+    assert.doesNotMatch(message, /haven't joined/);
+    assert.doesNotMatch(message, /channel/);
+  });
+
+  it("always says something", () => {
+    // The bug was the empty branch, not the wording: both inputs must yield a
+    // sentence, because the alternative is a button that does nothing.
+    for (const hasWorkingChannels of [true, false]) {
+      const message = resolveUnavailableActivityMessage({ hasWorkingChannels });
+      assert.equal(typeof message, "string");
+      assert.ok(message.length > 0);
+      assert.match(message, /can't be opened from here\.$/);
+    }
   });
 });

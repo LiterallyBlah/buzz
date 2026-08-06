@@ -10,6 +10,7 @@ import { toast } from "sonner";
 
 import { useAgentWorking } from "@/features/agents/agentWorkingSignal";
 import { isManagedAgentActive } from "@/features/agents/lib/managedAgentControlActions";
+import { resolveAgentSessionStopState } from "@/features/agents/ui/agentSessionPaneAgent";
 import {
   mergeObserverEventWindows,
   observerEventScrollId,
@@ -64,6 +65,12 @@ import { useChannelsQuery } from "@/features/channels/hooks";
 
 type AgentSessionThreadPanelProps = {
   agent: ChannelAgentSessionAgent;
+  /**
+   * Doubles as the width-resize affordance's enablement: the handle only
+   * renders when `onResizeStart` is supplied, so a host that does not own a
+   * resizable panel column simply omits these three and gets a fixed width.
+   */
+  canResetWidth?: boolean;
   channel: Channel | null;
   channelId?: string | null;
   canInterruptTurn: boolean;
@@ -79,13 +86,39 @@ type AgentSessionThreadPanelProps = {
    */
   onBack?: () => void;
   onClose: () => void;
+  onResetWidth?: () => void;
+  onResizeStart?: React.PointerEventHandler<HTMLButtonElement>;
   widthPx: number;
   transparentChrome?: boolean;
 };
 
+/**
+ * An agent's ACP activity, as a right-hand panel.
+ *
+ * The panel has two scopes and the difference is entirely `channel`/
+ * `channelId`. Channel-scoped (both supplied) is the original case: the pane
+ * is opened from a channel screen and shows only the frames attributable to
+ * that room, which is what makes it safe to open beside a timeline the viewer
+ * is already reading. Agent-scoped (both null) shows everything the observer
+ * feed has for the agent — `scopeByChannel` is a pass-through on a null scope
+ * — and is what non-channel routes get.
+ *
+ * That second scope is not a degraded mode. A project root announces turns
+ * against an issue or a pull request, not against a channel, so an activity
+ * pane opened from an issue view has no channel to name and inventing one
+ * would scope the feed to a room the turn never touched. "All channels" is the
+ * accurate label there, and the header says so rather than implying a scope
+ * the pane is not applying.
+ *
+ * What genuinely does not survive the channel-less scope is turn cancellation,
+ * which addresses a turn by (agent, channel) — see resolveAgentSessionStopState
+ * for why that is reported as a missing channel rather than as a property of
+ * the agent.
+ */
 export function AgentSessionThreadPanel({
   agent,
   canInterruptTurn,
+  canResetWidth,
   channel,
   channelId = null,
   layout = "standalone",
@@ -93,6 +126,8 @@ export function AgentSessionThreadPanel({
   profiles,
   onBack,
   onClose,
+  onResetWidth,
+  onResizeStart,
   widthPx,
   transparentChrome = false,
 }: AgentSessionThreadPanelProps) {
@@ -105,7 +140,15 @@ export function AgentSessionThreadPanel({
     agent.pubkey,
     sessionChannelId,
   );
-  const canStopCurrentTurn = isWorking && canInterruptTurn;
+  // `channel`, not `sessionChannelId`: cancellation needs the resolved Channel
+  // object below, and a bare id the pane could not turn into one would leave
+  // the action enabled over a handler that returns early.
+  const stopState = resolveAgentSessionStopState({
+    canInterruptTurn,
+    hasChannel: channel !== null,
+    isWorking,
+  });
+  const canStopCurrentTurn = stopState.enabled;
   useEscapeKey(onClose, isOverlay || isSinglePanelView);
 
   const scrollRef = React.useRef<HTMLDivElement>(null);
@@ -392,13 +435,7 @@ export function AgentSessionThreadPanel({
               onSelect={() => {
                 void handleInterruptTurn();
               }}
-              title={
-                canStopCurrentTurn
-                  ? "Interrupt the current ACP turn without stopping the agent process."
-                  : isWorking
-                    ? "Only locally managed agents can be interrupted from this community."
-                    : "Available while the agent is working."
-              }
+              title={stopState.reason}
             >
               <Octagon className="mt-0.5 h-4 w-4 text-muted-foreground" />
               <span className="min-w-0 flex-1">
@@ -407,9 +444,7 @@ export function AgentSessionThreadPanel({
                 </span>
                 {!canStopCurrentTurn ? (
                   <span className="mt-0.5 block text-xs text-muted-foreground">
-                    {isWorking
-                      ? "Only available for locally managed agents."
-                      : "Available while the agent is working."}
+                    {stopState.reason}
                   </span>
                 ) : null}
               </span>
@@ -468,9 +503,13 @@ export function AgentSessionThreadPanel({
 
   return (
     <AuxiliaryPanel
+      canResetWidth={canResetWidth}
       isSinglePanelView={isSinglePanelView}
       layout={layout}
       onClose={onClose}
+      onResetWidth={onResetWidth}
+      onResizeStart={onResizeStart}
+      resizeHandleTestId="agent-session-panel-resize"
       testId="agent-session-thread-panel"
       transparentChrome={transparentChrome}
       widthPx={widthPx}

@@ -2812,24 +2812,30 @@ async fn ingest_event_inner(
         };
 
         let pubkey_hex = auth.pubkey().to_hex();
-        // Spec WriteInsert (line 514) / WriteDuplicate (line 606): emit
-        // the abstract write action. The persist API returns
-        // `was_inserted` (true → Insert, false → Duplicate). This branch
-        // is the reaction path; channel_id is always Some here, so
-        // WriteInsertGlobal does not apply.
+        // Spec WriteInsert (line 514) / WriteInsertGlobal (line 559) /
+        // WriteDuplicate (line 606): emit the abstract write action. The
+        // persist API returns `was_inserted` (true → Insert, false →
+        // Duplicate). A reaction is channel-less whenever its target is —
+        // reactions on project roots (issues, pull requests) carry no `h`
+        // tag — so this seam observes the same three-way split as the
+        // message write at the trailing dispatch site, and channel-less
+        // duplicates collapse into WriteInsertGlobal the same way.
         let claimed = claimed_community_from_event(&event);
-        let action = if was_inserted {
-            TraceAction::WriteInsert {
+        let action = match (channel_id, was_inserted) {
+            (Some(ch), true) => TraceAction::WriteInsert {
                 msg_id: msg_id_label(event.id.as_bytes()),
-                channel: channel_label(channel_id.expect("reaction path has channel")),
+                channel: channel_label(ch),
                 claimed_community: claimed,
-            }
-        } else {
-            TraceAction::WriteDuplicate {
+            },
+            (Some(ch), false) => TraceAction::WriteDuplicate {
                 msg_id: msg_id_label(event.id.as_bytes()),
-                channel: channel_label(channel_id.expect("reaction path has channel")),
+                channel: channel_label(ch),
                 claimed_community: claimed,
-            }
+            },
+            (None, _) => TraceAction::WriteInsertGlobal {
+                msg_id: msg_id_label(event.id.as_bytes()),
+                claimed_community: claimed,
+            },
         };
         emit(tracer, action, state_for_request(tenant, auth.pubkey()));
         dispatch_persistent_event(

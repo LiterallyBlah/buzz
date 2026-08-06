@@ -283,6 +283,96 @@ pub struct AcpClient {
     /// authentication failure can name the stage without the classifier
     /// needing to know how the request was written.
     pending_stage: AuthStage,
+    /// The authentication methods the adapter advertised at `initialize`.
+    ///
+    /// Retained because the moment they are useful is not the moment they
+    /// arrive: `initialize` succeeds, turns run for hours, and then a
+    /// credential expires — and the owner asking "re-authenticate *how*"
+    /// needs the answer the adapter gave at startup. Nothing else in the
+    /// harness kept it, so the question had no answer at the only time anyone
+    /// asked it.
+    ///
+    /// Empty when the adapter advertised none, which is itself worth
+    /// reporting: it means this adapter has no method to offer and the owner
+    /// must go to the provider CLI directly.
+    auth_methods: Vec<AuthMethod>,
+}
+
+/// One authentication method an adapter advertised in its `initialize` result.
+///
+/// **This is adapter free text and is treated as such.** Unlike
+/// [`TerminalAuth`], whose every field is a closed enum precisely so it can be
+/// logged and published without review, an `AuthMethod` carries strings the
+/// adapter chose. It therefore travels on exactly one road: the NIP-AO observer
+/// frame, which is NIP-44 encrypted to the agent's owner. It must never reach a
+/// public root — see the notice copy in `lib.rs`, which names no method at all.
+///
+/// Both fields are length-bounded at parse time so an adapter cannot spend the
+/// observer frame's plaintext budget on an authentication method name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthMethod {
+    /// The `id` the adapter expects back in an `authenticate` call — e.g.
+    /// `claude-ai-login`.
+    pub id: String,
+    /// The human-readable `name`, falling back to the id when the adapter
+    /// advertised no name. Never empty: a method that can be named neither way
+    /// is dropped rather than reported as a blank choice.
+    pub label: String,
+}
+
+/// The longest an advertised id or label may be before it is truncated.
+///
+/// Generous for a real method name (`Log in with Claude Code`) and far too
+/// short to be a useful place to smuggle a document.
+const MAX_AUTH_METHOD_FIELD: usize = 120;
+
+/// Read the advertised authentication methods out of an `initialize` result.
+///
+/// Tolerant by design: a missing `authMethods`, a non-array, or an entry that
+/// is not an object all yield "no methods advertised" rather than an error.
+/// The adapter has already answered `initialize` successfully at this point,
+/// and refusing to start over the shape of an optional advisory field would
+/// trade a working harness for a tidier parse.
+///
+/// Note that `lib.rs`'s `extract_auth_methods` reads the same field and is
+/// deliberately *not* this function: that one backs the `auth-methods`
+/// subcommand, which dumps the adapter's entries verbatim for an operator
+/// staring at a terminal. This one produces the bounded pair the runtime is
+/// allowed to carry around and encrypt to an owner.
+fn auth_methods_from_initialize(init_result: &serde_json::Value) -> Vec<AuthMethod> {
+    let bounded = |value: &str| {
+        let trimmed = value.trim();
+        (!trimmed.is_empty()).then(|| {
+            trimmed
+                .chars()
+                .take(MAX_AUTH_METHOD_FIELD)
+                .collect::<String>()
+        })
+    };
+    init_result
+        .get("authMethods")
+        .and_then(|methods| methods.as_array())
+        .map(|methods| {
+            methods
+                .iter()
+                .filter_map(|method| {
+                    let id = method.get("id").and_then(|v| v.as_str()).and_then(bounded);
+                    let name = method
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .and_then(bounded);
+                    // A method with neither an id nor a name names nothing an
+                    // owner could act on, so it is dropped rather than
+                    // reported as an unlabelled choice.
+                    let label = name.clone().or_else(|| id.clone())?;
+                    Some(AuthMethod {
+                        id: id.unwrap_or_else(|| label.clone()),
+                        label,
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Recursively merge `overlay` into `base`, with `overlay` winning on scalar/shape
@@ -658,7 +748,16 @@ impl AcpClient {
             goose_usage: UsageTracker::default(),
             adapter_identity: AdapterIdentity::from_command(command),
             pending_stage: AuthStage::Other,
+            auth_methods: Vec::new(),
         })
+    }
+
+    /// The authentication methods this adapter advertised at `initialize`.
+    ///
+    /// Empty before `initialize`, and empty for an adapter that advertised
+    /// none.
+    pub(crate) fn auth_methods(&self) -> &[AuthMethod] {
+        &self.auth_methods
     }
 
     /// The family the adapter reported for itself at `initialize`.
@@ -755,6 +854,11 @@ impl AcpClient {
         // later classification depends on knowing which adapter family this
         // process belongs to, and this is the only moment it tells us.
         self.adapter_identity.observe_initialize(&result);
+        // Kept for the same reason as the identity above: this is the only
+        // moment the adapter says how it can be re-authenticated, and the
+        // moment somebody needs to know is much later — see
+        // [`auth_methods`](Self::auth_methods).
+        self.auth_methods = auth_methods_from_initialize(&result);
         self.steering_supported = result
             .pointer("/_meta/steering/supported")
             .and_then(|v| v.as_bool())
@@ -2589,6 +2693,64 @@ mod tests {
         );
         assert_eq!(msg["jsonrpc"].as_str(), Some("2.0"));
         assert_eq!(msg["method"].as_str(), Some("session/cancel"));
+    }
+
+    /// The advertised methods are what an owner is told to do about a
+    /// lockout, so the label has to survive and the id has to stay usable.
+    #[test]
+    fn advertised_auth_methods_are_read_as_id_and_label() {
+        let methods = auth_methods_from_initialize(&serde_json::json!({
+            "authMethods": [
+                { "id": "claude-ai-login", "name": "Log in with Claude Code",
+                  "description": "ignored" },
+                // No name: the id is the only thing left to call it.
+                { "id": "api-key" },
+                // No id: still nameable, so still worth showing.
+                { "name": "Vertex AI" },
+                // Blank on both sides names nothing an owner could act on.
+                { "id": "  ", "name": "" },
+                // Not an object at all.
+                "nonsense",
+            ]
+        }));
+        assert_eq!(
+            methods,
+            vec![
+                AuthMethod {
+                    id: "claude-ai-login".into(),
+                    label: "Log in with Claude Code".into()
+                },
+                AuthMethod {
+                    id: "api-key".into(),
+                    label: "api-key".into()
+                },
+                AuthMethod {
+                    id: "Vertex AI".into(),
+                    label: "Vertex AI".into()
+                },
+            ]
+        );
+    }
+
+    /// An advisory field must never be able to fail a working handshake, and
+    /// must never become a place to park a document.
+    #[test]
+    fn a_hostile_or_absent_auth_methods_field_is_survivable() {
+        for absent in [
+            serde_json::json!({}),
+            serde_json::json!({ "authMethods": null }),
+            serde_json::json!({ "authMethods": "not an array" }),
+            serde_json::json!({ "authMethods": [] }),
+        ] {
+            assert!(auth_methods_from_initialize(&absent).is_empty(), "{absent}");
+        }
+
+        let huge = auth_methods_from_initialize(&serde_json::json!({
+            "authMethods": [{ "id": "x".repeat(10_000), "name": "y".repeat(10_000) }]
+        }));
+        assert_eq!(huge.len(), 1);
+        assert_eq!(huge[0].id.chars().count(), MAX_AUTH_METHOD_FIELD);
+        assert_eq!(huge[0].label.chars().count(), MAX_AUTH_METHOD_FIELD);
     }
 
     #[test]

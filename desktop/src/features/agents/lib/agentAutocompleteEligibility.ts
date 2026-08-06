@@ -57,10 +57,21 @@ export function getMentionableAgentPubkeys({
 export function isAgentIdentityInManagedList(
   candidate: { isAgent?: boolean; pubkey: string },
   managedAgentPubkeys: ReadonlySet<string>,
+  invocableAgentPubkeys?: ReadonlySet<string>,
 ) {
+  if (candidate.isAgent !== true) {
+    return true;
+  }
+  const normalized = normalizePubkey(candidate.pubkey);
+  // Managed is not the only way an agent identity is real. A relay-resident
+  // agent (provisioned outside this desktop, attributed via a NIP-OA owner
+  // tag) is on no managed list anywhere, and requiring one would hide every
+  // such agent the moment its attribution becomes verifiable — while an
+  // unattributed directory ghost should stay hidden. So: managed, or
+  // explicitly invocable for this user (`getMentionableAgentPubkeys`).
   return (
-    candidate.isAgent !== true ||
-    managedAgentPubkeys.has(normalizePubkey(candidate.pubkey))
+    managedAgentPubkeys.has(normalized) ||
+    invocableAgentPubkeys?.has(normalized) === true
   );
 }
 

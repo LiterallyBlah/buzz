@@ -13,6 +13,41 @@ const INACCESSIBLE_ACTIVITY_MESSAGE =
   "This agent is active in a channel you haven't joined, so its activity can't be opened from here.";
 
 /**
+ * The other way the ingress can come up empty, and a different sentence
+ * because it is a different fact about the world.
+ *
+ * INACCESSIBLE_ACTIVITY_MESSAGE says the destination exists and is closed to
+ * the viewer. This one says no destination was found at all: the agent has no
+ * working channel and no channel the viewer shares with it, which is the normal
+ * state for an agent whose work is announced against something other than a
+ * channel. Saying "a channel you haven't joined" there would invent a room to
+ * blame and send the reader looking for an invitation that was never the
+ * problem.
+ */
+const UNREACHABLE_ACTIVITY_MESSAGE =
+  "This agent's activity can't be opened from here.";
+
+/**
+ * Which warning a failed open should show.
+ *
+ * Split out from the click handler because the choice is the whole substance
+ * of the fix: the branch previously returned false and showed nothing whenever
+ * `hasWorkingChannels` was false, so a click on a working agent's name did
+ * nothing at all and looked like a dead button rather than a limitation. There
+ * is always something honest to say, and which sentence is honest depends only
+ * on this one input.
+ */
+export function resolveUnavailableActivityMessage({
+  hasWorkingChannels,
+}: {
+  hasWorkingChannels: boolean;
+}): string {
+  return hasWorkingChannels
+    ? INACCESSIBLE_ACTIVITY_MESSAGE
+    : UNREACHABLE_ACTIVITY_MESSAGE;
+}
+
+/**
  * Can the viewer actually open this channel? Joined channels always;
  * open-visibility channels are readable without joining. Channels missing
  * from the viewer's channel list (e.g. private rooms they aren't in) are
@@ -163,12 +198,16 @@ export function useOpenAgentActivity() {
         void goChannel(channelId, { agentSession: pubkey });
         return true;
       }
-      // The agent may be working somewhere, just nowhere the viewer can open.
-      // Say so plainly rather than failing silently — without leaking which
-      // room, or navigating into it.
-      if (getAgentWorkingState(pubkey).channels.length > 0) {
-        toast.warning(INACCESSIBLE_ACTIVITY_MESSAGE);
-      }
+      // Nowhere to go. Say so plainly rather than failing silently — without
+      // leaking which room, or navigating into it. The unconditional warning
+      // is the point: a route with no AgentSessionProvider and an agent with
+      // no shared channel used to fall off the end of this function in
+      // silence, which is indistinguishable from a broken button.
+      toast.warning(
+        resolveUnavailableActivityMessage({
+          hasWorkingChannels: getAgentWorkingState(pubkey).channels.length > 0,
+        }),
+      );
       return false;
     },
     [findOpenableChannel, goChannel, onOpenAgentSession, resolveChannelId],

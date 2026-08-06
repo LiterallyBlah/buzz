@@ -72,11 +72,24 @@ in the reference implementation, the `title` of the ACP `session/update`
 transport traffic: "the harness read a line from the agent" is not "the agent is
 reading files", and a caption built that way is true only by coincidence.
 
-Because the label originates with the agent it is free text, and it is published
-to everyone who can read the issue. A publisher MUST flatten it to one line —
-whitespace runs collapsed, control characters removed — and bound its length;
-the reference implementation caps it at 80 characters. A label left with nothing
-in it after flattening MUST be omitted rather than published blank.
+**Command execution is the exception, and it is a MUST.** For a tool call of
+`kind` `execute` the title is not a description of the work — it is the command
+line. A publisher MUST NOT put it on the wire. This event is unencrypted and
+readable by everyone who can read the issue, so a quoted command line discloses
+absolute paths, environment variable names, hostnames and flags from a machine
+nobody chose to publish by filing an issue; it is also unreadable, since the
+caption renders as one short line and a wrapped invocation truncates to noise.
+The reference implementation publishes `running a command`, optionally suffixed
+with the command's first token when that token is a bare program name — no
+path separator, no `=`, at most 20 characters, and not a wrapper such as `env`
+or `sudo` — giving `running a command (cargo)`. Anything else gets the bare
+label.
+
+Because the label otherwise originates with the agent it is free text, and it is
+published to everyone who can read the issue. A publisher MUST flatten it to one
+line — whitespace runs collapsed, control characters removed — and bound its
+length; the reference implementation caps it at 80 characters. A label left with
+nothing in it after flattening MUST be omitted rather than published blank.
 
 **There is no `h`.** A receiver MUST refuse an event carrying one rather than
 guessing which binding wins — an activity event that names both a channel and a

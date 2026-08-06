@@ -526,6 +526,45 @@ fn advance_query_cursor(
     Ok(())
 }
 
+/// Where the NIP-OA `auth` tag on an event signed by
+/// [`BuzzClient::sign_event_preserving_attestation`] came from.
+///
+/// A rewrite of a replaceable event this identity already published replaces
+/// the previous revision wholesale, tags included. Reporting the provenance of
+/// the attestation lets the caller tell "there was never one" apart from
+/// "there was one and we could not carry it".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AttestationSource {
+    /// Neither this process nor the previous revision supplied an attestation.
+    None,
+    /// Injected from this process's own configured NIP-OA tag (`BUZZ_AUTH_TAG`).
+    Configured,
+    /// Carried verbatim from the previous revision after
+    /// `nip_oa::verify_auth_tag` confirmed it attests *this* identity's pubkey.
+    /// `owner_pubkey` is the hex owner key recovered from that verification.
+    Preserved { owner_pubkey: String },
+    /// The previous revision carried at least one `auth` tag, none of which
+    /// verified against this identity. Nothing was carried forward.
+    Unverifiable { reason: String },
+}
+
+/// Extract the `auth` tags of a raw relay event as their string elements.
+fn event_auth_tag_elements(event: &serde_json::Value) -> Vec<Vec<String>> {
+    let Some(tags) = event.get("tags").and_then(serde_json::Value::as_array) else {
+        return Vec::new();
+    };
+    tags.iter()
+        .filter_map(|tag| {
+            let elements: Vec<String> = tag
+                .as_array()?
+                .iter()
+                .map(|element| element.as_str().map(str::to_string))
+                .collect::<Option<Vec<String>>>()?;
+            (elements.first().map(String::as_str) == Some("auth")).then_some(elements)
+        })
+        .collect()
+}
+
 pub struct BuzzClient {
     http: reqwest::Client,
     relay_url: String, // base URL, no trailing slash, e.g. "https://relay.buzz.place"
@@ -594,22 +633,35 @@ impl BuzzClient {
     /// auth tag injection. Callers MUST NOT add `auth` tags to the builder
     /// before calling this method.
     pub fn sign_event(&self, builder: EventBuilder) -> Result<nostr::Event, CliError> {
-        let builder = if let Some(ref tag) = self.auth_tag {
-            builder.tags([tag.clone()])
-        } else {
-            builder
+        self.sign_with_attestation(builder, self.auth_tag.clone())
+    }
+
+    /// Sign `builder`, attaching `attestation` as the event's sole `auth` tag.
+    ///
+    /// This is the single producer of `auth` tags on signed events: every
+    /// public signing entry point resolves *which* attestation applies and
+    /// hands it here, so the "exactly one auth tag, and only the one we chose"
+    /// invariant is checked in one place rather than per call site.
+    fn sign_with_attestation(
+        &self,
+        builder: EventBuilder,
+        attestation: Option<Tag>,
+    ) -> Result<nostr::Event, CliError> {
+        let expected = usize::from(attestation.is_some());
+        let builder = match attestation {
+            Some(tag) => builder.tags([tag]),
+            None => builder,
         };
         let event = builder
             .sign_with_keys(&self.keys)
             .map_err(|e| CliError::Other(format!("signing failed: {e}")))?;
 
-        // Enforce: auth tags may only come from self.auth_tag injection.
+        // Enforce: auth tags may only come from the resolved attestation.
         let auth_count = event
             .tags
             .iter()
             .filter(|t| t.as_slice().first().map(|s| s.as_str()) == Some("auth"))
             .count();
-        let expected = if self.auth_tag.is_some() { 1 } else { 0 };
         if auth_count != expected {
             return Err(CliError::Other(format!(
                 "event has {auth_count} auth tags — expected {expected}; \
@@ -618,6 +670,97 @@ impl BuzzClient {
         }
 
         Ok(event)
+    }
+
+    /// Sign a rewrite of a replaceable event this identity already published,
+    /// keeping the NIP-OA owner attestation the previous revision carried.
+    ///
+    /// A replaceable-event rewrite (kind:0 being the one that matters) replaces
+    /// the stored event wholesale — tags included. [`sign_event`] can only
+    /// re-attach an attestation when the invoking process has one of its own
+    /// (`BUZZ_AUTH_TAG`), so a rewrite from a process without that variable
+    /// silently publishes a revision with no `auth` tag and de-attributes the
+    /// identity from its owner. Merging the previous revision's *content*
+    /// fields without also merging its attestation is not a merge.
+    ///
+    /// Precedence:
+    ///
+    /// 1. This process's own configured tag, when set — unchanged from
+    ///    [`sign_event`].
+    /// 2. Otherwise an `auth` tag on `previous_event`, but only one that
+    ///    `nip_oa::verify_auth_tag` accepts *against this identity's own
+    ///    pubkey*. That is the same check consumers apply (the desktop's
+    ///    `profile_valid_oa_owner_pubkey` calls the same function against the
+    ///    profile author), and it needs no key we do not hold: the NIP-OA
+    ///    preimage is `nostr:agent-auth:<agent_pubkey>:<conditions>`, so an
+    ///    attestation is bound to the agent identity rather than to any one
+    ///    event, and re-publishing it verbatim asserts nothing that was not
+    ///    already proven. An unverifiable tag is never carried.
+    ///
+    /// Returns the signed event and the provenance of its attestation so the
+    /// caller can report a dropped-but-unverifiable tag rather than swallow it.
+    pub fn sign_event_preserving_attestation(
+        &self,
+        builder: EventBuilder,
+        previous_event: Option<&serde_json::Value>,
+    ) -> Result<(nostr::Event, AttestationSource), CliError> {
+        let (attestation, source) = self.resolve_carried_attestation(previous_event);
+        let event = self.sign_with_attestation(builder, attestation)?;
+        Ok((event, source))
+    }
+
+    /// Decide which attestation a rewrite of `previous_event` should carry.
+    /// See [`sign_event_preserving_attestation`](Self::sign_event_preserving_attestation)
+    /// for the precedence rules.
+    fn resolve_carried_attestation(
+        &self,
+        previous_event: Option<&serde_json::Value>,
+    ) -> (Option<Tag>, AttestationSource) {
+        if let Some(tag) = self.auth_tag.clone() {
+            return (Some(tag), AttestationSource::Configured);
+        }
+        let Some(previous_event) = previous_event else {
+            return (None, AttestationSource::None);
+        };
+
+        let my_pubkey = self.keys.public_key();
+        let mut rejection: Option<String> = None;
+        for elements in event_auth_tag_elements(previous_event) {
+            let json = match serde_json::to_string(&elements) {
+                Ok(json) => json,
+                Err(e) => {
+                    rejection.get_or_insert(e.to_string());
+                    continue;
+                }
+            };
+            let owner = match buzz_sdk::nip_oa::verify_auth_tag(&json, &my_pubkey) {
+                Ok(owner) => owner,
+                Err(e) => {
+                    rejection.get_or_insert(e.to_string());
+                    continue;
+                }
+            };
+            // Carry the tag verbatim: the bytes that verified are the bytes we
+            // re-publish, so the revision cannot assert more than the original.
+            match Tag::parse(elements) {
+                Ok(tag) => {
+                    return (
+                        Some(tag),
+                        AttestationSource::Preserved {
+                            owner_pubkey: owner.to_hex(),
+                        },
+                    )
+                }
+                Err(e) => {
+                    rejection.get_or_insert(e.to_string());
+                }
+            }
+        }
+
+        match rejection {
+            Some(reason) => (None, AttestationSource::Unverifiable { reason }),
+            None => (None, AttestationSource::None),
+        }
     }
 
     /// Attach the `x-auth-tag` header if configured (NIP-OA relay membership delegation).
@@ -2316,7 +2459,8 @@ mod retry_policy_tests {
 #[cfg(test)]
 mod tests {
     use super::{
-        advance_query_cursor, create_response_with_id, extract_relay_response_field, BuzzClient,
+        advance_query_cursor, create_response_with_id, extract_relay_response_field,
+        AttestationSource, BuzzClient,
     };
     use nostr::{EventBuilder, Keys, Kind, Tag};
 
@@ -2387,6 +2531,229 @@ mod tests {
         let json = serde_json::to_string(&tag_vec).unwrap();
         let tag = Tag::parse(tag_vec).unwrap();
         (tag, json)
+    }
+
+    // --- NIP-OA attestation carry-over on replaceable-event rewrites ---
+
+    /// A raw kind:0 event authored by `agent_keys` carrying `auth_tags`.
+    fn published_profile(
+        agent_keys: &Keys,
+        auth_tags: Vec<serde_json::Value>,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "pubkey": agent_keys.public_key().to_hex(),
+            "kind": 0,
+            "created_at": 100,
+            "content": r#"{"display_name":"Hermes"}"#,
+            "tags": auth_tags,
+        })
+    }
+
+    /// The NIP-OA tag `owner_keys` would publish for `agent_keys`, as JSON.
+    fn attestation_for(owner_keys: &Keys, agent_keys: &Keys) -> serde_json::Value {
+        let json =
+            buzz_sdk::nip_oa::compute_auth_tag(owner_keys, &agent_keys.public_key(), "kind=0")
+                .unwrap();
+        serde_json::from_str(&json).unwrap()
+    }
+
+    fn auth_tags_of(event: &nostr::Event) -> Vec<&Tag> {
+        event
+            .tags
+            .iter()
+            .filter(|t| t.as_slice().first().map(|s| s.as_str()) == Some("auth"))
+            .collect()
+    }
+
+    fn unauthenticated_client(keys: Keys) -> BuzzClient {
+        BuzzClient::new("https://test.relay".into(), keys, None, None).unwrap()
+    }
+
+    /// The regression this whole seam exists for: an agent rewriting its own
+    /// profile from a process with no `BUZZ_AUTH_TAG` must not publish a
+    /// revision that has lost the owner attestation the previous one proved.
+    #[test]
+    fn rewrite_without_configured_tag_preserves_published_attestation() {
+        let owner_keys = Keys::generate();
+        let agent_keys = Keys::generate();
+        let attestation = attestation_for(&owner_keys, &agent_keys);
+        let previous = published_profile(&agent_keys, vec![attestation.clone()]);
+        let client = unauthenticated_client(agent_keys.clone());
+
+        let builder = EventBuilder::new(Kind::Custom(0), r#"{"about":"Renamed"}"#).tags([]);
+        let (event, source) = client
+            .sign_event_preserving_attestation(builder, Some(&previous))
+            .unwrap();
+
+        assert_eq!(
+            source,
+            AttestationSource::Preserved {
+                owner_pubkey: owner_keys.public_key().to_hex(),
+            }
+        );
+        let carried = auth_tags_of(&event);
+        assert_eq!(carried.len(), 1, "expected exactly one auth tag");
+        assert_eq!(
+            serde_json::to_value(carried[0].as_slice()).unwrap(),
+            attestation,
+            "the attestation must be re-published verbatim"
+        );
+        // And it still satisfies the check every consumer applies.
+        let owner = buzz_sdk::nip_oa::verify_auth_tag(
+            &serde_json::to_string(carried[0].as_slice()).unwrap(),
+            &agent_keys.public_key(),
+        )
+        .expect("carried attestation must verify against the agent identity");
+        assert_eq!(owner, owner_keys.public_key());
+    }
+
+    /// `sign_event` is the unguarded path: proving it still strips the
+    /// attestation is what makes the test above a regression test rather than
+    /// a restatement of behaviour that was already correct.
+    #[test]
+    fn plain_sign_event_drops_published_attestation_without_configured_tag() {
+        let owner_keys = Keys::generate();
+        let agent_keys = Keys::generate();
+        let _previous =
+            published_profile(&agent_keys, vec![attestation_for(&owner_keys, &agent_keys)]);
+        let client = unauthenticated_client(agent_keys);
+
+        let builder = EventBuilder::new(Kind::Custom(0), r#"{"about":"Renamed"}"#).tags([]);
+        let event = client.sign_event(builder).unwrap();
+
+        assert!(
+            auth_tags_of(&event).is_empty(),
+            "sign_event has no access to the previous revision and cannot carry its tag"
+        );
+    }
+
+    /// An attestation naming a *different* agent proves nothing about us, so it
+    /// is reported rather than re-published under our own key.
+    #[test]
+    fn rewrite_refuses_attestation_that_names_another_agent() {
+        let owner_keys = Keys::generate();
+        let other_agent_keys = Keys::generate();
+        let agent_keys = Keys::generate();
+        let previous = published_profile(
+            &agent_keys,
+            vec![attestation_for(&owner_keys, &other_agent_keys)],
+        );
+        let client = unauthenticated_client(agent_keys);
+
+        let builder = EventBuilder::new(Kind::Custom(0), r#"{"about":"Renamed"}"#).tags([]);
+        let (event, source) = client
+            .sign_event_preserving_attestation(builder, Some(&previous))
+            .unwrap();
+
+        assert!(
+            matches!(source, AttestationSource::Unverifiable { .. }),
+            "expected Unverifiable, got {source:?}"
+        );
+        assert!(auth_tags_of(&event).is_empty());
+    }
+
+    /// Structurally well-formed but cryptographically bogus: the shape the
+    /// `make_auth_tag` fixture produces. Carrying it would launder a forgery.
+    #[test]
+    fn rewrite_refuses_attestation_whose_signature_does_not_verify() {
+        let agent_keys = Keys::generate();
+        let (_tag, json) = make_auth_tag();
+        let bogus: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let previous = published_profile(&agent_keys, vec![bogus]);
+        let client = unauthenticated_client(agent_keys);
+
+        let builder = EventBuilder::new(Kind::Custom(0), r#"{"about":"Renamed"}"#).tags([]);
+        let (event, source) = client
+            .sign_event_preserving_attestation(builder, Some(&previous))
+            .unwrap();
+
+        assert!(
+            matches!(source, AttestationSource::Unverifiable { .. }),
+            "expected Unverifiable, got {source:?}"
+        );
+        assert!(auth_tags_of(&event).is_empty());
+    }
+
+    /// A valid attestation buried behind a junk one is still found.
+    #[test]
+    fn rewrite_preserves_valid_attestation_alongside_an_invalid_one() {
+        let owner_keys = Keys::generate();
+        let agent_keys = Keys::generate();
+        let (_tag, junk_json) = make_auth_tag();
+        let junk: serde_json::Value = serde_json::from_str(&junk_json).unwrap();
+        let valid = attestation_for(&owner_keys, &agent_keys);
+        let previous = published_profile(&agent_keys, vec![junk, valid.clone()]);
+        let client = unauthenticated_client(agent_keys);
+
+        let builder = EventBuilder::new(Kind::Custom(0), r#"{"about":"Renamed"}"#).tags([]);
+        let (event, source) = client
+            .sign_event_preserving_attestation(builder, Some(&previous))
+            .unwrap();
+
+        assert_eq!(
+            source,
+            AttestationSource::Preserved {
+                owner_pubkey: owner_keys.public_key().to_hex(),
+            }
+        );
+        let carried = auth_tags_of(&event);
+        assert_eq!(carried.len(), 1);
+        assert_eq!(
+            serde_json::to_value(carried[0].as_slice()).unwrap(),
+            valid,
+            "the verified tag, not the junk one, must be the one carried"
+        );
+    }
+
+    /// The invoking process's own tag still wins, and still lands exactly once.
+    #[test]
+    fn configured_tag_wins_over_the_published_one() {
+        let owner_keys = Keys::generate();
+        let agent_keys = Keys::generate();
+        let previous =
+            published_profile(&agent_keys, vec![attestation_for(&owner_keys, &agent_keys)]);
+        let (configured_tag, configured_json) = make_auth_tag();
+        let client = BuzzClient::new(
+            "https://test.relay".into(),
+            agent_keys,
+            Some(configured_tag),
+            Some(configured_json),
+        )
+        .unwrap();
+
+        let builder = EventBuilder::new(Kind::Custom(0), r#"{"about":"Renamed"}"#).tags([]);
+        let (event, source) = client
+            .sign_event_preserving_attestation(builder, Some(&previous))
+            .unwrap();
+
+        assert_eq!(source, AttestationSource::Configured);
+        let carried = auth_tags_of(&event);
+        assert_eq!(carried.len(), 1, "the two tags must not both land");
+        assert_eq!(carried[0].as_slice()[1], "a".repeat(64));
+    }
+
+    /// A person's profile has no attestation; nothing is invented for it.
+    #[test]
+    fn rewrite_of_an_unattested_profile_carries_nothing() {
+        let keys = Keys::generate();
+        let previous = published_profile(&keys, vec![]);
+        let client = unauthenticated_client(keys);
+
+        let builder = EventBuilder::new(Kind::Custom(0), r#"{"about":"Renamed"}"#).tags([]);
+        let (event, source) = client
+            .sign_event_preserving_attestation(builder, Some(&previous))
+            .unwrap();
+
+        assert_eq!(source, AttestationSource::None);
+        assert!(auth_tags_of(&event).is_empty());
+
+        // Same for a first-ever profile, where there is no previous revision.
+        let builder = EventBuilder::new(Kind::Custom(0), r#"{"about":"New"}"#).tags([]);
+        let (event, source) = client
+            .sign_event_preserving_attestation(builder, None)
+            .unwrap();
+        assert_eq!(source, AttestationSource::None);
+        assert!(auth_tags_of(&event).is_empty());
     }
 
     #[test]

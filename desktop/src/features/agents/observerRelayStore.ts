@@ -117,6 +117,76 @@ const knownAgentPubkeys = new Set<string>();
 const knownAgentsBySubscription = new Map<string, Set<string>>();
 const pendingUnknownAgentFrames: RelayEvent[] = [];
 
+/**
+ * Observer frames the ingest gate refused, keyed by normalized agent pubkey.
+ *
+ * A frame reaching this app is already `#p`-addressed to our own identity, so
+ * a refusal here means the relay routed us telemetry for an agent we cannot
+ * attribute to ourselves — in practice, an agent whose kind:0 carries no valid
+ * NIP-OA `auth` tag naming us as owner, since `combineObserverIngestionAgents`
+ * is the only production path into `knownAgentPubkeys` and it admits an
+ * externally-supervised agent solely on that attestation.
+ *
+ * Recording it is what makes the gate's failure distinguishable from an idle
+ * agent. Without this, `hasObserver` stays false, the connection state stays
+ * "open", and the panel reads as merely quiet forever — which is what made
+ * this class of misconfiguration expensive to diagnose from the UI alone.
+ *
+ * Only populated once the trusted set is genuinely non-empty: while it is
+ * still empty at startup the frame is buffered instead (see
+ * `pendingUnknownAgentFrames`), so a startup race is never reported as
+ * misconfiguration. An entry is dropped as soon as its agent becomes trusted,
+ * which also clears the narrower race where the trusted set is populated by
+ * managed agents before a relay agent's profile has loaded.
+ */
+export type UnattributedAgentFrames = {
+  /** Normalized pubkey of the agent whose frames were refused. */
+  agentPubkey: string;
+  /** How many of its frames have been dropped since the last store reset. */
+  droppedFrames: number;
+  /** `created_at` (unix seconds) of the most recently dropped frame. */
+  lastFrameAt: number;
+};
+
+const unattributedAgentFrames = new Map<string, UnattributedAgentFrames>();
+
+/** Agents already reported to the console, so the warning fires once each. */
+const warnedUnattributedAgents = new Set<string>();
+
+function recordUnattributedAgentFrame(agentPubkey: string, event: RelayEvent) {
+  const key = normalizePubkey(agentPubkey);
+  const previous = unattributedAgentFrames.get(key);
+  // Replace rather than mutate: `getUnattributedAgentFrames` is a
+  // useSyncExternalStore snapshot source and must return a new reference only
+  // when the value actually changed.
+  unattributedAgentFrames.set(key, {
+    agentPubkey: key,
+    droppedFrames: (previous?.droppedFrames ?? 0) + 1,
+    lastFrameAt: event.created_at,
+  });
+  if (!warnedUnattributedAgents.has(key)) {
+    warnedUnattributedAgents.add(key);
+    console.warn(
+      `[observerRelayStore] Dropped an observer frame addressed to this identity for agent ${key}: ` +
+        "it is not in the trusted agent set, so the frame was discarded before decryption. " +
+        "Its kind:0 profile most likely carries no valid NIP-OA owner attestation naming this " +
+        "account — re-publish the agent's profile with its auth tag to restore its activity feed.",
+    );
+  }
+  notifyListeners();
+}
+
+/**
+ * Read the refused-frame record for an agent, or `null` when none of its
+ * frames have been dropped. Reactive via `subscribeAgentObserverStore`.
+ */
+export function getUnattributedAgentFrames(
+  agentPubkey?: string | null,
+): UnattributedAgentFrames | null {
+  if (!agentPubkey) return null;
+  return unattributedAgentFrames.get(normalizePubkey(agentPubkey)) ?? null;
+}
+
 // Callback invoked when session_config_captured is received, so React Query
 // can invalidate the config-surface query for the affected agent. Wired up
 // by useManagedAgentObserverBridge via setSessionConfigCapturedCallback.
@@ -146,6 +216,15 @@ function registerKnownAgents(
     new Set(pubkeys.map((pubkey) => normalizePubkey(pubkey))),
   );
   recomputeKnownAgentPubkeys();
+  // An agent that has just become trusted is no longer unattributed — clear
+  // its refusal record so a race between the trusted set filling and its
+  // frames arriving cannot leave a stale "unattributed" claim on the panel.
+  for (const pubkey of knownAgentPubkeys) {
+    if (unattributedAgentFrames.delete(pubkey)) {
+      warnedUnattributedAgents.delete(pubkey);
+      notifyListeners();
+    }
+  }
   if (knownAgentPubkeys.size > 0 && pendingUnknownAgentFrames.length > 0) {
     const pending = pendingUnknownAgentFrames.splice(0);
     for (const event of pending) {
@@ -357,7 +436,12 @@ async function handleRelayObserverEvent(
       if (pendingUnknownAgentFrames.length > MAX_PENDING_UNKNOWN_AGENT_FRAMES) {
         pendingUnknownAgentFrames.shift();
       }
+      return;
     }
+    // The trusted set is populated and this agent is not in it. The gate holds
+    // — we still never decrypt — but the drop is recorded so the UI can say
+    // "unattributed" instead of rendering silence as idleness.
+    recordUnattributedAgentFrame(agentPubkey, event);
     return;
   }
 
@@ -756,6 +840,8 @@ export function resetAgentObserverStore() {
   knownAgentPubkeys.clear();
   knownAgentsBySubscription.clear();
   pendingUnknownAgentFrames.length = 0;
+  unattributedAgentFrames.clear();
+  warnedUnattributedAgents.clear();
   latestLiveSessionByAgentChannel.clear();
   agentManagementListeners.clear();
   onSessionConfigCaptured = null;
@@ -775,6 +861,18 @@ export function _testRegisterKnownAgents(
   pubkeys: readonly string[],
 ): void {
   registerKnownAgents(subscriptionId, pubkeys);
+}
+
+/**
+ * Test-only: drive the live relay frame handler directly, as the relay
+ * subscription callback does. Exercises the real ingest gate — including the
+ * startup buffering branch and the unattributed-agent record — rather than a
+ * re-implementation of it. Only call from tests.
+ */
+export function _testHandleRelayObserverEvent(
+  event: RelayEvent,
+): Promise<void> {
+  return handleRelayObserverEvent(event, generation);
 }
 
 /**

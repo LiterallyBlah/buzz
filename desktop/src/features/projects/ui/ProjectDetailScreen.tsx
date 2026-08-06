@@ -1,7 +1,6 @@
 import {
   ArrowLeft,
   ChevronRight,
-  ExternalLink,
   FolderGit2,
   MessageSquare,
 } from "lucide-react";
@@ -9,7 +8,14 @@ import * as React from "react";
 import { toast } from "sonner";
 
 import { useAppNavigation } from "@/app/navigation/useAppNavigation";
+import {
+  useManagedAgentsQuery,
+  useRelayAgentsQuery,
+} from "@/features/agents/hooks";
+import { resolveAgentSessionPaneAgent } from "@/features/agents/ui/agentSessionPaneAgent";
 import { useOpenDmMutation } from "@/features/channels/hooks";
+import { AgentSessionThreadPanel } from "@/features/channels/ui/AgentSessionThreadPanel";
+import { buildChannelAgentSessionCandidates } from "@/features/channels/ui/useChannelAgentSessions";
 import {
   type Project,
   useProjectQuery,
@@ -34,7 +40,10 @@ import { useProjectRepositoryRefSelection } from "@/features/projects/useProject
 import { useUpdateProjectPullRequestMutation } from "@/features/projects/pullRequestMutations";
 import { useCreateProjectIssueMutation } from "@/features/projects/issueMutations";
 import { useProfileQuery, useUsersBatchQuery } from "@/features/profile/hooks";
-import { mergeCurrentProfileIntoLookup } from "@/features/profile/lib/identity";
+import {
+  mergeCurrentProfileIntoLookup,
+  resolveUserLabel,
+} from "@/features/profile/lib/identity";
 import {
   type ProfilePanelTab,
   type ProfilePanelView,
@@ -55,6 +64,7 @@ import {
 import { useMeasuredCssVariable } from "@/shared/layout/useMeasuredCssVariable";
 import { cn } from "@/shared/lib/cn";
 import { isSafeUrl } from "@/shared/lib/url";
+import { AgentSessionProvider } from "@/shared/context/AgentSessionContext";
 import { ProfilePanelProvider } from "@/shared/context/ProfilePanelContext";
 import { useHistorySearchState } from "@/shared/hooks/useHistorySearchState";
 import { useThreadPanelWidth } from "@/shared/hooks/useThreadPanelWidth";
@@ -78,6 +88,7 @@ import {
 } from "./useOpenProjectTerminal";
 import type { CreateIssueDialogInput } from "./CreateIssueDialog";
 import { ProjectBranchActionDialogs } from "./ProjectBranchActionDialogs";
+import { ProjectDetailHero } from "./ProjectDetailHero";
 import {
   PROJECT_TAB_CRUMB_LABELS,
   projectPeople,
@@ -93,6 +104,11 @@ type ProjectDetailScreenProps = {
 };
 
 const PROJECT_DETAIL_PANEL_SEARCH_KEYS = [
+  // The agent whose ACP activity pane is open, by pubkey. URL-backed for the
+  // same reason `profile` is: these are panes a reader lands in and then wants
+  // to leave with the back button, and a pane held in component state would
+  // instead let back throw away the whole project route.
+  "agentSession",
   "profile",
   "profileTab",
   "profileView",
@@ -445,6 +461,13 @@ export function ProjectDetailScreen(props: ProjectDetailScreenProps) {
       return currentSource;
     });
   }, [hasLocalCheckout, hasRemoteSnapshot, selectedTag]);
+  const { applyPatch, values } = useHistorySearchState(
+    PROJECT_DETAIL_PANEL_SEARCH_KEYS,
+  );
+  const agentSessionPubkey = values.agentSession;
+  const profilePanelPubkey = values.profile;
+  const profilePanelTab = profilePanelTabFromSearch(values.profileTab);
+  const profilePanelView = profilePanelViewFromSearch(values.profileView);
   const peoplePubkeys = React.useMemo(() => {
     if (!project) return [];
     // Include PR authors/updaters so commit rows can resolve avatars for
@@ -468,9 +491,16 @@ export function ProjectDetailScreen(props: ProjectDetailScreenProps) {
         ...projectPeople(project),
         ...pullRequestPubkeys,
         ...issuePubkeys,
+        // The agent whose activity pane is open. It is usually already here as
+        // an issue recipient or commenter, but an agent that only ever
+        // announced turns is in none of those lists — and that agent is
+        // exactly the one whose pane a reader opens from the working
+        // indicator. Without this its header would fall back to a truncated
+        // pubkey while the indicator two panes over shows its name.
+        ...(agentSessionPubkey ? [agentSessionPubkey] : []),
       ]),
     ];
-  }, [issuesQuery.data, project, pullRequestsQuery.data]);
+  }, [agentSessionPubkey, issuesQuery.data, project, pullRequestsQuery.data]);
   const profilesQuery = useUsersBatchQuery(peoplePubkeys, {
     enabled: peoplePubkeys.length > 0,
   });
@@ -494,15 +524,66 @@ export function ProjectDetailScreen(props: ProjectDetailScreenProps) {
       email: gitIdentityQuery.data.email,
     };
   }, [gitIdentityQuery.data, identityQuery.data?.pubkey]);
-  const { applyPatch, values } = useHistorySearchState(
-    PROJECT_DETAIL_PANEL_SEARCH_KEYS,
+  // Only fetched while a pane is open. Both rosters are app-wide polling
+  // queries, and a project route that never opens an activity pane has no
+  // reason to hold either subscription — the pane is the only consumer here.
+  const agentSessionOpen = Boolean(agentSessionPubkey);
+  const managedAgentsQuery = useManagedAgentsQuery({
+    enabled: agentSessionOpen,
+  });
+  const relayAgentsQuery = useRelayAgentsQuery({ enabled: agentSessionOpen });
+  /**
+   * The agent the pane describes.
+   *
+   * Resolved rather than looked up, because the lookup is allowed to miss: a
+   * project turn names its agent by pubkey alone, and agents provisioned by
+   * hand as relay members appear on neither roster. See
+   * resolveAgentSessionPaneAgent for what the synthesized descriptor asserts
+   * and why a miss must still open a live pane.
+   */
+  const agentSessionAgent = React.useMemo(() => {
+    if (!agentSessionPubkey) return null;
+    return resolveAgentSessionPaneAgent({
+      candidates: buildChannelAgentSessionCandidates({
+        managedAgents: managedAgentsQuery.data ?? [],
+        relayAgents: relayAgentsQuery.data ?? [],
+      }),
+      // The same label the working indicator rendered, so the pane the click
+      // opens is headed by the name that was clicked.
+      fallbackName: resolveUserLabel({ profiles, pubkey: agentSessionPubkey }),
+      pubkey: agentSessionPubkey,
+    });
+  }, [
+    agentSessionPubkey,
+    managedAgentsQuery.data,
+    profiles,
+    relayAgentsQuery.data,
+  ]);
+  // The two panes share one column, so opening either closes the other. Done
+  // in a single patch so the swap is one history entry and back returns to the
+  // pane the reader came from rather than to an intermediate empty state.
+  const handleOpenAgentSession = React.useCallback(
+    (pubkey: string) =>
+      applyPatch({
+        agentSession: pubkey,
+        profile: null,
+        profileTab: null,
+        profileView: null,
+      }),
+    [applyPatch],
   );
-  const profilePanelPubkey = values.profile;
-  const profilePanelTab = profilePanelTabFromSearch(values.profileTab);
-  const profilePanelView = profilePanelViewFromSearch(values.profileView);
+  const handleCloseAgentSession = React.useCallback(
+    () => applyPatch({ agentSession: null }),
+    [applyPatch],
+  );
   const handleOpenProfilePanel = React.useCallback(
     (pubkey: string) =>
-      applyPatch({ profile: pubkey, profileTab: null, profileView: null }),
+      applyPatch({
+        agentSession: null,
+        profile: pubkey,
+        profileTab: null,
+        profileView: null,
+      }),
     [applyPatch],
   );
   const handleCloseProfilePanel = React.useCallback(
@@ -656,10 +737,20 @@ export function ProjectDetailScreen(props: ProjectDetailScreenProps) {
       sourceBranch: string;
       sourceCloneUrl: string;
       targetBranch: string;
+      targetCloneUrl: string | null;
     }) => {
-      const targetCloneUrl = project?.cloneUrls[0];
+      // The selection's own clone URL first; the button-resolved fallback
+      // (from the PR's tags, gated on it naming this repo) covers the cold
+      // deep-link whose relay-origin race froze cloneUrls empty. When both
+      // are missing the failure is the repo's reachability, and the error
+      // says so instead of blaming a selection that exists.
+      const targetCloneUrl = project?.cloneUrls[0] ?? input.targetCloneUrl;
       if (!project || !targetCloneUrl) {
-        throw new Error("No project selected.");
+        throw new Error(
+          project
+            ? "This project has no clone URL. Add a clone URL to the repository announcement, or reconnect to the relay that hosts it."
+            : "No project selected.",
+        );
       }
       return openProjectMergeRecoveryTerminal({
         ...input,
@@ -730,6 +821,10 @@ export function ProjectDetailScreen(props: ProjectDetailScreenProps) {
     null;
   const selectedIssue =
     issuesQuery.data?.find((item) => item.id === selectedIssueId) ?? null;
+  // Issues only, for now. A pull request detail is still a tall document —
+  // review timeline, commits, files changed — that needs the page to scroll,
+  // and folding it onto the same shell is the second phase of this work.
+  const issueOwnsScroll = Boolean(selectedIssue) && !selectedPullRequest;
   const displayedSnapshotCommits =
     repoSource === "local"
       ? (localRepoSnapshotQuery.data?.snapshot.commits ?? [])
@@ -776,224 +871,244 @@ export function ProjectDetailScreen(props: ProjectDetailScreenProps) {
   };
 
   return (
-    <ProfilePanelProvider onOpenProfilePanel={handleOpenProfilePanel}>
-      <ProjectBranchActionDialogs
-        actions={branchActions}
-        activeBranch={activeBranch}
-        activeBranchCommit={activeBranchCommit}
-        existingBranches={branchOptionsWithLocal}
-      />
-      <div className="flex min-h-0 min-w-0 flex-1 flex-row overflow-hidden">
-        <div className="relative flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
-          <div
-            className={cn(
-              "pointer-events-none relative z-30 overflow-hidden rounded-tl-xl bg-background/80 backdrop-blur-md supports-backdrop-filter:bg-background/70 dark:bg-background/70 dark:backdrop-blur-xl dark:supports-backdrop-filter:bg-background/55",
-              channelChrome.negativeMargin,
-              topChromeInset.divider,
-            )}
-            ref={projectDetailHeaderChromeRef}
-          >
+    // The activity indicator on an issue or pull request calls
+    // `openAgentActivity(pubkey)` from useOpenAgentActivity, which prefers this
+    // context handler over navigating anywhere. Providing it here is what makes
+    // the pane open in place; without it the hook falls back to finding a
+    // channel the agent works in, and a project turn is scoped to an issue
+    // root, not to any channel, so on this route there is nothing to find.
+    <AgentSessionProvider onOpenAgentSession={handleOpenAgentSession}>
+      <ProfilePanelProvider onOpenProfilePanel={handleOpenProfilePanel}>
+        <ProjectBranchActionDialogs
+          actions={branchActions}
+          activeBranch={activeBranch}
+          activeBranchCommit={activeBranchCommit}
+          existingBranches={branchOptionsWithLocal}
+        />
+        <div className="flex min-h-0 min-w-0 flex-1 flex-row overflow-hidden">
+          <div className="relative flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
             <div
-              className="pointer-events-auto flex min-h-[2.75rem] items-center justify-between gap-3 px-4 py-1.5"
-              data-tauri-drag-region
+              className={cn(
+                "pointer-events-none relative z-30 overflow-hidden rounded-tl-xl bg-background/80 backdrop-blur-md supports-backdrop-filter:bg-background/70 dark:bg-background/70 dark:backdrop-blur-xl dark:supports-backdrop-filter:bg-background/55",
+                channelChrome.negativeMargin,
+                topChromeInset.divider,
+              )}
+              ref={projectDetailHeaderChromeRef}
             >
-              <nav
-                aria-label="Project breadcrumb"
-                className="-ml-1 flex min-w-0 items-center gap-0.5 text-xs text-muted-foreground"
+              <div
+                className="pointer-events-auto flex min-h-[2.75rem] items-center justify-between gap-3 px-4 py-1.5"
+                data-tauri-drag-region
               >
-                <button
-                  className="flex shrink-0 items-center gap-1.5 rounded-md px-1 py-1 font-medium transition-colors hover:text-foreground focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring"
-                  onClick={() => {
-                    void goProjects();
-                  }}
-                  type="button"
+                <nav
+                  aria-label="Project breadcrumb"
+                  className="-ml-1 flex min-w-0 items-center gap-0.5 text-xs text-muted-foreground"
                 >
-                  <FolderGit2 className="h-3.5 w-3.5" />
-                  Projects
-                </button>
-                <ChevronRight className="h-3 w-3 shrink-0 text-muted-foreground/60" />
-                {activeWorkItemCrumb ? (
-                  <>
-                    <button
-                      className="min-w-0 truncate rounded-md px-0.5 py-1 font-medium transition-colors hover:text-foreground focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring"
-                      onClick={handleGoToProjectHome}
-                      type="button"
-                    >
-                      {project.name}
-                    </button>
-                    <ChevronRight className="h-3 w-3 shrink-0 text-muted-foreground/60" />
-                    <button
-                      className="shrink-0 rounded-md px-0.5 py-1 font-medium transition-colors hover:text-foreground focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring"
-                      onClick={activeWorkItemCrumb.clear}
-                      type="button"
-                    >
-                      {activeWorkItemCrumb.category}
-                    </button>
-                    <ChevronRight className="h-3 w-3 shrink-0 text-muted-foreground/60" />
-                    <span
-                      aria-current="page"
-                      className="min-w-0 truncate px-0.5 font-medium text-muted-foreground/60"
-                    >
-                      {activeWorkItemCrumb.title}
-                    </span>
-                  </>
-                ) : activeTabCrumb ? (
-                  <>
-                    <button
-                      className="min-w-0 truncate rounded-md px-0.5 py-1 font-medium transition-colors hover:text-foreground focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring"
-                      onClick={handleGoToProjectHome}
-                      type="button"
-                    >
-                      {project.name}
-                    </button>
-                    <ChevronRight className="h-3 w-3 shrink-0 text-muted-foreground/60" />
-                    <span
-                      aria-current="page"
-                      className="min-w-0 truncate px-0.5 font-medium text-muted-foreground/60"
-                    >
-                      {activeTabCrumb}
-                    </span>
-                  </>
-                ) : (
-                  <span
-                    aria-current="page"
-                    className="min-w-0 truncate px-0.5 font-medium text-muted-foreground/60"
+                  <button
+                    className="flex shrink-0 items-center gap-1.5 rounded-md px-1 py-1 font-medium transition-colors hover:text-foreground focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring"
+                    onClick={() => {
+                      void goProjects();
+                    }}
+                    type="button"
                   >
-                    {project.name}
-                  </span>
-                )}
-              </nav>
-              {project.projectChannelId ? (
-                <Button
-                  className="h-8 shrink-0 gap-1.5"
-                  onClick={() => {
-                    if (project.projectChannelId) {
-                      void goChannel(project.projectChannelId);
-                    }
-                  }}
-                  size="sm"
-                  variant="outline"
-                >
-                  <MessageSquare className="h-4 w-4" />
-                  Open Discussion
-                </Button>
-              ) : null}
-            </div>
-          </div>
-
-          <div className="flex min-h-0 min-w-0 flex-1 flex-col overflow-y-auto px-4 pb-4">
-            <div className="w-full space-y-3 pt-[calc(var(--buzz-channel-content-top-padding,5.75rem)_+_1px)]">
-              <section className="space-y-3">
-                <div className="flex min-w-0 items-start justify-between gap-3">
-                  <div className="min-w-0 flex-1 space-y-0.5">
-                    <div className="flex min-w-0 items-center gap-1.5">
-                      <h2 className="truncate text-xl font-semibold tracking-tight">
+                    <FolderGit2 className="h-3.5 w-3.5" />
+                    Projects
+                  </button>
+                  <ChevronRight className="h-3 w-3 shrink-0 text-muted-foreground/60" />
+                  {activeWorkItemCrumb ? (
+                    <>
+                      <button
+                        className="min-w-0 truncate rounded-md px-0.5 py-1 font-medium transition-colors hover:text-foreground focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring"
+                        onClick={handleGoToProjectHome}
+                        type="button"
+                      >
                         {project.name}
-                      </h2>
-                      {safeWebUrl ? (
-                        <Button
-                          asChild
-                          aria-label="Open project web page"
-                          className="h-6 w-6 shrink-0 text-muted-foreground hover:text-foreground"
-                          size="icon-xs"
-                          variant="ghost"
-                        >
-                          <a
-                            href={safeWebUrl}
-                            rel="noopener noreferrer"
-                            target="_blank"
-                          >
-                            <ExternalLink className="h-3.5 w-3.5" />
-                          </a>
-                        </Button>
-                      ) : null}
-                    </div>
-                  </div>
-                </div>
-              </section>
-
-              <WorkspaceTabs
-                key={`${project.id}:${tabsResetKey}`}
-                commitDiff={commitDiffQuery.data}
-                commitDiffError={commitDiffQuery.error}
-                commitDiffLoading={commitDiffQuery.isLoading}
-                createIssueAction={{
-                  onCreate: handleCreateIssue,
-                  pending: createIssueMutation.isPending,
-                }}
-                createPullRequestAction={{
-                  onCreated: handlePullRequestCreated,
-                  projects: projectsQuery.data ?? [project],
-                  reposDir: activeCommunity?.reposDir,
-                }}
-                updatePullRequestAction={
-                  openBranchPullRequest &&
-                  repoSyncStatusQuery.data?.remoteHead &&
-                  repoSyncStatusQuery.data.remoteHead !==
-                    openBranchPullRequest.commit
-                    ? {
-                        onUpdate: () => {
-                          void handleUpdatePullRequest();
-                        },
-                        pending: updatePullRequestMutation.isPending,
+                      </button>
+                      <ChevronRight className="h-3 w-3 shrink-0 text-muted-foreground/60" />
+                      <button
+                        className="shrink-0 rounded-md px-0.5 py-1 font-medium transition-colors hover:text-foreground focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring"
+                        onClick={activeWorkItemCrumb.clear}
+                        type="button"
+                      >
+                        {activeWorkItemCrumb.category}
+                      </button>
+                      <ChevronRight className="h-3 w-3 shrink-0 text-muted-foreground/60" />
+                      <span
+                        aria-current="page"
+                        className="min-w-0 truncate px-0.5 font-medium text-muted-foreground/60"
+                      >
+                        {activeWorkItemCrumb.title}
+                      </span>
+                    </>
+                  ) : activeTabCrumb ? (
+                    <>
+                      <button
+                        className="min-w-0 truncate rounded-md px-0.5 py-1 font-medium transition-colors hover:text-foreground focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring"
+                        onClick={handleGoToProjectHome}
+                        type="button"
+                      >
+                        {project.name}
+                      </button>
+                      <ChevronRight className="h-3 w-3 shrink-0 text-muted-foreground/60" />
+                      <span
+                        aria-current="page"
+                        className="min-w-0 truncate px-0.5 font-medium text-muted-foreground/60"
+                      >
+                        {activeTabCrumb}
+                      </span>
+                    </>
+                  ) : (
+                    <span
+                      aria-current="page"
+                      className="min-w-0 truncate px-0.5 font-medium text-muted-foreground/60"
+                    >
+                      {project.name}
+                    </span>
+                  )}
+                </nav>
+                {project.projectChannelId ? (
+                  <Button
+                    className="h-8 shrink-0 gap-1.5"
+                    onClick={() => {
+                      if (project.projectChannelId) {
+                        void goChannel(project.projectChannelId);
                       }
-                    : undefined
-                }
-                localSnapshot={localRepoSnapshotQuery.data}
-                localSnapshotError={localRepoSnapshotQuery.error}
-                localSnapshotLoading={localRepoSnapshotQuery.isLoading}
-                onBranchChange={handleBranchChange}
-                onOpenMergeRecoveryTerminal={handleOpenMergeRecoveryTerminal}
-                onOpenTerminal={() => {
-                  void handleOpenTerminal();
-                }}
-                terminalTitle={projectTerminalLabel(hasLocalCheckout)}
-                onSelectedCommitHashChange={handleSelectedCommitHashChange}
-                onSelectedIssueIdChange={handleSelectedIssueIdChange}
-                onSelectedPullRequestIdChange={
-                  handleSelectedPullRequestIdChange
-                }
-                onSelectedTabChange={setActiveTab}
-                profiles={profiles}
-                project={project}
-                repoDiff={displayedRepoDiff}
-                repoDiffError={displayedRepoDiffError}
-                repoDiffLoading={displayedRepoDiffLoading}
-                pullRequests={pullRequestsQuery.data ?? []}
-                pullRequestsError={pullRequestsQuery.error}
-                pullRequestsLoading={pullRequestsQuery.isLoading}
-                repoContributors={repoContributors}
-                repoSource={repoSource}
-                selectedCommitHash={selectedCommitHash}
-                selectedIssueId={selectedIssueId}
-                selectedPullRequestId={selectedPullRequestId}
-                snapshot={repoSnapshotQuery.data}
-                snapshotError={repoSnapshotQuery.error}
-                snapshotLoading={repoSnapshotQuery.isLoading}
-                sourceControls={filesSourceControls}
-                viewerGitIdentity={viewerGitIdentity}
-              />
+                    }}
+                    size="sm"
+                    variant="outline"
+                  >
+                    <MessageSquare className="h-4 w-4" />
+                    Open Discussion
+                  </Button>
+                ) : null}
+              </div>
+            </div>
+
+            <div
+              className={cn(
+                "flex min-h-0 min-w-0 flex-1 flex-col px-4 pb-4",
+                // With an issue open the thread owns the scroll region, so the
+                // page must stop being one. Two nested scrollers here is what
+                // produced the original complaint: the conversation could only
+                // be reached by scrolling a page whose header, hero and tab
+                // strip were all above it.
+                issueOwnsScroll ? "overflow-hidden" : "overflow-y-auto",
+              )}
+            >
+              <div
+                className={cn(
+                  "w-full pt-[calc(var(--buzz-channel-content-top-padding,5.75rem)_+_1px)]",
+                  issueOwnsScroll
+                    ? "flex min-h-0 flex-1 flex-col gap-3"
+                    : "space-y-3",
+                )}
+              >
+                {issueOwnsScroll ? null : (
+                  <ProjectDetailHero name={project.name} webUrl={safeWebUrl} />
+                )}
+
+                <WorkspaceTabs
+                  key={`${project.id}:${tabsResetKey}`}
+                  fillHeight={issueOwnsScroll}
+                  commitDiff={commitDiffQuery.data}
+                  commitDiffError={commitDiffQuery.error}
+                  commitDiffLoading={commitDiffQuery.isLoading}
+                  createIssueAction={{
+                    onCreate: handleCreateIssue,
+                    pending: createIssueMutation.isPending,
+                  }}
+                  createPullRequestAction={{
+                    onCreated: handlePullRequestCreated,
+                    projects: projectsQuery.data ?? [project],
+                    reposDir: activeCommunity?.reposDir,
+                  }}
+                  updatePullRequestAction={
+                    openBranchPullRequest &&
+                    repoSyncStatusQuery.data?.remoteHead &&
+                    repoSyncStatusQuery.data.remoteHead !==
+                      openBranchPullRequest.commit
+                      ? {
+                          onUpdate: () => {
+                            void handleUpdatePullRequest();
+                          },
+                          pending: updatePullRequestMutation.isPending,
+                        }
+                      : undefined
+                  }
+                  localSnapshot={localRepoSnapshotQuery.data}
+                  localSnapshotError={localRepoSnapshotQuery.error}
+                  localSnapshotLoading={localRepoSnapshotQuery.isLoading}
+                  onBranchChange={handleBranchChange}
+                  onOpenMergeRecoveryTerminal={handleOpenMergeRecoveryTerminal}
+                  onOpenTerminal={() => {
+                    void handleOpenTerminal();
+                  }}
+                  terminalTitle={projectTerminalLabel(hasLocalCheckout)}
+                  onSelectedCommitHashChange={handleSelectedCommitHashChange}
+                  onSelectedIssueIdChange={handleSelectedIssueIdChange}
+                  onSelectedPullRequestIdChange={
+                    handleSelectedPullRequestIdChange
+                  }
+                  onSelectedTabChange={setActiveTab}
+                  profiles={profiles}
+                  project={project}
+                  repoDiff={displayedRepoDiff}
+                  repoDiffError={displayedRepoDiffError}
+                  repoDiffLoading={displayedRepoDiffLoading}
+                  pullRequests={pullRequestsQuery.data ?? []}
+                  pullRequestsError={pullRequestsQuery.error}
+                  pullRequestsLoading={pullRequestsQuery.isLoading}
+                  repoContributors={repoContributors}
+                  repoSource={repoSource}
+                  selectedCommitHash={selectedCommitHash}
+                  selectedIssueId={selectedIssueId}
+                  selectedPullRequestId={selectedPullRequestId}
+                  snapshot={repoSnapshotQuery.data}
+                  snapshotError={repoSnapshotQuery.error}
+                  snapshotLoading={repoSnapshotQuery.isLoading}
+                  sourceControls={filesSourceControls}
+                  viewerGitIdentity={viewerGitIdentity}
+                />
+              </div>
             </div>
           </div>
+          {agentSessionAgent ? (
+            // Deliberately unscoped: `channel` and `channelId` are both null, so
+            // the pane shows the agent's whole observer feed and labels itself
+            // "All channels". A project root is an issue or a pull request, not
+            // a room, so there is no channel id to pass that would not be
+            // fabricated — and the turns that put the agent on this screen were
+            // announced against the root, not against any channel.
+            <AgentSessionThreadPanel
+              agent={agentSessionAgent}
+              canInterruptTurn={agentSessionAgent.canInterruptTurn}
+              canResetWidth={threadPanelWidth.canReset}
+              channel={null}
+              channelId={null}
+              onClose={handleCloseAgentSession}
+              onResetWidth={threadPanelWidth.onResetWidth}
+              onResizeStart={threadPanelWidth.onResizeStart}
+              profiles={profiles}
+              widthPx={threadPanelWidth.widthPx}
+            />
+          ) : profilePanelPubkey ? (
+            <UserProfilePanel
+              canResetWidth={threadPanelWidth.canReset}
+              currentPubkey={identityQuery.data?.pubkey}
+              onClose={handleCloseProfilePanel}
+              onOpenDm={handleOpenDm}
+              onOpenProfile={handleOpenProfilePanel}
+              onResetWidth={threadPanelWidth.onResetWidth}
+              onResizeStart={threadPanelWidth.onResizeStart}
+              onTabChange={handleProfilePanelTabChange}
+              onViewChange={handleProfilePanelViewChange}
+              pubkey={profilePanelPubkey}
+              tab={profilePanelTab}
+              view={profilePanelView}
+              widthPx={threadPanelWidth.widthPx}
+            />
+          ) : null}
         </div>
-        {profilePanelPubkey ? (
-          <UserProfilePanel
-            canResetWidth={threadPanelWidth.canReset}
-            currentPubkey={identityQuery.data?.pubkey}
-            onClose={handleCloseProfilePanel}
-            onOpenDm={handleOpenDm}
-            onOpenProfile={handleOpenProfilePanel}
-            onResetWidth={threadPanelWidth.onResetWidth}
-            onResizeStart={threadPanelWidth.onResizeStart}
-            onTabChange={handleProfilePanelTabChange}
-            onViewChange={handleProfilePanelViewChange}
-            pubkey={profilePanelPubkey}
-            tab={profilePanelTab}
-            view={profilePanelView}
-            widthPx={threadPanelWidth.widthPx}
-          />
-        ) : null}
-      </div>
-    </ProfilePanelProvider>
+      </ProfilePanelProvider>
+    </AgentSessionProvider>
   );
 }

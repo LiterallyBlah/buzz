@@ -7,7 +7,20 @@ import {
   pushProjectLocalRepository,
 } from "@/shared/api/projectGit";
 import type { Project, ProjectPullRequest } from "@/features/projects/hooks";
+import { projectCheckoutCloneUrl } from "./lib/pullRequestRepoContext";
 import { publishProjectPullRequestUpdate } from "./pullRequestMutations";
+
+/**
+ * Every hook here is checkout-scoped: it operates on the local clone named by
+ * `project.dtag`, so without a selected project there is genuinely nothing to
+ * act on and "No project selected." is the truth. A missing *clone URL* is a
+ * different failure entirely — the project is right there, its announcement
+ * (or the relay-origin cache behind it) just never yielded a URL. Reporting
+ * that as "No project selected." sent people hunting for the wrong problem, so
+ * the two conditions are now split.
+ */
+const NO_CLONE_URL_ERROR =
+  "This project has no clone URL. Add a clone URL to the repository announcement, or reconnect to the relay that hosts it.";
 
 /** Local-vs-remote git sync status for a project checkout (ahead/behind
  * counts, push/pull availability). Polls gently — each check runs a
@@ -33,11 +46,13 @@ export function useProjectRepoSyncStatusQuery(
       selectedBaseBranch ?? "default",
     ],
     queryFn: () => {
-      if (!project?.cloneUrls[0]) throw new Error("No project selected.");
+      if (!project) throw new Error("No project selected.");
+      const cloneUrl = project.cloneUrls[0];
+      if (!cloneUrl) throw new Error(NO_CLONE_URL_ERROR);
       return getProjectRepoSyncStatus({
         reposDir,
         projectDtag: project.dtag,
-        cloneUrl: project.cloneUrls[0],
+        cloneUrl,
         branchName: selectedBranch,
         baseBranch: selectedBaseBranch,
       });
@@ -61,11 +76,15 @@ export function usePushProjectLocalRepositoryMutation(
 
   return useMutation({
     mutationFn: async () => {
-      if (!project?.cloneUrls[0]) throw new Error("No project selected.");
+      if (!project) throw new Error("No project selected.");
+      // An open PR on this branch carries the same repo's `clone` tags, so it
+      // can supply the URL when the announcement's own list came up empty.
+      const cloneUrl = projectCheckoutCloneUrl(project, pullRequest);
+      if (!cloneUrl) throw new Error(NO_CLONE_URL_ERROR);
       const result = await pushProjectLocalRepository({
         reposDir,
         projectDtag: project.dtag,
-        cloneUrl: project.cloneUrls[0],
+        cloneUrl,
         branchName: selectedBranch,
         baseBranch: project.defaultBranch,
       });
@@ -115,11 +134,13 @@ export function useCloneProjectRepositoryMutation(
   const queryClient = useQueryClient();
   return useMutation({
     mutationFn: () => {
-      if (!project?.cloneUrls[0]) throw new Error("No project selected.");
+      if (!project) throw new Error("No project selected.");
+      const cloneUrl = project.cloneUrls[0];
+      if (!cloneUrl) throw new Error(NO_CLONE_URL_ERROR);
       return cloneProjectRepository({
         reposDir,
         projectDtag: project.dtag,
-        cloneUrl: project.cloneUrls[0],
+        cloneUrl,
         defaultBranch: project.defaultBranch,
       });
     },
@@ -150,11 +171,13 @@ export function usePullProjectLocalRepositoryMutation(
 
   return useMutation({
     mutationFn: () => {
-      if (!project?.cloneUrls[0]) throw new Error("No project selected.");
+      if (!project) throw new Error("No project selected.");
+      const cloneUrl = project.cloneUrls[0];
+      if (!cloneUrl) throw new Error(NO_CLONE_URL_ERROR);
       return pullProjectLocalRepository({
         reposDir,
         projectDtag: project.dtag,
-        cloneUrl: project.cloneUrls[0],
+        cloneUrl,
         branchName: selectedBranch,
       });
     },

@@ -539,6 +539,31 @@ fn queued_turn_id(event_id: &str) -> String {
     format!("queued:{event_id}")
 }
 
+/// The caption every command execution gets, in place of its command line.
+///
+/// One phrase for every shell, every adapter and every machine: it is the only
+/// sentence that is true of all of them and discloses nothing. See
+/// [`ProjectActivityPublisher::command_caption`] for why the command itself
+/// cannot go here.
+const COMMAND_CAPTION: &str = "running a command";
+
+/// How long a first token may be before it stops being a program name.
+///
+/// A real program name is short. Past this, the token is far more likely to be
+/// a base64 blob, a URL or a quoted argument that happened to have no space in
+/// it — none of which belong on a public root.
+const MAX_CAPTIONED_PROGRAM_LEN: usize = 20;
+
+/// First tokens that name how a command is run rather than what is run.
+///
+/// Publishing "running a command (env)" would be strictly worse than the bare
+/// label: it is no more informative, and it advertises that the real command is
+/// being wrapped — which is exactly the invocation whose arguments are the
+/// environment detail this caption exists to keep off a public root.
+const COMMAND_WRAPPERS: &[&str] = &[
+    "env", "sudo", "doas", "nohup", "nice", "time", "timeout", "xargs",
+];
+
 /// What this agent is currently announcing on one project root.
 struct LiveProjectTurn {
     turn_id: String,
@@ -625,11 +650,21 @@ impl ProjectActivityPublisher {
     /// asks for and is better than anything this file could synthesise. The
     /// builder trims, collapses and bounds it before it reaches the wire.
     ///
+    /// **Except for command execution, where the title is not a sentence about
+    /// the work — it *is* the command line.** See [`Self::command_caption`] for
+    /// why that one kind is captioned rather than quoted.
+    ///
     /// `tool_call_update` is folded in for its `title` alone: an agent that
     /// opens a call with a placeholder and names it on the first update would
     /// otherwise never have the real title read. Its `status` is deliberately
     /// ignored — "completed" is not a thing the agent is *doing*, and
-    /// announcing it would blank the caption between tools.
+    /// announcing it would blank the caption between tools. An update is judged
+    /// by the `kind` *it* carries: the publisher keys its state by root rather
+    /// than by tool call id, so an update that omits `kind` cannot be married
+    /// back to the call that opened it, and its title is taken at face value.
+    /// That is the observed adapter shape — a call names its kind and its
+    /// updates carry only a status — so the gap costs nothing today, and
+    /// closing it would mean tracking every open call id per root.
     fn stage_for_session_update(update: &serde_json::Value) -> Option<String> {
         let str_field = |key: &str| {
             update
@@ -639,17 +674,96 @@ impl ProjectActivityPublisher {
                 .filter(|s| !s.is_empty())
         };
         match update.get("sessionUpdate").and_then(|v| v.as_str())? {
-            "tool_call" => Some(
-                str_field("title")
-                    .map(str::to_string)
-                    .unwrap_or_else(|| Self::stage_for_tool_kind(str_field("kind")).to_string()),
-            ),
-            "tool_call_update" => str_field("title").map(str::to_string),
+            "tool_call" => {
+                let kind = str_field("kind");
+                if Self::is_command_execution_kind(kind) {
+                    return Some(Self::command_caption(str_field("title")));
+                }
+                Some(
+                    str_field("title")
+                        .map(str::to_string)
+                        .unwrap_or_else(|| Self::stage_for_tool_kind(kind).to_string()),
+                )
+            }
+            "tool_call_update" => {
+                let kind = str_field("kind");
+                str_field("title").map(|title| {
+                    if Self::is_command_execution_kind(kind) {
+                        Self::command_caption(Some(title))
+                    } else {
+                        title.to_string()
+                    }
+                })
+            }
             "agent_thought_chunk" => Some("thinking".to_string()),
             "agent_message_chunk" => Some("writing a reply".to_string()),
             "plan" => Some("planning".to_string()),
             _ => None,
         }
+    }
+
+    /// Whether an ACP tool `kind` means "the agent is running a shell command".
+    ///
+    /// `execute` is ACP's own spelling and the only kind whose `title` is
+    /// conventionally the command line itself rather than a description of it —
+    /// see [`Self::stage_for_tool_kind`], which is where this build's reading of
+    /// the `ToolKind` vocabulary lives. Matched exactly: a kind this build has
+    /// never heard of is not silently treated as a shell, because the honest
+    /// answer for an unknown kind is its title.
+    fn is_command_execution_kind(kind: Option<&str>) -> bool {
+        kind == Some("execute")
+    }
+
+    /// The caption for a command execution, which is deliberately *not* the
+    /// command.
+    ///
+    /// A `stage` rides a **public, unencrypted** kind:20003 — unlike the NIP-AO
+    /// transcript, which is encrypted to the owner — so every reader of the
+    /// issue sees it. An `execute` title is the raw command line, and quoting it
+    /// there fails twice over. It is unreadable: the indicator is one short line
+    /// beside a name, and `env -u BUZZ_RELAY_URL -u BUZZ_PRIVATE_KEY
+    /// PYTHONPATH=. /home/…` truncates to noise. And it discloses: absolute
+    /// paths, the names of environment variables the operator unsets, hostnames
+    /// and flags are all operational detail about a private machine that nobody
+    /// chose to publish by filing an issue.
+    ///
+    /// So the caption says the true, short thing instead. The first token is
+    /// appended only when it is a bare program name, because "running a command
+    /// (cargo)" tells a reader what is happening while disclosing nothing they
+    /// could not infer from the repository. Anything that is a path, an
+    /// assignment or a wrapper falls back to the bare label rather than
+    /// publishing a fragment of the command line.
+    fn command_caption(title: Option<&str>) -> String {
+        match title.and_then(Self::bare_program_name) {
+            Some(program) => format!("{COMMAND_CAPTION} ({program})"),
+            None => COMMAND_CAPTION.to_string(),
+        }
+    }
+
+    /// The first token of a command line, when it names a program plainly
+    /// enough to be worth publishing.
+    ///
+    /// The test is a whitelist rather than a blacklist, because the thing being
+    /// guarded against is unbounded free text: only ASCII letters, digits and
+    /// `-_.+` pass. That excludes every disclosing shape at once — `/usr/bin/x`
+    /// and `./script` by the slash, `PYTHONPATH=.` by the equals sign, and
+    /// quoting, substitution and redirection by everything else — without this
+    /// function needing to enumerate them.
+    fn bare_program_name(title: &str) -> Option<&str> {
+        let token = title.split_whitespace().next()?;
+        if token.len() > MAX_CAPTIONED_PROGRAM_LEN {
+            return None;
+        }
+        if !token
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '+'))
+        {
+            return None;
+        }
+        if COMMAND_WRAPPERS.contains(&token) {
+            return None;
+        }
+        Some(token)
     }
 
     /// The fallback caption for a tool call that arrived without a title.
@@ -6034,6 +6148,307 @@ fn spawn_failure_notice(
     }
 }
 
+// ── Auth-required episodes ───────────────────────────────────────────────────
+
+/// The NIP-AO observer kind that tells an owner their agent is locked out.
+///
+/// A kind of its own rather than another `turn_error`: an expired credential is
+/// not a turn that went wrong, it is a harness that cannot run any turn until a
+/// human does something, and the Desktop should be able to render it as such
+/// without pattern-matching error prose. It rides the existing observer plane,
+/// so it is NIP-44 encrypted to the owner and `p`-tagged to them by
+/// [`publish_relay_observer_event`] — which is the whole reason this is an
+/// observer frame and not new direct-message machinery.
+pub(crate) const OBSERVER_AUTH_REQUIRED: &str = "auth_required";
+
+/// What the agent says in public when its credential has expired.
+///
+/// **Every word of this is chosen for what it leaves out.** It rides a public
+/// comment on an issue, a PR or a channel, so it names no authentication
+/// method, no provider, no login URL and no CLI command: which credential
+/// expired and how it is renewed is operational detail about the operator's
+/// machine, and the people reading the issue can do nothing with it anyway.
+///
+/// What it does say is the two things the person who mentioned the agent
+/// actually needs: the agent is not ignoring them, and the one person who can
+/// fix it already knows.
+const AUTH_REQUIRED_PUBLIC_NOTICE: &str = "⚠️ I can't act on this right now — \
+     my operator session needs re-authentication. My owner has been notified. \
+     Please re-send once it's sorted.";
+
+/// One authentication outage, from the first failed turn to the next good one.
+///
+/// The unit here is deliberately the *episode* and not the turn. A credential
+/// that has expired fails every turn it is given, so an agent that answered
+/// per-turn would post a comment for every mention it had queued — ten mentions
+/// on a busy root become ten identical apologies, which is worse than the
+/// silence it was meant to replace, and none of the ten helps because the only
+/// person who can act has already been told once.
+///
+/// So the first failure claims both notifications and every subsequent failure
+/// claims nothing. A successful turn is the only thing that closes an episode:
+/// it is direct evidence the credential works again, which is a stronger and
+/// simpler signal than any timer, and it means a re-authenticated agent that
+/// later expires again gets a fresh episode and speaks up again.
+///
+/// One public notice per episode is a real trade: an outage that spans two
+/// roots answers on the first and leaves the second silent. That is the
+/// documented choice — a provider credential is global to this harness, so the
+/// outage is one fact, and the alternative (one notice per root) turns a
+/// stale credential into a broadcast across every project the agent watches.
+///
+/// **Follow-up, deliberately not in this change:** the ACP `authMethods` this
+/// frame carries include terminal device-flow methods (`claude-ai-login` and
+/// friends), which means the owner could in principle be shown the device code
+/// and send the resulting token back over Buzz to re-authenticate the agent
+/// in place. That flow needs its own trust review — it moves a live credential
+/// across the relay — so this change stops at telling the owner, and the
+/// accept-the-code-back path is left for a change that can be reviewed on its
+/// own merits.
+#[derive(Debug, Default)]
+pub(crate) struct AuthEpisode {
+    /// The failure that opened the current episode, or `None` when the
+    /// credential is believed good.
+    opened_by: Option<terminal_auth::TerminalAuth>,
+    /// Whether this episode's one public notice has been claimed.
+    public_notice_claimed: bool,
+    /// Whether this episode's one owner frame has been claimed.
+    owner_frame_claimed: bool,
+}
+
+impl AuthEpisode {
+    /// Record a terminal-auth failure, opening an episode if none is open.
+    fn observe_failure(&mut self, terminal: terminal_auth::TerminalAuth) {
+        if self.opened_by.is_none() {
+            tracing::warn!(
+                terminal = %terminal,
+                "auth-required episode opened — the agent cannot run turns until \
+                 its operator re-authenticates"
+            );
+            self.opened_by = Some(terminal);
+        }
+    }
+
+    /// Claim this episode's single public notice, if it is still unclaimed.
+    ///
+    /// Claims are recorded before the notice is sent rather than after,
+    /// because the send is a best-effort background task: a relay that refuses
+    /// the comment must not license a retry on the next failed turn, or a
+    /// persistently unreachable relay becomes a persistent notice storm the
+    /// moment it recovers.
+    fn claim_public_notice(&mut self) -> bool {
+        !std::mem::replace(&mut self.public_notice_claimed, true)
+    }
+
+    /// Claim this episode's single owner frame, if it is still unclaimed.
+    fn claim_owner_frame(&mut self) -> bool {
+        !std::mem::replace(&mut self.owner_frame_claimed, true)
+    }
+
+    /// Close any open episode, because a turn just succeeded.
+    ///
+    /// Returns whether an episode was actually open, so the caller can log a
+    /// recovery exactly once rather than on every good turn thereafter.
+    fn resolve(&mut self) -> bool {
+        if let Some(terminal) = self.opened_by.take() {
+            tracing::info!(
+                terminal = %terminal,
+                "auth-required episode closed — a turn completed, so the \
+                 credential works again"
+            );
+            self.public_notice_claimed = false;
+            self.owner_frame_claimed = false;
+            return true;
+        }
+        false
+    }
+}
+
+/// Where a public auth-required notice goes, and how it is addressed.
+///
+/// A project turn and a channel turn need genuinely different events — a
+/// kind:1 comment addressed to a repo coordinate and a root, versus a kind:9
+/// channel message — and the batch is the only thing that knows which one this
+/// turn was. Resolved into this enum first, so the decision is testable
+/// without a relay and the sending half stays a dumb executor.
+#[derive(Debug, Clone)]
+enum AuthNoticeTarget {
+    /// An issue or pull-request root, addressed by repo coordinate.
+    ProjectRoot {
+        coordinate: String,
+        meta: buzz_sdk::GitCommentMeta,
+    },
+    /// A channel, threaded under the triggering message.
+    Channel {
+        channel_id: Uuid,
+        thread_tags: queue::ThreadTags,
+    },
+}
+
+impl AuthNoticeTarget {
+    /// A description of this surface for the owner's frame.
+    ///
+    /// The owner is the one person entitled to know *where* their agent
+    /// addressed its apology, and it is the difference between "somebody was
+    /// told" and "this failed silently in a channel I forgot about".
+    ///
+    /// Says where the notice was *addressed*, not that a relay accepted it:
+    /// the send is a best-effort background task like every other notice here,
+    /// and a frame that waited for delivery confirmation would be a frame the
+    /// owner got late or not at all.
+    fn placement(&self) -> serde_json::Value {
+        match self {
+            Self::ProjectRoot { coordinate, meta } => serde_json::json!({
+                "surface": "project_root",
+                "coordinate": coordinate,
+                "root": meta.root_event,
+            }),
+            Self::Channel { channel_id, .. } => serde_json::json!({
+                "surface": "channel",
+                "channelId": channel_id.to_string(),
+            }),
+        }
+    }
+}
+
+/// Decide where a failed batch's public notice belongs.
+///
+/// A project batch runs under a route key that is a UUIDv5 of its root and
+/// names no channel, so posting to `batch.channel_id` would send the notice to
+/// a channel that does not exist — the reason this cannot simply reuse the
+/// existing channel-only failure-notice path. The batch's own validated
+/// project origin is what decides, exactly as it does for the observer route.
+fn auth_notice_target_for(batch: &FlushBatch) -> AuthNoticeTarget {
+    let last = batch
+        .events
+        .last()
+        .or_else(|| batch.cancelled_events.last());
+    match batch.project_origin() {
+        Some(origin) => AuthNoticeTarget::ProjectRoot {
+            coordinate: origin.coordinate().to_string(),
+            meta: buzz_sdk::GitCommentMeta {
+                root_event: origin.root().to_string(),
+                // Threaded under the comment that woke us, so the person who
+                // mentioned the agent sees the answer where they asked.
+                parent_event: last.map(|be| be.event.id.to_hex()),
+                // `p`-tagged for the same reason: on a busy root, an untagged
+                // comment is one the asker is never told about.
+                recipients: last
+                    .map(|be| be.event.pubkey.to_hex())
+                    .into_iter()
+                    .collect(),
+            },
+        },
+        None => AuthNoticeTarget::Channel {
+            channel_id: batch.channel_id,
+            thread_tags: last
+                .map(|be| queue::parse_thread_tags(&be.event))
+                .unwrap_or_default(),
+        },
+    }
+}
+
+/// Build the kind:1 comment that carries an auth-required notice to a root.
+///
+/// Separated from the send so the event a public root would actually receive
+/// can be inspected in a test — the one property that matters about this
+/// comment is what it does *not* contain.
+fn build_auth_required_comment(
+    coordinate: &str,
+    meta: &buzz_sdk::GitCommentMeta,
+) -> Option<nostr::EventBuilder> {
+    let Some(repo) = buzz_sdk::GitRepoCoord::from_a_tag_value(coordinate) else {
+        tracing::warn!(
+            coordinate = %coordinate,
+            "auth-required notice: unreadable repository coordinate — not posting"
+        );
+        return None;
+    };
+    buzz_sdk::build_git_comment(&repo, AUTH_REQUIRED_PUBLIC_NOTICE, meta)
+        .map_err(|error| {
+            tracing::warn!(%error, "auth-required notice: refused by the builder");
+        })
+        .ok()
+}
+
+/// Post the episode's one public notice, best effort.
+///
+/// Best effort in the same sense as every other notice in this file: a relay
+/// that will not take it is logged and swallowed, because an agent that cannot
+/// announce its own lockout must still shut down cleanly and must still tell
+/// its owner.
+fn spawn_auth_required_notice(rest_client: Option<&relay::RestClient>, target: AuthNoticeTarget) {
+    let Some(rest) = rest_client.cloned() else {
+        return;
+    };
+    tokio::spawn(async move {
+        match target {
+            AuthNoticeTarget::Channel {
+                channel_id,
+                thread_tags,
+            } => {
+                pool::post_failure_notice(
+                    &rest,
+                    channel_id,
+                    &thread_tags,
+                    AUTH_REQUIRED_PUBLIC_NOTICE,
+                )
+                .await;
+            }
+            AuthNoticeTarget::ProjectRoot { coordinate, meta } => {
+                let Some(builder) = build_auth_required_comment(&coordinate, &meta) else {
+                    return;
+                };
+                let event = match builder.sign_with_keys(&rest.keys) {
+                    Ok(event) => event,
+                    Err(error) => {
+                        tracing::warn!(%error, "auth-required notice: sign failed");
+                        return;
+                    }
+                };
+                match tokio::time::timeout(Duration::from_secs(5), rest.submit_event(&event)).await
+                {
+                    Ok(Ok(_)) => {}
+                    Ok(Err(error)) => {
+                        tracing::warn!(root = %meta.root_event, %error, "auth-required notice failed")
+                    }
+                    Err(_) => {
+                        tracing::warn!(root = %meta.root_event, "auth-required notice timed out")
+                    }
+                }
+            }
+        }
+    });
+}
+
+/// The owner's frame for an auth-required episode.
+///
+/// Carries the advertised method labels because "re-authenticate" without
+/// naming the method is not actionable: an owner staring at this needs to know
+/// whether the agent is asking for a Claude subscription login, an API key, or
+/// something else entirely. This is safe *here* and nowhere else — the frame is
+/// NIP-44 encrypted to the owner's key before it leaves the process, which is
+/// exactly the property the public notice does not have.
+fn auth_required_owner_payload(
+    terminal: terminal_auth::TerminalAuth,
+    methods: &[acp::AuthMethod],
+    placement: Option<serde_json::Value>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "adapter": terminal.adapter.as_str(),
+        "stage": terminal.stage.as_str(),
+        "signal": terminal.signal.as_str(),
+        "authMethods": methods
+            .iter()
+            .map(|method| serde_json::json!({ "id": method.id, "label": method.label }))
+            .collect::<Vec<_>>(),
+        // `null` when there was no public surface to answer on — a heartbeat
+        // turn, or a batch whose channel was removed. The owner should be able
+        // to tell "I told them and you" from "I could only tell you".
+        "publicNotice": placement.unwrap_or(serde_json::Value::Null),
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn handle_prompt_result(
     pool: &mut AgentPool,
@@ -6077,6 +6492,13 @@ fn handle_prompt_result(
     // branch below records what actually happened; only the hard-timeout
     // match arm in the death_message construction reads it.
     let mut hard_timeout_fate_suffix: Option<&'static str> = None;
+
+    // Where this turn's auth-required notice was posted, when one was. Recorded
+    // inside the batch block because the batch — the only thing that knows
+    // whether this turn came from a root or a channel — is consumed there, and
+    // read after it because the owner's frame is emitted once per turn on every
+    // path, including the ones that have no batch at all.
+    let mut auth_notice_placement: Option<serde_json::Value> = None;
 
     // Requeue BEFORE mark_complete: requeue() sets retry_after with a future
     // deadline, and mark_complete() checks for it to decide whether to preserve
@@ -6165,7 +6587,22 @@ fn handle_prompt_result(
                             terminal = %terminal,
                             "terminal authentication failure — batch durably disposed, no retry"
                         );
-                        spawn_failure_notice(rest_client, &batch, TERMINAL_AUTH_NOTICE.to_string());
+                        // Answer where the request came from, once per episode.
+                        // The person who mentioned this agent gets a reply
+                        // rather than silence; the ten people behind them in
+                        // the queue do not each get the same apology.
+                        let target = auth_notice_target_for(&batch);
+                        pool.auth_episode_mut().observe_failure(terminal);
+                        if pool.auth_episode_mut().claim_public_notice() {
+                            auth_notice_placement = Some(target.placement());
+                            spawn_auth_required_notice(rest_client, target);
+                        } else {
+                            tracing::debug!(
+                                terminal = %terminal,
+                                "auth-required notice already posted for this episode — \
+                                 staying quiet"
+                            );
+                        }
                     }
                     Err(e) => {
                         // We could not promise non-revival, so we must not act
@@ -6267,6 +6704,53 @@ fn handle_prompt_result(
         }
     };
 
+    // Tell the owner directly, once per episode. This is the notification the
+    // public notice above promises has been sent, and it is the only one of the
+    // two that may name the authentication method: the observer publisher
+    // NIP-44 encrypts it to the owner's key and `p`-tags them, whereas the
+    // notice is readable by everyone who can read the issue.
+    if let Some(terminal) = terminal_auth_of(&result.outcome) {
+        pool.auth_episode_mut().observe_failure(terminal);
+        if pool.auth_episode_mut().claim_owner_frame() {
+            let payload = auth_required_owner_payload(
+                terminal,
+                result.agent.acp.auth_methods(),
+                auth_notice_placement.take(),
+            );
+            // A frame on the bus only *reaches* the owner when the encrypted
+            // telemetry publisher is running: the bus itself also comes up for
+            // project routing alone, in which case nothing it carries is ever
+            // signed, encrypted or sent. Both halves are checked, because a
+            // locked-out agent whose owner is never told is the exact failure
+            // this change exists to remove, and it must not fail quietly.
+            // Logged at error and gated by the same claim as the frame, so it
+            // says its piece once per episode rather than once per failed turn.
+            if observer.is_none() || !encrypted_telemetry_enabled(config) {
+                tracing::error!(
+                    terminal = %terminal,
+                    payload = %payload,
+                    "auth-required: the encrypted observer plane is not running, so the \
+                     owner cannot be told the agent is locked out — restart the harness \
+                     with --relay-observer and a resolvable owner"
+                );
+            }
+            if let Some(observer) = observer.as_ref() {
+                observer.emit(
+                    OBSERVER_AUTH_REQUIRED,
+                    Some(agent_index),
+                    // Deliberately no project route on this frame.
+                    // `ProjectActivityPublisher` announces `working` for any
+                    // project-routed frame that is not a turn-terminal kind, so
+                    // routing this one would put the agent back on the root as
+                    // busy at the moment it had just given up. The root travels
+                    // in the payload instead, where only the owner reads it.
+                    &observer::context_for(channel_id, None, Some(turn_id.clone())),
+                    payload,
+                );
+            }
+        }
+    }
+
     match result.outcome {
         // Successful prompt — return agent to pool.
         PromptOutcome::Ok(_) => {
@@ -6275,6 +6759,10 @@ fn handle_prompt_result(
                 outcome = outcome_label,
                 "agent_returned"
             );
+            // A completed turn is direct evidence the credential works, and is
+            // the only thing that reopens the agent's ability to announce a
+            // future outage.
+            pool.auth_episode_mut().resolve();
             pool.return_agent(result.agent);
         }
         // Fatal outcomes: the agent subprocess is dead or poisoned — respawn it.
@@ -11212,11 +11700,13 @@ mod error_outcome_emission_tests {
     //! Pins the policy that error-class outcomes surface to the activity feed
     //! and never to the channel:
     //!
-    //! - Channel silence is enforced *structurally* — `handle_prompt_result`
-    //!   takes no relay handle, so it has no way to post a channel message. A
-    //!   future re-introduction of channel notices would have to add the relay
-    //!   parameter back, which these tests' construction would then refuse to
-    //!   compile against.
+    //! - Channel silence for the *error* outcomes is asserted by passing no
+    //!   relay handle: `handle_prompt_result` posts only through the
+    //!   `rest_client` it is given, so a `None` here is a channel that cannot
+    //!   be written to at all. (The structural version of this claim — that
+    //!   the function took no relay handle — stopped being true when
+    //!   dead-letter and auth-required notices were added; the notices those
+    //!   paths *do* post are pinned in their own sections below.)
     //! - Feed coverage is the regression-prone half and is asserted at runtime:
     //!   each error outcome must emit exactly one `turn_error` observer event.
     //!   If any branch drops its `emit_turn_error` call, the matching test goes
@@ -12805,6 +13295,439 @@ mod error_outcome_emission_tests {
             "the channel must NOT be marked complete when the disposition failed"
         );
     }
+
+    // ── auth-required: saying so instead of going quiet ────────────────────
+    //
+    // An expired provider credential used to be answered with silence: the
+    // turn failed, the batch was disposed of, and the person who mentioned the
+    // agent never learned why nothing happened. These pin the two things that
+    // now happen instead, and — just as importantly — how few times they
+    // happen.
+
+    /// Detection is the already-typed ACP classification, walked end to end.
+    ///
+    /// The seam matters more than either half: a shape that classifies but
+    /// does not survive into [`terminal_auth_of`] notifies nobody, and a shape
+    /// that reaches `terminal_auth_of` without having been classified would
+    /// mean the harness was re-deriving auth-ness from prose.
+    #[test]
+    fn an_auth_failure_is_recognised_end_to_end_and_nothing_else_is() {
+        let claude = terminal_auth::AdapterIdentity::from_command("claude-agent-acp");
+        let classified = |error: serde_json::Value| {
+            terminal_auth::classify_jsonrpc_error(&error, &claude, terminal_auth::AuthStage::Prompt)
+                .map(|terminal| PromptOutcome::Error(acp::AcpError::TerminalAuth(terminal)))
+                .unwrap_or_else(|| {
+                    PromptOutcome::Error(acp::AcpError::AgentError {
+                        code: error.get("code").and_then(|c| c.as_i64()).unwrap_or(-32000),
+                        message: error
+                            .get("message")
+                            .and_then(|m| m.as_str())
+                            .unwrap_or_default()
+                            .to_string(),
+                    })
+                })
+        };
+
+        // Positive: the structured ACP signal in either accepted shape, and
+        // the Claude prose the deployed adapter actually emits.
+        for error in [
+            serde_json::json!({ "code": -32000, "message": "Authentication required" }),
+            serde_json::json!({ "code": -32603, "data": { "type": "auth_required" } }),
+            serde_json::json!({ "code": 1, "data": { "authRequired": true } }),
+            serde_json::json!({
+                "code": -32603,
+                "message": "API Error: 401 {\"type\":\"error\"}",
+            }),
+        ] {
+            assert!(
+                terminal_auth_of(&classified(error.clone())).is_some(),
+                "an auth failure went unrecognised: {error}"
+            );
+        }
+
+        // Negative: a bare -32000, another service's expired token relayed
+        // through the same channel, a rate limit, and an ordinary tool
+        // failure. Announcing a lockout for any of these would tell the root
+        // its agent is broken when it is merely busy or unlucky.
+        for error in [
+            serde_json::json!({ "code": -32000, "message": "something went wrong" }),
+            serde_json::json!({
+                "code": -32603,
+                "message": "GitHub OAuth access token has expired. Re-authenticate to continue.",
+            }),
+            serde_json::json!({ "code": -32000, "message": "rate limit exceeded (429)" }),
+            serde_json::json!({ "code": -32602, "message": "unknown tool" }),
+            serde_json::json!({ "code": -32000, "data": { "type": "tool_error" } }),
+        ] {
+            assert!(
+                terminal_auth_of(&classified(error.clone())).is_none(),
+                "an ordinary failure was misread as a lockout: {error}"
+            );
+        }
+    }
+
+    fn a_terminal_auth() -> terminal_auth::TerminalAuth {
+        terminal_auth::TerminalAuth {
+            adapter: terminal_auth::AdapterFamily::Claude,
+            stage: terminal_auth::AuthStage::Prompt,
+            signal: terminal_auth::AuthSignal::ClaudeOauthUnrefreshable,
+        }
+    }
+
+    /// An episode speaks once and then holds its peace.
+    #[test]
+    fn an_episode_claims_each_notification_exactly_once() {
+        let mut episode = AuthEpisode::default();
+        episode.observe_failure(a_terminal_auth());
+        assert!(
+            episode.claim_public_notice(),
+            "the first failure must speak"
+        );
+        assert!(episode.claim_owner_frame(), "the owner must be told");
+
+        for _ in 0..9 {
+            episode.observe_failure(a_terminal_auth());
+            assert!(
+                !episode.claim_public_notice(),
+                "a second mention re-announced the same outage"
+            );
+            assert!(
+                !episode.claim_owner_frame(),
+                "the owner was told twice about one outage"
+            );
+        }
+    }
+
+    /// A good turn ends the episode, and a later expiry is a new one.
+    ///
+    /// Success is the reset rather than a timer because it is the only direct
+    /// evidence the credential works. An agent re-authenticated on Monday and
+    /// expired again on Friday must be able to say so again.
+    #[test]
+    fn a_successful_turn_closes_an_episode_and_re_arms_the_notices() {
+        let mut episode = AuthEpisode::default();
+        episode.observe_failure(a_terminal_auth());
+        assert!(episode.claim_public_notice());
+        assert!(episode.claim_owner_frame());
+
+        assert!(
+            episode.resolve(),
+            "an open episode must report that it closed"
+        );
+        assert!(
+            !episode.resolve(),
+            "a second success must not report a second recovery"
+        );
+
+        episode.observe_failure(a_terminal_auth());
+        assert!(
+            episode.claim_public_notice(),
+            "a fresh outage after a recovery must be announced"
+        );
+        assert!(episode.claim_owner_frame());
+    }
+
+    /// A batch that never had a public surface still has to be counted.
+    fn auth_batch(origin: Option<crate::project::ProjectOrigin>) -> FlushBatch {
+        let event = nostr::EventBuilder::new(nostr::Kind::Custom(9), "please look at this")
+            .sign_with_keys(&Keys::generate())
+            .expect("sign");
+        FlushBatch {
+            channel_id: Uuid::new_v4(),
+            events: vec![BatchEvent {
+                event,
+                prompt_tag: "test".into(),
+                received_at: std::time::Instant::now(),
+                project: origin,
+            }],
+            cancelled_events: vec![],
+            cancel_reason: None,
+        }
+    }
+
+    /// Fails the same pool over and over, which is exactly what an expired
+    /// credential does. The interesting assertion is always about the second
+    /// failure, so the harness has to survive the first.
+    struct AuthEpisodeHarness {
+        pool: AgentPool,
+        queue: EventQueue,
+        config: Config,
+        crash_history: Vec<SlotCircuit>,
+        respawn_tx: mpsc::Sender<RespawnResult>,
+        _respawn_rx: mpsc::Receiver<RespawnResult>,
+        respawn_tasks: tokio::task::JoinSet<()>,
+        observer: ObserverHandle,
+        _temp: tempfile::TempDir,
+    }
+
+    impl AuthEpisodeHarness {
+        fn new() -> Self {
+            let temp = tempfile::tempdir().expect("temp dir");
+            let mut queue = EventQueue::new(config::DedupMode::Queue);
+            queue.attach_terminal_auth_store(test_terminal_auth_store(&temp));
+            let (respawn_tx, _respawn_rx) = mpsc::channel(8);
+            Self {
+                pool: AgentPool::from_slots(vec![None]),
+                queue,
+                config: test_config(),
+                crash_history: vec![SlotCircuit {
+                    crash_times: Vec::new(),
+                    open_until: None,
+                    respawn_in_flight: false,
+                }],
+                respawn_tx,
+                _respawn_rx,
+                respawn_tasks: tokio::task::JoinSet::new(),
+                observer: ObserverHandle::in_process(),
+                _temp: temp,
+            }
+        }
+
+        async fn run(&mut self, batch: Option<FlushBatch>, outcome: PromptOutcome) {
+            let agent = dummy_agent(0).await;
+            let channel_id = batch
+                .as_ref()
+                .map(|b| b.channel_id)
+                .unwrap_or_else(Uuid::new_v4);
+            // `handle_prompt_result` accounts for exactly one in-flight task
+            // per completing agent, so every turn re-registers one.
+            let task_id = self.pool.join_set.spawn(async {}).id();
+            self.pool.task_map_mut().insert(
+                task_id,
+                crate::pool::TaskMeta {
+                    agent_index: 0,
+                    channel_id: Some(channel_id),
+                    turn_id: "auth-turn".to_string(),
+                    recoverable_batch: None,
+                    control_tx: None,
+                    steer_tx: None,
+                },
+            );
+            let mut heartbeat_in_flight = false;
+            let removed_channels = std::collections::HashSet::new();
+            handle_prompt_result(
+                &mut self.pool,
+                &mut self.queue,
+                &self.config,
+                PromptResult {
+                    agent,
+                    source: PromptSource::Channel(channel_id),
+                    turn_id: "auth-turn".to_string(),
+                    outcome,
+                    batch,
+                },
+                &mut heartbeat_in_flight,
+                &removed_channels,
+                &mut self.crash_history,
+                &self.respawn_tx,
+                &mut self.respawn_tasks,
+                Some(self.observer.clone()),
+                None,
+            );
+        }
+
+        fn owner_frames(&self) -> Vec<observer::ObserverEvent> {
+            self.observer
+                .snapshot()
+                .into_iter()
+                .filter(|event| event.kind == OBSERVER_AUTH_REQUIRED)
+                .collect()
+        }
+    }
+
+    /// Ten mentions to an expired agent produce one notification, not ten.
+    #[tokio::test]
+    async fn a_repeatedly_failing_credential_notifies_the_owner_once() {
+        let mut harness = AuthEpisodeHarness::new();
+        for _ in 0..10 {
+            harness
+                .run(
+                    Some(auth_batch(None)),
+                    PromptOutcome::Error(terminal_auth_error()),
+                )
+                .await;
+        }
+        assert_eq!(
+            harness.owner_frames().len(),
+            1,
+            "an expired agent spammed its owner once per failed turn"
+        );
+    }
+
+    /// The episode is bounded by recovery, not by process lifetime.
+    #[tokio::test]
+    async fn a_successful_turn_lets_the_next_outage_be_announced_again() {
+        let mut harness = AuthEpisodeHarness::new();
+        harness
+            .run(
+                Some(auth_batch(None)),
+                PromptOutcome::Error(terminal_auth_error()),
+            )
+            .await;
+        assert_eq!(harness.owner_frames().len(), 1);
+
+        harness
+            .run(None, PromptOutcome::Ok(acp::StopReason::EndTurn))
+            .await;
+        harness
+            .run(
+                Some(auth_batch(None)),
+                PromptOutcome::Error(terminal_auth_error()),
+            )
+            .await;
+        assert_eq!(
+            harness.owner_frames().len(),
+            2,
+            "a credential that expired again after a recovery stayed silent"
+        );
+    }
+
+    /// An ordinary failure opens no episode and notifies nobody.
+    #[tokio::test]
+    async fn an_ordinary_failure_never_claims_an_auth_notification() {
+        let mut harness = AuthEpisodeHarness::new();
+        harness
+            .run(
+                Some(auth_batch(None)),
+                PromptOutcome::Error(acp::AcpError::AgentError {
+                    code: -32000,
+                    message: "OAuth access token has expired. Re-authenticate to continue."
+                        .to_string(),
+                }),
+            )
+            .await;
+        assert!(
+            harness.owner_frames().is_empty(),
+            "an untyped agent error was announced as a credential lockout"
+        );
+    }
+
+    /// The owner's frame is the only one of the two that names the method.
+    #[test]
+    fn the_owner_frame_carries_the_advertised_auth_method() {
+        let payload = auth_required_owner_payload(
+            a_terminal_auth(),
+            &[acp::AuthMethod {
+                id: "claude-ai-login".into(),
+                label: "Log in with Claude Code".into(),
+            }],
+            Some(serde_json::json!({ "surface": "channel", "channelId": "c" })),
+        );
+        assert_eq!(payload["signal"], "claude_oauth_unrefreshable");
+        assert_eq!(payload["authMethods"][0]["id"], "claude-ai-login");
+        assert_eq!(
+            payload["authMethods"][0]["label"],
+            "Log in with Claude Code"
+        );
+        assert_eq!(payload["publicNotice"]["surface"], "channel");
+
+        // No public surface is a fact the owner needs: it distinguishes "I told
+        // them and you" from "I could only tell you".
+        let heartbeat = auth_required_owner_payload(a_terminal_auth(), &[], None);
+        assert!(heartbeat["publicNotice"].is_null());
+        assert_eq!(heartbeat["authMethods"].as_array().map(Vec::len), Some(0));
+    }
+
+    /// A project turn answers on its root, addressed so the asker is told.
+    #[test]
+    fn a_project_turns_notice_is_addressed_to_the_root_it_came_from() {
+        let coordinate = format!("30617:{}:buzz", "a".repeat(64));
+        let root = "48be1cc2000000000000000000000000000000000000000000000000000000ab";
+        let batch = auth_batch(Some(crate::project::ProjectOrigin::for_test(
+            &coordinate,
+            root,
+            false,
+        )));
+        let asker = batch.events[0].event.pubkey.to_hex();
+        let comment_id = batch.events[0].event.id.to_hex();
+
+        let AuthNoticeTarget::ProjectRoot { coordinate, meta } = auth_notice_target_for(&batch)
+        else {
+            panic!("a project batch was routed to a channel that does not exist");
+        };
+        assert_eq!(meta.root_event, root);
+        assert_eq!(meta.parent_event.as_deref(), Some(comment_id.as_str()));
+        assert_eq!(
+            meta.recipients,
+            vec![asker],
+            "an untagged comment is one the asker is never told about"
+        );
+
+        let event = build_auth_required_comment(&coordinate, &meta)
+            .expect("the comment must build")
+            .sign_with_keys(&Keys::generate())
+            .expect("sign");
+        let tag_values = |key: &str| -> Vec<String> {
+            event
+                .tags
+                .iter()
+                .filter_map(|t| {
+                    let s = t.as_slice();
+                    (s.first().map(String::as_str) == Some(key))
+                        .then(|| s.get(1).cloned())
+                        .flatten()
+                })
+                .collect()
+        };
+        assert_eq!(tag_values("a"), vec![coordinate]);
+        assert!(tag_values("e").contains(&root.to_string()));
+    }
+
+    /// A channel turn keeps the channel path, because a project root's
+    /// addressing would name a repository the channel does not have.
+    #[test]
+    fn a_channel_turns_notice_stays_on_the_channel() {
+        let batch = auth_batch(None);
+        let channel_id = batch.channel_id;
+        let AuthNoticeTarget::Channel {
+            channel_id: got, ..
+        } = auth_notice_target_for(&batch)
+        else {
+            panic!("a channel batch was addressed as a project root");
+        };
+        assert_eq!(got, channel_id);
+    }
+
+    /// The public notice says what happened and nothing about how to fix it.
+    ///
+    /// This is the trust boundary of the whole change: the frame that names the
+    /// authentication method is encrypted to the owner, and this one — readable
+    /// by everyone who can read the issue — must not leak the method id, the
+    /// provider, a login URL or a command to run.
+    #[test]
+    fn the_public_notice_discloses_no_method_url_or_command() {
+        let notice = AUTH_REQUIRED_PUBLIC_NOTICE.to_ascii_lowercase();
+        for forbidden in [
+            "http",
+            "://",
+            "www.",
+            ".com",
+            "login",
+            "claude",
+            "anthropic",
+            "codex",
+            "goose",
+            "oauth",
+            "token",
+            "api key",
+            "device",
+            "`",
+            "--",
+            "/",
+        ] {
+            assert!(
+                !notice.contains(forbidden),
+                "the public notice leaks {forbidden:?}: {AUTH_REQUIRED_PUBLIC_NOTICE}"
+            );
+        }
+        // And it still says the two things the asker needs.
+        assert!(notice.contains("re-authentication"));
+        assert!(notice.contains("owner has been notified"));
+        assert!(
+            AUTH_REQUIRED_PUBLIC_NOTICE.chars().count() < 200,
+            "a notice nobody reads is the same as no notice"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -14174,11 +15097,7 @@ mod project_activity_tests {
         state.ingest(&project_frame("turn_started", ROOT, "t1"), now);
 
         for (title, kind, expected) in [
-            (
-                "Running rtk git log --oneline",
-                "execute",
-                "Running rtk git log --oneline",
-            ),
+            ("Read AGENTS.md", "read", "Read AGENTS.md"),
             (
                 "Searching files for *buzz*",
                 "search",
@@ -14308,16 +15227,20 @@ mod project_activity_tests {
 
     /// A title is agent-supplied free text, and it is published to everyone who
     /// can read the issue. It reaches the wire as one bounded line.
+    ///
+    /// Driven through a non-`execute` kind on purpose: command executions no
+    /// longer publish their title at all, so the 80-character bound would go
+    /// untested if this case were captioned before it reached the builder.
     #[test]
     fn an_agent_supplied_title_reaches_the_wire_as_one_bounded_line() {
         let (mut state, keys) = publisher();
         let now = tokio::time::Instant::now();
         state.ingest(&project_frame("turn_started", ROOT, "t1"), now);
 
-        let title = format!("Running\n\tsh -c\u{7} '{}'", "x".repeat(200));
+        let title = format!("Searching\n\tfiles for\u{7} '{}'", "x".repeat(200));
         let events = signed(
             &keys,
-            state.ingest(&tool_call_frame(ROOT, "t1", &title, "execute"), now),
+            state.ingest(&tool_call_frame(ROOT, "t1", &title, "search"), now),
         );
         let stage = tag_of(&events[0], "stage").expect("no stage on the wire");
         assert!(
@@ -14325,7 +15248,115 @@ mod project_activity_tests {
             "a control character reached the issue: {stage:?}"
         );
         assert_eq!(stage.chars().count(), 80, "the caption was not bounded");
-        assert!(stage.starts_with("Running sh -c 'xxx"), "{stage:?}");
+        assert!(stage.starts_with("Searching files for 'xxx"), "{stage:?}");
+    }
+
+    /// A command execution is captioned, never quoted.
+    ///
+    /// The `stage` rides a public kind:20003. An `execute` title is the command
+    /// line, so publishing it put absolute paths, unset environment variable
+    /// names and machine layout onto a root that anyone can read — and did it in
+    /// a one-line indicator that truncated the whole thing to noise anyway.
+    #[test]
+    fn a_command_execution_is_captioned_rather_than_quoted() {
+        for (title, expected) in [
+            // The reported case verbatim: a wrapper, some unset variables, an
+            // assignment and an absolute path. None of it reaches the root.
+            (
+                "env -u BUZZ_RELAY_URL -u BUZZ_PRIVATE_KEY PYTHONPATH=. \
+                 /home/hermes/.local/bin/pytest -q",
+                "running a command",
+            ),
+            // A bare program name is worth saying: it is the one token that
+            // tells a reader what is happening and discloses nothing.
+            ("cargo test -p buzz-acp", "running a command (cargo)"),
+            ("cargo", "running a command (cargo)"),
+            // A path names the machine, not the work.
+            ("/usr/bin/foo --flag", "running a command"),
+            ("./scripts/deploy.sh", "running a command"),
+            // An assignment is environment detail with a value attached.
+            ("PYTHONPATH=. pytest -q", "running a command"),
+            // A wrapper says only that the real command is wrapped.
+            ("sudo systemctl restart buzz-relay", "running a command"),
+            // A token this long is not a program name.
+            (
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --flag",
+                "running a command",
+            ),
+            // Shell metacharacters never survive into the caption.
+            (
+                "bash -lc 'echo $BUZZ_PRIVATE_KEY'",
+                "running a command (bash)",
+            ),
+            ("$EDITOR notes.md", "running a command"),
+        ] {
+            let (mut state, keys) = publisher();
+            let now = tokio::time::Instant::now();
+            state.ingest(&project_frame("turn_started", ROOT, "t1"), now);
+
+            let events = signed(
+                &keys,
+                state.ingest(&tool_call_frame(ROOT, "t1", title, "execute"), now),
+            );
+            assert_eq!(events.len(), 1, "{title:?} announced nothing");
+            let stage = tag_of(&events[0], "stage");
+            assert_eq!(stage.as_deref(), Some(expected), "for title {title:?}");
+        }
+    }
+
+    /// The caption rule is scoped to command execution and nothing else.
+    ///
+    /// A `read` or `edit` title is the agent's own description of the work —
+    /// short, already safe, and better than anything this file could synthesise
+    /// — so it must keep reaching the wire unchanged.
+    #[test]
+    fn a_non_command_tool_keeps_its_own_title() {
+        for (title, kind) in [
+            ("Read /home/hermes/notes.md", "read"),
+            ("Edit crates/buzz-acp/src/lib.rs", "edit"),
+            ("Fetch https://example.invalid/spec", "fetch"),
+        ] {
+            let (mut state, keys) = publisher();
+            let now = tokio::time::Instant::now();
+            state.ingest(&project_frame("turn_started", ROOT, "t1"), now);
+
+            let events = signed(
+                &keys,
+                state.ingest(&tool_call_frame(ROOT, "t1", title, kind), now),
+            );
+            assert_eq!(events.len(), 1, "{kind} announced nothing");
+            assert_eq!(tag_of(&events[0], "stage").as_deref(), Some(title));
+        }
+    }
+
+    /// A late-named command execution is captioned too.
+    ///
+    /// `tool_call_update` is the other door a title comes through, and an
+    /// adapter that opens a call with a placeholder and names it on the first
+    /// update would otherwise put the raw command line on the root by the back
+    /// way in.
+    #[test]
+    fn a_command_named_by_an_update_is_captioned_too() {
+        let (mut state, keys) = publisher();
+        let now = tokio::time::Instant::now();
+        state.ingest(&project_frame("turn_started", ROOT, "t1"), now);
+
+        let named_late = session_update_frame(
+            ROOT,
+            "t1",
+            serde_json::json!({
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "call-1",
+                "kind": "execute",
+                "title": "env FOO=bar /opt/buzz/bin/buzz relay status",
+            }),
+        );
+        let events = signed(&keys, state.ingest(&named_late, now));
+        assert_eq!(events.len(), 1, "the update named no caption");
+        assert_eq!(
+            tag_of(&events[0], "stage").as_deref(),
+            Some("running a command")
+        );
     }
 
     /// A frame with no turn id, or an unreadable coordinate, announces nothing

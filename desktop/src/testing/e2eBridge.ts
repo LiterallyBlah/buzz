@@ -1123,6 +1123,18 @@ declare global {
       transcriptionEnabled: boolean;
     }) => Promise<void>;
     __BUZZ_E2E_PUSH_MOCK_FEED_ITEM__?: (item: RawFeedItem) => RawFeedItem;
+    /** Deliver a project-scoped event (an issue/PR comment from another
+     *  author) as though the relay had pushed it to an open root
+     *  subscription. Stored with the seeded project events so a refetch keeps
+     *  it, then emitted live. */
+    __BUZZ_E2E_PUSH_MOCK_PROJECT_EVENT__?: (input: {
+      content: string;
+      createdAt?: number;
+      id?: string;
+      kind?: number;
+      pubkey?: string;
+      tags: string[][];
+    }) => RelayEvent;
     /** Replace an existing feed item by id (or push if not found) and fire the updated event. */
     __BUZZ_E2E_REPLACE_MOCK_FEED_ITEM__?: (
       oldId: string,
@@ -9936,6 +9948,34 @@ export function maybeInstallE2eTauriMocks() {
     mockFeedOverrides[category].unshift(item);
     window.dispatchEvent(new CustomEvent("buzz:e2e-home-feed-updated"));
     return item;
+  };
+  window.__BUZZ_E2E_PUSH_MOCK_PROJECT_EVENT__ = ({
+    content,
+    createdAt,
+    id,
+    kind,
+    pubkey,
+    tags,
+  }) => {
+    const event = createMockEvent(
+      kind ?? 1,
+      content,
+      tags,
+      pubkey,
+      createdAt,
+      id,
+    );
+    // Both halves matter for a stored event: the store is what a refetch
+    // re-reads, and the live emit is what an already-open root subscription
+    // hears. Seeding only the store would make the arrival look like a reload
+    // rather than a push.
+    //
+    // Ephemeral kinds — NIP-PA activity above all — are emitted and not
+    // stored, which is what the relay does with them. Storing one would let a
+    // turn that ended survive a refetch as an agent still working.
+    if (isMockProjectScopedEvent(event)) getMockProjectEventStore().push(event);
+    emitMockGlobalEvent(event);
+    return event;
   };
   window.__BUZZ_E2E_REPLACE_MOCK_FEED_ITEM__ = (oldId, item) => {
     const category = item.category === "mention" ? "mentions" : item.category;
