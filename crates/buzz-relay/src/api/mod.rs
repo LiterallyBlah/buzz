@@ -86,9 +86,7 @@ pub mod relay_members {
             // cryptographically self-proving, so membership does not weaken
             // it; membership just stops being a reason to ignore it.
             if state.config.allow_nip_oa_auth {
-                if let Some(owner_pubkey) =
-                    extract_nip_oa_owner(pubkey_bytes, auth_tag_header)
-                {
+                if let Some(owner_pubkey) = extract_nip_oa_owner(pubkey_bytes, auth_tag_header) {
                     return Ok(MembershipDecision::ViaOwner(owner_pubkey));
                 }
             }

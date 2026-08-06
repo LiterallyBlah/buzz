@@ -134,21 +134,27 @@ export function MergePullRequestButton({
         })
       : [];
 
+  const recoverySourceCloneUrl =
+    pullRequest.cloneUrls[0] ?? project.cloneUrls[0];
+  const recoveryTargetCloneUrl = projectCheckoutCloneUrl(project, pullRequest);
+  const recoveryExpectedCommit = pullRequest.commit;
+  const recoveryPullRequestId = pullRequest.id;
+
   const handleOpenRecoveryTerminal = React.useCallback(async () => {
-    const sourceCloneUrl = pullRequest.cloneUrls[0] ?? project.cloneUrls[0];
-    if (!conflictRecovery || !pullRequest.commit || !sourceCloneUrl) return;
+    if (!conflictRecovery || !recoveryExpectedCommit || !recoverySourceCloneUrl)
+      return;
     setIsPreparingRecovery(true);
     try {
       const result = await onOpenTerminal?.({
-        expectedCommit: pullRequest.commit,
+        expectedCommit: recoveryExpectedCommit,
         sourceBranch: conflictRecovery.sourceBranch,
-        sourceCloneUrl,
+        sourceCloneUrl: recoverySourceCloneUrl,
         targetBranch: conflictRecovery.targetBranch,
-        targetCloneUrl: projectCheckoutCloneUrl(project, pullRequest),
+        targetCloneUrl: recoveryTargetCloneUrl,
       });
       if (!result) return;
       setPreparedRecoveryState({
-        pullRequestId: pullRequest.id,
+        pullRequestId: recoveryPullRequestId,
         recoveryRef: result.recoveryRef,
         targetRef: result.targetRef,
       });
@@ -165,10 +171,10 @@ export function MergePullRequestButton({
   }, [
     conflictRecovery,
     onOpenTerminal,
-    project.cloneUrls,
-    pullRequest.cloneUrls,
-    pullRequest.commit,
-    pullRequest.id,
+    recoveryExpectedCommit,
+    recoveryPullRequestId,
+    recoverySourceCloneUrl,
+    recoveryTargetCloneUrl,
   ]);
 
   const handlePublishMergedStatus = React.useCallback(async () => {
