@@ -4,6 +4,7 @@ import type {
   Project,
   ProjectPullRequest,
   ProjectPullRequestListItem,
+  Repository,
 } from "@/features/projects/hooks";
 import { relativeTime } from "@/features/projects/lib/projectsViewHelpers";
 import type { ProjectWorkItemSection } from "@/features/projects/projectWorkItems";
@@ -11,10 +12,10 @@ import {
   resolveUserLabel,
   type UserProfileLookup,
 } from "@/features/profile/lib/identity";
-import { UserProfilePopover } from "@/features/profile/ui/UserProfilePopover";
 import { Button } from "@/shared/ui/button";
 import { Card } from "@/shared/ui/card";
 import { DropdownMenuItem } from "@/shared/ui/dropdown-menu";
+import { ProjectAuthorIdentity } from "./ProjectAuthorIdentity";
 import { ProjectEventTypeIcon } from "./ProjectEventTypeIcon";
 import { ProjectItemDeleteMenu } from "./ProjectItemDeleteMenu";
 import { ProjectsWorkItemsLoadNotice } from "./ProjectsWorkItemsLoadNotice";
@@ -29,32 +30,16 @@ import {
   PROJECT_LIST_ROW_TRAILING_CLASS,
 } from "./projectListRowStyles";
 
-/** Author name that opens the user profile popover. */
-function AuthorNameButton({
-  label,
-  pubkey,
-}: {
-  label: string;
-  pubkey: string;
-}) {
-  return (
-    <UserProfilePopover pubkey={pubkey} triggerElement="span">
-      <button
-        className="relative z-10 rounded-sm hover:underline focus-visible:outline-hidden focus-visible:ring-1 focus-visible:ring-ring"
-        type="button"
-      >
-        {label}
-      </button>
-    </UserProfilePopover>
-  );
-}
-
 type ProjectsPullRequestsListProps = {
   error: unknown;
   failedSections: ProjectWorkItemSection[];
   isLoading: boolean;
   isRetrying: boolean;
-  onOpen: (project: Project, pullRequest: ProjectPullRequest) => void;
+  onOpen: (
+    project: Project,
+    repository: Repository,
+    pullRequest: ProjectPullRequest,
+  ) => void;
   onRetry: () => void;
   profiles?: UserProfileLookup;
   pullRequests: ProjectPullRequestListItem[];
@@ -72,11 +57,13 @@ function PullRequestGridCard({
   project,
   profiles,
   pullRequest,
+  repository,
   onOpen,
 }: {
   project: Project;
   profiles?: UserProfileLookup;
   pullRequest: ProjectPullRequest;
+  repository: Repository;
   onOpen: (project: Project, pullRequest: ProjectPullRequest) => void;
 }) {
   const authorLabel = resolveUserLabel({
@@ -124,7 +111,7 @@ function PullRequestGridCard({
           <ProjectItemDeleteMenu
             author={pullRequest.author}
             label={`More options for ${pullRequest.title}`}
-            project={project}
+            project={repository}
             rootId={pullRequest.id}
             subject="pull request"
             targetId={pullRequest.id}
@@ -150,8 +137,9 @@ function PullRequestGridCard({
             <span>created {relativeTime(pullRequest.createdAt)}</span>
             <span>
               by{" "}
-              <AuthorNameButton
+              <ProjectAuthorIdentity
                 label={authorLabel}
+                profiles={profiles}
                 pubkey={pullRequest.author}
               />
             </span>
@@ -172,11 +160,13 @@ function PullRequestListRow({
   project,
   profiles,
   pullRequest,
+  repository,
   onOpen,
 }: {
   project: Project;
   profiles?: UserProfileLookup;
   pullRequest: ProjectPullRequest;
+  repository: Repository;
   onOpen: (project: Project, pullRequest: ProjectPullRequest) => void;
 }) {
   const authorLabel = resolveUserLabel({
@@ -210,11 +200,13 @@ function PullRequestListRow({
             <span className="font-mono text-foreground">
               #{pullRequest.id.slice(0, 8)}
             </span>
-            <span>
-              by{" "}
-              <AuthorNameButton
+            <span className="inline-flex items-center gap-1">
+              <span>by</span>
+              <ProjectAuthorIdentity
                 label={authorLabel}
+                profiles={profiles}
                 pubkey={pullRequest.author}
+                testId="projects-pr-author"
               />
             </span>
             <span className="md:hidden">·</span>
@@ -243,7 +235,7 @@ function PullRequestListRow({
           <ProjectItemDeleteMenu
             author={pullRequest.author}
             label={`More options for ${pullRequest.title}`}
-            project={project}
+            project={repository}
             rootId={pullRequest.id}
             subject="pull request"
             targetId={pullRequest.id}
@@ -310,13 +302,16 @@ export function ProjectsPullRequestsList({
       <div className="space-y-3">
         {loadNotice}
         <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
-          {pullRequests.map(({ project, pullRequest }) => (
+          {pullRequests.map(({ project, pullRequest, repository }) => (
             <PullRequestGridCard
-              key={pullRequest.id}
-              onOpen={onOpen}
+              key={`${repository.id}:${pullRequest.id}`}
+              onOpen={(selectedProject, selectedPullRequest) =>
+                onOpen(selectedProject, repository, selectedPullRequest)
+              }
               profiles={profiles}
               project={project}
               pullRequest={pullRequest}
+              repository={repository}
             />
           ))}
         </div>
@@ -331,13 +326,16 @@ export function ProjectsPullRequestsList({
         className={PROJECT_LIST_CONTAINER_CLASS}
         data-testid="projects-list-container"
       >
-        {pullRequests.map(({ project, pullRequest }) => (
+        {pullRequests.map(({ project, pullRequest, repository }) => (
           <PullRequestListRow
-            key={pullRequest.id}
-            onOpen={onOpen}
+            key={`${repository.id}:${pullRequest.id}`}
+            onOpen={(selectedProject, selectedPullRequest) =>
+              onOpen(selectedProject, repository, selectedPullRequest)
+            }
             profiles={profiles}
             project={project}
             pullRequest={pullRequest}
+            repository={repository}
           />
         ))}
       </div>

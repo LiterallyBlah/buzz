@@ -131,7 +131,9 @@ export function projectRootLiveFilters(
   ];
 }
 
-type WorkItems = ProjectsWorkItemsResult<{ repoAddress: string }>;
+type WorkItems = ProjectsWorkItemsResult<{
+  repositories: { repoAddress: string }[];
+}>;
 
 function mergeWorkItems(current: WorkItems, event: RelayEvent): WorkItems {
   let changed = false;

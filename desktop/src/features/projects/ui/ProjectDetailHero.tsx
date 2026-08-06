@@ -1,9 +1,11 @@
 import { ExternalLink } from "lucide-react";
+import type { ReactNode } from "react";
 
 import { Button } from "@/shared/ui/button";
 
 /**
- * The project name and its optional web link, above the workspace tabs.
+ * The project name, its optional web link, and the repository picker, above
+ * the workspace tabs.
  *
  * Rendered only when no work item is open. Inside an issue thread the
  * breadcrumb already names both the project and the item, so the hero is a
@@ -13,13 +15,16 @@ import { Button } from "@/shared/ui/button";
  * Lives in its own file because `ProjectDetailScreen` is over the repo's
  * file-size limit; the rule there is that an over-limit file may not grow, and
  * a self-contained block of presentation is the cheapest thing to lift out.
+ * The picker arrives as a node so this file stays presentation only.
  */
 export function ProjectDetailHero({
   name,
+  repositoryPicker,
   webUrl,
 }: {
   name: string;
-  /** Already validated by `isSafeUrl`; null when absent or rejected. */
+  repositoryPicker: ReactNode;
+  /** Null when absent, or when the caller declined to link out to the host. */
   webUrl: string | null;
 }) {
   return (
@@ -44,6 +49,12 @@ export function ProjectDetailHero({
               </Button>
             ) : null}
           </div>
+        </div>
+        <div className="flex shrink-0 items-center gap-2">
+          <span className="hidden text-xs font-medium text-muted-foreground sm:inline">
+            Repository
+          </span>
+          {repositoryPicker}
         </div>
       </div>
     </section>

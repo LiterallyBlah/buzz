@@ -21,6 +21,7 @@ import {
 import {
   playNotificationSound,
   resolveSlotSound,
+  shouldPlayNotificationSound,
 } from "@/features/notifications/lib/sound";
 import type { Channel, RelayEvent } from "@/shared/api/types";
 
@@ -32,6 +33,7 @@ export function useAppShellDesktopNotifications({
   notificationSettings,
   openSearchHit,
   pubkey,
+  silentChannelIds,
 }: {
   channels: Channel[];
   enabled: boolean;
@@ -42,6 +44,7 @@ export function useAppShellDesktopNotifications({
     hit: import("@/shared/api/types").SearchHit,
   ) => Promise<unknown>;
   pubkey?: string;
+  silentChannelIds?: ReadonlySet<string>;
 }) {
   // Project routing is resolved here rather than passed in like goChannel /
   // goHome: `useAppNavigation` is a side-effect-free wrapper over the router's
@@ -87,7 +90,9 @@ export function useAppShellDesktopNotifications({
         },
       }).then((didSend) => {
         if (!didSend) return;
-        playNotificationSound(resolveSlotSound(notificationSettings, "dm"));
+        if (shouldPlayNotificationSound(channel.id, silentChannelIds)) {
+          playNotificationSound(resolveSlotSound(notificationSettings, "dm"));
+        }
         void requestDockBounce();
       });
     },
@@ -133,9 +138,11 @@ export function useAppShellDesktopNotifications({
         },
       }).then((didSend) => {
         if (!didSend) return;
-        playNotificationSound(
-          resolveSlotSound(notificationSettings, "thread_reply"),
-        );
+        if (shouldPlayNotificationSound(channelId, silentChannelIds)) {
+          playNotificationSound(
+            resolveSlotSound(notificationSettings, "thread_reply"),
+          );
+        }
         void requestDockBounce();
       });
     },

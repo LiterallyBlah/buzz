@@ -9,7 +9,7 @@ import {
   KIND_GIT_STATUS_MERGED,
   KIND_GIT_STATUS_OPEN,
 } from "@/shared/constants/kinds";
-import type { Project } from "./hooks";
+import type { Repository as Project } from "./hooks";
 import {
   buildGitIssueTags,
   buildGitStatusTags,

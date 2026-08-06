@@ -7,7 +7,7 @@ import { getIdentity } from "@/shared/api/tauriIdentity";
 import { KIND_DELETION } from "@/shared/constants/kinds";
 import type { RelayEvent } from "@/shared/api/types";
 import { normalizePubkey } from "@/shared/lib/pubkey";
-import type { Project } from "./hooks";
+import type { Repository as Project } from "./hooks";
 import { applyProjectRootEvent } from "./projectRootLiveUpdates";
 
 /** What a tombstone published from the project views is deleting. */

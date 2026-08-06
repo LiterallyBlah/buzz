@@ -1,7 +1,7 @@
 import { FileCode2, MessageSquareText } from "lucide-react";
 
 import { ForumComposer } from "@/features/forum/ui/ForumComposer";
-import type { Project } from "@/features/projects/hooks";
+import type { Repository as Project } from "@/features/projects/hooks";
 import type {
   ProjectPullRequestComment,
   ProjectPullRequestCommentAnchor,

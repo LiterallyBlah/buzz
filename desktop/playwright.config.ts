@@ -102,6 +102,7 @@ export default defineConfig({
         "**/reaction-order.spec.ts",
         "**/reaction-names.spec.ts",
         "**/inbox-reactions.spec.ts",
+        "**/inbox-edit.spec.ts",
         "**/send-channel-binding.spec.ts",
         "**/project-commit-detail.spec.ts",
         "**/project-inbox.spec.ts",
@@ -139,6 +140,7 @@ export default defineConfig({
         "**/where-to-run-config.spec.ts",
         "**/huddle-transcription.spec.ts",
         "**/agent-numeric-tuning.spec.ts",
+        "**/needs-restart-screenshots.spec.ts",
       ],
       use: {
         ...devices["Desktop Chrome"],

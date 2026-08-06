@@ -29,9 +29,9 @@ import { toast } from "sonner";
 
 import { useCreateProjectPullRequestCommentMutation } from "@/features/projects/commentMutations";
 import type {
-  Project,
   ProjectPullRequest,
   ProjectPullRequestCommentAnchor,
+  Repository as Project,
 } from "@/features/projects/hooks";
 import { canReviewProjectPullRequest } from "@/features/projects/pullRequestReviews";
 import type { ProjectPullRequestComment } from "@/features/projects/projectPullRequests.mjs";
