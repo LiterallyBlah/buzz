@@ -45,7 +45,6 @@ import {
   ProfileAuthorName,
   ProfileIdentityButton,
 } from "./ProjectProfileIdentity";
-import { ProjectActivityIndicator } from "./ProjectActivityIndicator";
 import { PullRequestReviewTimeline } from "./ProjectPullRequestReviewTimeline";
 import { ProjectRichContent } from "./ProjectRichContent";
 import { ProjectRootAgentsSection } from "./ProjectRootAgentsSection";
@@ -633,10 +632,12 @@ export function ProjectPullRequestDetail({
         </header>
       ) : null}
 
-      <ProjectActivityIndicator
-        profiles={profiles}
-        rootEventId={pullRequest.id}
-      />
+      {/* No inline activity strip. Live agent state for a work item is
+          reported once, in the detail rail's Agents section, which carries the
+          stage caption this strip used to be the only source of. Two surfaces
+          reporting one fact drift, and the one at a fixed scroll position is
+          the one a reader has to travel to. The shared thread shell is still
+          phase 2; this is only the duplicate. */}
 
       {pullRequest.updates.length > 0 ? (
         <section className="space-y-3 border-border/50 border-t p-4">

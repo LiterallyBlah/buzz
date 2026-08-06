@@ -11,6 +11,7 @@ import {
   type ProjectRootAgent,
   type ProjectRootCommentAuthor,
 } from "@/features/projects/projectRootAgents";
+import type { ProjectAgentActivity } from "@/features/projects/projectAgentActivity";
 import { useProjectSeenAgents } from "@/features/projects/projectSeenAgents";
 import { useProjectAgentActivity } from "@/features/projects/useProjectAgentActivity";
 import { normalizePubkey } from "@/shared/lib/pubkey";
@@ -91,21 +92,32 @@ function AgentStateBadge({ state }: { state: ProjectRootAgent["state"] }) {
  */
 export function ProjectRootAgentsSection({
   commentAuthors,
+  live: providedLive,
   profiles,
   rootEventId,
 }: {
   commentAuthors?: readonly ProjectRootCommentAuthor[];
+  /**
+   * Activity from a caller that already has it, instead of a second REQ.
+   *
+   * Offered rather than required, and this is the whole reason the section
+   * subscribes at all: the rail outlives any one live surface on several
+   * routes — the pull-request "Files changed" and "Checks" tabs render it
+   * beside content that has no activity subscription of its own — so a
+   * required prop would leave the section frozen exactly where a reader is
+   * most likely to be waiting on a build. The issue detail passes its own
+   * because it needs the same frames to drive the jump-to-latest pill, and
+   * two REQs with an identical `#e` filter on one root is a duplicate rather
+   * than a fallback.
+   */
+  live?: readonly ProjectAgentActivity[];
   profiles?: UserProfileLookup;
   rootEventId: string;
 }) {
-  // Its own subscription rather than a prop threaded down from the detail
-  // view. The rail outlives the live indicator on several routes — the
-  // pull-request "Files changed" and "Checks" tabs render the rail beside
-  // content that never mounts the indicator — so a shared subscription owned
-  // by the indicator would leave this section frozen exactly where a reader is
-  // most likely to be waiting on a build. The extra REQ carries the same `#e`
-  // filter on a root already on screen.
-  const live = useProjectAgentActivity(rootEventId);
+  // `null` is the hook's own "open nothing", so a caller-supplied feed costs
+  // no subscription here rather than opening one and discarding it.
+  const ownLive = useProjectAgentActivity(providedLive ? null : rootEventId);
+  const live = providedLive ?? ownLive;
   const seen = useProjectSeenAgents(rootEventId);
   const knownAgents = useKnownAgentPubkeys();
   const { openAgentActivity } = useOpenAgentActivity();

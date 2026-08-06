@@ -134,17 +134,35 @@ export function useProjectThreadPin({
       setActivitySettledBelow(true);
   }, [rootId, workingAgents]);
 
-  // Content that grows after layout — an image resolving, a code block
-  // wrapping, the composer expanding under a click — moves the floor without
-  // emitting a scroll event. Re-pinning only while already pinned is what
-  // keeps this from yanking a reader who has deliberately scrolled up.
+  // Anything that moves the floor without emitting a scroll event.
+  //
+  // Two boxes, because the floor is a function of both and they move for
+  // different reasons. The content grows — an image resolves, a code block
+  // wraps — and the distance to the bottom grows with it. The *container*
+  // shrinks — the docked composer expands from its one-line bar, and it is a
+  // flex sibling outside this region, so its growth is taken out of the
+  // thread's height. Measured: focusing the compact composer takes 28px off
+  // `clientHeight` with `scrollTop` and `scrollHeight` unchanged, which is 28px
+  // of the newest comment sliding above the floor at the moment the reader is
+  // answering it.
+  //
+  // Observing only the content leaves that second case to whatever else
+  // happens to re-pin. Something does today — the composer refocuses its editor
+  // after expanding, and the second `focusin` re-runs the focus handler against
+  // the new height — but that is another component's internal sequencing, not
+  // an invariant this hook can rely on.
+  //
+  // Re-pinning only while already pinned is what keeps this from yanking a
+  // reader who has deliberately scrolled up.
   React.useEffect(() => {
     const content = contentRef.current;
-    if (!content || typeof ResizeObserver === "undefined") return;
+    const scroller = scrollRef.current;
+    if (!content || !scroller || typeof ResizeObserver === "undefined") return;
     const observer = new ResizeObserver(() => {
       if (isAtBottomRef.current) scrollToBottom("auto");
     });
     observer.observe(content);
+    observer.observe(scroller);
     return () => observer.disconnect();
   }, [scrollToBottom]);
 

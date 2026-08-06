@@ -34,6 +34,7 @@ import {
   type UserProfileLookup,
 } from "@/features/profile/lib/identity";
 import { workingAgentsKey } from "@/features/projects/lib/projectThreadPin";
+import type { ProjectAgentActivity } from "@/features/projects/projectAgentActivity";
 import { relativeTime } from "@/features/projects/lib/projectsViewHelpers";
 import { useProjectAgentActivity } from "@/features/projects/useProjectAgentActivity";
 import type { ChannelMember } from "@/shared/api/types";
@@ -641,6 +642,7 @@ export function ProjectIssueDetail({
           : "min-h-0 overflow-y-auto border-l border-border/60"
       }
       issue={issue}
+      live={liveActivity}
       profiles={profiles}
     />
   );
@@ -730,12 +732,19 @@ export function ProjectIssueDetail({
 function IssueMetaRail({
   className,
   issue,
+  live,
   profiles,
   stacked = false,
 }: {
   /** Layout override for the pinned layout, which places the rail itself. */
   className?: string;
   issue: ProjectIssue;
+  /**
+   * Activity the detail already subscribes to, in the pinned layout. Absent in
+   * the stacked one, where nothing above the rail is listening and the agents
+   * section opens its own.
+   */
+  live?: readonly ProjectAgentActivity[];
   profiles?: UserProfileLookup;
   stacked?: boolean;
 }) {
@@ -769,6 +778,7 @@ function IssueMetaRail({
           belongs on the people side of that line. */}
       <ProjectRootAgentsSection
         commentAuthors={issue.comments}
+        live={live}
         profiles={profiles}
         rootEventId={issue.id}
       />

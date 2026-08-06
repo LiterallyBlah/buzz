@@ -224,6 +224,92 @@ test("an open issue owns its scroll region and stays on the newest comment", asy
 });
 
 /**
+ * Focusing the composer must not cost the floor.
+ *
+ * The docked composer is a flex sibling *outside* the scroll region, and it
+ * expands from a one-line bar when focused. That expansion is taken out of the
+ * thread's height: measured here, `clientHeight` drops by ~28px while
+ * `scrollTop` and `scrollHeight` are untouched, which is the newest comment
+ * sliding above the floor at the exact moment the reader is answering it.
+ *
+ * Nothing in the hook noticed until the ResizeObserver was pointed at the
+ * scroll container as well as its content — the behaviour was held up by the
+ * composer refocusing its own editor after expanding, which re-ran the focus
+ * handler against the new height. That is another component's internal
+ * sequencing. This test is what makes it an invariant instead of a coincidence.
+ */
+test("focusing the composer keeps the thread on its newest comment", async ({
+  page,
+}) => {
+  await enableProjectsFeature(page);
+  await installMockBridge(page);
+  await page.setViewportSize({ width: 1440, height: 620 });
+
+  const issueId = await openFirstIssue(page);
+  for (let index = 0; index < 12; index += 1) {
+    await pushComment(page, issueId, `Reply before composing ${index + 1}.`);
+  }
+  await expect(page.getByText("Reply before composing 12.")).toBeVisible({
+    timeout: 10_000,
+  });
+  await expect
+    .poll(async () => {
+      const { clientHeight, scrollHeight, scrollTop } =
+        await threadMetrics(page);
+      return scrollHeight - clientHeight - scrollTop <= 32;
+    })
+    .toBe(true);
+
+  const before = await threadMetrics(page);
+  expect(before.scrollTop).toBeGreaterThan(0);
+
+  await page.locator('[data-placeholder="Add a comment…"]').first().click();
+
+  // The composer really did take height out of the thread, so what follows is
+  // a claim about a container that shrank rather than one that never moved.
+  await expect
+    .poll(async () => (await threadMetrics(page)).clientHeight)
+    .toBeLessThan(before.clientHeight);
+
+  // And the floor still holds — *exactly*, not within the 32px at-bottom
+  // threshold. The measured slip is 28px, which is inside that threshold, so
+  // asserting `<= 32` here would pass with the defect fully present and this
+  // test would be decoration. What is being claimed is that the thread is on
+  // its floor, which is what a reader answering the newest comment is owed.
+  await expect
+    .poll(async () => {
+      const { clientHeight, scrollHeight, scrollTop } =
+        await threadMetrics(page);
+      return scrollHeight - clientHeight - scrollTop;
+    })
+    .toBeLessThanOrEqual(2);
+
+  // The newest comment is inside the *thread*, not merely inside the window:
+  // at a 28px slip it is still on screen, just clipped by the scroll box it
+  // lives in, which `toBeInViewport` would not notice.
+  const clipped = await page.evaluate(() => {
+    const scroller = document.querySelector(
+      '[data-testid="project-issue-thread-scroll"]',
+    );
+    const comments = [
+      ...document.querySelectorAll(
+        '[data-testid="project-issue-thread-scroll"] p',
+      ),
+    ];
+    const last = comments.find((node) =>
+      node.textContent?.includes("Reply before composing 12."),
+    );
+    if (!scroller || !last) return null;
+    return (
+      last.getBoundingClientRect().bottom -
+      scroller.getBoundingClientRect().bottom
+    );
+  });
+  expect(clipped).not.toBeNull();
+  expect(clipped as number).toBeLessThanOrEqual(0);
+});
+
+/**
  * The half of "new activity" that is not a comment.
  *
  * An agent handed an issue by a peer call announces NIP-PA for the length of
