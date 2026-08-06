@@ -1,4 +1,4 @@
-import type { Channel, RelayAgent } from "@/shared/api/types";
+import type { Channel, ChannelType, RelayAgent } from "@/shared/api/types";
 import { normalizePubkey } from "@/shared/lib/pubkey";
 
 export function getSharedChannelIds(channels: readonly Channel[] | undefined) {
@@ -45,6 +45,25 @@ export type AgentEligibilityScope =
   | { type: "community" }
   | { type: "channel"; channelId: string }
   | { type: "managed-only" };
+
+export const COMMUNITY_AGENT_ELIGIBILITY_SCOPE = {
+  type: "community",
+} as const satisfies AgentEligibilityScope;
+
+export function resolveAgentEligibilityScope({
+  channelId,
+  channelType,
+  explicitScope,
+}: {
+  channelId?: string | null;
+  channelType?: ChannelType | null;
+  explicitScope?: AgentEligibilityScope;
+}): AgentEligibilityScope {
+  if (explicitScope) return explicitScope;
+  return channelId && isAgentMentionChannelType(channelType)
+    ? { type: "channel", channelId }
+    : { type: "managed-only" };
+}
 
 export function getMentionableAgentPubkeys({
   currentPubkey,

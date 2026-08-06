@@ -106,6 +106,7 @@ export default defineConfig({
         "**/send-channel-binding.spec.ts",
         "**/project-commit-detail.spec.ts",
         "**/project-inbox.spec.ts",
+        "**/project-agent-mentions.spec.ts",
         "**/project-issue-thread.spec.ts",
         "**/project-pr-review.spec.ts",
         "**/persona-model-combobox-screenshots.spec.ts",

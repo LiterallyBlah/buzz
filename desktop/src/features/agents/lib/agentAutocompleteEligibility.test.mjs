@@ -10,6 +10,7 @@ import {
   isAgentMentionChannelType,
   relayAgentCanRespondInChannel,
   relayAgentIsSharedWithUser,
+  resolveAgentEligibilityScope,
   shouldHideAgentFromMentions,
   uniqueAutocompleteLabels,
 } from "./agentAutocompleteEligibility.ts";
@@ -198,6 +199,41 @@ test("getMentionableAgentPubkeys: scopes channel composers and fails closed with
       eligibilityScope: { type: "managed-only" },
     }),
     new Set([PUB_A]),
+  );
+});
+
+test("resolveAgentEligibilityScope: project work surfaces explicitly use community eligibility", () => {
+  assert.deepEqual(
+    resolveAgentEligibilityScope({
+      explicitScope: { type: "community" },
+    }),
+    { type: "community" },
+  );
+  assert.deepEqual(
+    resolveAgentEligibilityScope({
+      channelId: "buzz",
+      channelType: "forum",
+      explicitScope: { type: "community" },
+    }),
+    { type: "community" },
+  );
+});
+
+test("resolveAgentEligibilityScope: ordinary channels retain exact channel eligibility", () => {
+  assert.deepEqual(
+    resolveAgentEligibilityScope({
+      channelId: "general",
+      channelType: "stream",
+    }),
+    { type: "channel", channelId: "general" },
+  );
+});
+
+test("resolveAgentEligibilityScope: absent or unsupported context stays managed-only", () => {
+  assert.deepEqual(resolveAgentEligibilityScope({}), { type: "managed-only" });
+  assert.deepEqual(
+    resolveAgentEligibilityScope({ channelId: "direct", channelType: "dm" }),
+    { type: "managed-only" },
   );
 });
 

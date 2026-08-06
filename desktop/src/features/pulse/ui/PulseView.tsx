@@ -5,6 +5,7 @@ import {
   useManagedAgentsQuery,
   useRelayAgentsQuery,
 } from "@/features/agents/hooks";
+import { COMMUNITY_AGENT_ELIGIBILITY_SCOPE } from "@/features/agents/lib/agentAutocompleteEligibility";
 import {
   useContactListQuery,
   useUsersBatchQuery,
@@ -387,6 +388,7 @@ export function PulseView({ currentPubkey }: PulseViewProps) {
                 </div>
               )}
               <ForumComposer
+                agentEligibilityScope={COMMUNITY_AGENT_ELIGIBILITY_SCOPE}
                 autocompleteBelow
                 className="pulse-composer overflow-hidden rounded-2xl border-border/50 bg-background/70 p-2 shadow-none backdrop-blur-xl supports-[backdrop-filter]:bg-background/55"
                 compact

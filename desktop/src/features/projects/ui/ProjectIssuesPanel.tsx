@@ -8,6 +8,7 @@ import {
 import * as React from "react";
 import { toast } from "sonner";
 
+import { COMMUNITY_AGENT_ELIGIBILITY_SCOPE } from "@/features/agents/lib/agentAutocompleteEligibility";
 import { ForumComposer } from "@/features/forum/ui/ForumComposer";
 import { useCreateProjectIssueCommentMutation } from "@/features/projects/commentMutations";
 import {
@@ -592,6 +593,7 @@ export function ProjectIssueDetail({
 
   const composer = (
     <ForumComposer
+      agentEligibilityScope={COMMUNITY_AGENT_ELIGIBILITY_SCOPE}
       className="border border-border/60 bg-background/45"
       compact={fillHeight}
       disabled={commentMutation.isPending}

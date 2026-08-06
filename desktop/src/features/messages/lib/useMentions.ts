@@ -18,9 +18,10 @@ import {
   getMentionableAgentPubkeys,
   getSharedChannelIds,
   isAgentIdentityInAllowedList,
-  isAgentMentionChannelType,
+  resolveAgentEligibilityScope,
   shouldHideAgentFromMentions,
   uniqueAutocompleteLabels,
+  type AgentEligibilityScope,
 } from "@/features/agents/lib/agentAutocompleteEligibility";
 import {
   useInfiniteUserSearchQuery,
@@ -57,6 +58,7 @@ export type PersonaMentionTarget = {
   persona: AgentPersona;
 };
 type UseMentionsOptions = {
+  agentEligibilityScope?: AgentEligibilityScope;
   channelType?: ChannelType | null;
 };
 function formatSearchUserDisplayName(user: UserSearchResult) {
@@ -194,16 +196,20 @@ export function useMentions(
     () => getSharedChannelIds(channelsQuery.data),
     [channelsQuery.data],
   );
-  const mentionChannelId = isAgentMentionChannelType(options?.channelType)
-    ? channelId
-    : null;
+  const agentEligibilityScope = React.useMemo(
+    () =>
+      resolveAgentEligibilityScope({
+        channelId,
+        channelType: options?.channelType,
+        explicitScope: options?.agentEligibilityScope,
+      }),
+    [channelId, options?.agentEligibilityScope, options?.channelType],
+  );
   const mentionableAgentPubkeys = React.useMemo(
     () =>
       getMentionableAgentPubkeys({
         currentPubkey,
-        eligibilityScope: mentionChannelId
-          ? { type: "channel", channelId: mentionChannelId }
-          : { type: "managed-only" },
+        eligibilityScope: agentEligibilityScope,
         managedAgentPubkeys,
         relayAgents: relayAgentsQuery.data,
         sharedChannelIds,
@@ -211,7 +217,7 @@ export function useMentions(
     [
       currentPubkey,
       managedAgentPubkeys,
-      mentionChannelId,
+      agentEligibilityScope,
       relayAgentsQuery.data,
       sharedChannelIds,
     ],
