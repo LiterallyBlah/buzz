@@ -15,7 +15,7 @@ async function enableProjectsFeature(page: Page) {
   });
 }
 
-async function openFirstIssue(page: Page) {
+async function openProject(page: Page) {
   await page.goto("/", { waitUntil: "domcontentloaded" });
   await page.getByTestId("open-projects-view").click();
   await page.getByRole("button", { name: "Repositories", exact: true }).click();
@@ -25,6 +25,10 @@ async function openFirstIssue(page: Page) {
     )
     .first()
     .click();
+}
+
+async function openFirstIssue(page: Page) {
+  await openProject(page);
   await page.getByRole("tab", { name: "Issues", exact: true }).click();
 
   const firstIssue = page.getByTestId("project-issue-row").first();
@@ -64,6 +68,80 @@ async function pushComment(page: Page, issueId: string, body: string) {
       repoAddress: BUZZ_REPO_ADDRESS,
     },
   );
+}
+
+/**
+ * Seed an issue with a body of our choosing and open it.
+ *
+ * The seeded fixtures all carry their subject as their content, so the two
+ * cases that break the layout — no description at all, and one long enough to
+ * clamp — are unreachable without publishing one.
+ */
+async function seedAndOpenIssue(page: Page, subject: string, body: string) {
+  const id = await page.evaluate(
+    ({ author, content, repoAddress, title }) =>
+      window.__BUZZ_E2E_PUSH_MOCK_PROJECT_EVENT__?.({
+        content,
+        kind: 1621,
+        pubkey: author,
+        tags: [
+          ["a", repoAddress],
+          ["subject", title],
+        ],
+      })?.id ?? null,
+    {
+      author: TEST_IDENTITIES.alice.pubkey,
+      content: body,
+      repoAddress: BUZZ_REPO_ADDRESS,
+      title: subject,
+    },
+  );
+  // The list is a query, not a live subscription, so the tab has to be entered
+  // after the publish for the row to exist.
+  await page.getByRole("tab", { name: "Issues", exact: true }).click();
+  const row = page.locator(`[data-project-event-id="${id}"]`).first();
+  await expect(row).toBeVisible({ timeout: 10_000 });
+  await row.getByTitle("View issue").click();
+  await expect(page.getByTestId("project-issue-detail")).toBeVisible();
+  return id as string;
+}
+
+/**
+ * The stacked border widths across one boundary, top to bottom.
+ *
+ * Returned as data rather than asserted in the page, because the failure this
+ * guards is "two hairlines where there should be one" and the only honest way
+ * to say that is to show both numbers.
+ */
+async function boundaryRules(page: Page) {
+  return page.evaluate(() => {
+    const scroll = document.querySelector(
+      '[data-testid="project-issue-thread-scroll"]',
+    ) as HTMLElement;
+    const content = scroll?.firstElementChild as HTMLElement;
+    const children = [...content.children] as HTMLElement[];
+    const rules: { gap: number; total: number }[] = [];
+    for (let index = 0; index < children.length - 1; index += 1) {
+      const above = children[index];
+      const below = children[index + 1];
+      const aboveRect = above.getBoundingClientRect();
+      const belowRect = below.getBoundingClientRect();
+      const aboveBorder = Number.parseFloat(
+        getComputedStyle(above).borderBottomWidth,
+      );
+      const belowBorder = Number.parseFloat(
+        getComputedStyle(below).borderTopWidth,
+      );
+      // Only boundaries where the two blocks actually touch: a sticky header
+      // overlapping scrolled content is not a shared edge.
+      if (Math.abs(belowRect.top - aboveRect.bottom) > 1) continue;
+      rules.push({
+        gap: index,
+        total: aboveBorder + belowBorder,
+      });
+    }
+    return rules;
+  });
 }
 
 /**
@@ -170,6 +248,131 @@ test("the issue description is presented as a document, not as a comment", async
   // And the description carries no byline — attribution is what would make it
   // read as a message again, and the header already names the author.
   await expect(description.getByRole("img")).toHaveCount(0);
+});
+
+/** Multi-paragraph, with a list — enough to clamp, and enough block children
+ *  that `-webkit-line-clamp` has more than one thing to count. */
+const LONG_DESCRIPTION = [
+  "The relay drops a reconnect attempt when the backoff timer and the socket close race, and the window is small but reachable on a flaky link.",
+  "",
+  "Reproduction is unreliable by hand. The clearest signal is that the attempt counter stops incrementing while the socket stays in CLOSING.",
+  "",
+  "- The jitter is applied before the cap rather than after.",
+  "- The timer is not cancelled on an explicit disconnect.",
+  "- Nothing resets the attempt counter on a successful open.",
+  "",
+  "Fixing the ordering is the small half. The counter reset is the one that changes what a user feels, because it turns a brief blip into a minutes-long outage on their screen.",
+].join("\n");
+
+/**
+ * An issue with no description at all.
+ *
+ * `IssueBody` renders nothing without content, so the block that follows the
+ * sticky header changes identity — and the header is `border-b`, so whatever
+ * lands there must not draw its own top rule. Both widths are covered because
+ * the block is a different one in each: the conversation heading above `xl`,
+ * the meta rail below it.
+ */
+test("an issue with no description draws one rule under the header, not two", async ({
+  page,
+}) => {
+  await enableProjectsFeature(page);
+  await installMockBridge(page);
+  await page.setViewportSize({ width: 1440, height: 620 });
+
+  await openProject(page);
+  await seedAndOpenIssue(page, "An issue with no description at all", "");
+  await expect(page.getByTestId("project-work-item-description")).toHaveCount(
+    0,
+  );
+
+  // Every boundary where two blocks actually touch carries at most one
+  // hairline. Asserted over all of them rather than the one that regressed,
+  // because the point is the invariant, not the instance.
+  for (const rule of await boundaryRules(page)) {
+    expect(rule.total).toBeLessThanOrEqual(1);
+  }
+
+  // Below xl the rail takes the first slot instead, and it brings a border on
+  // both edges. Same invariant, different block.
+  await page.setViewportSize({ width: 900, height: 620 });
+  await page
+    .getByTestId("project-issue-thread-scroll")
+    .evaluate((element) => element.scrollTo({ top: 0 }));
+  await expect(page.getByTestId("project-issue-meta-rail")).toBeVisible();
+  for (const rule of await boundaryRules(page)) {
+    expect(rule.total).toBeLessThanOrEqual(1);
+  }
+});
+
+/**
+ * A description long enough to clamp, inside the panel.
+ *
+ * `-webkit-line-clamp` needs `display: -webkit-box`, and putting that on a
+ * container of several block children is the combination worth having eyes on:
+ * it can silently count blocks instead of lines. Asserted through the toggle
+ * because that is the reader's whole interface to it.
+ */
+test("a long description clamps inside the panel and expands back", async ({
+  page,
+}) => {
+  await enableProjectsFeature(page);
+  await installMockBridge(page);
+  await page.setViewportSize({ width: 1440, height: 620 });
+
+  await openProject(page);
+  await seedAndOpenIssue(
+    page,
+    "Fix reconnect backoff jitter",
+    LONG_DESCRIPTION,
+  );
+
+  const description = page.getByTestId("project-work-item-description");
+  const toggle = page.getByTestId("project-issue-body-toggle");
+  await expect(toggle).toBeVisible();
+  await expect(toggle).toHaveText("Show more");
+
+  const measure = () =>
+    description.evaluate((section) => {
+      const panel = section.querySelector("div") as HTMLElement;
+      const clamped = panel.querySelector("div") as HTMLElement;
+      const button = section.querySelector(
+        '[data-testid="project-issue-body-toggle"]',
+      ) as HTMLElement;
+      const panelRect = panel.getBoundingClientRect();
+      const buttonRect = button.getBoundingClientRect();
+      return {
+        clipped: clamped.scrollHeight - clamped.clientHeight > 1,
+        clampedHeight: Math.round(clamped.getBoundingClientRect().height),
+        panelHeight: Math.round(panelRect.height),
+        // The toggle belongs to the document, so it has to be inside the
+        // panel's box and not floating in the gutter beneath it.
+        buttonInsidePanel:
+          buttonRect.top >= panelRect.top - 1 &&
+          buttonRect.bottom <= panelRect.bottom + 1,
+      };
+    });
+
+  const collapsed = await measure();
+  expect(collapsed.clipped).toBe(true);
+  expect(collapsed.buttonInsidePanel).toBe(true);
+
+  await toggle.click();
+  await expect(toggle).toHaveText("Show less");
+  const expanded = await measure();
+  // Really showing more: the clamp is off and the panel grew with it.
+  expect(expanded.clipped).toBe(false);
+  expect(expanded.clampedHeight).toBeGreaterThan(collapsed.clampedHeight);
+  expect(expanded.panelHeight).toBeGreaterThan(collapsed.panelHeight);
+  expect(expanded.buttonInsidePanel).toBe(true);
+
+  await toggle.click();
+  await expect(toggle).toHaveText("Show more");
+  const recollapsed = await measure();
+  expect(recollapsed.clipped).toBe(true);
+  // Exactly back, not approximately: a clamp that re-measures itself wrong on
+  // the way back is the failure mode worth naming.
+  expect(recollapsed.panelHeight).toBe(collapsed.panelHeight);
 });
 
 /**

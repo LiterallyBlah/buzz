@@ -635,11 +635,25 @@ export function ProjectIssueDetail({
     );
   }
 
+  // One rule per boundary, and the sticky header already draws the first one.
+  //
+  // The header is `border-b`, so whichever block happens to come first inside
+  // the scroll region must not also draw a top rule — two 1px hairlines with
+  // nothing between them make a 2px line for a single boundary, heavier than
+  // every other divider on the surface. Which block comes first is not fixed:
+  // an issue with no description drops `IssueBody` entirely, so the first
+  // block is the rail below `xl` and the conversation heading above it.
+  //
+  // Hence one flag rather than a rule on each: the description is what stands
+  // between the header and everything after it, and when it is absent the
+  // header's own border is the boundary.
+  const hasDescription = Boolean(issue.content);
+
   const rail = (
     <IssueMetaRail
       className={
         isNarrow
-          ? "border-y border-border/60"
+          ? cn("border-b border-border/60", hasDescription && "border-t")
           : "min-h-0 overflow-y-auto border-l border-border/60"
       }
       issue={issue}
@@ -680,14 +694,15 @@ export function ProjectIssueDetail({
                 material where the newest comment should be. Status stays
                 reachable from the sticky header instead. */}
             {isNarrow ? rail : null}
-            {/* Where the document ends and the conversation starts. The rule
-                is dropped when the rail is above us, because the rail already
-                closes with a border and two of them stack into a double line
-                for the same one boundary. */}
+            {/* Where the document ends and the conversation starts — but only
+                when something above us has not already closed. The rail brings
+                its own bottom border, and an issue with no description leaves
+                the sticky header directly above this heading with its border
+                already drawn. See `hasDescription`. */}
             <div
               className={cn(
                 "px-4 pt-3",
-                !isNarrow && "border-t border-border/50",
+                !isNarrow && hasDescription && "border-t border-border/50",
               )}
             >
               <h4 className="flex items-center gap-1.5 text-sm font-semibold text-foreground">
