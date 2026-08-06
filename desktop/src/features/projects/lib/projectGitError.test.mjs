@@ -19,6 +19,22 @@ test("explains unsupported authenticated GitHub clones without exposing git outp
   );
 });
 
+test("explains how an owner repairs an older unbound Buzz repository", () => {
+  assert.deepEqual(
+    projectCloneErrorPresentation(
+      new Error(
+        'remote: run: buzz repos bind --id buzz --channel <channel-uuid> — repository "buzz" has no channel binding, so the relay cannot authorize access\nfatal: The requested URL returned error: 404',
+      ),
+      "https://relay.example/git/owner/buzz.git",
+    ),
+    {
+      title: "Repository access channel required",
+      description:
+        "This older repository has no access channel. Open the project and use Set access to choose which channel may read it.",
+    },
+  );
+});
+
 test("presents missing and network failures clearly", () => {
   assert.equal(
     projectCloneErrorPresentation(new Error("Repository not found")).title,

@@ -51,7 +51,7 @@ export function useBindProjectRepositoryChannelMutation() {
   const queryClient = useQueryClient();
   return useMutation({
     mutationFn: bindProjectRepositoryChannel,
-    onSuccess: (repository) => {
+    onSuccess: async (repository) => {
       queryClient.setQueryData<Project[]>(projectsQueryKey, (current = []) =>
         current.map((project) => ({
           ...project,
@@ -62,7 +62,16 @@ export function useBindProjectRepositoryChannelMutation() {
           ),
         })),
       );
-      void queryClient.invalidateQueries({ queryKey: projectsQueryKey });
+      // The signed repository head changes the relay's git authorisation result
+      // without changing the repository id or clone URL. Invalidate both the
+      // overview snapshots and every open detail query so a successful repair
+      // replaces the cached denial immediately rather than requiring a reload.
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: projectsQueryKey }),
+        queryClient.invalidateQueries({
+          queryKey: ["project", repository.id],
+        }),
+      ]);
     },
   });
 }

@@ -9,6 +9,7 @@ import {
   Loader2,
   LockKeyhole,
   RefreshCw,
+  ShieldCheck,
 } from "lucide-react";
 
 import type { ProjectRepoFile } from "@/features/projects/hooks";
@@ -162,6 +163,12 @@ export function ReadmePanel({
   if (gitDataState === "unavailable") {
     const reason = unavailableReason ?? "unknown";
     const unavailableContent = {
+      unbound: {
+        description:
+          "This older repository has no access channel. If you own it, use Set access above to choose which channel may read it.",
+        icon: ShieldCheck,
+        title: "Repository access channel required",
+      },
       authentication: {
         description:
           "Buzz could not authenticate with this repository. Check your access and try again.",

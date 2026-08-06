@@ -272,6 +272,11 @@ function RepositoryUnavailableIndicator({
 }) {
   if (!reason) return null;
   const status = {
+    unbound: {
+      description:
+        "This older repository needs its owner to choose an access channel from Set access after opening it.",
+      label: "Access setup needed",
+    },
     authentication: {
       description: "Buzz could not authenticate with this repository.",
       label: "Access failed",

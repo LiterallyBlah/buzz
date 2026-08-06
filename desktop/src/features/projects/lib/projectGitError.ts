@@ -1,3 +1,5 @@
+import { isNoChannelBindingError } from "./projectBranchErrors";
+
 export type ProjectGitErrorPresentation = {
   title: string;
   description: string;
@@ -22,6 +24,14 @@ export function projectCloneErrorPresentation(
 ): ProjectGitErrorPresentation {
   const message = errorText(error);
   const github = isGitHubUrl(cloneUrl);
+
+  if (isNoChannelBindingError(message)) {
+    return {
+      title: "Repository access channel required",
+      description:
+        "This older repository has no access channel. Open the project and use Set access to choose which channel may read it.",
+    };
+  }
 
   if (
     /\b(?:401|403)\b|authenticat|authoriz|permission denied|access denied|ssh certificate/.test(
