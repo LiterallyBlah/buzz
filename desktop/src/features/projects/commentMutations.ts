@@ -2,10 +2,12 @@ import { useMutation, useQueryClient } from "@tanstack/react-query";
 
 import { relayClient } from "@/shared/api/relayClient";
 import { signRelayEvent } from "@/shared/api/tauri";
+import { getIdentity } from "@/shared/api/tauriIdentity";
 import { KIND_TEXT_NOTE } from "@/shared/constants/kinds";
 import type { RelayEvent } from "@/shared/api/types";
-import type { Project } from "./hooks";
+import type { Repository as Project } from "./hooks";
 import type { ProjectIssue } from "./projectIssues.mjs";
+import { nextProjectIssueCommentCreatedAt } from "./projectIssues.mjs";
 import type {
   ProjectPullRequest,
   ProjectPullRequestCommentAnchor,
@@ -140,10 +142,16 @@ async function createProjectIssueComment({
     ...[...recipients].map((recipient) => ["p", recipient]),
     ...(mediaTags ?? []),
   ];
+  const identity = await getIdentity();
 
   const event = await signRelayEvent({
     kind: KIND_TEXT_NOTE,
     content: body,
+    createdAt: nextProjectIssueCommentCreatedAt(
+      issue,
+      Math.floor(Date.now() / 1_000),
+      identity.pubkey,
+    ),
     tags,
   });
 

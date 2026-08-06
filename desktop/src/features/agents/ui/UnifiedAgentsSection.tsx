@@ -1,10 +1,5 @@
 import * as React from "react";
-import {
-  AlertTriangle,
-  ChevronDown,
-  ChevronRight,
-  RefreshCw,
-} from "lucide-react";
+import { AlertTriangle, ChevronDown, ChevronRight } from "lucide-react";
 
 import { resolveAgentCardModelLabel } from "@/features/agents/lib/agentCardModelLabel";
 import { friendlyAgentLastError } from "@/features/agents/lib/friendlyAgentLastError";
@@ -19,6 +14,7 @@ import type { ProfilePanelOpenOptions } from "@/shared/context/ProfilePanelConte
 import { useFeedbackToasts } from "@/shared/hooks/useToastEffect";
 import { useFileImportZone } from "@/shared/hooks/useFileImportZone";
 import { Badge } from "@/shared/ui/badge";
+import { RestartDiffBadge } from "./RestartDiffBadge";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -367,10 +363,10 @@ function AgentPersonaCard({
             Configuration missing
           </Badge>
         ) : agent?.needsRestart ? (
-          <Badge className="gap-1" variant="warning">
-            <RefreshCw className="h-3 w-3" />
-            Restart required
-          </Badge>
+          <RestartDiffBadge
+            autoRestartEnabled={agent.autoRestartOnConfigChange}
+            restartDiff={agent.restartDiff}
+          />
         ) : null
       }
     />
@@ -442,10 +438,10 @@ function StandaloneAgentCard({
             Configuration missing
           </Badge>
         ) : agent.needsRestart ? (
-          <Badge className="gap-1" variant="warning">
-            <RefreshCw className="h-3 w-3" />
-            Restart required
-          </Badge>
+          <RestartDiffBadge
+            autoRestartEnabled={agent.autoRestartOnConfigChange}
+            restartDiff={agent.restartDiff}
+          />
         ) : null
       }
     />

@@ -7,7 +7,7 @@ import {
   type ProjectDeletionSubject,
   useDeleteProjectEventMutation,
 } from "@/features/projects/deletionMutations";
-import type { Project } from "@/features/projects/hooks";
+import type { Repository as Project } from "@/features/projects/hooks";
 import { useIdentityQuery } from "@/shared/api/hooks";
 import {
   AlertDialog,

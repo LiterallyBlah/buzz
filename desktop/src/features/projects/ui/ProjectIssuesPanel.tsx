@@ -11,8 +11,8 @@ import { toast } from "sonner";
 import { ForumComposer } from "@/features/forum/ui/ForumComposer";
 import { useCreateProjectIssueCommentMutation } from "@/features/projects/commentMutations";
 import {
-  type Project,
   type ProjectIssue,
+  type Repository as Project,
   useProjectIssuesQuery,
 } from "@/features/projects/hooks";
 import {
@@ -47,6 +47,7 @@ import {
   ProjectFeedRowMonoCell,
 } from "./ProjectFeedRow";
 import { ProjectItemDeleteMenu } from "./ProjectItemDeleteMenu";
+import { ProjectOriginReference } from "./ProjectOriginReference";
 import { OverviewRailSection } from "./ProjectOverviewPanel";
 import { ProfileIdentityButton } from "./ProjectProfileIdentity";
 import { ProjectRichContent } from "./ProjectRichContent";
@@ -175,10 +176,15 @@ function IssueRow({
       trailing={
         <>
           {issue.comments.length > 0 ? (
-            <span className="flex items-center gap-1 text-xs text-muted-foreground">
+            <button
+              aria-label={`View ${issue.comments.length} comments`}
+              className="flex items-center gap-1 rounded-md text-xs text-muted-foreground hover:text-foreground focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring"
+              onClick={onOpen}
+              type="button"
+            >
               <MessageSquare className="h-3.5 w-3.5" />
               {issue.comments.length}
-            </span>
+            </button>
           ) : null}
           <ProjectFeedRowCluster>
             <ProjectFeedRowMonoCell
@@ -435,9 +441,13 @@ function IssueThreadHeader({
       )}
       data-testid="project-issue-thread-header"
     >
-      <p className="flex items-center gap-1.5 text-xs font-medium text-muted-foreground">
+      <p className="flex flex-wrap items-center gap-1.5 text-xs font-medium text-muted-foreground">
         <CircleDot className="h-3.5 w-3.5" />
         Issue from {authorLabel}
+        <ProjectOriginReference
+          agentName={issue.originAgentName}
+          channelId={issue.channelId}
+        />
       </p>
       <div className="mt-1 flex items-start justify-between gap-3">
         <h3

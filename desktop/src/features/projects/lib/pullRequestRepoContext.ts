@@ -32,7 +32,7 @@
  * reports what is genuinely missing when neither can answer.
  */
 
-import type { Project } from "../hooks";
+import type { Repository as Project } from "../hooks";
 import type { ProjectPullRequest } from "../projectPullRequests.mjs";
 import { parseRepoCoordinate } from "./repoCoordinate";
 

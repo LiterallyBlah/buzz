@@ -11,9 +11,9 @@ import {
 import * as React from "react";
 
 import type {
-  Project,
   ProjectPullRequest,
   ProjectPullRequestCommentAnchor,
+  Repository as Project,
 } from "@/features/projects/hooks";
 import {
   formatExactTimestamp,
