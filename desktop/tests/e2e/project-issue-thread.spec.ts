@@ -357,6 +357,34 @@ test("a long description clamps inside the panel and expands back", async ({
   expect(collapsed.clipped).toBe(true);
   expect(collapsed.buttonInsidePanel).toBe(true);
 
+  // An issue with no comments opens at the top of its description, not at the
+  // floor. Pinning to the newest comment means nothing when there is none, and
+  // the reader would otherwise meet a long description at its last line with
+  // the label naming it scrolled behind the sticky header.
+  const opening = await page.evaluate(() => {
+    const scroll = document.querySelector(
+      '[data-testid="project-issue-thread-scroll"]',
+    ) as HTMLElement;
+    const label = document.querySelector(
+      '[data-testid="project-work-item-description"] p',
+    ) as HTMLElement;
+    const header = document.querySelector(
+      '[data-testid="project-issue-thread-header"]',
+    ) as HTMLElement;
+    return {
+      scrollTop: scroll.scrollTop,
+      overflows: scroll.scrollHeight - scroll.clientHeight,
+      labelBelowHeader:
+        label.getBoundingClientRect().top >=
+        header.getBoundingClientRect().bottom,
+    };
+  });
+  // The thread really is long enough to have somewhere to scroll to, so this
+  // is a claim about where it chose to stand rather than about a short page.
+  expect(opening.overflows).toBeGreaterThan(0);
+  expect(opening.scrollTop).toBe(0);
+  expect(opening.labelBelowHeader).toBe(true);
+
   await toggle.click();
   await expect(toggle).toHaveText("Show less");
   const expanded = await measure();

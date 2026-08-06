@@ -11,10 +11,14 @@ import {
  *
  * The whole point of the surface: with an agent replying every few seconds,
  * the bottom of the thread is the only place worth being, and it should not
- * cost a scroll to get there or a decision to stay. So the thread opens
- * pinned, stays pinned while the reader is at the floor, and — the part that
- * makes leaving the floor safe — counts what arrived while they were away
+ * cost a scroll to get there or a decision to stay. So the thread opens on its
+ * newest comment, stays there while the reader is at the floor, and — the part
+ * that makes leaving the floor safe — counts what arrived while they were away
  * instead of silently growing underneath them.
+ *
+ * "Newest comment" and "the floor" are the same place only while comments
+ * exist; with none, the floor is the end of the issue description and opening
+ * there is wrong. See `openThread`.
  *
  * Three things drive a re-pin, and the third is the one that is easy to omit
  * and then spend an afternoon on: new comments, opening a different issue, and
@@ -77,6 +81,35 @@ export function useProjectThreadPin({
     }
   }, []);
 
+  /**
+   * Open on the newest comment — or, when there is no comment, at the top.
+   *
+   * "Pinned to the newest comment" has no referent on a thread with none, and
+   * scrolling to the floor anyway lands the reader at the *end* of the issue
+   * description with its opening lines behind the sticky header. On a long
+   * description that means the first thing they see is a mid-sentence
+   * fragment, and the label identifying it as the description is one of the
+   * things scrolled out of sight.
+   *
+   * The at-bottom state is still measured rather than assumed, so a short
+   * description that does not overflow is at the floor exactly as before and
+   * the first arriving comment pins normally; a long one is honestly not at
+   * the floor, and a comment arriving while it is being read offers the pill
+   * instead of yanking the page.
+   */
+  const openThread = React.useCallback((commentsPresent: boolean) => {
+    const element = scrollRef.current;
+    if (!element) return;
+    if (commentsPresent) {
+      element.scrollTo({ top: element.scrollHeight, behavior: "auto" });
+    }
+    const atBottom = isThreadAtBottom(element);
+    isAtBottomRef.current = atBottom;
+    setIsAtBottom(atBottom);
+    setUnreadBelow(0);
+    setActivitySettledBelow(false);
+  }, []);
+
   // Opening and arrival are one effect rather than two, because switching
   // issues changes the root and the comment count in the same commit: split
   // across two effects, the second one sees a count that jumped from the old
@@ -89,7 +122,7 @@ export function useProjectThreadPin({
     previousCountRef.current = commentCount;
 
     if (isNewRoot) {
-      scrollToBottom("auto");
+      openThread(commentCount > 0);
       return;
     }
     if (commentCount === previousCommentCount) return;
@@ -105,13 +138,19 @@ export function useProjectThreadPin({
         unread,
       }),
     );
-  }, [commentCount, rootId, scrollToBottom]);
+  }, [commentCount, openThread, rootId, scrollToBottom]);
 
   // The first commit is not a root change — the refs were initialised from
-  // this root — so the opening pin is its own effect.
+  // this root — so the opening pin is its own effect. Guarded by a ref rather
+  // than an empty dependency list because it needs the comment count, and a
+  // count that arrives in a later commit must not re-open the thread under a
+  // reader who has since scrolled.
+  const openedRef = React.useRef(false);
   React.useLayoutEffect(() => {
-    scrollToBottom("auto");
-  }, [scrollToBottom]);
+    if (openedRef.current) return;
+    openedRef.current = true;
+    openThread(commentCount > 0);
+  }, [commentCount, openThread]);
 
   // A turn ending while the reader is away. Kept apart from the arrival effect
   // above because it is not a count: an agent can finish without commenting,
