@@ -7833,7 +7833,7 @@ mod project_situation_tests {
     #[test]
     fn the_peer_roster_excludes_this_agent() {
         let me = ALICE.to_ascii_uppercase();
-        let configured = vec![
+        let configured = [
             me.clone(),
             BOB.to_string(),
             "not-a-pubkey".to_string(),

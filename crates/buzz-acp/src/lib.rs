@@ -1610,6 +1610,7 @@ const OBSERVER_CONTROL_FRESHNESS_SECS: i64 = 300;
 /// threading three more strings through here to reach one `emit` would have
 /// coupled every control command to the runtime's identity in order to serve
 /// one of them.
+#[allow(clippy::too_many_arguments)]
 fn handle_relay_observer_control_event(
     keys: &nostr::Keys,
     event: nostr::Event,
@@ -5806,11 +5807,11 @@ fn apply_cancel_all_cutoff(pool: &mut AgentPool) -> (usize, usize) {
         .task_map()
         .iter()
         .filter(|(_, meta)| meta.channel_id.is_some())
-        .map(|(task_id, _)| task_id.clone())
+        .map(|(task_id, _)| *task_id)
         .collect();
 
     for task_id in &task_ids {
-        pool.mark_cancel_all_cutoff(task_id.clone());
+        pool.mark_cancel_all_cutoff(*task_id);
     }
 
     let mut signalled = 0;
@@ -6468,7 +6469,7 @@ fn handle_prompt_result(
     let task_id = pool
         .task_map()
         .iter()
-        .find_map(|(task_id, meta)| (meta.agent_index == agent_index).then(|| task_id.clone()))
+        .find_map(|(task_id, meta)| (meta.agent_index == agent_index).then_some(*task_id))
         .expect("prompt result has registered task metadata");
     pool.task_map_mut().remove(&task_id);
     let cancel_all_cutoff = pool.take_cancel_all_cutoff(task_id);
