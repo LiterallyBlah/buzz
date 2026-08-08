@@ -9,9 +9,10 @@ import {
   Loader2,
   LockKeyhole,
   RefreshCw,
-  ShieldCheck,
 } from "lucide-react";
 
+import { useAppNavigation } from "@/app/navigation/useAppNavigation";
+import { useChannelsQuery } from "@/features/channels/hooks";
 import type { ProjectRepoFile } from "@/features/projects/hooks";
 import type { ProjectRepoUnavailableReason } from "@/features/projects/lib/projectRepoAvailability";
 import { Button } from "@/shared/ui/button";
@@ -91,7 +92,50 @@ function normalizeReadmeMarkdown(content: string) {
     .trim();
 }
 
+/**
+ * Description for the access-restricted state. Links to the bound channel
+ * when it is visible to the viewer (public channels appear in the channel
+ * list even before joining); private channels fall back to generic copy.
+ */
+function AccessRestrictedDescription({
+  accessChannelId,
+}: {
+  accessChannelId: string;
+}) {
+  const { goChannel } = useAppNavigation();
+  const channelsQuery = useChannelsQuery();
+  const channel = channelsQuery.data?.find(
+    (candidate) => candidate.id === accessChannelId,
+  );
+
+  if (!channel) {
+    return (
+      <>
+        Repository access is granted through a channel you can’t see. Ask the
+        repository owner for an invite.
+      </>
+    );
+  }
+
+  return (
+    <>
+      Repository access is granted through{" "}
+      <button
+        aria-label={`Open repository access channel #${channel.name}`}
+        className="font-medium text-foreground underline-offset-2 hover:underline"
+        onClick={() => void goChannel(channel.id)}
+        type="button"
+      >
+        #{channel.name}
+      </button>
+      , and you’re not a member. Join the channel or ask the repository owner
+      for an invite.
+    </>
+  );
+}
+
 export function ReadmePanel({
+  accessChannelId,
   file,
   gitDataState,
   externalHost,
@@ -99,6 +143,8 @@ export function ReadmePanel({
   sourceControls,
   unavailableReason,
 }: {
+  /** `buzz-channel` binding of the repository, for access-restricted copy. */
+  accessChannelId?: string | null;
   file: ProjectRepoFile | null;
   gitDataState: "checking" | "available" | "empty" | "unavailable";
   externalHost?: string;
@@ -163,12 +209,6 @@ export function ReadmePanel({
   if (gitDataState === "unavailable") {
     const reason = unavailableReason ?? "unknown";
     const unavailableContent = {
-      unbound: {
-        description:
-          "This older repository has no access channel. If you own it, use Set access above to choose which channel may read it.",
-        icon: ShieldCheck,
-        title: "Repository access channel required",
-      },
       authentication: {
         description:
           "Buzz could not authenticate with this repository. Check your access and try again.",
@@ -180,6 +220,18 @@ export function ReadmePanel({
           "The project announcement exists, but its git repository was not found on the Buzz relay.",
         icon: CircleAlert,
         title: "Repository not initialized",
+      },
+      access: {
+        description:
+          "Repository access is granted through its channel, and you’re not a member of the channel bound to this repository. Ask the repository owner for an invite.",
+        icon: LockKeyhole,
+        title: "Repository access restricted",
+      },
+      unbound: {
+        description:
+          "This repository has no access channel binding, so the relay cannot authorize anyone to read it. The repository owner can bind a channel from the Access menu.",
+        icon: LockKeyhole,
+        title: "No access channel bound",
       },
       network: {
         description:
@@ -228,9 +280,13 @@ export function ReadmePanel({
               : unavailable.title}
           </h3>
           <p className="mt-1 max-w-lg text-sm text-muted-foreground">
-            {externalHost
-              ? "Clone this repository locally to explore its files, commits, and contributors in Buzz."
-              : unavailable.description}
+            {externalHost ? (
+              "Clone this repository locally to explore its files, commits, and contributors in Buzz."
+            ) : reason === "access" && accessChannelId ? (
+              <AccessRestrictedDescription accessChannelId={accessChannelId} />
+            ) : (
+              unavailable.description
+            )}
           </p>
           {externalUrl ? (
             <a

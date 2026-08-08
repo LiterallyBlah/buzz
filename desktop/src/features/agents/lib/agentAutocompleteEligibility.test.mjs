@@ -411,7 +411,7 @@ test("shouldHideAgentFromMentions: normalizes the pubkey before lookup", () => {
   );
 });
 
-test("coalesceAgentAutocompleteCandidates: merges agents with the same persona id", () => {
+test("coalesceAgentAutocompleteCandidates: keeps agents with the same persona id distinct", () => {
   const first = makeAgent({ pubkey: PUB_A, personaId: "pinky" });
   const second = makeAgent({
     pubkey: PUB_B,
@@ -419,10 +419,10 @@ test("coalesceAgentAutocompleteCandidates: merges agents with the same persona i
     isMember: true,
   });
 
-  assert.deepEqual(coalesce([first, second]), [second]);
+  assert.deepEqual(coalesce([first, second]), [first, second]);
 });
 
-test("coalesceAgentAutocompleteCandidates: merges agents with the same owner and name", () => {
+test("coalesceAgentAutocompleteCandidates: keeps agents with the same owner and name distinct", () => {
   const first = makeAgent({ pubkey: PUB_A, ownerPubkey: OWNER_PUBKEY });
   const second = makeAgent({
     pubkey: PUB_B,
@@ -430,7 +430,7 @@ test("coalesceAgentAutocompleteCandidates: merges agents with the same owner and
     isMember: true,
   });
 
-  assert.deepEqual(coalesce([first, second]), [second]);
+  assert.deepEqual(coalesce([first, second]), [first, second]);
 });
 
 test("coalesceAgentAutocompleteCandidates: keeps same-name agents with different owners distinct", () => {
@@ -457,12 +457,22 @@ test("coalesceAgentAutocompleteCandidates: keeps owner-less managed same-name ag
   assert.deepEqual(coalesce([first, second]), [first, second]);
 });
 
-test("coalesceAgentAutocompleteCandidates: merges current-owner same-name agents", () => {
+test("coalesceAgentAutocompleteCandidates: keeps current-owner same-name agents distinct", () => {
   const first = makeAgent({ pubkey: PUB_A, ownerPubkey: CURRENT_PUBKEY });
   const second = makeAgent({
     pubkey: PUB_B,
     ownerPubkey: CURRENT_PUBKEY,
     isManagedAgent: true,
+  });
+
+  assert.deepEqual(coalesce([first, second]), [first, second]);
+});
+
+test("coalesceAgentAutocompleteCandidates: coalesces repeated source rows for the same pubkey", () => {
+  const first = makeAgent({ pubkey: PUB_A });
+  const second = makeAgent({
+    pubkey: PUB_A.toUpperCase(),
+    isMember: true,
   });
 
   assert.deepEqual(coalesce([first, second]), [second]);
