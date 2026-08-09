@@ -1905,6 +1905,51 @@ fn format_project_context(
     )
 }
 
+/// Format the project-root operations cheat sheet.
+///
+/// This stays separate from `[Project]` so the observer's size trimmer can
+/// elide either section independently while preserving both headers.
+fn format_buzz_project_operations(class: &str) -> String {
+    format!(
+        r#"[Buzz Project Operations]
+This root lives on the Buzz relay. Buzz and git use the same nouns for
+different things — this section is about the Buzz ones. Git is still git:
+use it normally to edit code. It is just not how you report or deliver.
+
+These acts are visible on this root:
+  buzz issues comment    a durable comment on this {class}
+  buzz issues status     open / closed / resolved
+  buzz notes publish     a long-form document on the relay (plans, specs)
+  buzz patches send      sends the patch itself; needs no remote
+  buzz pr open           proposes code — requires a clone URL announced by
+      this repository. A repository that announces none cannot take a pull
+      request; send a patch or publish a note instead.
+
+These acts are NOT visible on this root:
+  git commit, git branch, git tag   change a checkout on this machine only.
+      No Buzz event is created and nobody reading this {class} can see them.
+  git push                          visible only if the destination is a
+      clone URL this repository announces.
+  writing a file in your workspace  local until you publish it.
+
+So "write up the plan and commit it", on a Buzz issue, means publish it —
+a comment or a note. If the work happened in a local checkout, say where
+that checkout is and publish the artifact here."#
+    )
+}
+
+/// Format the standing Buzz-project warning for channel and DM turns.
+fn format_buzz_projects_hint() -> String {
+    String::from(
+        r#"[Buzz Projects]
+If this conversation turns to a repository, issue or pull request: those
+are Buzz objects on the relay, not git objects in a checkout. A git commit
+publishes nothing on Buzz. Work becomes visible via `buzz issues comment`,
+`buzz notes publish`, `buzz patches send` or `buzz pr open`. `buzz repos
+list` and `buzz issues list` show what exists."#,
+    )
+}
+
 /// Format the `[Project Conversation]` section: what has been said on this root.
 ///
 /// Its own block rather than more lines inside `[Project]` for the reason every
@@ -2257,13 +2302,14 @@ pub(crate) fn base_section(base_prompt: &str) -> String {
 /// 0. `[Base]` — base prompt (only for legacy agents without systemPrompt support)
 /// 1. `[System]` — system prompt (only for legacy agents without systemPrompt support)
 /// 2. `[Agent Memory — core]` — if agent core memory is set
-/// 3. `[Context]` — scope, channel name, and contextual hints for the agent —
-///    **or**, for a project-routed turn, `[Project]` (repository, root, title,
-///    description, reply command) followed by `[Project Conversation]` and
-///    `[Peer Agents]` when a [`ProjectSituation`] was fetched. The two families
-///    are alternatives: a project turn has no channel and a channel turn has no
-///    root, so emitting both would hand the agent a working instruction and a
-///    broken one and let it choose.
+/// 3. `[Context]` followed by `[Buzz Projects]` — scope, channel name,
+///    contextual hints, and the standing relay-vs-git distinction — **or**, for
+///    a project-routed turn, `[Project]` followed by `[Buzz Project Operations]`,
+///    `[Project Conversation]`, and `[Peer Agents]` when a
+///    [`ProjectSituation`] was fetched. The two families are alternatives: a
+///    project turn has no channel and a channel turn has no root, so emitting
+///    both would hand the agent a working instruction and a broken one and let
+///    it choose.
 /// 4. `[Thread Context]` or `[Conversation Context]` — if fetched
 /// 5. `[Event]` / `[Buzz events]` — the triggering event(s)
 ///
@@ -2295,7 +2341,7 @@ pub fn format_prompt(batch: &FlushBatch, args: &FormatPromptArgs<'_>) -> Vec<Str
         .map(|ci| ci.channel_type == "dm")
         .unwrap_or(false);
 
-    let mut sections: Vec<String> = Vec::with_capacity(7);
+    let mut sections: Vec<String> = Vec::with_capacity(8);
 
     // For legacy agents (protocol_version < 2), inject base_prompt and
     // system_prompt as user-message sections. Modern agents receive these
@@ -2385,6 +2431,7 @@ pub fn format_prompt(batch: &FlushBatch, args: &FormatPromptArgs<'_>) -> Vec<Str
             call_directive.is_some(),
             args.project_situation,
         ));
+        sections.push(format_buzz_project_operations(project.class_noun()));
         // The situation's other two halves, each as its own block so an
         // oversized one is elided in place rather than taking the sections
         // around it with it. Both are project-only: they are gated here rather
@@ -2420,6 +2467,7 @@ pub fn format_prompt(batch: &FlushBatch, args: &FormatPromptArgs<'_>) -> Vec<Str
             args.conversation_context.is_some(),
             reply_anchor.as_deref(),
         ));
+        sections.push(format_buzz_projects_hint());
     }
 
     if let Some(ref directive) = call_directive {
@@ -2754,7 +2802,7 @@ mod peer_call_prompt_tests {
             "the result command does not carry the project route"
         );
         assert!(
-            !prompt.contains("buzz issues comment"),
+            !prompt.contains("To reply on this issue:"),
             "a call turn was still offered the comment command, which leaves the call open"
         );
 
@@ -2909,6 +2957,75 @@ mod project_context_tests {
             .iter()
             .find(|s| s.starts_with(header))
             .unwrap_or_else(|| panic!("no section starting {header:?} in {sections:#?}"))
+    }
+
+    #[test]
+    fn a_project_turn_emits_only_the_full_buzz_operations_section() {
+        let sections = render(false, "@mention", None, None);
+
+        assert!(
+            sections
+                .iter()
+                .any(|s| s.starts_with("[Buzz Project Operations]")),
+            "a project turn has no operations cheat sheet: {sections:#?}"
+        );
+        assert!(
+            !sections.iter().any(|s| s.starts_with("[Buzz Projects]")),
+            "a project turn emitted both Buzz cheat sheets: {sections:#?}"
+        );
+    }
+
+    #[test]
+    fn a_channel_turn_emits_only_the_short_buzz_projects_section() {
+        let event = EventBuilder::new(Kind::Custom(9), "ordinary channel message")
+            .tags([])
+            .sign_with_keys(&Keys::generate())
+            .expect("sign");
+        let batch = FlushBatch {
+            channel_id: Uuid::new_v4(),
+            events: vec![BatchEvent {
+                event,
+                prompt_tag: "@mention".into(),
+                received_at: Instant::now(),
+                project: None,
+            }],
+            cancelled_events: vec![],
+            cancel_reason: None,
+        };
+        let sections = format_prompt(&batch, &FormatPromptArgs::default());
+
+        assert!(
+            sections.iter().any(|s| s.starts_with("[Buzz Projects]")),
+            "a channel turn has no standing Buzz-project hint: {sections:#?}"
+        );
+        assert!(
+            !sections
+                .iter()
+                .any(|s| s.starts_with("[Buzz Project Operations]")),
+            "a channel turn emitted both Buzz cheat sheets: {sections:#?}"
+        );
+    }
+
+    #[test]
+    fn the_full_operations_section_uses_the_root_class_noun() {
+        let issue_sections = render(false, "@mention", None, None);
+        let pull_request_sections = render(true, "@mention", None, None);
+        let issue = section(&issue_sections, "[Buzz Project Operations]");
+        let pull_request = section(&pull_request_sections, "[Buzz Project Operations]");
+
+        assert!(issue.contains("a durable comment on this issue"), "{issue}");
+        assert!(
+            issue.contains("nobody reading this issue can see them"),
+            "{issue}"
+        );
+        assert!(
+            pull_request.contains("a durable comment on this pull request"),
+            "{pull_request}"
+        );
+        assert!(
+            pull_request.contains("nobody reading this pull request can see them"),
+            "{pull_request}"
+        );
     }
 
     /// The turn knows what the issue is called and what it says.
@@ -3259,6 +3376,14 @@ mod project_context_tests {
 
         assert!(joined.contains("[Peer Call]"), "not framed as a call");
         assert!(
+            joined.contains("[Buzz Project Operations]"),
+            "a peer-call turn lost the project operations cheat sheet"
+        );
+        assert!(
+            !joined.contains("[Buzz Projects]"),
+            "a peer-call turn emitted both Buzz cheat sheets"
+        );
+        assert!(
             joined.contains("Title: Reconnect drops the subscription"),
             "a callee was left blind to the issue it was called about"
         );
@@ -3280,7 +3405,7 @@ mod project_context_tests {
             "a call turn was handed a mention mechanism it has no reply to use it in: {roster}"
         );
         assert!(
-            !joined.contains("buzz issues comment"),
+            !section(&sections, "[Project]").contains("buzz issues comment"),
             "a call turn kept the comment command, which leaves the call open forever"
         );
     }
@@ -3875,10 +4000,13 @@ mod tests {
                     ..Default::default()
                 },
             )
-            .join("\n\n")
         };
 
-        let pull_request = render(true);
+        let pull_request_sections = render(true);
+        let pull_request = pull_request_sections
+            .iter()
+            .find(|s| s.starts_with("[Project]"))
+            .expect("pull-request turn has no project section");
         assert!(
             pull_request.contains("To reply on this pull request"),
             "the PR turn does not name its class"
@@ -3892,7 +4020,11 @@ mod tests {
             "the PR turn was given both commands and left to choose"
         );
 
-        let issue = render(false);
+        let issue_sections = render(false);
+        let issue = issue_sections
+            .iter()
+            .find(|s| s.starts_with("[Project]"))
+            .expect("issue turn has no project section");
         assert!(issue.contains("To reply on this issue"));
         assert!(
             issue.contains("buzz issues comment"),
