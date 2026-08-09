@@ -1909,7 +1909,28 @@ fn format_project_context(
 ///
 /// This stays separate from `[Project]` so the observer's size trimmer can
 /// elide either section independently while preserving both headers.
-fn format_buzz_project_operations(class: &str) -> String {
+fn format_buzz_project_operations(
+    project: &crate::project::ProjectOrigin,
+    owes_result: bool,
+) -> String {
+    let class = project.class_noun();
+    let reply_actions = if owes_result {
+        String::from(concat!(
+            "  This turn is a peer call. Do not comment to answer it — close it with\n",
+            "      the result command in [Peer Call] below."
+        ))
+    } else {
+        let (status_command, statuses) = if project.is_pull_request() {
+            ("buzz pr status", "open / closed / merged")
+        } else {
+            ("buzz issues status", "open / closed / resolved")
+        };
+        format!(
+            "  {:<19}    a durable comment on this {class}\n  {status_command:<19}    {statuses}",
+            project.reply_command(),
+        )
+    };
+
     format!(
         r#"[Buzz Project Operations]
 This root lives on the Buzz relay. Buzz and git use the same nouns for
@@ -1917,8 +1938,7 @@ different things — this section is about the Buzz ones. Git is still git:
 use it normally to edit code. It is just not how you report or deliver.
 
 These acts are visible on this root:
-  buzz issues comment    a durable comment on this {class}
-  buzz issues status     open / closed / resolved
+{reply_actions}
   buzz notes publish     a long-form document on the relay (plans, specs)
   buzz patches send      sends the patch itself; needs no remote
   buzz pr open           proposes code — requires a clone URL announced by
@@ -2431,7 +2451,10 @@ pub fn format_prompt(batch: &FlushBatch, args: &FormatPromptArgs<'_>) -> Vec<Str
             call_directive.is_some(),
             args.project_situation,
         ));
-        sections.push(format_buzz_project_operations(project.class_noun()));
+        sections.push(format_buzz_project_operations(
+            project,
+            call_directive.is_some(),
+        ));
         // The situation's other two halves, each as its own block so an
         // oversized one is elided in place rather than taking the sections
         // around it with it. Both are project-only: they are gated here rather
@@ -2802,8 +2825,12 @@ mod peer_call_prompt_tests {
             "the result command does not carry the project route"
         );
         assert!(
-            !prompt.contains("To reply on this issue:"),
+            !prompt.contains("buzz issues comment"),
             "a call turn was still offered the comment command, which leaves the call open"
+        );
+        assert!(
+            !prompt.contains("buzz pr comment"),
+            "a call turn was offered the pull-request comment command"
         );
 
         // The emitted command is one the production builder accepts. A prompt
@@ -3018,6 +3045,8 @@ mod project_context_tests {
             issue.contains("nobody reading this issue can see them"),
             "{issue}"
         );
+        assert!(issue.contains("buzz issues status"), "{issue}");
+        assert!(issue.contains("open / closed / resolved"), "{issue}");
         assert!(
             pull_request.contains("a durable comment on this pull request"),
             "{pull_request}"
@@ -3026,6 +3055,65 @@ mod project_context_tests {
             pull_request.contains("nobody reading this pull request can see them"),
             "{pull_request}"
         );
+        assert!(pull_request.contains("buzz pr status"), "{pull_request}");
+        assert!(
+            pull_request.contains("open / closed / merged"),
+            "{pull_request}"
+        );
+    }
+
+    #[test]
+    fn the_visible_acts_list_is_exact_for_each_class_and_call_state() {
+        fn visible_acts(block: &str) -> &str {
+            block
+                .split_once("These acts are visible on this root:\n")
+                .and_then(|(_, rest)| {
+                    rest.split_once("\n\nThese acts are NOT visible on this root:")
+                })
+                .map(|(visible, _)| visible)
+                .expect("operations block has no bounded visible-acts list")
+        }
+
+        let issue = format_buzz_project_operations(&origin(false), false);
+        let pull_request = format_buzz_project_operations(&origin(true), false);
+        let issue_call = format_buzz_project_operations(&origin(false), true);
+        let pull_request_call = format_buzz_project_operations(&origin(true), true);
+        let call = concat!(
+            "  This turn is a peer call. Do not comment to answer it — close it with\n",
+            "      the result command in [Peer Call] below.\n",
+            "  buzz notes publish     a long-form document on the relay (plans, specs)\n",
+            "  buzz patches send      sends the patch itself; needs no remote\n",
+            "  buzz pr open           proposes code — requires a clone URL announced by\n",
+            "      this repository. A repository that announces none cannot take a pull\n",
+            "      request; send a patch or publish a note instead."
+        );
+
+        assert_eq!(
+            visible_acts(&issue),
+            concat!(
+                "  buzz issues comment    a durable comment on this issue\n",
+                "  buzz issues status     open / closed / resolved\n",
+                "  buzz notes publish     a long-form document on the relay (plans, specs)\n",
+                "  buzz patches send      sends the patch itself; needs no remote\n",
+                "  buzz pr open           proposes code — requires a clone URL announced by\n",
+                "      this repository. A repository that announces none cannot take a pull\n",
+                "      request; send a patch or publish a note instead."
+            )
+        );
+        assert_eq!(
+            visible_acts(&pull_request),
+            concat!(
+                "  buzz pr comment        a durable comment on this pull request\n",
+                "  buzz pr status         open / closed / merged\n",
+                "  buzz notes publish     a long-form document on the relay (plans, specs)\n",
+                "  buzz patches send      sends the patch itself; needs no remote\n",
+                "  buzz pr open           proposes code — requires a clone URL announced by\n",
+                "      this repository. A repository that announces none cannot take a pull\n",
+                "      request; send a patch or publish a note instead."
+            )
+        );
+        assert_eq!(visible_acts(&issue_call), call);
+        assert_eq!(visible_acts(&pull_request_call), call);
     }
 
     /// The turn knows what the issue is called and what it says.
@@ -3380,6 +3468,12 @@ mod project_context_tests {
             "a peer-call turn lost the project operations cheat sheet"
         );
         assert!(
+            joined.contains(
+                "This turn is a peer call. Do not comment to answer it — close it with\n      the result command in [Peer Call] below."
+            ),
+            "the operations sheet does not point the callee to [Peer Call]"
+        );
+        assert!(
             !joined.contains("[Buzz Projects]"),
             "a peer-call turn emitted both Buzz cheat sheets"
         );
@@ -3405,9 +3499,15 @@ mod project_context_tests {
             "a call turn was handed a mention mechanism it has no reply to use it in: {roster}"
         );
         assert!(
-            !section(&sections, "[Project]").contains("buzz issues comment"),
+            !joined.contains("buzz issues comment"),
             "a call turn kept the comment command, which leaves the call open forever"
         );
+        assert!(
+            !joined.contains("buzz pr comment"),
+            "a call turn kept the pull-request comment command"
+        );
+        assert!(!joined.contains("buzz issues status"));
+        assert!(!joined.contains("buzz pr status"));
     }
 
     /// A channel turn cannot acquire any of it.
@@ -4003,10 +4103,7 @@ mod tests {
         };
 
         let pull_request_sections = render(true);
-        let pull_request = pull_request_sections
-            .iter()
-            .find(|s| s.starts_with("[Project]"))
-            .expect("pull-request turn has no project section");
+        let pull_request = pull_request_sections.join("\n\n");
         assert!(
             pull_request.contains("To reply on this pull request"),
             "the PR turn does not name its class"
@@ -4021,10 +4118,7 @@ mod tests {
         );
 
         let issue_sections = render(false);
-        let issue = issue_sections
-            .iter()
-            .find(|s| s.starts_with("[Project]"))
-            .expect("issue turn has no project section");
+        let issue = issue_sections.join("\n\n");
         assert!(issue.contains("To reply on this issue"));
         assert!(
             issue.contains("buzz issues comment"),
