@@ -72,6 +72,13 @@ function formatSearchUserSecondaryLabel(user: UserSearchResult) {
   }
   return null;
 }
+function toNormalizedPubkeySet(
+  records: readonly { pubkey: string }[] | undefined,
+) {
+  return new Set(
+    (records ?? []).map((record) => normalizePubkey(record.pubkey)),
+  );
+}
 function appendUniqueName(current: string[], name: string): string[] {
   return current.some(
     (candidate) => candidate.toLowerCase() === name.toLowerCase(),
@@ -165,12 +172,7 @@ export function useMentions(
     [managedAgentsQuery.data],
   );
   const managedAgentPubkeys = React.useMemo(
-    () =>
-      new Set(
-        (managedAgentsQuery.data ?? []).map((agent) =>
-          normalizePubkey(agent.pubkey),
-        ),
-      ),
+    () => toNormalizedPubkeySet(managedAgentsQuery.data),
     [managedAgentsQuery.data],
   );
   const relayAgentNamesByPubkey = React.useMemo(
@@ -184,27 +186,33 @@ export function useMentions(
     [relayAgentsQuery.data],
   );
   const directoryAgentPubkeys = React.useMemo(
-    () =>
-      new Set(
-        (relayAgentsQuery.data ?? []).map((agent) =>
-          normalizePubkey(agent.pubkey),
-        ),
-      ),
+    () => toNormalizedPubkeySet(relayAgentsQuery.data),
     [relayAgentsQuery.data],
   );
   const sharedChannelIds = React.useMemo(
     () => getSharedChannelIds(channelsQuery.data),
     [channelsQuery.data],
   );
-  const agentEligibilityScope = React.useMemo(
-    () =>
-      resolveAgentEligibilityScope({
-        channelId,
-        channelType: options?.channelType,
-        explicitScope: options?.agentEligibilityScope,
-      }),
-    [channelId, options?.agentEligibilityScope, options?.channelType],
+  const memberPubkeys = React.useMemo(
+    () => toNormalizedPubkeySet(members),
+    [members],
   );
+  const agentEligibilityScope = React.useMemo(() => {
+    const scope = resolveAgentEligibilityScope({
+      channelId,
+      channelType: options?.channelType,
+      explicitScope: options?.agentEligibilityScope,
+    });
+    // `memberPubkeys` is what lets a channel member be mentioned even when its
+    // own kind:10100 `channelIds` predates the channel. Only the channel scope
+    // consults it; community scope never looked at the channel to begin with.
+    return scope.type === "channel" ? { ...scope, memberPubkeys } : scope;
+  }, [
+    channelId,
+    memberPubkeys,
+    options?.agentEligibilityScope,
+    options?.channelType,
+  ]);
   const mentionableAgentPubkeys = React.useMemo(
     () =>
       getMentionableAgentPubkeys({
@@ -247,11 +255,6 @@ export function useMentions(
   const activePersonaIds = React.useMemo(
     () => new Set(activePersonas.map((persona) => persona.id)),
     [activePersonas],
-  );
-  const memberPubkeys = React.useMemo(
-    () =>
-      new Set((members ?? []).map((member) => normalizePubkey(member.pubkey))),
-    [members],
   );
   const mentionCandidates = React.useMemo<MentionCandidate[]>(() => {
     const candidatesByPubkey = new Map<string, MentionCandidate>();
