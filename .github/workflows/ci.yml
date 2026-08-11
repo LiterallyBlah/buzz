@@ -506,6 +506,9 @@ jobs:
           PGSCHEMA_PLAN_USER: buzz
           PGSCHEMA_PLAN_PASSWORD: buzz_dev
         run: |
+          docker exec -e PGPASSWORD=buzz_dev buzz-postgres \
+            psql -U buzz -d buzz -v ON_ERROR_STOP=1 \
+            -c 'CREATE EXTENSION IF NOT EXISTS pgcrypto;'
           ./bin/pgschema apply --file schema/schema.sql --auto-approve
           docker exec -i -e PGPASSWORD=buzz_dev buzz-postgres \
             psql -U buzz -d buzz -v ON_ERROR_STOP=1 < scripts/attach-schema-partitions.sql
@@ -666,6 +669,9 @@ jobs:
           PGSCHEMA_PLAN_USER: buzz
           PGSCHEMA_PLAN_PASSWORD: buzz_dev
         run: |
+          docker exec -e PGPASSWORD=buzz_dev buzz-postgres \
+            psql -U buzz -d buzz -v ON_ERROR_STOP=1 \
+            -c 'CREATE EXTENSION IF NOT EXISTS pgcrypto;'
           ./bin/pgschema apply --file schema/schema.sql --auto-approve
           docker exec -i -e PGPASSWORD=buzz_dev buzz-postgres \
             psql -U buzz -d buzz -v ON_ERROR_STOP=1 < scripts/attach-schema-partitions.sql

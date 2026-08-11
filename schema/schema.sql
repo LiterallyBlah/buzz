@@ -5,6 +5,8 @@
 -- Dumped from database version PostgreSQL 17.10
 -- Dumped by pgschema version 1.7.4
 
+CREATE EXTENSION IF NOT EXISTS pgcrypto;
+
 
 --
 -- Name: approval_status; Type: TYPE; Schema: -; Owner: -
