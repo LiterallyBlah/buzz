@@ -273,7 +273,7 @@ async fn provenance_binds_authorization_domain_and_transport_context() {
         b"body",
     );
     let provenance_a = sign_provenance(
-        ASSERTION,
+        proxy_assertion(),
         "POST",
         "relay.example.com:443",
         "/events",
@@ -281,7 +281,7 @@ async fn provenance_binds_authorization_domain_and_transport_context() {
         NOW,
         &[0x29; 16],
     );
-    let assertion = assertion_header(ASSERTION);
+    let assertion = assertion_header(proxy_assertion());
     let replay = ReplayReader::default();
     let evidence_a = verifier
         .verify(
@@ -310,7 +310,7 @@ async fn provenance_binds_authorization_domain_and_transport_context() {
 
     let provenance_b = sign_provenance_in_domain(
         DOMAIN_B,
-        ASSERTION,
+        proxy_assertion(),
         "POST",
         "relay.example.com:443",
         "/events",
@@ -622,7 +622,7 @@ async fn committed_nonce_and_unavailable_replay_state_fail_closed() {
     let other_authority_request = request("GET", "other.example.com:443", "/same-nonce", b"");
     let same_nonce_other_domain = sign_provenance_in_domain(
         DOMAIN_B,
-        ASSERTION,
+        proxy_assertion(),
         "GET",
         "other.example.com:443",
         "/same-nonce",
