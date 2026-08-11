@@ -45,24 +45,11 @@ Corporate NIP-OA delegation is transport-wide and therefore accepts only an
 empty conditions string. Conditional tags must be evaluated for a specific
 operation and are not treated as blanket corporate identity authority.
 
-## Privacy and public assertions
+## Privacy
 
 `BUZZ_CORPORATE_IDENTITY_DISPLAY_CLAIM` is private. Its default (`email`) is
 stored only in the community-scoped binding table and audit data; it is not
 published to Nostr.
-
-Public projection is separately opt-in with
-`BUZZ_CORPORATE_IDENTITY_PUBLIC_DISPLAY_CLAIM`. When set, that claim is
-published as a relay-signed NIP-85 label. Assertions carry both `active=true`
-and an `expiration` no later than one hour or the JWT's expiry, whichever comes
-first. Clients require the relay signature, active status, and a future
-expiration. Removing the opt-in publishes an inactive replacement only when a
-prior public assertion exists.
-
-NIP-85 events are replaceable relay events and may also remain in downstream
-caches or archives after replacement. Operators must choose a non-sensitive,
-user-approved public label and account for that retention when configuring the
-public claim.
 
 ## Route policy
 
