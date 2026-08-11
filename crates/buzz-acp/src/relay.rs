@@ -642,6 +642,8 @@ enum RelayCommand {
     BeginRootCatchUp {
         root: Box<crate::project::VerifiedBoundRoot>,
     },
+    /// Re-offer a forwarded membership event after authoritative discovery failed.
+    RetryMembership { event_id: String, ts: u64 },
 }
 
 type WsStream = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
@@ -1101,6 +1103,19 @@ impl HarnessRelay {
             .send(RelayCommand::BeginRootCatchUp {
                 root: Box::new(root),
             })
+            .await
+            .map_err(|_| RelayError::ConnectionClosed)
+    }
+
+    /// Make a forwarded membership notification replayable after its
+    /// authoritative REST reconciliation failed.
+    pub async fn retry_membership_notification(
+        &self,
+        event_id: String,
+        ts: u64,
+    ) -> Result<(), RelayError> {
+        self.cmd_tx
+            .send(RelayCommand::RetryMembership { event_id, ts })
             .await
             .map_err(|_| RelayError::ConnectionClosed)
     }
@@ -1887,6 +1902,16 @@ fn root_e_tag_value(event: &Event) -> Option<String> {
     marked.or_else(|| tag_value(event, "e"))
 }
 
+fn mark_membership_for_retry(state: &mut BgState, event_id: &str, ts: u64) {
+    state.seen_ids.remove(event_id);
+    state.membership_dropped_since = Some(
+        state
+            .membership_dropped_since
+            .map_or(ts, |floor| floor.min(ts)),
+    );
+    state.proactive_resubscribe_needed = true;
+}
+
 /// Record a command's intent in state while disconnected (no WebSocket).
 ///
 /// Subscribe/Unsubscribe/SubscribeMembership record intent so reconnect
@@ -2035,6 +2060,9 @@ fn apply_command_to_state(state: &mut BgState, cmd: RelayCommand) {
             if state.membership_last_seen.is_none() {
                 state.membership_last_seen = Some(ts);
             }
+        }
+        RelayCommand::RetryMembership { event_id, ts } => {
+            mark_membership_for_retry(state, &event_id, ts);
         }
         // Durable publishes are parked (bounded, visible overflow) so the
         // post-reconnect drain delivers them. Superseding ephemera are dropped:
@@ -2418,6 +2446,10 @@ async fn execute_connected_command(
                 state.membership_last_seen = Some(ts);
             }
             debug!("startup watermark set to {ts}");
+            true
+        }
+        RelayCommand::RetryMembership { event_id, ts } => {
+            mark_membership_for_retry(state, &event_id, ts);
             true
         }
         // Control-flow commands — callers handle these before dispatching.
@@ -3410,33 +3442,13 @@ async fn handle_ws_message(
                             Err(mpsc::error::TrySendError::Closed(_)) => return false,
                         }
                     } else if subscription_id == MEMBERSHIP_NOTIF_SUB_ID {
-                        // Shape gate first, before anything with a side effect.
-                        //
-                        // `send_membership_subscribe` asks for exactly these two
-                        // kinds, so anything else arriving here is a relay off
-                        // its own contract. Accepting it was a watermark
-                        // poisoning path, not a cosmetic one: a wrong-kind event
-                        // advanced `membership_last_seen`, and reconnect uses
-                        // that value directly as the membership REQ's `since`
-                        // (`resubscribe_after_reconnect`, and the rate-limit
-                        // drain). One signed event with a far-future timestamp
-                        // therefore moved the watermark past legitimate
-                        // membership notifications and they were never replayed
-                        // — the agent silently keeps acting on stale membership.
-                        //
-                        // Refusing here costs the frame nothing it is entitled
-                        // to: the event is not deduped, so its own channel
-                        // subscription still delivers it normally.
-                        let kind_u32 = event.kind.as_u16() as u32;
-                        if !matches!(
-                            kind_u32,
-                            KIND_MEMBER_ADDED_NOTIFICATION | KIND_MEMBER_REMOVED_NOTIFICATION
-                        ) {
+                        // Validate the exact membership kind and target before any
+                        // deduplication or watermark side effect. The outbound #p filter is
+                        // not an authority boundary for received relay frames.
+                        if !is_membership_event_for_agent(&event, agent_pubkey_hex) {
                             warn!(
-                                kind = kind_u32,
-                                event_id = %event.id.to_hex(),
-                                "non-membership kind on the membership subscription — refusing without \
-                                 spending dedup or watermarks"
+                                event_id = %event.id,
+                                "membership notification has wrong kind or target — dropping"
                             );
                             return true;
                         }
@@ -3866,6 +3878,24 @@ async fn handle_ws_message(
                             "unsolicited frame on a project subscription this agent did not open — dropping"
                         );
                     } else if let Some(channel_id) = channel_id_from_sub_id(&subscription_id) {
+                        // A syntactically valid `ch-<uuid>` is not proof that this
+                        // connection still owns the subscription. Membership removal,
+                        // explicit unsubscribe and channel-local CLOSED all clear the
+                        // registry before delayed relay frames can arrive. Refuse such
+                        // frames before spending dedup or replay-watermark state.
+                        let is_active = state
+                            .active_subscriptions
+                            .get(&channel_id)
+                            .is_some_and(|active_id| active_id == &subscription_id);
+                        if !is_active {
+                            warn!(
+                                channel_id = %channel_id,
+                                sub_id = %subscription_id,
+                                "unsolicited frame on an inactive channel subscription — dropping"
+                            );
+                            return true;
+                        }
+
                         let ts = event.created_at.as_secs();
                         let event_id_hex = event.id.to_hex();
                         if state.record_event(channel_id, &event) {
@@ -5811,6 +5841,16 @@ fn extract_h_tag_uuid(event: &nostr::Event) -> Option<Uuid> {
     })
 }
 
+fn is_membership_event_for_agent(event: &nostr::Event, agent_pubkey_hex: &str) -> bool {
+    if !matches!(event.kind, nostr::Kind::Custom(44100 | 44101)) {
+        return false;
+    }
+    event.tags.iter().any(|tag| {
+        let values = tag.as_slice();
+        values.len() >= 2 && values[0] == "p" && values[1].eq_ignore_ascii_case(agent_pubkey_hex)
+    })
+}
+
 /// Build and send a NIP-42 AUTH response event.
 ///
 /// If `auth_tag` is provided (NIP-OA owner attestation), it is included in the
@@ -7177,6 +7217,77 @@ mod tests {
     use buzz_core::kind::KIND_GIT_REPO_ANNOUNCEMENT;
 
     #[test]
+    fn failed_authoritative_reconciliation_rewinds_membership_replay() {
+        let mut state = BgState::new();
+        let event_id = "membership-event".to_string();
+        state.seen_ids.insert(event_id.clone());
+        state.membership_last_seen = Some(200);
+
+        apply_command_to_state(
+            &mut state,
+            RelayCommand::RetryMembership {
+                event_id: event_id.clone(),
+                ts: 150,
+            },
+        );
+
+        assert!(!state.seen_ids.contains(&event_id));
+        assert_eq!(state.membership_dropped_since, Some(150));
+        assert!(state.proactive_resubscribe_needed);
+        assert_eq!(state.membership_last_seen, Some(200));
+    }
+
+    #[tokio::test]
+    async fn missing_and_wrong_membership_targets_do_not_mutate_replay_state() {
+        let agent_keys = Keys::generate();
+        let other_keys = Keys::generate();
+        let agent_pubkey = agent_keys.public_key().to_hex();
+        let channel_id = Uuid::new_v4();
+        let h_tag = nostr::Tag::parse(["h", channel_id.to_string().as_str()]).unwrap();
+        let wrong_p = nostr::Tag::parse(["p", other_keys.public_key().to_hex().as_str()]).unwrap();
+        let missing_target = EventBuilder::new(nostr::Kind::Custom(44100), "")
+            .tags([h_tag.clone()])
+            .sign_with_keys(&other_keys)
+            .unwrap();
+        let wrong_target = EventBuilder::new(nostr::Kind::Custom(44101), "")
+            .tags([h_tag, wrong_p])
+            .sign_with_keys(&other_keys)
+            .unwrap();
+        let (mut ws, mut server) = test_ws_pair().await;
+        let (event_tx, mut event_rx) = mpsc::channel(4);
+        let (control_tx, _control_rx) = mpsc::channel(1);
+        let mut state = BgState::new();
+
+        for event in [missing_target, wrong_target] {
+            let event_id = event.id.to_hex();
+            let frame =
+                serde_json::to_string(&json!(["EVENT", MEMBERSHIP_NOTIF_SUB_ID, event])).unwrap();
+            server.send(Message::Text(frame.into())).await.unwrap();
+            let ingress::FrameRead::Frame(frame) = ingress::read_frame(&mut ws).await else {
+                panic!("scripted relay frame was not received");
+            };
+            assert_eq!(
+                ingress::dispatch_frame(
+                    frame,
+                    &mut ws,
+                    &event_tx,
+                    &control_tx,
+                    &mut state,
+                    &agent_keys,
+                    "ws://localhost",
+                    &agent_pubkey,
+                    None,
+                )
+                .await,
+                ingress::FrameDispatch::Handled
+            );
+            assert!(!state.seen_ids.contains(&event_id));
+            assert_eq!(state.membership_last_seen, None);
+            assert!(event_rx.try_recv().is_err());
+        }
+    }
+
+    #[test]
     fn relay_ws_to_http_plain() {
         assert_eq!(
             relay_ws_to_http("ws://localhost:3000"),
@@ -8175,10 +8286,19 @@ mod tests {
         text: String,
         event_tx: &mpsc::Sender<Option<BuzzEvent>>,
     ) -> bool {
+        let keys = nostr::Keys::generate();
+        dispatch_over_fresh_connection_as(state, text, event_tx, &keys).await
+    }
+
+    async fn dispatch_over_fresh_connection_as(
+        state: &mut BgState,
+        text: String,
+        event_tx: &mpsc::Sender<Option<BuzzEvent>>,
+        keys: &nostr::Keys,
+    ) -> bool {
         use futures_util::SinkExt;
         let (mut ws, mut server) = test_ws_pair().await;
         let (observer_tx, _observer_rx) = mpsc::channel(8);
-        let keys = nostr::Keys::generate();
         server
             .send(Message::Text(text.into()))
             .await
@@ -8193,7 +8313,7 @@ mod tests {
             event_tx,
             &observer_tx,
             state,
-            &keys,
+            keys,
             "ws://test",
             &keys.public_key().to_hex(),
             None,
@@ -8215,6 +8335,18 @@ mod tests {
     ) {
         let text = serde_json::to_string(&json!(["EVENT", sub_id, event])).expect("encode frame");
         let keep_going = dispatch_over_fresh_connection(state, text, event_tx).await;
+        assert!(keep_going, "dispatch must not signal connection loss");
+    }
+
+    async fn deliver_frame_as(
+        state: &mut BgState,
+        sub_id: &str,
+        event: &Event,
+        event_tx: &mpsc::Sender<Option<BuzzEvent>>,
+        keys: &nostr::Keys,
+    ) {
+        let text = serde_json::to_string(&json!(["EVENT", sub_id, event])).expect("encode frame");
+        let keep_going = dispatch_over_fresh_connection_as(state, text, event_tx, keys).await;
         assert!(keep_going, "dispatch must not signal connection loss");
     }
 
@@ -9957,6 +10089,7 @@ mod tests {
         let keys = nostr::Keys::generate();
         let channel_id = Uuid::new_v4();
         let event = mixed_surface_event(&keys, channel_id, &test_root_id(), 1_000);
+        subscribe_channel(&mut state, channel_id);
 
         let watched = open_watched(&mut state).await;
         deliver_frame(&mut state, &watched, &event, &tx).await;
@@ -9986,6 +10119,7 @@ mod tests {
         let keys = nostr::Keys::generate();
         let channel_id = Uuid::new_v4();
         let event = mixed_surface_event(&keys, channel_id, &test_root_id(), 1_000);
+        subscribe_channel(&mut state, channel_id);
 
         deliver_frame(&mut state, &channel_sub_id(channel_id), &event, &tx).await;
         let watched = open_watched(&mut state).await;
@@ -10045,6 +10179,7 @@ mod tests {
         let channel_id = Uuid::new_v4();
         let event = mixed_surface_event(&keys, channel_id, &test_root_id(), 1_000);
         let id = event.id.to_hex();
+        subscribe_channel(&mut state, channel_id);
 
         deliver_frame(&mut state, &channel_sub_id(channel_id), &event, &tx).await;
         assert_eq!(drain(&mut rx).len(), 1, "the channel delivery lands");
@@ -11866,15 +12001,21 @@ mod tests {
 
     // ── The membership subscription accepts only membership kinds ────────────
 
-    fn membership_notification(keys: &nostr::Keys, channel_id: Uuid, kind: u32, ts: u64) -> Event {
+    fn membership_notification(
+        signer: &nostr::Keys,
+        target: &nostr::Keys,
+        channel_id: Uuid,
+        kind: u32,
+        ts: u64,
+    ) -> Event {
         EventBuilder::new(nostr::Kind::Custom(kind as u16), "membership")
             .custom_created_at(nostr::Timestamp::from(ts))
             .tags([
                 nostr::Tag::parse(vec!["h".to_string(), channel_id.to_string()]).expect("h tag"),
-                nostr::Tag::parse(vec!["p".to_string(), keys.public_key().to_hex()])
+                nostr::Tag::parse(vec!["p".to_string(), target.public_key().to_hex()])
                     .expect("p tag"),
             ])
-            .sign_with_keys(keys)
+            .sign_with_keys(signer)
             .expect("signing should succeed")
     }
 
@@ -11893,6 +12034,7 @@ mod tests {
         // A perfectly valid channel message, delivered on the wrong sub.
         let event = mixed_surface_event(&keys, channel_id, &test_root_id(), 9_999_999);
         let id = event.id.to_hex();
+        subscribe_channel(&mut state, channel_id);
 
         deliver_frame(&mut state, MEMBERSHIP_NOTIF_SUB_ID, &event, &tx).await;
 
@@ -11927,10 +12069,16 @@ mod tests {
             let mut state = BgState::new();
             let (tx, mut rx) = mpsc::channel(16);
             let keys = nostr::Keys::generate();
+            let signer = nostr::Keys::generate();
             let channel_id = Uuid::new_v4();
-            let event = membership_notification(&keys, channel_id, kind, 1_000);
+            let event = membership_notification(&signer, &keys, channel_id, kind, 1_000);
+            let agent_hex = keys.public_key().to_hex();
+            assert!(
+                is_membership_event_for_agent(&event, &agent_hex),
+                "positive-control fixture must target the dispatch agent"
+            );
 
-            deliver_frame(&mut state, MEMBERSHIP_NOTIF_SUB_ID, &event, &tx).await;
+            deliver_frame_as(&mut state, MEMBERSHIP_NOTIF_SUB_ID, &event, &tx, &keys).await;
 
             let delivered = drain(&mut rx);
             assert_eq!(delivered.len(), 1, "kind {kind} must still be delivered");
@@ -16392,6 +16540,75 @@ for line in sys.stdin:
                 },
                 replay_since: Some(1_000),
             },
+        );
+    }
+
+    #[tokio::test]
+    async fn a_late_event_after_unsubscribe_cannot_enter_the_work_queue() {
+        let mut state = BgState::new();
+        let (tx, mut rx) = mpsc::channel(16);
+        let keys = nostr::Keys::generate();
+        let channel_id = Uuid::new_v4();
+        let event = mixed_surface_event(&keys, channel_id, &test_root_id(), 2_000);
+        let event_id = event.id.to_hex();
+
+        subscribe_channel(&mut state, channel_id);
+        apply_command_to_state(&mut state, RelayCommand::Unsubscribe { channel_id });
+        deliver_frame(&mut state, &channel_sub_id(channel_id), &event, &tx).await;
+
+        assert!(
+            drain(&mut rx).is_empty(),
+            "removed channel must queue no work"
+        );
+        assert!(
+            !state.seen_ids.contains(&event_id),
+            "a refused late frame must not spend dedup state"
+        );
+        assert!(
+            !state.last_seen.contains_key(&channel_id),
+            "a refused late frame must not move the replay watermark"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_late_event_after_channel_local_closed_cannot_enter_the_work_queue() {
+        let mut state = BgState::new();
+        let (tx, mut rx) = mpsc::channel(16);
+        let keys = nostr::Keys::generate();
+        let channel_id = Uuid::new_v4();
+        let sub_id = channel_sub_id(channel_id);
+        let event = mixed_surface_event(&keys, channel_id, &test_root_id(), 2_000);
+        let event_id = event.id.to_hex();
+
+        subscribe_channel(&mut state, channel_id);
+        let closed = serde_json::to_string(&json!([
+            "CLOSED",
+            sub_id,
+            "restricted: channel access revoked"
+        ]))
+        .expect("encode CLOSED");
+        assert!(
+            dispatch_over_fresh_connection(&mut state, closed, &tx).await,
+            "channel-local CLOSED must keep the socket alive"
+        );
+        assert!(
+            !state.active_subscriptions.contains_key(&channel_id),
+            "CLOSED must clear channel admission before any delayed frame"
+        );
+
+        deliver_frame(&mut state, &sub_id, &event, &tx).await;
+
+        assert!(
+            drain(&mut rx).is_empty(),
+            "closed channel must queue no work"
+        );
+        assert!(
+            !state.seen_ids.contains(&event_id),
+            "a refused late frame must not spend dedup state"
+        );
+        assert!(
+            !state.last_seen.contains_key(&channel_id),
+            "a refused late frame must not move the replay watermark"
         );
     }
 
