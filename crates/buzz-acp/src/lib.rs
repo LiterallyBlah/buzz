@@ -11279,6 +11279,7 @@ mod drain_control_tests {
                     recoverable_batch: None,
                     control_tx: Some(tx),
                     steer_tx: None,
+                    successful_steer_deliveries: HashSet::new(),
                 },
             );
             receivers.push(rx);
@@ -13616,6 +13617,7 @@ mod error_outcome_emission_tests {
                 recoverable_batch: Some(batch.clone()),
                 control_tx: None,
                 steer_tx: None,
+                successful_steer_deliveries: HashSet::new(),
             },
         );
 
@@ -14840,6 +14842,7 @@ mod error_outcome_emission_tests {
                     recoverable_batch: None,
                     control_tx: None,
                     steer_tx: None,
+                    successful_steer_deliveries: HashSet::new(),
                 },
             );
 
@@ -15216,6 +15219,7 @@ mod error_outcome_emission_tests {
                     recoverable_batch: None,
                     control_tx: None,
                     steer_tx: None,
+                    successful_steer_deliveries: HashSet::new(),
                 },
             );
             let mut heartbeat_in_flight = false;

@@ -865,8 +865,10 @@ export function injectObserverEventsForE2E(
   agentPubkey: string,
   events: ObserverEvent[],
 ) {
+  if (appendAgentEvents(agentPubkey, events)) {
+    notifyListeners();
+  }
   for (const event of events) {
-    appendAgentEvent(agentPubkey, event);
     // Mirror `handleRelayObserverEvent`: a `control_result` is not merely
     // stored, it is delivered to whoever is waiting on it. Without this a
     // seeded drain acknowledgement would sit in the event log while the
