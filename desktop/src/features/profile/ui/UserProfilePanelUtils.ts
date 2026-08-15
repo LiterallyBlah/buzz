@@ -130,7 +130,12 @@ export function deriveProfileChannels(
     links.set(id, { id, name });
   });
 
-  if (managedAgent && channels) {
+  // `relayAgent.channels` is the agent's own kind:10100 snapshot, taken when
+  // it last published; nothing republishes it when the agent is later added
+  // to a channel. Union in the channels this pubkey is actually a member of
+  // so the tab reflects the relay's membership, not a stale self-report.
+  // Keyed by channel id, so a channel present in both lists appears once.
+  if ((managedAgent || relayAgent) && channels) {
     for (const channel of channels) {
       const isMember = channel.memberPubkeys.some(
         (memberPubkey) => memberPubkey.toLowerCase() === pubkeyLower,
