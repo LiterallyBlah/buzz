@@ -7,20 +7,20 @@
 
 use std::path::PathBuf;
 
-use crate::huddle::models::{global_model_manager, ModelStatus};
-pub(crate) use crate::huddle::models::{
+pub(crate) use crate::huddle::models::kws::{
     KWS_DECODER, KWS_ENCODER, KWS_JOINER, KWS_REQUIRED_FILES, KWS_TOKENS,
 };
+use crate::huddle::models::{global_model_manager, ModelStatus};
 
 /// Where the wake-word model lives once installed, or `None` if it is not
 /// ready yet.
 pub fn kws_model_dir() -> Option<PathBuf> {
-    crate::huddle::models::kws_model_dir()
+    crate::huddle::models::kws::kws_model_dir()
 }
 
 /// `true` once every wake-word file is installed.
 pub fn is_kws_ready() -> bool {
-    crate::huddle::models::is_kws_ready()
+    crate::huddle::models::kws::is_kws_ready()
 }
 
 /// One-shot edge: `true` exactly once after the wake-word download completes.
