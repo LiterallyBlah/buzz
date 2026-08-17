@@ -260,7 +260,7 @@ pub async fn start_huddle(
         //    Best-effort: don't fail the huddle if this fails.
         let guidelines = agents::voice_mode_guidelines(&parent_channel_id);
         if let Ok(guidelines_builder) =
-            events::build_huddle_guidelines(&ephemeral_channel_id, &guidelines)
+            events::build_voice_guidelines(&ephemeral_channel_id, &guidelines)
         {
             if let Err(e) = submit_event(guidelines_builder, &state).await {
                 eprintln!("buzz-desktop: huddle guidelines (kind:48106) failed: {e}");
