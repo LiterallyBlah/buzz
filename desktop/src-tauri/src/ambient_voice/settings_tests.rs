@@ -1,0 +1,272 @@
+//! Ambient-voice settings load/save/migration tests.
+//!
+//! Mirrors `huddle::tts_settings`'s test set: defaults, unversioned migration,
+//! future-version refusal, and round-tripping of fields a newer client may
+//! own. Adds the checks specific to this feature — an empty binding set must
+//! stay empty (no default wake phrase), and a malformed binding must not be
+//! able to reach the keyword spotter.
+
+use super::*;
+
+const AGENT: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+fn binding() -> WakeBinding {
+    WakeBinding {
+        wake_word: "hey hermes".to_string(),
+        agent_pubkey: AGENT.to_string(),
+        destination: None,
+    }
+}
+
+#[test]
+fn defaults_are_off_with_no_wake_word() {
+    let settings = AmbientVoiceSettings::default();
+    assert_eq!(settings.version, CURRENT_VERSION);
+    assert!(!settings.enabled);
+    assert!(!settings.muted);
+    assert!(settings.wake_bindings.is_empty());
+    assert_eq!(settings.stt.backend, SpeechBackend::Local);
+    assert_eq!(settings.tts.backend, SpeechBackend::Local);
+    assert!(settings.input_device_id.is_none());
+    assert!(settings.output_device.is_none());
+    assert!(!settings.is_runnable());
+}
+
+#[test]
+fn a_missing_file_loads_defaults() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    assert_eq!(
+        load_from_path(&dir.path().join(SETTINGS_FILE)).expect("load"),
+        AmbientVoiceSettings::default()
+    );
+}
+
+#[test]
+fn settings_survive_a_save_load_round_trip() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join(SETTINGS_FILE);
+    let settings = AmbientVoiceSettings {
+        version: CURRENT_VERSION,
+        enabled: true,
+        muted: false,
+        wake_bindings: vec![binding()],
+        stt: SpeechBackendSettings::default(),
+        tts: SpeechBackendSettings::default(),
+        input_device_id: Some("mic-abc".to_string()),
+        output_device: Some("Speakers (Realtek)".to_string()),
+    };
+    save_to_path(&path, &settings).expect("save");
+    assert_eq!(load_from_path(&path).expect("load"), settings);
+}
+
+#[test]
+fn the_persisted_file_uses_the_documented_camel_case_schema() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join(SETTINGS_FILE);
+    let settings = AmbientVoiceSettings {
+        enabled: true,
+        wake_bindings: vec![binding()],
+        input_device_id: Some("mic-abc".to_string()),
+        ..AmbientVoiceSettings::default()
+    };
+    save_to_path(&path, &settings).expect("save");
+    let value: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).expect("read")).expect("json");
+    assert_eq!(value["version"], 1);
+    assert_eq!(value["enabled"], true);
+    assert_eq!(value["wakeBindings"][0]["wakeWord"], "hey hermes");
+    assert_eq!(value["wakeBindings"][0]["agentPubkey"], AGENT);
+    assert!(value["wakeBindings"][0]["destination"].is_null());
+    assert_eq!(value["stt"]["backend"], "local");
+    assert_eq!(value["inputDeviceId"], "mic-abc");
+}
+
+#[test]
+fn unversioned_settings_migrate_to_v1_defaults() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join(SETTINGS_FILE);
+    std::fs::write(&path, r#"{"wakeWord":"legacy","enabled":true}"#).expect("fixture write");
+    assert_eq!(
+        load_from_path(&path).expect("migration"),
+        AmbientVoiceSettings::default()
+    );
+}
+
+#[test]
+fn future_schema_versions_are_refused_rather_than_reset() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join(SETTINGS_FILE);
+    std::fs::write(&path, r#"{"version":99,"enabled":true}"#).expect("fixture write");
+    let error = load_from_path(&path).expect_err("future version");
+    assert!(
+        error.contains("newer than this Buzz build supports"),
+        "{error}"
+    );
+}
+
+#[test]
+fn a_v1_file_missing_optional_sections_still_loads() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join(SETTINGS_FILE);
+    std::fs::write(&path, r#"{"version":1,"enabled":true}"#).expect("fixture write");
+    let settings = load_from_path(&path).expect("load");
+    assert!(settings.enabled);
+    assert!(settings.wake_bindings.is_empty());
+    assert_eq!(settings.stt.backend, SpeechBackend::Local);
+    // Enabled with no binding is configured-but-not-runnable, never a default
+    // wake phrase.
+    assert!(!settings.is_runnable());
+}
+
+#[test]
+fn an_unknown_speech_backend_degrades_to_local() {
+    // A file written by a future build that ships the M3 HTTP backend must
+    // still open here, and must not silently keep a remote endpoint armed.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join(SETTINGS_FILE);
+    std::fs::write(
+        &path,
+        r#"{"version":1,"enabled":true,"stt":{"backend":"http","endpointUrl":"https://example.invalid/v1"},"tts":{"backend":"http","endpointUrl":null}}"#,
+    )
+    .expect("fixture write");
+    let settings = load_from_path(&path).expect("load");
+    assert_eq!(settings.stt.backend, SpeechBackend::Local);
+    assert_eq!(settings.tts.backend, SpeechBackend::Local);
+    // The URL is preserved so switching back on a newer build is lossless.
+    assert_eq!(
+        settings.stt.endpoint_url.as_deref(),
+        Some("https://example.invalid/v1")
+    );
+}
+
+#[test]
+fn malformed_bindings_are_dropped_on_load() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join(SETTINGS_FILE);
+    std::fs::write(
+        &path,
+        format!(
+            r#"{{"version":1,"enabled":true,"wakeBindings":[
+                {{"wakeWord":"the","agentPubkey":"{AGENT}"}},
+                {{"wakeWord":"hey hermes","agentPubkey":"nothex"}},
+                {{"wakeWord":"hey hermes","agentPubkey":"{AGENT}"}}
+            ]}}"#
+        ),
+    )
+    .expect("fixture write");
+    let settings = load_from_path(&path).expect("load");
+    assert_eq!(settings.wake_bindings, vec![binding()]);
+}
+
+#[test]
+fn saving_refuses_a_binding_the_spotter_could_not_arm() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join(SETTINGS_FILE);
+    for bad in [
+        WakeBinding {
+            wake_word: "the".to_string(),
+            ..binding()
+        },
+        WakeBinding {
+            agent_pubkey: "not-a-pubkey".to_string(),
+            ..binding()
+        },
+        WakeBinding {
+            destination: Some("not-a-uuid".to_string()),
+            ..binding()
+        },
+        WakeBinding {
+            wake_word: "x".repeat(MAX_WAKE_WORD_CHARS + 1),
+            ..binding()
+        },
+    ] {
+        let settings = AmbientVoiceSettings {
+            enabled: true,
+            wake_bindings: vec![bad.clone()],
+            ..AmbientVoiceSettings::default()
+        };
+        assert!(
+            save_to_path(&path, &settings).is_err(),
+            "expected {bad:?} to be refused"
+        );
+    }
+}
+
+#[test]
+fn a_channel_destination_round_trips_for_a_later_milestone() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join(SETTINGS_FILE);
+    let channel = uuid::Uuid::new_v4().to_string();
+    let settings = AmbientVoiceSettings {
+        enabled: true,
+        wake_bindings: vec![WakeBinding {
+            destination: Some(channel.clone()),
+            ..binding()
+        }],
+        ..AmbientVoiceSettings::default()
+    };
+    save_to_path(&path, &settings).expect("save");
+    assert_eq!(
+        load_from_path(&path).expect("load").wake_bindings[0]
+            .destination
+            .as_deref(),
+        Some(channel.as_str())
+    );
+}
+
+#[test]
+fn the_binding_list_is_capped() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join(SETTINGS_FILE);
+    let settings = AmbientVoiceSettings {
+        enabled: true,
+        wake_bindings: vec![binding(); MAX_WAKE_BINDINGS + 1],
+        ..AmbientVoiceSettings::default()
+    };
+    assert!(save_to_path(&path, &settings).is_err());
+
+    let bindings = (0..MAX_WAKE_BINDINGS + 4)
+        .map(|_| {
+            serde_json::json!({"wakeWord": "hey hermes", "agentPubkey": AGENT, "destination": null})
+        })
+        .collect::<Vec<_>>();
+    std::fs::write(
+        &path,
+        serde_json::to_vec(&serde_json::json!({
+            "version": 1,
+            "enabled": true,
+            "wakeBindings": bindings,
+        }))
+        .expect("encode"),
+    )
+    .expect("fixture write");
+    assert_eq!(
+        load_from_path(&path).expect("load").wake_bindings.len(),
+        MAX_WAKE_BINDINGS
+    );
+}
+
+#[test]
+fn only_the_first_binding_drives_the_m1_runtime() {
+    let second = WakeBinding {
+        wake_word: "good morning buzz".to_string(),
+        ..binding()
+    };
+    let settings = AmbientVoiceSettings {
+        enabled: true,
+        wake_bindings: vec![binding(), second],
+        ..AmbientVoiceSettings::default()
+    };
+    assert_eq!(settings.primary_binding(), Some(&binding()));
+    assert!(settings.is_runnable());
+}
+
+#[test]
+fn invalid_json_is_an_error_so_the_file_is_preserved() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join(SETTINGS_FILE);
+    std::fs::write(&path, "{not json").expect("fixture write");
+    assert!(load_from_path(&path)
+        .expect_err("invalid json")
+        .contains("not valid JSON"));
+}

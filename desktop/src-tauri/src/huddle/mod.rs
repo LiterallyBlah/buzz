@@ -231,6 +231,10 @@ pub async fn start_huddle(
         hs.ephemeral_channel_id = Some(ephemeral_channel_id.clone());
         generation
     };
+    // Arbitration: a huddle owns the microphone. Suspend the ambient session
+    // before any media work so the two never double-process the same audio.
+    // No-op unless the ambientVoice preview feature is configured.
+    crate::ambient_voice::suspend_for_huddle(&state);
     state.emit_huddle_state_changed();
 
     // All steps wrapped so we can roll back on ANY failure, including step 1.
@@ -418,6 +422,8 @@ pub async fn join_huddle(
         hs.huddle_thread_event_id = huddle_thread_event_id;
         generation
     };
+    // Arbitration: the huddle wins the microphone (see `start_huddle`).
+    crate::ambient_voice::suspend_for_huddle(&state);
 
     // Seed participant list with own pubkey as a fallback until relay responds.
     let own_pubkey = state
@@ -510,6 +516,9 @@ fn teardown_huddle(state: &AppState) -> Result<(), String> {
     // Drop the Arcs here (implicit) — triggers thread join via Drop.
     drop(old_stt);
     drop(old_tts);
+    // Arbitration: the microphone is free again. Resumes the ambient session
+    // if — and only if — this huddle suspended one.
+    crate::ambient_voice::resume_after_huddle(state);
     // Notify frontend that we're back to Idle.
     state.emit_huddle_state_changed();
     Ok(())

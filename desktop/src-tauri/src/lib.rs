@@ -1,4 +1,5 @@
 #![recursion_limit = "256"] // Deep Tauri command futures exceed the default layout query depth.
+mod ambient_voice;
 mod app_menu;
 mod app_state;
 mod archive;
@@ -417,6 +418,12 @@ pub fn run() {
             if let Ok(mut huddle) = state.huddle_state.lock() {
                 huddle.tts_enabled = tts_settings.agent_text_to_speech;
             }
+
+            // Ambient voice: load persisted settings (enablement, wake
+            // binding, devices) so they survive restart. Starting the session
+            // is deferred to the frontend provider once the relay and identity
+            // are usable — resolving a DM destination needs both.
+            ambient_voice::hydrate_at_boot(&app_handle, &state);
 
             // Bring up the runtime-owned shared-compute coordinator before
             // saved agents are restored. Its lifetime is tied to the app, not
@@ -863,6 +870,16 @@ pub fn run() {
             huddle::agent_voice::ensure_huddle_agent_voice_settings,
             huddle::agent_voice::set_huddle_agent_tts_enabled,
             huddle::agent_voice::set_huddle_agent_voice,
+            ambient_voice::get_ambient_voice_settings,
+            ambient_voice::set_ambient_voice_settings,
+            ambient_voice::set_ambient_voice_enabled,
+            ambient_voice::set_ambient_voice_muted,
+            ambient_voice::get_ambient_voice_status,
+            ambient_voice::get_ambient_model_status,
+            ambient_voice::check_ambient_hotstart,
+            ambient_voice::check_ambient_wake_word,
+            ambient_voice::push_ambient_audio_pcm,
+            ambient_voice::ambient_speak,
             speak_agent_message,
             interrupt_huddle_speech,
             add_agent_to_huddle,

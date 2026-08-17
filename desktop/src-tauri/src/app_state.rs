@@ -61,6 +61,9 @@ pub struct AppState {
         crate::managed_agents::readiness::provider_cache::ProviderReadinessCache,
     pub huddle_state: Mutex<HuddleState>,
     pub huddle_audio: crate::huddle::tts_settings::HuddleAudioSettingsState,
+    /// `ambientVoice` preview feature: persisted settings plus the live
+    /// wake-word session. Inert unless the feature is switched on.
+    pub ambient_voice: crate::ambient_voice::AmbientVoiceState,
     /// Tauri app handle — stored after setup so huddle commands can emit
     /// `huddle-state-changed` events without needing the handle threaded
     /// through every call site.
@@ -226,6 +229,7 @@ pub fn build_app_state() -> AppState {
         session_config_cache: Mutex::new(HashMap::new()),
         huddle_state: Mutex::new(HuddleState::default()),
         huddle_audio: Default::default(),
+        ambient_voice: Default::default(),
         app_handle: Mutex::new(None),
         media_proxy_port: AtomicU16::new(0),
         prevent_sleep: Arc::new(Mutex::new(
