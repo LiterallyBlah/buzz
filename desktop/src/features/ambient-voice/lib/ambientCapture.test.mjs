@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { JSDOM } from "jsdom";
 
 import {
   ambientReplyChannel,
@@ -35,6 +36,88 @@ test("the flag being off is enough to prevent any microphone acquisition", () =>
     shouldCaptureAmbientAudio(inputs({ featureEnabled: false })),
     false,
   );
+});
+
+test("the mounted provider never calls getUserMedia while the flag is off", async () => {
+  const dom = new JSDOM("<!doctype html><html><body></body></html>", {
+    url: "http://localhost/",
+  });
+  let microphoneCalls = 0;
+  Object.defineProperty(dom.window.navigator, "mediaDevices", {
+    configurable: true,
+    value: {
+      getUserMedia: async () => {
+        microphoneCalls += 1;
+        throw new Error(
+          "getUserMedia must not be called while ambientVoice is off",
+        );
+      },
+    },
+  });
+
+  const globals = [
+    "window",
+    "document",
+    "navigator",
+    "localStorage",
+    "HTMLElement",
+    "Node",
+    "Event",
+    "StorageEvent",
+    "IS_REACT_ACT_ENVIRONMENT",
+  ];
+  const previous = new Map(
+    globals.map((name) => [
+      name,
+      Object.getOwnPropertyDescriptor(globalThis, name),
+    ]),
+  );
+  const install = (name, value) =>
+    Object.defineProperty(globalThis, name, {
+      configurable: true,
+      writable: true,
+      value,
+    });
+
+  install("window", dom.window);
+  install("document", dom.window.document);
+  install("navigator", dom.window.navigator);
+  install("localStorage", dom.window.localStorage);
+  install("HTMLElement", dom.window.HTMLElement);
+  install("Node", dom.window.Node);
+  install("Event", dom.window.Event);
+  install("StorageEvent", dom.window.StorageEvent);
+  install("IS_REACT_ACT_ENVIRONMENT", true);
+
+  let cleanup = () => {};
+  try {
+    const React = await import("react");
+    const testing = await import("@testing-library/react");
+    const { AmbientVoiceProvider } = await import(
+      "../AmbientVoiceProvider.tsx"
+    );
+    cleanup = testing.cleanup;
+
+    const view = testing.render(
+      React.createElement(AmbientVoiceProvider, {
+        ownsAudioSession: true,
+        activeHuddleChannelId: null,
+      }),
+    );
+    await testing.act(async () => {
+      await Promise.resolve();
+    });
+
+    assert.equal(microphoneCalls, 0);
+    view.unmount();
+  } finally {
+    cleanup();
+    dom.window.close();
+    for (const [name, descriptor] of previous) {
+      if (descriptor) Object.defineProperty(globalThis, name, descriptor);
+      else delete globalThis[name];
+    }
+  }
 });
 
 test("captures only when every gate agrees", () => {
