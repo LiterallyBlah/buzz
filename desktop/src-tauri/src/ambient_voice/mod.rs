@@ -540,9 +540,11 @@ pub fn resume_after_huddle(state: &AppState) {
 
 /// Load persisted settings into `AppState` at launch.
 ///
-/// Does **not** start a session: `lib.rs` calls [`reconcile`] once the relay
-/// and identity are usable. Enablement, devices and the wake binding all come
-/// from here, which is what makes them survive restart.
+/// Does **not** start a session. The frontend provider does that, by polling
+/// [`check_ambient_hotstart`] once the relay and identity are usable — and only
+/// while the preview flag is on, which is what keeps the flag authoritative
+/// over a stale `enabled` on disk. Enablement, devices and the wake binding all
+/// come from here, which is what makes them survive restart.
 pub fn hydrate_at_boot(app: &AppHandle, state: &AppState) {
     let (loaded, error) = settings::load_for_app(app);
     if let Ok(mut guard) = state.ambient_voice.settings.lock() {
