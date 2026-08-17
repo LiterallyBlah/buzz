@@ -502,19 +502,35 @@ pub fn build_huddle_ended(
     build_huddle_event(48103, parent_channel_id, ephemeral_channel_id, &[], None)
 }
 
+/// Kind 48106 — voice-mode guidelines for agents reading `channel_id`.
+///
+/// Posted to whichever channel the agent will answer in, so it is seen via
+/// EOSE replay when the agent subscribes. Uses a dedicated kind so the TTS
+/// pipeline can filter it out without fragile content-prefix matching.
+///
+/// Two callers today: huddles post it to the ephemeral channel
+/// ([`build_huddle_guidelines`]), and the ambient voice session posts it to
+/// the bound agent's destination. The event is identical; only the text and
+/// the destination differ.
+pub fn build_voice_guidelines(
+    channel_id: &str,
+    guidelines_text: &str,
+) -> Result<EventBuilder, String> {
+    validate_channel_id(channel_id)?;
+    check_content(guidelines_text)?;
+    let tags = vec![tag(vec!["h", channel_id])?];
+    Ok(EventBuilder::new(Kind::Custom(48106), guidelines_text).tags(tags))
+}
+
 /// Kind 48106 — voice-mode guidelines for agents in a huddle.
 ///
 /// Posted to the **ephemeral** channel (not the parent) so agents see it
-/// via EOSE replay when they subscribe. Uses a dedicated kind so the TTS
-/// pipeline can filter it out without fragile content-prefix matching.
+/// via EOSE replay when they subscribe.
 pub fn build_huddle_guidelines(
     ephemeral_channel_id: &str,
     guidelines_text: &str,
 ) -> Result<EventBuilder, String> {
-    validate_channel_id(ephemeral_channel_id)?;
-    check_content(guidelines_text)?;
-    let tags = vec![tag(vec!["h", ephemeral_channel_id])?];
-    Ok(EventBuilder::new(Kind::Custom(48106), guidelines_text).tags(tags))
+    build_voice_guidelines(ephemeral_channel_id, guidelines_text)
 }
 
 // ── Social notes ────────────────────────────────────────────────────────────
