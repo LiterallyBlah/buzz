@@ -178,10 +178,6 @@ pub(crate) enum ProbeFreshness {
 }
 
 impl ProviderReadinessCache {
-    pub(crate) fn new() -> Self {
-        Self::default()
-    }
-
     /// Resolve a capability verdict, running `probe` at most once per
     /// fingerprint across all concurrent callers.
     ///
@@ -558,27 +554,27 @@ mod tests {
 
     #[test]
     fn a_live_verdict_is_reused_and_a_forced_refresh_is_not() {
-        let cache = ProviderReadinessCache::new();
+        let cache = ProviderReadinessCache::default();
         let fp = fingerprint(&invocation());
         let calls = AtomicUsize::new(0);
 
-        let mut probe = || {
+        let probe = || {
             calls.fetch_add(1, Ordering::SeqCst);
             ProviderCapability::Ready
         };
 
         assert_eq!(
-            cache.resolve(&fp, ProbeFreshness::Cached, &mut probe),
+            cache.resolve(&fp, ProbeFreshness::Cached, probe),
             ProviderCapability::Ready
         );
         assert_eq!(
-            cache.resolve(&fp, ProbeFreshness::Cached, &mut probe),
+            cache.resolve(&fp, ProbeFreshness::Cached, probe),
             ProviderCapability::Ready
         );
         assert_eq!(calls.load(Ordering::SeqCst), 1, "the second read is cached");
 
         assert_eq!(
-            cache.resolve(&fp, ProbeFreshness::ForceRefresh, &mut probe),
+            cache.resolve(&fp, ProbeFreshness::ForceRefresh, probe),
             ProviderCapability::Ready
         );
         assert_eq!(
@@ -590,7 +586,7 @@ mod tests {
 
     #[test]
     fn different_fingerprints_do_not_share_a_verdict() {
-        let cache = ProviderReadinessCache::new();
+        let cache = ProviderReadinessCache::default();
         let ready_fp = fingerprint(&invocation());
         let mut other = invocation();
         other.agent_command = "codex-acp".into();
@@ -622,7 +618,7 @@ mod tests {
 
     #[test]
     fn an_expired_verdict_is_re_probed() {
-        let cache = ProviderReadinessCache::new();
+        let cache = ProviderReadinessCache::default();
         let fp = fingerprint(&invocation());
         cache.resolve(&fp, ProbeFreshness::Cached, || ProviderCapability::Ready);
 
@@ -645,7 +641,7 @@ mod tests {
 
     #[test]
     fn equal_concurrent_fingerprints_share_one_probe() {
-        let cache = StdArc::new(ProviderReadinessCache::new());
+        let cache = StdArc::new(ProviderReadinessCache::default());
         let fp = fingerprint(&invocation());
         let calls = StdArc::new(AtomicUsize::new(0));
         let started = StdArc::new(std::sync::Barrier::new(8));
@@ -685,7 +681,7 @@ mod tests {
         // card, manual restart, Doctor) arriving together each waited for the
         // in-flight probe and then claimed another one — eight serial provider
         // calls for one question.
-        let cache = StdArc::new(ProviderReadinessCache::new());
+        let cache = StdArc::new(ProviderReadinessCache::default());
         let fp = fingerprint(&invocation());
         let calls = StdArc::new(AtomicUsize::new(0));
         let started = StdArc::new(std::sync::Barrier::new(8));
@@ -728,17 +724,17 @@ mod tests {
         // Sharing an in-flight probe must not become "reuse whatever is
         // cached": a forced refresh that arrives when nothing is running still
         // has to go and ask.
-        let cache = ProviderReadinessCache::new();
+        let cache = ProviderReadinessCache::default();
         let fp = fingerprint(&invocation());
         let calls = AtomicUsize::new(0);
-        let mut probe = || {
+        let probe = || {
             calls.fetch_add(1, Ordering::SeqCst);
             ProviderCapability::Ready
         };
 
-        cache.resolve(&fp, ProbeFreshness::Cached, &mut probe);
-        cache.resolve(&fp, ProbeFreshness::ForceRefresh, &mut probe);
-        cache.resolve(&fp, ProbeFreshness::ForceRefresh, &mut probe);
+        cache.resolve(&fp, ProbeFreshness::Cached, probe);
+        cache.resolve(&fp, ProbeFreshness::ForceRefresh, probe);
+        cache.resolve(&fp, ProbeFreshness::ForceRefresh, probe);
         assert_eq!(
             calls.load(Ordering::SeqCst),
             3,
@@ -748,7 +744,7 @@ mod tests {
 
     #[test]
     fn forced_refreshes_of_different_fingerprints_stay_independent() {
-        let cache = StdArc::new(ProviderReadinessCache::new());
+        let cache = StdArc::new(ProviderReadinessCache::default());
         let calls = StdArc::new(AtomicUsize::new(0));
 
         let handles: Vec<_> = (0..4)
@@ -778,7 +774,7 @@ mod tests {
     fn a_cached_caller_joining_an_in_flight_forced_refresh_does_not_add_a_probe() {
         // Mixed traffic: launch restore (Cached) and a Retry click
         // (ForceRefresh) landing together must still be one provider call.
-        let cache = StdArc::new(ProviderReadinessCache::new());
+        let cache = StdArc::new(ProviderReadinessCache::default());
         let fp = fingerprint(&invocation());
         let calls = StdArc::new(AtomicUsize::new(0));
         let started = StdArc::new(std::sync::Barrier::new(6));
@@ -814,7 +810,7 @@ mod tests {
 
     #[test]
     fn a_not_applicable_gate_never_reaches_the_provider() {
-        let cache = ProviderReadinessCache::new();
+        let cache = ProviderReadinessCache::default();
         let prepared = prepare(
             &cache,
             &ProviderGate::NotApplicable,
@@ -831,7 +827,7 @@ mod tests {
 
     #[test]
     fn an_unavailable_gate_prepares_a_fail_closed_verdict_without_probing() {
-        let cache = ProviderReadinessCache::new();
+        let cache = ProviderReadinessCache::default();
         let prepared = prepare(
             &cache,
             &ProviderGate::Unavailable,
@@ -856,7 +852,7 @@ mod tests {
 
     #[test]
     fn verify_accepts_only_the_descriptor_that_was_probed() {
-        let cache = ProviderReadinessCache::new();
+        let cache = ProviderReadinessCache::default();
         let gate = ProviderGate::Probe {
             acp_binary: std::path::PathBuf::from("/opt/buzz/buzz-acp"),
         };
@@ -904,7 +900,7 @@ mod tests {
         // can move under it. A verdict taken through sidecar A proves nothing
         // about a spawn through sidecar B, and the capability fingerprint
         // cannot notice: the sidecar is excluded from it on purpose.
-        let cache = ProviderReadinessCache::new();
+        let cache = ProviderReadinessCache::default();
         assert_eq!(
             fingerprint(&invocation_through(SIDECAR_A)),
             fingerprint(&invocation_through(SIDECAR_B)),
@@ -940,7 +936,7 @@ mod tests {
 
     #[test]
     fn a_resolved_and_an_unresolved_sidecar_never_authorise_each_other() {
-        let cache = ProviderReadinessCache::new();
+        let cache = ProviderReadinessCache::default();
 
         // Unresolved while probing, resolved by the time we spawn.
         let unresolved = prepare(
@@ -982,7 +978,7 @@ mod tests {
         // The two identities stay separate: the verdict is bound to its exact
         // sidecar, while the capability slot — which is about the provider, not
         // about which copy of our own binary asked — is still shared.
-        let cache = ProviderReadinessCache::new();
+        let cache = ProviderReadinessCache::default();
         let first = prepare(
             &cache,
             &gate_through(SIDECAR_A),
@@ -1029,7 +1025,7 @@ mod tests {
     fn verify_does_no_provider_io() {
         // `verify` is the half that runs with every lifecycle lock held, so it
         // must never be able to reach the cache, let alone a subprocess.
-        let cache = ProviderReadinessCache::new();
+        let cache = ProviderReadinessCache::default();
         let gate = ProviderGate::Probe {
             acp_binary: std::path::PathBuf::from("/opt/buzz/buzz-acp"),
         };
@@ -1053,7 +1049,7 @@ mod tests {
         let store = StdArc::new(std::sync::Mutex::new(0usize));
         let runtimes = StdArc::new(std::sync::Mutex::new(0usize));
 
-        let cache = StdArc::new(ProviderReadinessCache::new());
+        let cache = StdArc::new(ProviderReadinessCache::default());
         let gate = ProviderGate::Probe {
             acp_binary: std::path::PathBuf::from("/opt/buzz/buzz-acp"),
         };
@@ -1115,7 +1111,7 @@ mod tests {
 
     #[test]
     fn unequal_concurrent_fingerprints_probe_independently() {
-        let cache = StdArc::new(ProviderReadinessCache::new());
+        let cache = StdArc::new(ProviderReadinessCache::default());
         let calls = StdArc::new(AtomicUsize::new(0));
 
         let handles: Vec<_> = (0..4)
