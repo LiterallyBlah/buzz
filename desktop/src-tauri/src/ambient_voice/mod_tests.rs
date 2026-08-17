@@ -165,6 +165,7 @@ fn the_status_report_serialises_with_the_keys_the_frontend_reads() {
         "destinationChannelId",
         "agentPubkey",
         "wakeWord",
+        "inputDeviceId",
         "loadError",
     ] {
         assert!(value.get(key).is_some(), "missing {key} in {value}");

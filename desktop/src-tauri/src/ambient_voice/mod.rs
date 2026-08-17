@@ -168,6 +168,10 @@ pub struct AmbientVoiceStatusReport {
     pub destination_channel_id: Option<String>,
     pub agent_pubkey: Option<String>,
     pub wake_word: Option<String>,
+    /// Persisted input device. The frontend re-acquires the microphone when
+    /// this changes, so a device chosen in settings takes effect without a
+    /// restart.
+    pub input_device_id: Option<String>,
     /// Set when settings could not be loaded; writes are refused meanwhile.
     pub load_error: Option<String>,
 }
@@ -210,6 +214,7 @@ fn build_report(state: &AppState) -> Result<AmbientVoiceStatusReport, String> {
         wake_word: settings
             .primary_binding()
             .map(|binding| binding.wake_word.clone()),
+        input_device_id: settings.input_device_id.clone(),
         load_error: ambient
             .load_error
             .lock()

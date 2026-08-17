@@ -1,7 +1,11 @@
 import type * as React from "react";
 import { AppHuddleBar } from "@/app/AppHuddleBar";
 import * as BuzzTheme from "@/app/BuzzThemeSurfaces";
-import { HuddleProvider } from "@/features/huddle";
+import {
+  AmbientVoiceIndicator,
+  AmbientVoiceProvider,
+} from "@/features/ambient-voice";
+import { HuddleProvider, useHuddle } from "@/features/huddle";
 import { RemindMeLaterProvider } from "@/features/reminders/ui/RemindMeLaterProvider";
 import { cn } from "@/shared/lib/cn";
 
@@ -42,6 +46,10 @@ export function AppHuddleShell({
       onShowHuddleInMainApp={isRoom ? undefined : onShowHuddleInMainApp}
       onViewHuddleChannel={isRoom ? undefined : onViewHuddleChannel}
     >
+      {/* Inside HuddleProvider so it can see the active huddle, and gated on
+          audio-session ownership so the dedicated huddle window never opens a
+          second microphone. Renders nothing while the flag is off. */}
+      <AmbientVoiceArbitration ownsAudioSession={!isRoom} />
       <RemindMeLaterProvider pubkey={currentPubkey}>
         <div
           className="buzz-huddle-shell relative h-dvh overflow-hidden overscroll-none"
@@ -79,5 +87,38 @@ export function AppHuddleShell({
         </div>
       </RemindMeLaterProvider>
     </HuddleProvider>
+  );
+}
+
+/**
+ * Reads the live huddle state and hands it to the ambient session.
+ *
+ * A separate component because `useHuddle` needs a consumer *inside* the
+ * provider. The native side also suspends the ambient session from the huddle
+ * start/join paths — this is the webview half of the same arbitration, and it
+ * is what releases the microphone device rather than merely ignoring its
+ * frames.
+ */
+function AmbientVoiceArbitration({
+  ownsAudioSession,
+}: {
+  ownsAudioSession: boolean;
+}) {
+  const { activeEphemeralChannelId, isStarting } = useHuddle();
+  return (
+    <>
+      <AmbientVoiceProvider
+        activeHuddleChannelId={
+          isStarting ? "starting" : activeEphemeralChannelId
+        }
+        ownsAudioSession={ownsAudioSession}
+      />
+      {/* The indicator renders nothing unless the feature is on and
+          configured. While it is, the OS microphone light is permanently lit,
+          so the app owes the user a visible state and a one-click mute. */}
+      {ownsAudioSession ? (
+        <AmbientVoiceIndicator className="pointer-events-auto fixed bottom-3 left-3 z-50 max-w-64 bg-background/90 backdrop-blur-sm" />
+      ) : null}
+    </>
   );
 }
