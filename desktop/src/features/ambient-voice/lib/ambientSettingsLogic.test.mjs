@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  ambientModelRows,
   ambientSaveBlock,
   mergeAgentOptions,
   modelStatusLabel,
@@ -128,4 +129,33 @@ test("model status reads as progress, not as a state name", () => {
     modelStatusLabel({ status: "failed", error: "network" }),
     "Failed: network",
   );
+});
+
+test("all three local models are listed, in the order the session needs them", () => {
+  // Listing only the wake word was the M1 gap: a missing speech-to-text model
+  // makes the session deaf and a missing voice makes it mute, and neither
+  // failure surfaces anywhere else in the app.
+  const models = {
+    kws: { status: "ready" },
+    stt: { status: "downloading", progress_percent: 7 },
+    tts: { status: "failed", error: "checksum mismatch" },
+  };
+  assert.deepEqual(
+    ambientModelRows(models).map((row) => [
+      row.key,
+      row.label,
+      modelStatusLabel(row.status),
+    ]),
+    [
+      ["kws", "Wake word", "Ready"],
+      ["stt", "Speech to text", "Downloading… 7%"],
+      ["tts", "Voice", "Failed: checksum mismatch"],
+    ],
+  );
+});
+
+test("nothing is listed before the model manager has answered", () => {
+  // A blank list is honest; inventing "Not downloaded" for three models the
+  // app has not asked about yet would be a fabricated alarm on every launch.
+  assert.deepEqual(ambientModelRows(null), []);
 });

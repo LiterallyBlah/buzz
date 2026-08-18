@@ -1,5 +1,7 @@
 import type {
+  AmbientModelStatus,
   AmbientVoiceSettings,
+  ModelStatus,
   WakeBinding,
   WakeWordCheck,
 } from "./ambientVoiceApi";
@@ -115,14 +117,39 @@ export function withPrimaryBinding(
   return { ...settings, wakeBindings: [binding, ...rest] };
 }
 
-/** Progress copy for the on-demand wake-word model download. */
-export function modelStatusLabel(
-  status:
-    | { status: "not_downloaded" }
-    | { status: "downloading"; progress_percent: number }
-    | { status: "ready" }
-    | { status: "failed"; error: string },
-): string {
+/** One local model, as listed in the settings section. */
+export type AmbientModelRow = {
+  /** Field on `AmbientModelStatus`; also the row's React key. */
+  key: keyof AmbientModelStatus;
+  /** What the model does, in the user's terms rather than the engine's. */
+  label: string;
+  status: ModelStatus;
+};
+
+/**
+ * Every model an ambient session needs, in the order it is needed.
+ *
+ * The section used to list the wake-word download alone, which is the one
+ * model whose absence is *visible* — no wake word, no session, and the status
+ * line says so. The other two fail silently: without speech-to-text nothing is
+ * ever transcribed, and without the voice the agent's replies simply are not
+ * spoken (`start_ambient_tts` treats a missing model as non-fatal on purpose).
+ * A user hitting either of those sees a working indicator and no audio, with
+ * nothing anywhere to explain it.
+ */
+export function ambientModelRows(
+  models: AmbientModelStatus | null,
+): AmbientModelRow[] {
+  if (!models) return [];
+  return [
+    { key: "kws", label: "Wake word", status: models.kws },
+    { key: "stt", label: "Speech to text", status: models.stt },
+    { key: "tts", label: "Voice", status: models.tts },
+  ];
+}
+
+/** Progress copy for a local model download. */
+export function modelStatusLabel(status: ModelStatus): string {
   switch (status.status) {
     case "not_downloaded":
       return "Not downloaded";

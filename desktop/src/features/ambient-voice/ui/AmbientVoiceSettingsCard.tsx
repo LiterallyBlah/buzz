@@ -31,6 +31,7 @@ import {
   type WakeWordCheck,
 } from "../lib/ambientVoiceApi";
 import {
+  ambientModelRows,
   ambientSaveBlock,
   mergeAgentOptions,
   modelStatusLabel,
@@ -381,9 +382,30 @@ export function AmbientVoiceSettingsCard() {
               {report ? ambientStatusLabel(report.status) : "Not started"}
             </p>
           </div>
-          <p className="text-2xs text-muted-foreground">
-            {models ? `Wake word model: ${modelStatusLabel(models.kws)}` : ""}
-          </p>
+        </SettingsOptionRow>
+
+        <SettingsOptionRow>
+          <div className="min-w-0">
+            <p className="text-sm font-medium">Voice models</p>
+            <p className="text-sm font-normal text-muted-foreground">
+              All three run on this computer. Until every one is ready the
+              session is either deaf or silent.
+            </p>
+          </div>
+          <div
+            className="flex shrink-0 flex-col items-end gap-0.5"
+            data-testid="ambient-models"
+          >
+            {ambientModelRows(models).map((model) => (
+              <p
+                className="text-2xs text-muted-foreground"
+                data-testid={`ambient-model-${model.key}`}
+                key={model.key}
+              >
+                {`${model.label}: ${modelStatusLabel(model.status)}`}
+              </p>
+            ))}
+          </div>
         </SettingsOptionRow>
       </SettingsOptionGroup>
 
