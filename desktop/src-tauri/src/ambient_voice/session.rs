@@ -9,10 +9,14 @@
 //!       ├─ sherpa-onnx KeywordSpotter   (ALWAYS fed, including during TTS)
 //!       │     on fire → cancel TTS (barge-in) → arm the utterance machine
 //!       └─ earshot VAD → UtteranceMachine (gated while TTS plays)
-//!             on decode → sherpa-onnx Parakeet → transcript
+//!             on decode → Transcriber → transcript
+//!                         (sherpa-onnx Parakeet here, or a speech server)
 //!   → transcript_tx  [tokio mpsc]
 //!   → publisher task → kind:9 to the bound agent's destination
 //! ```
+//!
+//! Everything above the decode step is local whatever the settings say: only
+//! the finished utterance is swappable ([`super::transcriber`]).
 //!
 //! One resample feeds both consumers. The model wants 16 kHz/80-dim fbank and
 //! `feat_config.sample_rate` therefore stays at the model's rate — it is a

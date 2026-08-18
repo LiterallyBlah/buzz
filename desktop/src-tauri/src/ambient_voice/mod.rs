@@ -1,9 +1,13 @@
 //! Ambient voice — the `ambientVoice` preview feature.
 //!
-//! A wake word, one agent, all inference on-device. The user says the wake
-//! word, speaks, and the utterance arrives in the bound agent's DM as an
-//! ordinary kind:9 message; the agent's reply is read back aloud. Nothing but
-//! relay traffic leaves the machine.
+//! A wake word and one agent. The user says the wake word, speaks, and the
+//! utterance arrives in the bound agent's DM as an ordinary kind:9 message;
+//! the agent's reply is read back aloud.
+//!
+//! Every stage runs on this computer by default, and the wake word always
+//! does. Recognition and the voice can each be pointed at a server instead —
+//! see "Backend choice" below, which is also where what leaves the machine in
+//! that case is written down.
 //!
 //! ## Layout
 //!
