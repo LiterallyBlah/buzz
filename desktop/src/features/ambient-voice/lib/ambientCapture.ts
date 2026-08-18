@@ -67,3 +67,31 @@ export function ambientReplyChannel(
  * usually cannot start a session and something has to notice when it can.
  */
 export const AMBIENT_HOTSTART_INTERVAL_MS = 3_000;
+
+/** Sent when a device that was working disappears mid-session. */
+export const AMBIENT_CAPTURE_LOST_MESSAGE =
+  "The microphone stopped — reconnect it or choose another one in settings";
+
+/**
+ * What to tell the native side when the webview cannot hold a microphone.
+ *
+ * The indicator and the settings section print this verbatim, so these are
+ * sentences naming what the user can do rather than the `DOMException` name,
+ * which says nothing to anyone. The exception itself still goes to the console:
+ * this string is for the person, not for the bug report.
+ */
+export function ambientCaptureErrorMessage(error: unknown): string {
+  switch (error instanceof Error ? error.name : "") {
+    case "NotAllowedError":
+    case "SecurityError":
+      return "Microphone access was refused — allow it for Buzz in your system settings";
+    case "NotFoundError":
+    case "OverconstrainedError":
+      return "The microphone chosen for ambient voice is not available — choose another one in settings";
+    case "NotReadableError":
+    case "AbortError":
+      return "The microphone could not be opened — another application may be using it";
+    default:
+      return "The microphone could not be opened for ambient voice";
+  }
+}

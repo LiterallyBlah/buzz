@@ -8,14 +8,17 @@ import {
 } from "@/features/huddle/lib/audioWorklet";
 import { useFeatureEnabled } from "@/shared/features";
 import {
+  ambientCaptureErrorMessage,
   ambientReplyChannel,
   shouldCaptureAmbientAudio,
+  AMBIENT_CAPTURE_LOST_MESSAGE,
   AMBIENT_HOTSTART_INTERVAL_MS,
 } from "./lib/ambientCapture";
 import {
   AMBIENT_STATE_CHANGED_EVENT,
   checkAmbientHotstart,
   getAmbientVoiceStatus,
+  reportAmbientCaptureError,
   type AmbientVoiceStatusReport,
 } from "./lib/ambientVoiceApi";
 import { useAmbientReplySubscription } from "./lib/useAmbientReplySubscription";
@@ -162,6 +165,24 @@ export function AmbientVoiceProvider({
     let localWorklet: AudioWorkletHandle | null = null;
     let localStream: MediaStream | null = null;
 
+    // The native side cannot see any of this: it has no device handle, only a
+    // queue that stops filling. Telling it is what turns a dead microphone into
+    // the error state the indicator shows, instead of a session that claims to
+    // be listening. The report also stops the session, so the existing
+    // hot-start poll is what re-arms once a device is available again — there
+    // is deliberately no retry of our own here.
+    const reportFailure = (message: string) => {
+      if (disposed) return;
+      void reportAmbientCaptureError(message)
+        .then(setReport)
+        .catch((error) => {
+          console.warn(
+            "[ambient] capture failure could not be reported:",
+            error,
+          );
+        });
+    };
+
     void (async () => {
       try {
         // The persisted device comes from the status report rather than a
@@ -184,6 +205,11 @@ export function AmbientVoiceProvider({
           return;
         }
         const track = stream.getAudioTracks()[0];
+        // A device unplugged mid-session ends its track and simply stops
+        // producing frames; `stop()` on our own teardown does not fire this.
+        track?.addEventListener("ended", () =>
+          reportFailure(AMBIENT_CAPTURE_LOST_MESSAGE),
+        );
         const worklet = await setupAudioWorklet(track, "voice_activity", true, {
           command: "push_ambient_audio_pcm",
           pushToTalk: false,
@@ -201,6 +227,7 @@ export function AmbientVoiceProvider({
         // cannot leave the OS microphone indicator lit.
         releaseTracks(localStream);
         console.error("[ambient] microphone setup failed:", error);
+        reportFailure(ambientCaptureErrorMessage(error));
       }
     })();
 

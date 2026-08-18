@@ -66,6 +66,10 @@ const WORKLET_SAMPLE_RATE: u32 = 48_000;
 /// Upper bound on one raw-binary audio batch, mirroring `push_audio_pcm`.
 const MAX_AUDIO_BATCH_BYTES: usize = 1024 * 1024;
 
+/// Upper bound on a capture-failure message from the webview. It is shown
+/// verbatim on the indicator, which is one short line wide.
+const MAX_CAPTURE_ERROR_CHARS: usize = 200;
+
 // ── Runtime state ────────────────────────────────────────────────────────────
 
 /// Live session objects. Everything here is torn down together.
@@ -957,6 +961,57 @@ pub fn push_ambient_audio_pcm(
         return Ok(());
     };
     session.push_audio(bytes.to_vec())
+}
+
+/// Make a webview-supplied failure fit to show.
+///
+/// It reaches the indicator verbatim, so an empty message would leave the pill
+/// blank and an unbounded one would push the rest of the app's chrome off it.
+fn capture_error_detail(message: &str) -> String {
+    let message = message.trim();
+    if message.is_empty() {
+        return "The microphone could not be opened for ambient voice".to_string();
+    }
+    message.chars().take(MAX_CAPTURE_ERROR_CHARS).collect()
+}
+
+/// Turn a webview capture failure into the error state.
+///
+/// Split from the command so the transition lock stays at the command boundary
+/// and this is testable against a plain `AppState`.
+fn apply_capture_error(state: &AppState, message: &str) -> Result<(), String> {
+    if state.ambient_voice.runtime()?.session.is_none() {
+        // The session is already down — a stop the webview had not seen yet.
+        // There is no false "listening" to correct here, and overwriting `Off`
+        // with a late failure would be a lie of its own.
+        return Ok(());
+    }
+    stop_session(state, AmbientStatus::Error(capture_error_detail(message)))?;
+    publish_report(state);
+    Ok(())
+}
+
+/// Report that the webview could not keep a microphone open.
+///
+/// The microphone is acquired in the webview (`getUserMedia`), so a device that
+/// is refused, cannot be opened, or is unplugged mid-session is invisible to
+/// the worker: it simply never receives another sample, and goes on reporting
+/// that it is listening for the wake word. That false state is the whole
+/// problem — the indicator exists to say what is happening to the audio.
+///
+/// The session is stopped rather than left running under a pinned error for two
+/// reasons: nothing is reaching it, and a stopped session is what
+/// [`check_ambient_hotstart`] re-arms once the device comes back or the user
+/// picks another one — the same recovery a worker that exited already gets, so
+/// the webview needs no retry loop of its own.
+#[tauri::command]
+pub async fn report_ambient_capture_error(
+    message: String,
+    state: State<'_, AppState>,
+) -> Result<AmbientVoiceStatusReport, String> {
+    let _transition = state.ambient_voice.transition.lock().await;
+    apply_capture_error(&state, &message)?;
+    build_report(&state)
 }
 
 /// Speak an agent reply through the ambient TTS pipeline.

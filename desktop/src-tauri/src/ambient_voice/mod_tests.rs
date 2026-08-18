@@ -278,6 +278,43 @@ fn mute_and_the_indicator_position_never_cost_a_restart() {
 }
 
 #[test]
+fn a_microphone_failure_in_the_webview_becomes_a_visible_error() {
+    // The microphone is opened in the webview, so a device that is refused,
+    // busy or unplugged is invisible to the native worker — it never receives
+    // another sample and the indicator went on saying "listening for the wake
+    // word". The message the webview sends is what the user reads, so it is
+    // kept verbatim, and only made fit to show.
+    assert_eq!(
+        capture_error_detail("  Microphone access was refused  "),
+        "Microphone access was refused"
+    );
+    // Nothing to show is worse than a plain sentence: the pill would go blank
+    // in the one state it exists to describe.
+    assert_eq!(
+        capture_error_detail("   "),
+        "The microphone could not be opened for ambient voice"
+    );
+    let shouted = "e".repeat(MAX_CAPTURE_ERROR_CHARS * 3);
+    assert_eq!(
+        capture_error_detail(&shouted).chars().count(),
+        MAX_CAPTURE_ERROR_CHARS
+    );
+}
+
+#[test]
+fn a_late_capture_failure_cannot_resurrect_a_stopped_session() {
+    // The webview can be a frame or two behind a teardown, exactly as it can
+    // for `push_ambient_audio_pcm`. With nothing running there is no false
+    // "listening" to correct, and pinning a failure over `Off` would replace
+    // one wrong answer with another.
+    let state = crate::app_state::build_app_state();
+    apply_capture_error(&state, "Microphone access was refused").expect("apply");
+    let report = build_report(&state).expect("report");
+    assert_eq!(report.status, AmbientStatus::Off);
+    assert!(!report.capturing);
+}
+
+#[test]
 fn the_status_report_serialises_with_the_keys_the_frontend_reads() {
     let state = crate::app_state::build_app_state();
     let report = build_report(&state).expect("report");

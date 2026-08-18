@@ -127,6 +127,16 @@ export const checkAmbientHotstart = () =>
 export const ambientSpeak = (text: string) =>
   invoke<void>("ambient_speak", { text });
 
+/**
+ * Tell the native side the webview lost the microphone.
+ *
+ * `getUserMedia` lives here, so a device that is refused, busy or unplugged is
+ * invisible to the native worker — it would go on reporting that it is
+ * listening. `message` is shown to the user verbatim.
+ */
+export const reportAmbientCaptureError = (message: string) =>
+  invoke<AmbientVoiceStatusReport>("report_ambient_capture_error", { message });
+
 /** Human-readable label for the listening indicator. */
 export function ambientStatusLabel(status: AmbientStatus): string {
   switch (status.state) {

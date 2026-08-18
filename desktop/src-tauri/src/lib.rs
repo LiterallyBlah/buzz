@@ -865,6 +865,7 @@ pub fn run() {
             ambient_voice::check_ambient_hotstart,
             ambient_voice::check_ambient_wake_word,
             ambient_voice::push_ambient_audio_pcm,
+            ambient_voice::report_ambient_capture_error,
             ambient_voice::ambient_speak,
             speak_agent_message,
             interrupt_huddle_speech,
