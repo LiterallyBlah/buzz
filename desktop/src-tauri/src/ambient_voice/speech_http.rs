@@ -168,6 +168,14 @@ impl SpeechEndpointCheck {
 /// connection rather than paying a handshake per utterance.
 pub(crate) fn blocking_client() -> Result<reqwest::blocking::Client, String> {
     reqwest::blocking::Client::builder()
+        // A speech request carries the microphone audio (STT) or the reply text
+        // (TTS). Neither may leave for an address the user did not type, so a
+        // 307/308 that would re-POST the body to a redirect target is refused,
+        // not chased, and the ambient proxy environment cannot reroute it
+        // either. This matches the app's other outbound clients
+        // (`app_state::build_media_fetch_client`, `commands::link_preview`).
+        .redirect(reqwest::redirect::Policy::none())
+        .no_proxy()
         .build()
         .map_err(|error| format!("could not build the speech HTTP client: {error}"))
 }
@@ -265,17 +273,35 @@ pub(crate) fn synthesize(
         .map_err(|error| format!("speech audio could not be read: {error}"))
 }
 
+/// Build the async client the health probe uses.
+///
+/// Its own client, not the app-wide `http_client`, and with the same redirect
+/// and proxy stance as [`blocking_client`]: the Check button exists to tell the
+/// user whether the address they typed answers, so it must reach that address
+/// and not one a redirect or a proxy substitutes for it.
+fn probe_client() -> Result<reqwest::Client, String> {
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .no_proxy()
+        .build()
+        .map_err(|error| format!("could not build the speech probe client: {error}"))
+}
+
 /// Ask a candidate endpoint whether it is there.
 ///
-/// Async, and on the shared client, because its caller is a Tauri command: a
-/// blocking request on the runtime would stall every other command for as long
-/// as an unreachable address takes to time out.
-pub(crate) async fn probe_endpoint(client: &reqwest::Client, raw: &str) -> SpeechEndpointCheck {
+/// Async because its caller is a Tauri command: a blocking request on the
+/// runtime would stall every other command for as long as an unreachable
+/// address takes to time out.
+pub(crate) async fn probe_endpoint(raw: &str) -> SpeechEndpointCheck {
     let endpoint = match SpeechEndpoint::parse(raw) {
         Ok(endpoint) => endpoint,
         Err(detail) => return SpeechEndpointCheck::malformed(detail),
     };
     let url = endpoint.health_url();
+    let client = match probe_client() {
+        Ok(client) => client,
+        Err(detail) => return SpeechEndpointCheck::unreachable(url, detail),
+    };
     match client.get(&url).timeout(HEALTH_TIMEOUT).send().await {
         Ok(response) if response.status().is_success() => SpeechEndpointCheck::ready(url),
         Ok(response) => SpeechEndpointCheck::unreachable(

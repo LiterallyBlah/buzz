@@ -327,9 +327,8 @@ pub fn check_ambient_wake_word(wake_word: String) -> WakeWordCheck {
 #[tauri::command]
 pub async fn check_speech_endpoint(
     url: String,
-    state: State<'_, AppState>,
 ) -> Result<speech_http::SpeechEndpointCheck, String> {
-    Ok(speech_http::probe_endpoint(&state.http_client, &url).await)
+    Ok(speech_http::probe_endpoint(&url).await)
 }
 
 /// Raw-binary PCM sink for the ambient AudioWorklet.

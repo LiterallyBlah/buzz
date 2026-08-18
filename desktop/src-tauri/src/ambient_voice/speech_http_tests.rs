@@ -203,6 +203,44 @@ fn an_address_nothing_is_listening_on_fails_rather_than_hangs() {
     assert!(error.contains("did not answer"), "{error}");
 }
 
+#[test]
+fn a_redirect_does_not_carry_the_utterance_to_another_host() {
+    // The module guarantees (speech_http.rs module docs) that the microphone
+    // audio only ever goes to the base URL the user typed. A 307/308 re-POSTs
+    // the identical body, so a configured server that redirects — a compromised
+    // box, or a captive portal / transparent proxy intercepting plain http —
+    // must NOT be followed: the utterance may not reach the redirect target,
+    // and the target's answer may not become the user's transcript.
+    let attacker = StubSpeechServer::always(StubReply::json(r#"{"text": "pwned"}"#));
+    let configured = StubSpeechServer::always(StubReply::redirect(
+        307,
+        &format!("{}/v1/audio/transcriptions", attacker.base_url()),
+    ));
+    let client = blocking_client().expect("client");
+    let samples: Vec<f32> = (0..1_600).map(|i| (i as f32 / 40.0).sin() * 0.5).collect();
+
+    let error = transcribe(
+        &client,
+        &endpoint(configured.base_url()),
+        &samples,
+        UTTERANCE_RATE,
+    )
+    .expect_err("a redirect is not a transcript");
+    assert!(error.contains("307"), "{error}");
+    assert!(
+        !error.contains("pwned"),
+        "the redirect target's answer became the transcript: {error}"
+    );
+
+    // The utterance reached the configured server (we did send it there)…
+    assert_eq!(configured.wait_for_requests(1, WAIT).len(), 1);
+    // …and never the redirect target.
+    assert!(
+        attacker.requests().is_empty(),
+        "the microphone audio was re-POSTed to the redirect target"
+    );
+}
+
 // ── Synthesis ────────────────────────────────────────────────────────────────
 
 #[test]
@@ -250,9 +288,8 @@ fn a_server_that_will_not_speak_says_why() {
 #[tokio::test]
 async fn the_check_button_reports_ready_unreachable_and_malformed_apart() {
     let ready = StubSpeechServer::always(StubReply::json(r#"{"ready": true}"#));
-    let client = reqwest::Client::new();
 
-    let check = probe_endpoint(&client, ready.base_url()).await;
+    let check = probe_endpoint(ready.base_url()).await;
     assert_eq!(check.status, SpeechEndpointStatus::Ready);
     assert_eq!(check.detail, None);
     assert_eq!(
@@ -267,7 +304,7 @@ async fn the_check_button_reports_ready_unreachable_and_malformed_apart() {
 
     // A server that is there but not serving speech is not "ready".
     let refusing = StubSpeechServer::always(StubReply::status(404, "no such path"));
-    let check = probe_endpoint(&client, refusing.base_url()).await;
+    let check = probe_endpoint(refusing.base_url()).await;
     assert_eq!(check.status, SpeechEndpointStatus::Unreachable);
     assert!(
         check.detail.unwrap_or_default().contains("404"),
@@ -280,13 +317,13 @@ async fn the_check_button_reports_ready_unreachable_and_malformed_apart() {
         server.base_url().to_string()
     };
     assert_eq!(
-        probe_endpoint(&client, &closed).await.status,
+        probe_endpoint(&closed).await.status,
         SpeechEndpointStatus::Unreachable
     );
 
     // And a URL that could never be probed is a different answer again: the
     // fault is in the field, not on the network.
-    let check = probe_endpoint(&client, "speech.example:30120").await;
+    let check = probe_endpoint("speech.example:30120").await;
     assert_eq!(check.status, SpeechEndpointStatus::Malformed);
     assert_eq!(check.probed_url, None);
     assert!(check

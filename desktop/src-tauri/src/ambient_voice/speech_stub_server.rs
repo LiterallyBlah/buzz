@@ -43,6 +43,9 @@ pub(crate) struct StubReply {
     pub status: u16,
     pub content_type: &'static str,
     pub body: Vec<u8>,
+    /// A `Location` header, for the redirect replies that prove the speech
+    /// client does not chase a 307/308 to another host.
+    pub location: Option<String>,
 }
 
 impl StubReply {
@@ -51,6 +54,7 @@ impl StubReply {
             status: 200,
             content_type: "application/json",
             body: body.as_bytes().to_vec(),
+            location: None,
         }
     }
 
@@ -59,6 +63,7 @@ impl StubReply {
             status: 200,
             content_type: "audio/wav",
             body,
+            location: None,
         }
     }
 
@@ -67,6 +72,17 @@ impl StubReply {
             status,
             content_type: "text/plain",
             body: body.as_bytes().to_vec(),
+            location: None,
+        }
+    }
+
+    /// A redirect answer: `status` (e.g. 307) pointing at `location`.
+    pub fn redirect(status: u16, location: &str) -> Self {
+        Self {
+            status,
+            content_type: "text/plain",
+            body: Vec::new(),
+            location: Some(location.to_string()),
         }
     }
 }
@@ -219,10 +235,15 @@ fn find_head_end(buffer: &[u8]) -> Option<usize> {
 }
 
 fn write_reply(mut stream: TcpStream, reply: &StubReply) {
+    let location = match &reply.location {
+        Some(target) => format!("Location: {target}\r\n"),
+        None => String::new(),
+    };
     let head = format!(
-        "HTTP/1.1 {} STUB\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 {} STUB\r\nContent-Type: {}\r\n{}Content-Length: {}\r\nConnection: close\r\n\r\n",
         reply.status,
         reply.content_type,
+        location,
         reply.body.len()
     );
     let _ = stream.write_all(head.as_bytes());
