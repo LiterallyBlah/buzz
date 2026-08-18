@@ -115,9 +115,11 @@ function AmbientVoiceArbitration({
       />
       {/* The indicator renders nothing unless the feature is on and
           configured. While it is, the OS microphone light is permanently lit,
-          so the app owes the user a visible state and a one-click mute. */}
+          so the app owes the user a visible state and a one-click mute.
+          It positions itself: the pill is draggable and remembers where it was
+          left, so the corner is its own business rather than the shell's. */}
       {ownsAudioSession ? (
-        <AmbientVoiceIndicator className="pointer-events-auto fixed bottom-3 left-3 z-50 max-w-64 bg-background/90 backdrop-blur-sm" />
+        <AmbientVoiceIndicator className="pointer-events-auto z-50 max-w-64 bg-background/90 backdrop-blur-sm" />
       ) : null}
     </>
   );

@@ -21,6 +21,12 @@ export type AmbientStatus =
   | { state: "speaking" }
   | { state: "error"; detail: string };
 
+/**
+ * Mirrors `ambient_voice::settings::IndicatorPosition` — where the user parked
+ * the listening pill, in CSS pixels from the top left of the window.
+ */
+export type AmbientIndicatorPosition = { x: number; y: number };
+
 /** Mirrors `ambient_voice::AmbientVoiceStatusReport`. */
 export type AmbientVoiceStatusReport = {
   enabled: boolean;
@@ -33,6 +39,8 @@ export type AmbientVoiceStatusReport = {
   agentPubkey: string | null;
   wakeWord: string | null;
   inputDeviceId: string | null;
+  /** `null` until the user drags the pill; the default corner applies. */
+  indicatorPosition: AmbientIndicatorPosition | null;
   loadError: string | null;
 };
 
@@ -54,6 +62,12 @@ export type AmbientVoiceSettings = {
   tts: { backend: "local"; endpointUrl: string | null };
   inputDeviceId: string | null;
   outputDevice: string | null;
+  /**
+   * Written only by `setAmbientIndicatorPosition`. The native side keeps the
+   * stored value over whatever a whole-object settings write carries, so a
+   * settings copy fetched before a drag cannot move the pill back.
+   */
+  indicatorPosition: AmbientIndicatorPosition | null;
 };
 
 export type WakeWordCheck = {
@@ -92,6 +106,14 @@ export const setAmbientVoiceMuted = (muted: boolean) =>
 
 export const getAmbientVoiceStatus = () =>
   invoke<AmbientVoiceStatusReport>("get_ambient_voice_status");
+
+/** Remember where the pill was dragged to. `null` restores the default corner. */
+export const setAmbientIndicatorPosition = (
+  position: AmbientIndicatorPosition | null,
+) =>
+  invoke<AmbientVoiceStatusReport>("set_ambient_indicator_position", {
+    position,
+  });
 
 export const getAmbientModelStatus = () =>
   invoke<AmbientModelStatus>("get_ambient_model_status");
