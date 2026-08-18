@@ -109,6 +109,109 @@ fn the_beam_and_trailing_blank_settings_match_the_spike_findings() {
     );
 }
 
+// ── Status announcements ─────────────────────────────────────────────────────
+
+/// A shared, thread-safe list of the statuses a notifier was handed.
+type Announced = Arc<Mutex<Vec<AmbientStatus>>>;
+
+/// Build a notifier that appends every announced status to `announced`.
+fn recorder(announced: &Announced) -> AmbientStatusNotifier {
+    let announced = Arc::clone(announced);
+    Arc::new(move |next: &AmbientStatus| {
+        announced
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(next.clone());
+    })
+}
+
+#[test]
+fn every_transition_is_announced_and_repeats_are_not() {
+    // The indicator never polls, so a transition the worker does not announce
+    // is a pill frozen on the last lifecycle event — the M1 dogfood bug. The
+    // other half matters just as much: the worker re-asserts the same status
+    // on most VAD frames, and one event per 32 ms frame would be an IPC flood
+    // for a pill that does not change.
+    let cell = Arc::new(Mutex::new(AmbientStatus::Off));
+    let announced: Announced = Arc::new(Mutex::new(Vec::new()));
+    let sink = StatusSink::new(Arc::clone(&cell), Some(recorder(&announced)));
+
+    sink.set(AmbientStatus::Listening);
+    sink.set(AmbientStatus::Listening);
+    sink.set(AmbientStatus::Heard);
+    sink.set(AmbientStatus::Capturing);
+    sink.set(AmbientStatus::Capturing);
+    sink.set(AmbientStatus::Transcribing);
+    sink.set(AmbientStatus::Speaking);
+    sink.set(AmbientStatus::Listening);
+
+    assert_eq!(
+        *announced.lock().expect("announced"),
+        vec![
+            AmbientStatus::Listening,
+            AmbientStatus::Heard,
+            AmbientStatus::Capturing,
+            AmbientStatus::Transcribing,
+            AmbientStatus::Speaking,
+            AmbientStatus::Listening,
+        ]
+    );
+    // The shared cell every reader (`AmbientSession::status`) sees stays in
+    // step with what was announced.
+    assert_eq!(*cell.lock().expect("cell"), AmbientStatus::Listening);
+}
+
+#[test]
+fn a_session_without_a_notifier_still_records_its_status() {
+    // The notifier is optional: no app handle must degrade to "the pill does
+    // not live-update", never to "the session stops recording state".
+    let cell = Arc::new(Mutex::new(AmbientStatus::Off));
+    let sink = StatusSink::new(Arc::clone(&cell), None);
+    sink.set(AmbientStatus::Heard);
+    assert_eq!(*cell.lock().expect("cell"), AmbientStatus::Heard);
+}
+
+#[test]
+fn the_worker_announces_the_transitions_it_makes() {
+    // End-to-end through the production worker rather than the sink alone: an
+    // empty model directory makes `create_keyword_spotter` fail, which is a
+    // real worker-thread transition, and it has to arrive at the notifier and
+    // not only in the shared cell.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let announced: Announced = Arc::new(Mutex::new(Vec::new()));
+    let cell = Arc::new(Mutex::new(AmbientStatus::Starting));
+
+    let (session, _transcripts) = AmbientSession::new(AmbientSessionConfig {
+        kws_model_dir: dir.path().to_path_buf(),
+        stt_model_dir: dir.path().to_path_buf(),
+        keywords_buf: "\u{2581}HE Y\n".to_string(),
+        tts_active: Arc::new(AtomicBool::new(false)),
+        tts_cancel: Arc::new(AtomicBool::new(false)),
+        muted: Arc::new(AtomicBool::new(false)),
+        status: Arc::clone(&cell),
+        on_status_change: Some(recorder(&announced)),
+        input_sample_rate: 16_000,
+    })
+    .expect("session");
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        if !announced.lock().expect("announced").is_empty() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    session.shutdown();
+
+    let announced = announced.lock().expect("announced").clone();
+    assert!(
+        announced
+            .iter()
+            .any(|status| matches!(status, AmbientStatus::Error(_))),
+        "the worker's own transition never reached the frontend seam: {announced:?}"
+    );
+}
+
 // ── Fixture-driven tests through the real engine ─────────────────────────────
 
 fn model_dir_from_env() -> PathBuf {

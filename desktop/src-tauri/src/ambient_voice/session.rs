@@ -77,6 +77,54 @@ const NUM_TRAILING_BLANKS: i32 = 2;
 
 // ── Public handle ────────────────────────────────────────────────────────────
 
+/// Called on every status transition the audio worker makes.
+///
+/// The indicator is event-driven — it never polls — so a transition the worker
+/// keeps to itself is a pill frozen on whatever the last lifecycle change
+/// (on/off, mute, huddle) reported. [`super::start_session`] binds this to the
+/// same `STATE_CHANGED_EVENT` emit every lifecycle change already uses, so the
+/// engine's states reach the frontend over the one existing channel.
+pub type AmbientStatusNotifier = Arc<dyn Fn(&AmbientStatus) + Send + Sync>;
+
+/// The worker's handle on the shared status cell plus the frontend notifier.
+///
+/// Two properties are load-bearing:
+///
+/// * **Only transitions are announced.** The worker re-asserts the same status
+///   on most VAD frames; an event per 32 ms frame would be an IPC flood for a
+///   pill that does not change.
+/// * **The status lock is released before the notifier runs.** The notifier
+///   rebuilds the whole status report, which takes the runtime lock and then
+///   reads this same cell — announcing while holding it would deadlock the
+///   audio thread against the command thread.
+pub(crate) struct StatusSink {
+    status: Arc<Mutex<AmbientStatus>>,
+    notify: Option<AmbientStatusNotifier>,
+}
+
+impl StatusSink {
+    pub(crate) fn new(
+        status: Arc<Mutex<AmbientStatus>>,
+        notify: Option<AmbientStatusNotifier>,
+    ) -> Self {
+        Self { status, notify }
+    }
+
+    /// Record `next`, and tell the frontend when it is a change.
+    pub(crate) fn set(&self, next: AmbientStatus) {
+        {
+            let mut current = self.status.lock().unwrap_or_else(|e| e.into_inner());
+            if *current == next {
+                return;
+            }
+            *current = next.clone();
+        }
+        if let Some(notify) = self.notify.as_ref() {
+            notify(&next);
+        }
+    }
+}
+
 /// A running ambient session.
 ///
 /// Not `Clone` — the owner is `AmbientVoiceRuntime` in `AppState`. Dropping it
@@ -105,6 +153,10 @@ pub struct AmbientSessionConfig {
     pub tts_cancel: Arc<AtomicBool>,
     pub muted: Arc<AtomicBool>,
     pub status: Arc<Mutex<AmbientStatus>>,
+    /// Announces every worker status transition to the frontend. `None` in
+    /// tests and when the app handle is not available yet; the session still
+    /// runs, the indicator just does not live-update.
+    pub on_status_change: Option<AmbientStatusNotifier>,
     /// Sample rate of the PCM pushed in. 48 kHz from the AudioWorklet.
     pub input_sample_rate: u32,
 }
@@ -164,6 +216,13 @@ impl AmbientSession {
         self.thread.as_ref().is_none_or(|h| h.is_finished())
     }
 
+    /// Apply mute to the live worker.
+    ///
+    /// Deliberately writes the status cell directly rather than through a
+    /// [`StatusSink`]: the caller (`set_ambient_voice_muted`) holds the runtime
+    /// lock here and publishes its own report immediately afterwards, so
+    /// announcing from inside would re-enter that lock for an event the
+    /// command is about to send anyway.
     pub fn set_muted(&self, muted: bool) {
         self.muted.store(muted, Ordering::Release);
         let mut status = self.status.lock().unwrap_or_else(|e| e.into_inner());
@@ -296,10 +355,6 @@ pub(crate) fn drain_detections(
 
 // ── Worker ───────────────────────────────────────────────────────────────────
 
-fn set_status(status: &Arc<Mutex<AmbientStatus>>, next: AmbientStatus) {
-    *status.lock().unwrap_or_else(|e| e.into_inner()) = next;
-}
-
 fn ambient_worker(
     config: AmbientSessionConfig,
     audio_rx: Receiver<Vec<u8>>,
@@ -314,14 +369,19 @@ fn ambient_worker(
         tts_cancel,
         muted,
         status,
+        on_status_change,
         input_sample_rate,
     } = config;
+
+    // Every `status` write in this thread goes through the sink, which is what
+    // makes the indicator follow the session rather than the settings.
+    let status = StatusSink::new(status, on_status_change);
 
     let spotter = match create_keyword_spotter(&kws_model_dir, &keywords_buf) {
         Ok(spotter) => spotter,
         Err(error) => {
             eprintln!("buzz-desktop: ambient wake-word engine unavailable: {error}");
-            set_status(&status, AmbientStatus::Error(error));
+            status.set(AmbientStatus::Error(error));
             drain_until_shutdown(audio_rx, &shutdown);
             return;
         }
@@ -330,7 +390,7 @@ fn ambient_worker(
         Ok(recognizer) => recognizer,
         Err(error) => {
             eprintln!("buzz-desktop: ambient speech recognizer unavailable: {error}");
-            set_status(&status, AmbientStatus::Error(error));
+            status.set(AmbientStatus::Error(error));
             drain_until_shutdown(audio_rx, &shutdown);
             return;
         }
@@ -340,7 +400,7 @@ fn ambient_worker(
         Ok(resampler) => resampler,
         Err(error) => {
             eprintln!("buzz-desktop: ambient resampler init failed: {error}");
-            set_status(&status, AmbientStatus::Error(error));
+            status.set(AmbientStatus::Error(error));
             drain_until_shutdown(audio_rx, &shutdown);
             return;
         }
@@ -354,14 +414,11 @@ fn ambient_worker(
     let mut leftover_16k: Vec<f32> = Vec::new();
     let mut speech_buf: Vec<f32> = Vec::new();
 
-    set_status(
-        &status,
-        if muted.load(Ordering::Acquire) {
-            AmbientStatus::Muted
-        } else {
-            AmbientStatus::Listening
-        },
-    );
+    status.set(if muted.load(Ordering::Acquire) {
+        AmbientStatus::Muted
+    } else {
+        AmbientStatus::Listening
+    });
 
     loop {
         if shutdown.load(Ordering::Acquire) {
@@ -410,7 +467,7 @@ fn ambient_worker(
                     if machine.on_wake(now) {
                         speech_buf.clear();
                     }
-                    set_status(&status, AmbientStatus::Heard);
+                    status.set(AmbientStatus::Heard);
                 }
 
                 // ── Stage 2: utterance capture, gated during playback ────
@@ -426,20 +483,20 @@ fn ambient_worker(
                         FrameOutcome::Idle => {}
                         FrameOutcome::Buffer => {
                             if speech_buf.is_empty() {
-                                set_status(&status, AmbientStatus::Capturing);
+                                status.set(AmbientStatus::Capturing);
                             }
                             speech_buf.extend_from_slice(&frame);
                         }
                         FrameOutcome::Drop => {
                             speech_buf.clear();
-                            set_status(&status, current_idle_status(&machine, playing));
+                            status.set(current_idle_status(&machine, playing));
                         }
                         FrameOutcome::Decode => {
                             speech_buf.extend_from_slice(&frame);
-                            set_status(&status, AmbientStatus::Transcribing);
+                            status.set(AmbientStatus::Transcribing);
                             transcribe(&recognizer, &speech_buf, &transcript_tx);
                             speech_buf.clear();
-                            set_status(&status, AmbientStatus::Listening);
+                            status.set(AmbientStatus::Listening);
                         }
                     }
                 }
@@ -447,7 +504,7 @@ fn ambient_worker(
         }
     }
 
-    set_status(&status, AmbientStatus::Off);
+    status.set(AmbientStatus::Off);
 }
 
 fn current_idle_status(machine: &UtteranceMachine, tts_playing: bool) -> AmbientStatus {

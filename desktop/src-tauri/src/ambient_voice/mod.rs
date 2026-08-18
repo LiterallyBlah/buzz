@@ -378,6 +378,7 @@ async fn start_session(state: &AppState, settings: &AmbientVoiceSettings) -> Res
         tts_cancel: Arc::clone(&ambient.tts_cancel),
         muted: Arc::clone(&ambient.muted),
         status: Arc::clone(&ambient.reported),
+        on_status_change: worker_status_notifier(state),
         input_sample_rate: WORKLET_SAMPLE_RATE,
     })?;
 
@@ -402,6 +403,29 @@ async fn start_session(state: &AppState, settings: &AmbientVoiceSettings) -> Res
         runtime.destination = Some(destination);
     }
     Ok(())
+}
+
+/// The audio worker's route to the indicator.
+///
+/// Without this the only `STATE_CHANGED_EVENT` emits are the lifecycle ones —
+/// on/off, mute, huddle arbitration — so the pill shows whatever the session
+/// was doing when it last started and never moves through armed → heard →
+/// capturing → transcribing → speaking. Reusing `publish_report` rather than a
+/// second, thinner event keeps one payload shape on the wire.
+///
+/// `None` when there is no app handle (unit tests, early boot): the session
+/// still runs, the indicator simply does not live-update.
+fn worker_status_notifier(state: &AppState) -> Option<session::AmbientStatusNotifier> {
+    let app = app_handle(state)?;
+    let notifier: session::AmbientStatusNotifier = Arc::new(move |_status: &AmbientStatus| {
+        // The status is read back out of `AppState` by `build_report`, so the
+        // argument is only the transition that woke us.
+        let Some(state) = app.try_state::<AppState>() else {
+            return;
+        };
+        publish_report(&state);
+    });
+    Some(notifier)
 }
 
 /// Build the ambient TTS pipeline.
