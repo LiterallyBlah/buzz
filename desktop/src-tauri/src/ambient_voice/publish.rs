@@ -172,8 +172,18 @@ impl AmbientPublisher {
         let Some(content) = normalize_transcript(text) else {
             return Ok(());
         };
-        let builder =
-            events::build_message(channel_id, &content, None, &[agent_pubkey], &[], &[], &[])?;
+        let builder = events::build_message(
+            channel_id,
+            &content,
+            None,
+            &[agent_pubkey],
+            &[],
+            &[],
+            &[],
+            &[],
+            None,
+            &self.relay_base_url,
+        )?;
         self.post(builder, "transcript").await
     }
 }

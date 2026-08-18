@@ -200,8 +200,19 @@ fn boundary_ambient_voice_blocks_ncryptsec() {
     let channel = uuid::Uuid::new_v4();
 
     // A transcript carrying key-backup material must never reach the socket.
-    let builder =
-        crate::events::build_message(channel, NCRYPTSEC, None, &[], &[], &[], &[]).unwrap();
+    let builder = crate::events::build_message(
+        channel,
+        NCRYPTSEC,
+        None,
+        &[],
+        &[],
+        &[],
+        &[],
+        &[],
+        None,
+        &crate::relay::relay_api_base_url(),
+    )
+    .unwrap();
     let err =
         crate::ambient_voice::publish::sign_and_guard_ambient_body(builder, &keys).unwrap_err();
     assert_guard_error(&err);
@@ -213,9 +224,19 @@ fn boundary_ambient_voice_blocks_ncryptsec() {
     assert_guard_error(&err);
 
     // Ordinary speech passes through unchanged.
-    let builder =
-        crate::events::build_message(channel, "what is on my calendar", None, &[], &[], &[], &[])
-            .unwrap();
+    let builder = crate::events::build_message(
+        channel,
+        "what is on my calendar",
+        None,
+        &[],
+        &[],
+        &[],
+        &[],
+        &[],
+        None,
+        &crate::relay::relay_api_base_url(),
+    )
+    .unwrap();
     assert!(crate::ambient_voice::publish::sign_and_guard_ambient_body(builder, &keys).is_ok());
 }
 

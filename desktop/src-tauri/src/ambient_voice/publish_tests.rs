@@ -16,8 +16,19 @@ fn the_signed_body_is_guarded_before_it_can_be_posted() {
     // clean body passes through unchanged and parses as the event we signed.
     let signing = keys();
     let channel = Uuid::new_v4();
-    let builder =
-        events::build_message(channel, "hello there", None, &[], &[], &[], &[]).expect("builder");
+    let builder = events::build_message(
+        channel,
+        "hello there",
+        None,
+        &[],
+        &[],
+        &[],
+        &[],
+        &[],
+        None,
+        &crate::relay::relay_api_base_url(),
+    )
+    .expect("builder");
     let body = sign_and_guard_ambient_body(builder, &signing).expect("guarded body");
     let value: serde_json::Value = serde_json::from_slice(&body).expect("event json");
     assert_eq!(value["kind"], 9);
@@ -37,6 +48,9 @@ fn the_transcript_event_is_an_ordinary_kind_9_addressed_to_the_agent() {
         &[],
         &[],
         &[],
+        &[],
+        None,
+        &crate::relay::relay_api_base_url(),
     )
     .expect("builder");
     let body = sign_and_guard_ambient_body(builder, &signing).expect("guarded body");

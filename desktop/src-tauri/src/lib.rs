@@ -407,24 +407,9 @@ pub fn run() {
                 *guard = Some(app_handle.clone());
             }
 
-            let (tts_settings, tts_settings_load_error) =
-                huddle::tts_settings::load_for_app(&app_handle);
-            if let Ok(mut guard) = state.huddle_audio.tts.lock() {
-                *guard = tts_settings.clone();
-            }
-            if let Ok(mut guard) = state.huddle_audio.tts_load_error.lock() {
-                *guard = tts_settings_load_error;
-            }
-            if let Ok(mut huddle) = state.huddle_state.lock() {
-                huddle.tts_enabled = tts_settings.agent_text_to_speech;
-            }
-
-            // Ambient voice: load persisted settings (enablement, wake
-            // binding, devices) so they survive restart. Starting the session
-            // is deferred to the frontend provider once the relay and identity
-            // are usable — resolving a DM destination needs both.
+            huddle::tts_settings::hydrate_for_app(&app_handle, &state);
+            // Load persisted ambient settings; the frontend starts the session once ready.
             ambient_voice::hydrate_at_boot(&app_handle, &state);
-
             // Bring up the runtime-owned shared-compute coordinator before
             // saved agents are restored. Its lifetime is tied to the app, not
             // a UI mount; it publishes discovery and reconciles membership for
