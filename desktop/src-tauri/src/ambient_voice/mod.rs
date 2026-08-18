@@ -21,6 +21,8 @@
 //! | [`speech_wav`] | PCM16 WAV coding for that wire |
 //! | [`status`] | what the listening indicator shows |
 //! | [`transcriber`] | which recogniser an utterance goes to |
+//! | [`tts_backend`] | which pipeline speaks the replies |
+//! | [`http_tts`] | that pipeline, when the replies are spoken by a server |
 //!
 //! ## Lifecycle
 //!
@@ -40,6 +42,7 @@
 //! utterance, and only a reply already published to the relay, ever leave.
 
 pub mod commands;
+pub mod http_tts;
 pub mod launch;
 pub mod models;
 pub mod publish;
@@ -49,6 +52,7 @@ pub mod speech_http;
 pub mod speech_wav;
 pub mod status;
 pub mod transcriber;
+pub mod tts_backend;
 pub mod utterance;
 pub mod wake_word;
 
@@ -70,13 +74,14 @@ use tauri::{AppHandle, Emitter, Manager};
 use uuid::Uuid;
 
 use crate::app_state::AppState;
-use crate::huddle::{state::HuddlePhase, tts::TtsPipeline, tts_settings};
+use crate::huddle::state::HuddlePhase;
 
 use launch::LaunchDiagnostics;
 use publish::{AmbientDestination, AmbientPublisher};
 use session::{AmbientSession, AmbientSessionConfig, AudioFlowSnapshot};
 use settings::AmbientVoiceSettings;
 use status::AmbientStatus;
+use tts_backend::{start_ambient_tts, AmbientTts};
 use wake_word::WakeWordTokenizer;
 
 /// Event name the frontend listens on for every ambient state transition.
@@ -120,7 +125,7 @@ const STALE_AUDIO_AFTER: Duration = Duration::from_secs(5);
 #[derive(Default)]
 pub struct AmbientRuntime {
     session: Option<AmbientSession>,
-    tts: Option<Arc<TtsPipeline>>,
+    tts: Option<AmbientTts>,
     destination: Option<Arc<AmbientDestination>>,
     /// What [`start_session`] built the live session from, or `None` when no
     /// session is running.
@@ -683,61 +688,6 @@ fn worker_status_notifier(state: &AppState) -> Option<session::AmbientStatusNoti
         publish_report(&state);
     });
     Some(notifier)
-}
-
-/// Build the ambient TTS pipeline.
-///
-/// Deliberately its own pipeline rather than the huddle's: the huddle's is
-/// gated on `HuddlePhase::Active` and is torn down with the huddle, and the
-/// two must never contend for the output device. A missing TTS model is not
-/// fatal — the transcript path still works, the replies just are not spoken.
-async fn start_ambient_tts(
-    state: &AppState,
-    settings: &AmbientVoiceSettings,
-) -> Result<Option<Arc<TtsPipeline>>, String> {
-    let Some(model_dir) = models::tts_model_dir() else {
-        eprintln!("buzz-desktop: ambient voice started without TTS (model not ready)");
-        return Ok(None);
-    };
-    let app = app_handle(state);
-    let preferences = state
-        .huddle_audio
-        .tts
-        .lock()
-        .map_err(|error| format!("text-to-speech settings lock poisoned: {error}"))
-        .map(|tts| tts.voice_preferences.clone())?;
-    let voice = match app.as_ref() {
-        Some(app) => tts_settings::pocket_voice_reference(app, &preferences)?,
-        None => tts_settings::bundled_pocket_voice_reference(&preferences),
-    };
-
-    let ambient = &state.ambient_voice;
-    let tts_active = Arc::clone(&ambient.tts_active);
-    let tts_cancel = Arc::clone(&ambient.tts_cancel);
-    tts_cancel.store(false, Ordering::Release);
-    let output_device = settings.output_device.clone();
-
-    // Construction loads ONNX sessions (~200 ms) — off the async runtime.
-    let built = tokio::task::spawn_blocking(move || {
-        TtsPipeline::new_with_voice(
-            model_dir,
-            tts_active,
-            tts_cancel,
-            &voice,
-            output_device,
-            app,
-        )
-    })
-    .await
-    .map_err(|error| format!("ambient TTS startup panicked: {error}"))?;
-
-    match built {
-        Ok(pipeline) => Ok(Some(Arc::new(pipeline))),
-        Err(error) => {
-            eprintln!("buzz-desktop: ambient TTS unavailable: {error}");
-            Ok(None)
-        }
-    }
 }
 
 /// Drain transcripts and publish them, until the session generation moves.
