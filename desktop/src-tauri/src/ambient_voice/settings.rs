@@ -20,7 +20,8 @@
 //!       "agentPubkey": "<64 hex>",
 //!       "destination": null }      // null → DM with the agent
 //!   ],
-//!   "stt": { "backend": "local", "endpointUrl": null },
+//!   "stt": { "backend": "local",           // or "http"
+//!            "endpointUrl": null },        // base URL when "http"
 //!   "tts": { "backend": "local", "endpointUrl": null },
 //!   "inputDeviceId": null,
 //!   "outputDevice": null,
@@ -48,25 +49,53 @@ pub(crate) const CURRENT_VERSION: u32 = 1;
 /// hand-edited file from arming an unbounded keyword set at boot.
 pub(crate) const MAX_WAKE_BINDINGS: usize = 16;
 
-/// Speech backend selection.
+/// Speech backend selection, per role.
 ///
-/// `Local` is the only backend M1 implements. The enum exists so M3 can add
-/// `Http` without restructuring the settings schema or its consumers; a file
-/// naming an unknown backend falls back to `Local` rather than failing to load.
+/// `Local` is the on-device model — the default, and what every install runs
+/// until the user says otherwise. `Http` sends that role's audio to an
+/// OpenAI-compatible speech server instead (`super::speech_http` holds the
+/// wire contract). The choice is per role because the two run on separate
+/// ports, and because sending utterances away is a different decision from
+/// having replies spoken by a remote voice.
+///
+/// A file naming a backend this build does not know falls back to `Local`
+/// rather than failing to load, so a newer client's file still opens here and
+/// no audio leaves the device on a name we cannot interpret.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum SpeechBackend {
     #[default]
     Local,
+    Http,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct SpeechBackendSettings {
     pub backend: SpeechBackend,
-    /// Reserved for M3 server endpoints. Always `None` in M1; preserved
-    /// verbatim across load/save so a newer client's value is not destroyed.
+    /// Base URL of the speech server, e.g. `http://your-server:30120`. The
+    /// role's paths are appended to it. Kept verbatim across load/save even
+    /// while the role runs locally, so switching back and forth does not cost
+    /// the user the URL they typed.
     pub endpoint_url: Option<String>,
+}
+
+impl SpeechBackendSettings {
+    /// The base URL this role should talk to, or `None` when it runs on-device.
+    ///
+    /// A blank URL under `Http` reads as "not configured yet" rather than as an
+    /// error: the settings field is written as the user types, and a session
+    /// that refused to start on a half-typed URL would be worse than one that
+    /// keeps running locally until the URL is there.
+    pub fn http_base_url(&self) -> Option<&str> {
+        if self.backend != SpeechBackend::Http {
+            return None;
+        }
+        self.endpoint_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|url| !url.is_empty())
+    }
 }
 
 /// Where the user parked the listening indicator, in CSS pixels from the top
@@ -264,8 +293,11 @@ pub(crate) fn load_from_path(path: &Path) -> Result<AmbientVoiceSettings, String
 
 /// Replace unknown `stt`/`tts` backend names with the local default.
 ///
-/// A file written by a build that ships the M3 `http` backend must still open
-/// here — degrading to local is correct and safe (no audio leaves the device).
+/// A file written by a build that ships a backend this one does not have must
+/// still open here — degrading to local is correct and safe (no audio leaves
+/// the device). Known-ness is asked of serde rather than of a second list of
+/// names, so adding a variant to [`SpeechBackend`] cannot leave a name that
+/// loads in one place and is scrubbed in the other.
 fn sanitize_backends(mut value: serde_json::Value) -> serde_json::Value {
     for key in ["stt", "tts"] {
         let Some(section) = value
@@ -276,8 +308,7 @@ fn sanitize_backends(mut value: serde_json::Value) -> serde_json::Value {
         };
         let known = section
             .get("backend")
-            .and_then(serde_json::Value::as_str)
-            .is_some_and(|backend| backend == "local");
+            .is_some_and(|backend| serde_json::from_value::<SpeechBackend>(backend.clone()).is_ok());
         if !known {
             section.insert(
                 "backend".to_string(),

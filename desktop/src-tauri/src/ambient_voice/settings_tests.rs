@@ -187,13 +187,15 @@ fn a_v1_file_missing_optional_sections_still_loads() {
 
 #[test]
 fn an_unknown_speech_backend_degrades_to_local() {
-    // A file written by a future build that ships the M3 HTTP backend must
-    // still open here, and must not silently keep a remote endpoint armed.
+    // A file written by a future build that ships a backend this one does not
+    // have must still open, and must not leave a role pointing at something
+    // this build cannot interpret. Local is the safe reading: no audio leaves
+    // the device.
     let dir = tempfile::tempdir().expect("temp dir");
     let path = dir.path().join(SETTINGS_FILE);
     std::fs::write(
         &path,
-        r#"{"version":1,"enabled":true,"stt":{"backend":"http","endpointUrl":"https://example.invalid/v1"},"tts":{"backend":"http","endpointUrl":null}}"#,
+        r#"{"version":1,"enabled":true,"stt":{"backend":"grpc","endpointUrl":"https://example.invalid/v1"},"tts":{"backend":42,"endpointUrl":null}}"#,
     )
     .expect("fixture write");
     let settings = load_from_path(&path).expect("load");
@@ -204,6 +206,78 @@ fn an_unknown_speech_backend_degrades_to_local() {
         settings.stt.endpoint_url.as_deref(),
         Some("https://example.invalid/v1")
     );
+}
+
+#[test]
+fn an_http_backend_and_its_url_survive_a_save_and_load_verbatim() {
+    // The whole point of the M3 choice: a role the user pointed at a server
+    // stays pointed there across a restart. It is loaded before the first
+    // session starts, so anything lost here is a session that silently ran on
+    // the wrong backend.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join(SETTINGS_FILE);
+    let settings = AmbientVoiceSettings {
+        enabled: true,
+        wake_bindings: vec![binding()],
+        stt: SpeechBackendSettings {
+            backend: SpeechBackend::Http,
+            endpoint_url: Some("http://speech.example:30120".to_string()),
+        },
+        tts: SpeechBackendSettings {
+            backend: SpeechBackend::Http,
+            endpoint_url: Some("http://speech.example:30121".to_string()),
+        },
+        ..AmbientVoiceSettings::default()
+    };
+    save_to_path(&path, &settings).expect("save");
+    assert_eq!(load_from_path(&path).expect("load"), settings);
+
+    // And on the wire, in the shape `AmbientVoiceSettings` in
+    // `ambientVoiceApi.ts` reads.
+    let value: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).expect("read")).expect("json");
+    assert_eq!(
+        value["stt"],
+        serde_json::json!({ "backend": "http", "endpointUrl": "http://speech.example:30120" })
+    );
+    assert_eq!(
+        value["tts"],
+        serde_json::json!({ "backend": "http", "endpointUrl": "http://speech.example:30121" })
+    );
+}
+
+#[test]
+fn a_role_only_talks_to_a_server_when_one_is_both_chosen_and_named() {
+    // `http_base_url` is the single question every consumer asks, and both
+    // halves have to be true. A URL kept beside a local choice is remembered,
+    // not armed; a blank URL under `http` is a field the user has not finished
+    // typing, and a session that refused to run on it would be worse than one
+    // that stays local until it is there.
+    let remembered = SpeechBackendSettings {
+        backend: SpeechBackend::Local,
+        endpoint_url: Some("http://speech.example:30120".to_string()),
+    };
+    assert_eq!(remembered.http_base_url(), None);
+
+    let unnamed = SpeechBackendSettings {
+        backend: SpeechBackend::Http,
+        endpoint_url: Some("   ".to_string()),
+    };
+    assert_eq!(unnamed.http_base_url(), None);
+    assert_eq!(
+        SpeechBackendSettings {
+            backend: SpeechBackend::Http,
+            endpoint_url: None,
+        }
+        .http_base_url(),
+        None
+    );
+
+    let armed = SpeechBackendSettings {
+        backend: SpeechBackend::Http,
+        endpoint_url: Some("  http://speech.example:30120  ".to_string()),
+    };
+    assert_eq!(armed.http_base_url(), Some("http://speech.example:30120"));
 }
 
 #[test]
