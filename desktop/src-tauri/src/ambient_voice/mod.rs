@@ -668,6 +668,24 @@ pub fn get_ambient_voice_settings(
     state.ambient_voice.settings_snapshot()
 }
 
+/// Apply a client settings payload over what the runtime currently holds.
+///
+/// `muted` and `enabled` only ever change through their dedicated commands
+/// (`set_ambient_voice_muted`, `set_ambient_voice_enabled`); the settings card
+/// holds a copy from whenever it mounted, so a later save from it must not be
+/// able to re-assert those two fields.
+fn merge_client_settings(
+    current: &AmbientVoiceSettings,
+    incoming: AmbientVoiceSettings,
+) -> AmbientVoiceSettings {
+    AmbientVoiceSettings {
+        version: settings::CURRENT_VERSION,
+        muted: current.muted,
+        enabled: current.enabled,
+        ..incoming
+    }
+}
+
 /// Replace the ambient settings and reconcile the runtime.
 #[tauri::command]
 pub async fn set_ambient_voice_settings(
@@ -675,8 +693,7 @@ pub async fn set_ambient_voice_settings(
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<AmbientVoiceStatusReport, String> {
-    let mut next = settings;
-    next.version = settings::CURRENT_VERSION;
+    let next = merge_client_settings(&state.ambient_voice.settings_snapshot()?, settings);
     persist_and_reconcile(&app, &state, next).await
 }
 

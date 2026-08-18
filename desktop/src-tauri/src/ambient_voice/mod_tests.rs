@@ -152,6 +152,64 @@ fn the_wake_word_check_rejects_what_the_engine_cannot_be_given() {
 }
 
 #[test]
+fn a_settings_save_cannot_flip_mute_or_enablement() {
+    // The settings card reads one `AmbientVoiceSettings` snapshot at mount and
+    // writes the WHOLE object back on every later save (device pickers, the
+    // wake-word blur, agent selection). Mute and enablement move underneath it
+    // — from the bottom-left indicator, from the Experiments toggle — without
+    // that snapshot being refreshed. So an unrelated save carries a stale
+    // `muted` / `enabled`, and before this was fixed it re-asserted them:
+    // unmuting from the indicator never stuck, and a save from an open
+    // settings page could silently re-open the microphone after the user had
+    // switched the feature off.
+    let current = AmbientVoiceSettings {
+        enabled: true,
+        muted: false,
+        ..bound(true)
+    };
+    // What a card mounted before the user unmuted would send back.
+    let stale = AmbientVoiceSettings {
+        enabled: false,
+        muted: true,
+        input_device_id: Some("mic-abc".to_string()),
+        ..bound(false)
+    };
+
+    let merged = merge_client_settings(&current, stale.clone());
+
+    // Runtime-authoritative fields come from the runtime, never the payload.
+    assert!(
+        !merged.muted,
+        "a stale save re-asserted mute: {merged:?} (current {current:?})"
+    );
+    assert!(
+        merged.enabled,
+        "a stale save re-asserted enablement: {merged:?} (current {current:?})"
+    );
+    // Everything else in the payload is still the client's to set.
+    assert_eq!(merged.input_device_id.as_deref(), Some("mic-abc"));
+    assert_eq!(merged.wake_bindings, stale.wake_bindings);
+    assert_eq!(merged.version, settings::CURRENT_VERSION);
+
+    // And the mirror case: a card that mounted while unmuted and enabled must
+    // not be able to un-mute or re-enable a runtime the user has since muted
+    // and switched off either.
+    let current = AmbientVoiceSettings {
+        enabled: false,
+        muted: true,
+        ..bound(false)
+    };
+    let stale = AmbientVoiceSettings {
+        enabled: true,
+        muted: false,
+        ..bound(true)
+    };
+    let merged = merge_client_settings(&current, stale);
+    assert!(merged.muted, "a stale save cleared mute: {merged:?}");
+    assert!(!merged.enabled, "a stale save re-enabled capture: {merged:?}");
+}
+
+#[test]
 fn the_status_report_serialises_with_the_keys_the_frontend_reads() {
     let state = crate::app_state::build_app_state();
     let report = build_report(&state).expect("report");
