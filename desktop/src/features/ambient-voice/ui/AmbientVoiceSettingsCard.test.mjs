@@ -1,5 +1,6 @@
 /**
- * What the Ambient voice settings section says about the local models.
+ * What the Ambient voice settings section says about the local models, and
+ * whether it still agrees with the native runtime once that runtime moves.
  *
  * Dogfood hit a session that ran, showed a live indicator, and made no sound.
  * The cause was a text-to-speech model that had not finished downloading —
@@ -14,6 +15,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
+import { AMBIENT_STATE_CHANGED_EVENT } from "../lib/ambientVoiceApi.ts";
 import { ambientReport, withAmbientDom } from "../lib/ambientVoiceTestDom.mjs";
 
 const SETTINGS = {
@@ -30,7 +32,7 @@ const SETTINGS = {
   indicatorPosition: null,
 };
 
-async function mountSettings(models, body) {
+async function mountSettings(models, body, { report = ambientReport() } = {}) {
   await withAmbientDom(
     {
       invoke: (command) => {
@@ -38,7 +40,7 @@ async function mountSettings(models, body) {
           case "get_ambient_voice_settings":
             return SETTINGS;
           case "get_ambient_voice_status":
-            return ambientReport();
+            return report;
           case "get_ambient_model_status":
             return models;
           case "list_managed_agents":
@@ -57,7 +59,7 @@ async function mountSettings(models, body) {
         }
       },
     },
-    async ({ dom }) => {
+    async ({ dom, emit }) => {
       const { OVERRIDES_KEY } = await import("@/shared/features/store.ts");
       dom.window.localStorage.setItem(
         OVERRIDES_KEY,
@@ -73,11 +75,22 @@ async function mountSettings(models, body) {
       const view = testing.render(
         React.createElement(AmbientVoiceSettingsCard),
       );
-      await testing.act(async () => {
-        await new Promise((resolve) => setTimeout(resolve, 0));
-      });
+      const flush = async () => {
+        await testing.act(async () => {
+          await new Promise((resolve) => setTimeout(resolve, 0));
+        });
+      };
+      await flush();
       try {
-        await body({ view });
+        await body({
+          view,
+          announce: async (next) => {
+            await testing.act(async () => {
+              emit(AMBIENT_STATE_CHANGED_EVENT, next);
+            });
+            await flush();
+          },
+        });
       } finally {
         testing.cleanup();
       }
@@ -125,4 +138,55 @@ test("a model that was never downloaded says so rather than staying blank", asyn
       );
     },
   );
+});
+
+const READY_MODELS = {
+  kws: { status: "ready" },
+  stt: { status: "ready" },
+  tts: { status: "ready" },
+};
+
+test("mute and status follow the runtime, not the snapshot taken at mount", async () => {
+  // Mute is the native runtime's to own — the listening pill and the
+  // Experiments toggle both move it without this section being told. Reading
+  // it from one status report fetched at mount meant the settings page and the
+  // pill could disagree indefinitely: the microphone was shut and this switch
+  // still said it was open.
+  await mountSettings(READY_MODELS, async ({ announce, view }) => {
+    assert.equal(
+      view.getByTestId("ambient-mute").getAttribute("aria-checked"),
+      "false",
+    );
+    assert.equal(
+      view.getByTestId("ambient-status").textContent,
+      "Listening for the wake word",
+    );
+
+    await announce(ambientReport({ muted: true, status: { state: "muted" } }));
+
+    assert.equal(
+      view.getByTestId("ambient-mute").getAttribute("aria-checked"),
+      "true",
+    );
+    assert.equal(view.getByTestId("ambient-status").textContent, "Muted");
+  });
+});
+
+test("a session that fails after mount is shown here, not left as listening", async () => {
+  // The same staleness in its worst form: the native side gave up, the pill
+  // says so, and this section would go on describing a live session.
+  await mountSettings(READY_MODELS, async ({ announce, view }) => {
+    await announce(
+      ambientReport({
+        capturing: false,
+        live: false,
+        status: { state: "error", detail: "The microphone was disconnected" },
+      }),
+    );
+
+    assert.equal(
+      view.getByTestId("ambient-status").textContent,
+      "The microphone was disconnected",
+    );
+  });
 });

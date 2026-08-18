@@ -40,7 +40,7 @@ const GLOBALS = [
  *   Handles every `invoke` the component makes. Throw to make one fail.
  * @param {number} [options.width] Window width in CSS pixels.
  * @param {number} [options.height] Window height in CSS pixels.
- * @param {(context: {dom: JSDOM, calls: {command: string, args: object}[]}) => Promise<void>} body
+ * @param {(context: {dom: JSDOM, calls: {command: string, args: object}[], emit: (event: string, payload: unknown) => void}) => Promise<void>} body
  */
 export async function withAmbientDom({ invoke, width, height }, body) {
   const dom = new JSDOM("<!doctype html><html><body></body></html>", {
@@ -60,20 +60,42 @@ export async function withAmbientDom({ invoke, width, height }, body) {
   if (typeof height === "number") setViewport(dom, { height });
 
   const calls = [];
+  // Every registered `listen()`, so a test can push a native state event at a
+  // mounted component the same way the backend does.
+  const listeners = [];
+  let nextCallbackId = 0;
   dom.window.__TAURI_INTERNALS__ = {
     invoke: async (command, args) => {
       calls.push({ command, args: args ?? {} });
       // `listen()` and its teardown go through the same door; answering them
       // here keeps the event subscription from rejecting.
-      if (command === "plugin:event|listen") return 1;
+      if (command === "plugin:event|listen") {
+        listeners.push({ event: args.event, handler: args.handler });
+        return listeners.length;
+      }
       if (command === "plugin:event|unlisten") return null;
       return invoke(command, args ?? {});
     },
+    // Ids are monotonic rather than derived from `calls.length`, which two
+    // callbacks registered between the same pair of invokes would share — the
+    // second would silently replace the first and `emit` would wake the wrong
+    // component.
     transformCallback: (callback) => {
-      const id = calls.length + 1;
-      dom.window[`_${id}`] = callback;
-      return id;
+      nextCallbackId += 1;
+      dom.window[`_${nextCallbackId}`] = callback;
+      return nextCallbackId;
     },
+  };
+  /** Deliver `payload` to every listener registered for `event`. */
+  const emit = (event, payload) => {
+    for (const listener of listeners) {
+      if (listener.event !== event) continue;
+      dom.window[`_${listener.handler}`]?.({
+        event,
+        id: listener.handler,
+        payload,
+      });
+    }
   };
   // `unlisten()` reaches for this before it invokes anything; without it an
   // unmount rejects after the test has finished and surfaces as an
@@ -101,7 +123,7 @@ export async function withAmbientDom({ invoke, width, height }, body) {
   install("IS_REACT_ACT_ENVIRONMENT", true);
 
   try {
-    await body({ dom, calls });
+    await body({ dom, calls, emit });
   } finally {
     // Unmount teardown (`unlisten`) is asynchronous. Let it finish while the
     // window it reads from still exists.

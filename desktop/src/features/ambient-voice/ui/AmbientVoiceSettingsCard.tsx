@@ -1,3 +1,4 @@
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import * as React from "react";
 import { ChevronDown, Mic, MicOff } from "lucide-react";
 
@@ -18,6 +19,7 @@ import {
 import { Input } from "@/shared/ui/input";
 import { Switch } from "@/shared/ui/switch";
 import {
+  AMBIENT_STATE_CHANGED_EVENT,
   ambientStatusLabel,
   checkAmbientWakeWord,
   getAmbientModelStatus,
@@ -69,13 +71,9 @@ export function AmbientVoiceSettingsCard() {
     let disposed = false;
     void (async () => {
       try {
-        const [loaded, status] = await Promise.all([
-          getAmbientVoiceSettings(),
-          getAmbientVoiceStatus(),
-        ]);
+        const loaded = await getAmbientVoiceSettings();
         if (disposed) return;
         setSettings(loaded);
-        setReport(status);
         const binding = loaded.wakeBindings[0];
         setWakeWord(binding?.wakeWord ?? "");
         setAgentPubkey(binding?.agentPubkey ?? null);
@@ -91,6 +89,49 @@ export function AmbientVoiceSettingsCard() {
     })();
     return () => {
       disposed = true;
+    };
+  }, []);
+
+  // ── Live native state ────────────────────────────────────────────────────
+  //
+  // Mute and enablement belong to the native runtime — the listening pill
+  // mutes, the Experiments toggle enables — and a report fetched once at mount
+  // goes stale the moment either moves, leaving this section showing a shut
+  // microphone as open. The indicator already follows the same event, so this
+  // is the same subscription rather than a second source of truth.
+  //
+  // Listener first, snapshot second: a transition that happens while the IPC
+  // is in flight must not be lost behind a stale answer.
+  React.useEffect(() => {
+    let disposed = false;
+    let unlisten: UnlistenFn | null = null;
+    void listen<AmbientVoiceStatusReport>(
+      AMBIENT_STATE_CHANGED_EVENT,
+      (event) => {
+        if (!disposed) setReport(event.payload);
+      },
+    )
+      .then((dispose) => {
+        if (disposed) {
+          dispose();
+          return;
+        }
+        unlisten = dispose;
+        void getAmbientVoiceStatus()
+          .then((snapshot) => {
+            // Only seed; a live event that already arrived is newer.
+            if (!disposed) setReport((current) => current ?? snapshot);
+          })
+          .catch(() => {
+            /* the section stays on "Not started" until an event arrives */
+          });
+      })
+      .catch(() => {
+        /* no listener: the rows below fall back to their unknown state */
+      });
+    return () => {
+      disposed = true;
+      unlisten?.();
     };
   }, []);
 
