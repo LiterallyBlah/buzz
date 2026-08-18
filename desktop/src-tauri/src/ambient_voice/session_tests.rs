@@ -109,6 +109,21 @@ fn the_beam_and_trailing_blank_settings_match_the_spike_findings() {
     );
 }
 
+#[test]
+fn an_utterance_that_could_not_be_transcribed_stays_on_the_indicator() {
+    // With speech on a server, a failed utterance is the one thing the user
+    // cannot see any other way: they spoke, nothing was published, and the
+    // agent never answers. Going straight back to "listening for the wake
+    // word" would leave them with a pill that claims to work.
+    assert_eq!(
+        status_after_decode(Err("Speech server failed: HTTP 502".to_string())),
+        AmbientStatus::Error("Speech server failed: HTTP 502".to_string())
+    );
+    // Audio that simply carried no words is not a failure, and must not put a
+    // red state on screen every time someone clears their throat.
+    assert_eq!(status_after_decode(Ok(())), AmbientStatus::Listening);
+}
+
 // ── Status announcements ─────────────────────────────────────────────────────
 
 /// A shared, thread-safe list of the statuses a notifier was handed.
@@ -184,6 +199,7 @@ fn the_worker_announces_the_transitions_it_makes() {
     let (session, _transcripts) = AmbientSession::new(AmbientSessionConfig {
         kws_model_dir: dir.path().to_path_buf(),
         stt_model_dir: dir.path().to_path_buf(),
+        stt_endpoint: None,
         keywords_buf: "\u{2581}HE Y\n".to_string(),
         tts_active: Arc::new(AtomicBool::new(false)),
         tts_cancel: Arc::new(AtomicBool::new(false)),
@@ -224,6 +240,7 @@ fn the_worker_stamps_the_audio_it_takes_off_the_queue() {
     let (session, _transcripts) = AmbientSession::new(AmbientSessionConfig {
         kws_model_dir: dir.path().to_path_buf(),
         stt_model_dir: dir.path().to_path_buf(),
+        stt_endpoint: None,
         keywords_buf: "\u{2581}HE Y\n".to_string(),
         tts_active: Arc::new(AtomicBool::new(false)),
         tts_cancel: Arc::new(AtomicBool::new(false)),

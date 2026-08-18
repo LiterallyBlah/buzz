@@ -37,6 +37,7 @@ use std::{
 use tokio::sync::mpsc as tokio_mpsc;
 
 use super::status::AmbientStatus;
+use super::transcriber::Transcriber;
 use super::utterance::{FrameOutcome, UtteranceMachine, VAD_FRAME_SAMPLES};
 
 /// Bounded audio queue capacity — same shape and reasoning as `huddle::stt`:
@@ -55,7 +56,7 @@ const VAD_THRESHOLD: f32 = 0.5;
 /// fp32 / ~0.95% int8 at one thread, and **two threads strictly worse**; the
 /// recognizer follows `huddle::stt`'s conservative default for the same
 /// oversubscription reason.
-const NUM_THREADS: i32 = 1;
+pub(crate) const NUM_THREADS: i32 = 1;
 
 /// Decoder beam width.
 ///
@@ -208,6 +209,11 @@ pub struct AmbientSession {
 pub struct AmbientSessionConfig {
     pub kws_model_dir: PathBuf,
     pub stt_model_dir: PathBuf,
+    /// Base URL of the speech server this session transcribes through, or
+    /// `None` to use the model in `stt_model_dir`. Resolved from settings
+    /// before the thread starts, like everything else here — the worker takes
+    /// no locks.
+    pub stt_endpoint: Option<String>,
     /// Pre-validated, pre-tokenised keyword payload. **Must** come from
     /// [`super::wake_word::WakeWordTokenizer::keywords_buf`] — raw text here
     /// kills the process.
@@ -392,26 +398,6 @@ fn path_str(dir: &Path, file: &str) -> String {
     dir.join(file).to_string_lossy().into_owned()
 }
 
-fn create_recognizer(model_dir: &Path) -> Result<sherpa_onnx::OfflineRecognizer, String> {
-    use sherpa_onnx::{OfflineRecognizer, OfflineRecognizerConfig};
-
-    let tokens_path = model_dir.join("tokens.txt");
-    let model_path = model_dir.join("model.int8.onnx");
-    if !tokens_path.is_file() || !model_path.is_file() {
-        return Err(format!(
-            "speech-to-text model not found at {}",
-            model_dir.display()
-        ));
-    }
-    let mut config = OfflineRecognizerConfig::default();
-    config.model_config.nemo_ctc.model = Some(model_path.to_string_lossy().into_owned());
-    config.model_config.tokens = Some(tokens_path.to_string_lossy().into_owned());
-    config.model_config.num_threads = NUM_THREADS;
-    config.model_config.debug = false;
-    OfflineRecognizer::create(&config)
-        .ok_or_else(|| "could not create the speech recognizer".to_string())
-}
-
 /// Decode everything the stream is ready for and return the keywords that
 /// fired, resetting the spotter after each so the next detection starts from a
 /// clean beam.
@@ -449,6 +435,7 @@ fn ambient_worker(
     let AmbientSessionConfig {
         kws_model_dir,
         stt_model_dir,
+        stt_endpoint,
         keywords_buf,
         tts_active,
         tts_cancel,
@@ -471,8 +458,8 @@ fn ambient_worker(
             return;
         }
     };
-    let recognizer = match create_recognizer(&stt_model_dir) {
-        Ok(recognizer) => recognizer,
+    let transcriber = match Transcriber::build(&stt_model_dir, stt_endpoint.as_deref()) {
+        Ok(transcriber) => transcriber,
         Err(error) => {
             eprintln!("buzz-desktop: ambient speech recognizer unavailable: {error}");
             status.set(AmbientStatus::Error(error));
@@ -583,9 +570,9 @@ fn ambient_worker(
                         FrameOutcome::Decode => {
                             speech_buf.extend_from_slice(&frame);
                             status.set(AmbientStatus::Transcribing);
-                            transcribe(&recognizer, &speech_buf, &transcript_tx);
+                            let outcome = transcribe(&transcriber, &speech_buf, &transcript_tx);
                             speech_buf.clear();
-                            status.set(AmbientStatus::Listening);
+                            status.set(status_after_decode(outcome));
                         }
                     }
                 }
@@ -594,6 +581,21 @@ fn ambient_worker(
     }
 
     status.set(AmbientStatus::Off);
+}
+
+/// What the indicator shows once an utterance has been decoded.
+///
+/// A failure stays there until the next transition rather than flashing past.
+/// The user has just spoken and heard nothing back, and going straight back to
+/// "listening for the wake word" would be the same class of lie the audio
+/// watchdog was built to end: a pill claiming to work while the thing it
+/// describes is broken. The next wake word replaces it, so nothing has to
+/// clear it.
+fn status_after_decode(outcome: Result<(), String>) -> AmbientStatus {
+    match outcome {
+        Ok(()) => AmbientStatus::Listening,
+        Err(error) => AmbientStatus::Error(error),
+    }
 }
 
 fn current_idle_status(machine: &UtteranceMachine, tts_playing: bool) -> AmbientStatus {
@@ -605,27 +607,28 @@ fn current_idle_status(machine: &UtteranceMachine, tts_playing: bool) -> Ambient
     }
 }
 
+/// Turn the captured utterance into a published transcript.
+///
+/// The error is the transcriber's own — already logged there, and returned
+/// here so the caller can leave it on the indicator. Audio that carried no
+/// words is `Ok`: an utterance the recogniser found nothing in is an ordinary
+/// outcome, not a fault to report.
 fn transcribe(
-    recognizer: &sherpa_onnx::OfflineRecognizer,
+    transcriber: &Transcriber,
     speech_buf: &[f32],
     transcript_tx: &tokio_mpsc::Sender<String>,
-) {
+) -> Result<(), String> {
     if speech_buf.is_empty() {
-        return;
+        return Ok(());
     }
-    let stream = recognizer.create_stream();
-    stream.accept_waveform(16_000, speech_buf);
-    recognizer.decode(&stream);
-    let text = stream
-        .get_result()
-        .map(|result| result.text.trim().to_string())
-        .unwrap_or_default();
+    let text = transcriber.transcribe(speech_buf)?;
     if text.is_empty() {
-        return;
+        return Ok(());
     }
     if let Err(error) = transcript_tx.blocking_send(text) {
         eprintln!("buzz-desktop: ambient transcript channel closed: {error}");
     }
+    Ok(())
 }
 
 /// Keep draining until shutdown so a dead worker cannot back-pressure the

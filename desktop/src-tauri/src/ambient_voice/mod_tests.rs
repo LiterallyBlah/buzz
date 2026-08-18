@@ -257,6 +257,72 @@ fn a_configuration_change_restarts_the_running_session() {
 }
 
 #[test]
+fn a_speech_backend_change_restarts_the_running_session() {
+    // Both roles are bound once, when the session starts: the worker builds
+    // its transcriber from the STT choice and the reply pipeline is built
+    // against the TTS one. Without these in the recorded configuration,
+    // switching a role to a server -- or repointing it at another one -- would
+    // take effect only after the user switched the whole feature off and on
+    // again, and until then the settings screen and the running session would
+    // disagree about where the user's voice is going.
+    use settings::{SpeechBackend, SpeechBackendSettings};
+    let running = bound(true);
+    let started_with = SessionConfig::of(&running);
+
+    let to_server = AmbientVoiceSettings {
+        stt: SpeechBackendSettings {
+            backend: SpeechBackend::Http,
+            endpoint_url: Some("http://speech.example:30120".to_string()),
+        },
+        ..running.clone()
+    };
+    assert!(session_needs_restart(Some(&started_with), &to_server));
+
+    let repointed = AmbientVoiceSettings {
+        stt: SpeechBackendSettings {
+            backend: SpeechBackend::Http,
+            endpoint_url: Some("http://other.example:30120".to_string()),
+        },
+        ..running.clone()
+    };
+    assert!(session_needs_restart(
+        Some(&SessionConfig::of(&to_server)),
+        &repointed
+    ));
+
+    let spoken_remotely = AmbientVoiceSettings {
+        tts: SpeechBackendSettings {
+            backend: SpeechBackend::Http,
+            endpoint_url: Some("http://speech.example:30121".to_string()),
+        },
+        ..running.clone()
+    };
+    assert!(session_needs_restart(Some(&started_with), &spoken_remotely));
+
+    // And back again: a role returned to this computer is just as much a
+    // change to what the worker was built with.
+    assert!(session_needs_restart(
+        Some(&SessionConfig::of(&to_server)),
+        &running
+    ));
+
+    // A URL remembered beside a local choice changes nothing that runs, so it
+    // must not cost the user a session rebuild -- two ONNX model loads and a
+    // re-resolved destination -- while they are typing one.
+    let remembered = AmbientVoiceSettings {
+        stt: SpeechBackendSettings {
+            backend: SpeechBackend::Local,
+            endpoint_url: Some("http://speech.example:30120".to_string()),
+        },
+        ..running.clone()
+    };
+    assert!(!session_needs_restart(
+        Some(&SessionConfig::of(&remembered)),
+        &remembered
+    ));
+}
+
+#[test]
 fn mute_and_the_indicator_position_never_cost_a_restart() {
     // Mute is applied to the live worker in place, and every reconcile runs
     // through the same predicate: rebuilding the session to close a microphone

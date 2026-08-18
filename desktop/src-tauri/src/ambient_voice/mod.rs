@@ -20,6 +20,7 @@
 //! | [`speech_http`] | the wire contract for a role that runs on a server |
 //! | [`speech_wav`] | PCM16 WAV coding for that wire |
 //! | [`status`] | what the listening indicator shows |
+//! | [`transcriber`] | which recogniser an utterance goes to |
 //!
 //! ## Lifecycle
 //!
@@ -47,6 +48,7 @@ pub mod settings;
 pub mod speech_http;
 pub mod speech_wav;
 pub mod status;
+pub mod transcriber;
 pub mod utterance;
 pub mod wake_word;
 
@@ -180,6 +182,13 @@ struct SessionConfig {
     input_device_id: Option<String>,
     /// Consumed by `start_ambient_tts` when it builds the pipeline.
     output_device: Option<String>,
+    /// Which backend hears the user, and where. The worker builds its
+    /// transcriber once, at start, so a role switched to a server — or pointed
+    /// at a different one — only reaches the audio path through a restart.
+    stt: settings::SpeechBackendSettings,
+    /// Which backend speaks the replies. Bound once for the same reason: the
+    /// pipeline is built at start, against one endpoint or one local model.
+    tts: settings::SpeechBackendSettings,
 }
 
 impl SessionConfig {
@@ -188,6 +197,8 @@ impl SessionConfig {
             binding: settings.primary_binding().cloned(),
             input_device_id: settings.input_device_id.clone(),
             output_device: settings.output_device.clone(),
+            stt: settings.stt.clone(),
+            tts: settings.tts.clone(),
         }
     }
 }
@@ -617,6 +628,7 @@ async fn start_session(state: &AppState, settings: &AmbientVoiceSettings) -> Res
     let (session, transcript_rx) = AmbientSession::new(AmbientSessionConfig {
         kws_model_dir: kws_dir,
         stt_model_dir: stt_dir,
+        stt_endpoint: settings.stt.http_base_url().map(str::to_string),
         keywords_buf,
         tts_active: Arc::clone(&ambient.tts_active),
         tts_cancel: Arc::clone(&ambient.tts_cancel),
