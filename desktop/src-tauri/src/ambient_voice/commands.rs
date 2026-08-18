@@ -14,9 +14,9 @@ use crate::app_state::AppState;
 
 use super::{
     app_handle, build_report, capture_failure_is_pacing, emit_state_changed, models,
-    publish_report, reconcile, settings, status::AmbientStatus, stop_session, wake_word,
-    AmbientVoiceSettings, AmbientVoiceStatusReport, WebviewCaptureFlow, MAX_AUDIO_BATCH_BYTES,
-    MAX_CAPTURE_ERROR_CHARS,
+    publish_report, reconcile, settings, speech_http, status::AmbientStatus, stop_session,
+    wake_word, AmbientVoiceSettings, AmbientVoiceStatusReport, WebviewCaptureFlow,
+    MAX_AUDIO_BATCH_BYTES, MAX_CAPTURE_ERROR_CHARS,
 };
 use wake_word::{WakeWordTokenizer, MAX_WAKE_WORD_CHARS};
 
@@ -310,6 +310,26 @@ pub fn check_ambient_wake_word(wake_word: String) -> WakeWordCheck {
             checked_against_model: true,
         },
     }
+}
+
+/// Ask a speech server whether it is there, for the settings "Check" button.
+///
+/// Its own command rather than a side effect of saving, because the answer is
+/// about the address the user is typing and not about the session: nothing
+/// here starts, stops or reconfigures anything. A URL that cannot be reached
+/// is still saved — the server may simply be off — and the session goes on
+/// running the way it already was.
+///
+/// The probe is a `GET` on the health path. Two hundred means ready; anything
+/// else, including nothing at all, is `unreachable` with the reason attached;
+/// an address that could never be probed is `malformed`, which is a different
+/// fault in a different place (the field, not the network) and reads as one.
+#[tauri::command]
+pub async fn check_speech_endpoint(
+    url: String,
+    state: State<'_, AppState>,
+) -> Result<speech_http::SpeechEndpointCheck, String> {
+    Ok(speech_http::probe_endpoint(&state.http_client, &url).await)
 }
 
 /// Raw-binary PCM sink for the ambient AudioWorklet.
