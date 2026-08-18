@@ -306,9 +306,9 @@ fn sanitize_backends(mut value: serde_json::Value) -> serde_json::Value {
         else {
             continue;
         };
-        let known = section
-            .get("backend")
-            .is_some_and(|backend| serde_json::from_value::<SpeechBackend>(backend.clone()).is_ok());
+        let known = section.get("backend").is_some_and(|backend| {
+            serde_json::from_value::<SpeechBackend>(backend.clone()).is_ok()
+        });
         if !known {
             section.insert(
                 "backend".to_string(),

@@ -17,6 +17,8 @@
 //! | [`session`] | the audio worker: spotter → barge-in → VAD → recogniser |
 //! | [`publish`] | egress boundary 9: kind:9 transcripts and kind:48106 |
 //! | [`models`] | wake-word model access over the shared download manager |
+//! | [`speech_http`] | the wire contract for a role that runs on a server |
+//! | [`speech_wav`] | PCM16 WAV coding for that wire |
 //! | [`status`] | what the listening indicator shows |
 //!
 //! ## Lifecycle
@@ -27,12 +29,14 @@
 //! microphone should be hard to switch on by accident and trivial to switch
 //! off.
 //!
-//! ## Backend seam
+//! ## Backend choice
 //!
-//! `settings::SpeechBackend` has one variant today. It exists so server-side
-//! speech (a later milestone) becomes a new variant plus a new implementation
-//! behind the same call sites, rather than a restructure. There is deliberately
-//! **no** HTTP code here.
+//! Each speech role — hearing and speaking — runs either on this computer or
+//! on a server the user names (`settings::SpeechBackend`). The wake word, the
+//! voice activity detector and the utterance machine are always local: they
+//! decide *whether* there is anything to send, and a server that saw the
+//! microphone continuously would be a different feature. Only a finished
+//! utterance, and only a reply already published to the relay, ever leave.
 
 pub mod commands;
 pub mod launch;
@@ -40,9 +44,17 @@ pub mod models;
 pub mod publish;
 pub mod session;
 pub mod settings;
+pub mod speech_http;
+pub mod speech_wav;
 pub mod status;
 pub mod utterance;
 pub mod wake_word;
+
+/// A real HTTP server on loopback, so the speech backends are tested against
+/// the wire rather than against a mock that shares their assumptions.
+#[cfg(test)]
+#[path = "speech_stub_server.rs"]
+mod speech_stub_server;
 
 use std::{
     sync::{
