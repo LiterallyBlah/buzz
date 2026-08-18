@@ -16,6 +16,12 @@ import {
   AMBIENT_HOTSTART_INTERVAL_MS,
 } from "./lib/ambientCapture";
 import {
+  ambientRebuildAttempted,
+  shouldRebuildAmbientCapture,
+  AMBIENT_REBUILD_START,
+  type AmbientRebuildState,
+} from "./lib/ambientAudioWatchdog";
+import {
   AMBIENT_STATE_CHANGED_EVENT,
   checkAmbientHotstart,
   getAmbientVoiceStatus,
@@ -62,8 +68,14 @@ export function AmbientVoiceProvider({
   // Whether the pipeline below is actually built. Distinct from `shouldCapture`,
   // which is only what the native report asks for: the gap between the two is
   // where a `getUserMedia` still waiting on a permission prompt lives, and a
-  // report that never says `captureReady` is itself the diagnosis.
+  // report that never says `captureReady` is itself the diagnosis. It is also
+  // what the watchdog below refuses to rebuild into.
   const [captureReady, setCaptureReady] = React.useState(false);
+  // Rebuild bookkeeping lives outside the capture effect on purpose: the effect
+  // is what a rebuild re-runs, so a counter kept inside it would reset itself
+  // every attempt and the cap would never be reached.
+  const rebuildRef = React.useRef<AmbientRebuildState>(AMBIENT_REBUILD_START);
+  const [rebuildNonce, setRebuildNonce] = React.useState(0);
 
   // ── Native state: listen first, then snapshot ────────────────────────────
   //
@@ -155,6 +167,7 @@ export function AmbientVoiceProvider({
   // microphone in settings takes effect without a restart.
   const inputDeviceId = report?.inputDeviceId ?? null;
 
+  // biome-ignore lint/correctness/useExhaustiveDependencies: rebuildNonce is an intentional trigger only; the watchdog bumps it to rebuild this pipeline and its value is never read here.
   React.useEffect(() => {
     const releaseTracks = (stream: MediaStream | null) => {
       for (const track of stream?.getTracks() ?? []) track.stop();
@@ -248,7 +261,10 @@ export function AmbientVoiceProvider({
       if (streamRef.current === localStream) streamRef.current = null;
       setCaptureReady(false);
     };
-  }, [shouldCapture, inputDeviceId]);
+    // `rebuildNonce` is the watchdog's handle on this effect: bumping it tears
+    // the pipeline down and builds a fresh one, which is what a settings off/on
+    // does to this webview and the only thing that has ever fixed the fault.
+  }, [shouldCapture, inputDeviceId, rebuildNonce]);
 
   // ── Audio flow ───────────────────────────────────────────────────────────
   //
@@ -258,16 +274,52 @@ export function AmbientVoiceProvider({
   // it is also what makes a session that has gone quiet visible: staleness
   // moves with the clock rather than with a transition, so nothing else would
   // ever emit it.
+  //
+  // The answer is then acted on. A session that is running, unmuted and
+  // receiving nothing is deaf, and rebuilding the capture pipeline is the fix
+  // the user would otherwise perform by hand in settings. Every gate on that is
+  // in `ambientAudioWatchdog`, which explains why each one exists.
   React.useEffect(() => {
     if (!shouldCapture) return;
     let disposed = false;
     const tick = () => {
-      void reportAmbientAudioFlow(
-        workletRef.current?.pushedBatches() ?? 0,
-        captureReady,
-      )
+      const pushed = workletRef.current?.pushedBatches() ?? 0;
+      void reportAmbientAudioFlow(pushed, captureReady)
         .then((next) => {
-          if (!disposed) setReport(next);
+          if (disposed) return;
+          setReport(next);
+          if (!next.audioStale) {
+            // Audio is arriving. Whatever went wrong is over, so the next
+            // silence gets the full allowance rather than the remains of this
+            // one — the same reason the native pacing restarts per failure.
+            rebuildRef.current = AMBIENT_REBUILD_START;
+            return;
+          }
+          const nowMs = Date.now();
+          if (
+            !shouldRebuildAmbientCapture({
+              report: next,
+              captureReady,
+              state: rebuildRef.current,
+              nowMs,
+            })
+          ) {
+            return;
+          }
+          rebuildRef.current = ambientRebuildAttempted(
+            rebuildRef.current,
+            nowMs,
+          );
+          console.warn(
+            "[ambient] no audio is reaching the session — rebuilding capture",
+            {
+              attempt: rebuildRef.current.attempts,
+              pushedByWebview: pushed,
+              receivedByWorker: next.audioBatchesReceived,
+              msSinceLastAudio: next.msSinceLastAudio,
+            },
+          );
+          setRebuildNonce((nonce) => nonce + 1);
         })
         .catch((error) => {
           console.debug("[ambient] audio flow report failed:", error);
@@ -279,6 +331,13 @@ export function AmbientVoiceProvider({
       window.clearInterval(id);
     };
   }, [shouldCapture, captureReady]);
+
+  // A session that stopped, a mute, or a microphone chosen in settings all mean
+  // the next silence is a new fault: give it the full allowance again.
+  // biome-ignore lint/correctness/useExhaustiveDependencies: inputDeviceId is an intentional trigger only — a device chosen in settings resets the allowance; its value is not read here.
+  React.useEffect(() => {
+    rebuildRef.current = AMBIENT_REBUILD_START;
+  }, [shouldCapture, inputDeviceId]);
 
   // ── Replies ──────────────────────────────────────────────────────────────
   useAmbientReplySubscription(
