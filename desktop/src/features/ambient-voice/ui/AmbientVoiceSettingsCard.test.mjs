@@ -36,13 +36,32 @@ const SETTINGS = {
   indicatorPosition: null,
 };
 
-async function mountSettings(models, body, { report = ambientReport() } = {}) {
+/**
+ * A `check_speech_endpoint` answer, in the exact shape the native side sends —
+ * pinned by `the_check_result_serialises_in_the_shape_the_frontend_parses` in
+ * `ambient_voice/speech_http_tests.rs`.
+ */
+const READY_ENDPOINT = {
+  status: "ready",
+  detail: null,
+  probedUrl: "http://speech.example:30120/v1/health/ready",
+};
+
+async function mountSettings(
+  models,
+  body,
+  {
+    report = ambientReport(),
+    settings = SETTINGS,
+    endpointCheck = READY_ENDPOINT,
+  } = {},
+) {
   await withAmbientDom(
     {
       invoke: (command) => {
         switch (command) {
           case "get_ambient_voice_settings":
-            return SETTINGS;
+            return settings;
           case "get_ambient_voice_status":
             return report;
           case "get_ambient_model_status":
@@ -58,12 +77,16 @@ async function mountSettings(models, body, { report = ambientReport() } = {}) {
               tokens: null,
               checkedAgainstModel: false,
             };
+          case "check_speech_endpoint":
+            return endpointCheck;
+          case "set_ambient_voice_settings":
+            return report;
           default:
             throw new Error(`unexpected command: ${command}`);
         }
       },
     },
-    async ({ dom, emit }) => {
+    async ({ calls, dom, emit }) => {
       const { OVERRIDES_KEY } = await import("@/shared/features/store.ts");
       dom.window.localStorage.setItem(
         OVERRIDES_KEY,
@@ -87,10 +110,18 @@ async function mountSettings(models, body, { report = ambientReport() } = {}) {
       await flush();
       try {
         await body({
+          calls,
+          testing,
           view,
           announce: async (next) => {
             await testing.act(async () => {
               emit(AMBIENT_STATE_CHANGED_EVENT, next);
+            });
+            await flush();
+          },
+          act: async (interact) => {
+            await testing.act(async () => {
+              interact();
             });
             await flush();
           },
@@ -247,4 +278,153 @@ test("a session that fails after mount is shown here, not left as listening", as
       "The microphone was disconnected",
     );
   });
+});
+
+// ── Speech backends ──────────────────────────────────────────────────────────
+
+/** Settings with speech-to-text pointed at a server. */
+const SERVER_STT = {
+  ...SETTINGS,
+  stt: { backend: "http", endpointUrl: "http://speech.example:30120" },
+};
+
+test("a role that runs on this computer offers no address to fill in", async () => {
+  // The default, and the shape of every existing settings file: both rows are
+  // there, neither shows a URL field, and nothing suggests audio is leaving.
+  await mountSettings(READY_MODELS, async ({ view }) => {
+    assert.equal(
+      view.getByTestId("ambient-speech-stt-trigger").textContent,
+      "This computer",
+    );
+    assert.equal(
+      view.getByTestId("ambient-speech-tts-trigger").textContent,
+      "This computer",
+    );
+    assert.equal(view.queryByTestId("ambient-speech-stt-url"), null);
+    assert.equal(view.queryByTestId("ambient-speech-tts-url"), null);
+  });
+});
+
+test("a role pointed at a server shows the address and names what is sent there", async () => {
+  await mountSettings(
+    READY_MODELS,
+    async ({ view }) => {
+      assert.equal(
+        view.getByTestId("ambient-speech-stt-trigger").textContent,
+        "A server",
+      );
+      assert.equal(
+        view.getByTestId("ambient-speech-stt-url").value,
+        "http://speech.example:30120",
+      );
+      // What is actually sent, and the one thing that never is. Someone
+      // switching this on is deciding to send their voice somewhere, and the
+      // screen has to say exactly what that means.
+      const hint = view.getByTestId("ambient-speech-stt-hint").textContent;
+      assert.match(hint, /\/v1\/audio\/transcriptions/);
+      assert.match(hint, /wake word itself is always heard on this computer/);
+      // The other role is untouched by the first one's choice.
+      assert.equal(view.queryByTestId("ambient-speech-tts-url"), null);
+    },
+    { settings: SERVER_STT },
+  );
+});
+
+test("Check reports what the native side answered, at the URL it probed", async () => {
+  await mountSettings(
+    READY_MODELS,
+    async ({ act, calls, view }) => {
+      await act(() => {
+        view.getByTestId("ambient-speech-stt-check").click();
+      });
+      const checked = calls.filter(
+        (call) => call.command === "check_speech_endpoint",
+      );
+      assert.equal(checked.length, 1);
+      assert.deepEqual(checked[0].args, {
+        url: "http://speech.example:30120",
+      });
+      assert.equal(
+        view.getByTestId("ambient-speech-stt-check-result").textContent,
+        "Answered at http://speech.example:30120/v1/health/ready",
+      );
+    },
+    { settings: SERVER_STT },
+  );
+});
+
+test("a server that does not answer is told apart from an address that cannot work", async () => {
+  // The two failures send the user to different places: one to their typing,
+  // the other to their server. A single "check failed" would send them to the
+  // wrong one half the time.
+  await mountSettings(
+    READY_MODELS,
+    async ({ act, view }) => {
+      await act(() => {
+        view.getByTestId("ambient-speech-stt-check").click();
+      });
+      assert.equal(
+        view.getByTestId("ambient-speech-stt-check-result").textContent,
+        "No answer from http://speech.example:30120/v1/health/ready: The server answered HTTP 404 at its health path.",
+      );
+    },
+    {
+      settings: SERVER_STT,
+      endpointCheck: {
+        status: "unreachable",
+        detail: "The server answered HTTP 404 at its health path.",
+        probedUrl: "http://speech.example:30120/v1/health/ready",
+      },
+    },
+  );
+});
+
+test("an address typed into the field is saved in the shape the native side reads", async () => {
+  // The whole payload, because the card posts the whole settings object: the
+  // role that changed carries the URL, the other role is untouched, and the
+  // shape matches `SpeechBackendSettings` exactly (pinned from the producing
+  // side by `an_http_backend_and_its_url_survive_a_save_and_load_verbatim`).
+  await mountSettings(
+    READY_MODELS,
+    async ({ act, calls, testing, view }) => {
+      const field = view.getByTestId("ambient-speech-tts-url");
+      // Chosen but not yet addressed: the native side runs this role locally
+      // until there is a URL, and the row says so rather than implying the
+      // voice has already moved.
+      assert.equal(
+        view.getByTestId("ambient-speech-tts-notice").textContent,
+        "Add the server's address. Until then this runs on this computer.",
+      );
+
+      await act(() => {
+        testing.fireEvent.change(field, {
+          target: { value: "  http://speech.example:30121  " },
+        });
+        testing.fireEvent.blur(field);
+      });
+
+      const saved = calls.filter(
+        (call) => call.command === "set_ambient_voice_settings",
+      );
+      assert.equal(saved.length, 1, "the address was never persisted");
+      assert.deepEqual(saved[0].args.settings.tts, {
+        backend: "http",
+        endpointUrl: "http://speech.example:30121",
+      });
+      assert.deepEqual(saved[0].args.settings.stt, {
+        backend: "local",
+        endpointUrl: null,
+      });
+      assert.deepEqual(
+        saved[0].args.settings.wakeBindings,
+        SETTINGS.wakeBindings,
+      );
+    },
+    {
+      settings: {
+        ...SETTINGS,
+        tts: { backend: "http", endpointUrl: null },
+      },
+    },
+  );
 });

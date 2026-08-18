@@ -93,14 +93,48 @@ export type WakeBinding = {
   destination: string | null;
 };
 
+/** Mirrors `ambient_voice::settings::SpeechBackend`. */
+export type SpeechBackend = "local" | "http";
+
+/**
+ * Mirrors `ambient_voice::settings::SpeechBackendSettings`.
+ *
+ * `endpointUrl` is a **base** URL — the native side appends the API's paths to
+ * it. It is kept while the role runs locally too, so switching back and forth
+ * does not cost the user what they typed.
+ */
+export type SpeechBackendSettings = {
+  backend: SpeechBackend;
+  endpointUrl: string | null;
+};
+
+/**
+ * Mirrors `ambient_voice::speech_http::SpeechEndpointCheck`.
+ *
+ * Pinned from the producing side by
+ * `the_check_result_serialises_in_the_shape_the_frontend_parses` in
+ * `ambient_voice/speech_http_tests.rs`; that test, this type and the fixtures
+ * in `ambientSpeechBackend.test.mjs` change together.
+ */
+export type SpeechEndpointCheck = {
+  /** `ready` — answered; `unreachable` — did not; `malformed` — not a URL. */
+  status: "ready" | "malformed" | "unreachable";
+  /** Shown verbatim. `null` only when the server is ready. */
+  detail: string | null;
+  /** What was actually probed. `null` when nothing could be derived. */
+  probedUrl: string | null;
+};
+
 /** Mirrors `ambient_voice::settings::AmbientVoiceSettings`. */
 export type AmbientVoiceSettings = {
   version: number;
   enabled: boolean;
   muted: boolean;
   wakeBindings: WakeBinding[];
-  stt: { backend: "local"; endpointUrl: string | null };
-  tts: { backend: "local"; endpointUrl: string | null };
+  /** Where what the user says is turned into text. */
+  stt: SpeechBackendSettings;
+  /** Where the agent's replies are turned into speech. */
+  tts: SpeechBackendSettings;
   inputDeviceId: string | null;
   outputDevice: string | null;
   /**
@@ -171,6 +205,16 @@ export const checkAmbientWakeWord = (wakeWord: string) =>
 
 export const checkAmbientHotstart = () =>
   invoke<AmbientVoiceStatusReport>("check_ambient_hotstart");
+
+/**
+ * Ask whether a speech server is there.
+ *
+ * Answers about the address, not about the session: nothing is started,
+ * stopped or reconfigured, and a URL that fails a check is still savable — the
+ * server may simply be switched off.
+ */
+export const checkSpeechEndpoint = (url: string) =>
+  invoke<SpeechEndpointCheck>("check_speech_endpoint", { url });
 
 export const ambientSpeak = (text: string) =>
   invoke<void>("ambient_speak", { text });

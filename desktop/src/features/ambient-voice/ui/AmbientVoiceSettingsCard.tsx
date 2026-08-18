@@ -42,7 +42,13 @@ import {
   withPrimaryBinding,
   type AmbientAgentOption,
 } from "../lib/ambientSettingsLogic";
+import {
+  withSpeechBackend,
+  LOCAL_SPEECH_BACKEND,
+  SPEECH_ROLES,
+} from "../lib/ambientSpeechBackend";
 import { useAmbientAudioDevices } from "../lib/useAmbientAudioDevices";
+import { AmbientSpeechBackendRow } from "./AmbientSpeechBackendRow";
 
 const WAKE_WORD_CHECK_DEBOUNCE_MS = 250;
 
@@ -257,11 +263,12 @@ export function AmbientVoiceSettingsCard() {
         title="Ambient voice"
         description={
           <>
-            Say a wake word and talk to one agent, hands-free. Speech
-            recognition, the wake word and the voice all run on this computer —
-            only the transcript leaves, as an ordinary message. While this is
-            switched on the microphone stays open, so your operating system will
-            show its microphone indicator the whole time.
+            Say a wake word and talk to one agent, hands-free. The wake word is
+            always heard on this computer, and nothing is sent anywhere until it
+            fires; speech recognition and the voice run here too unless you
+            point them at a server below. While this is switched on the
+            microphone stays open, so your operating system will show its
+            microphone indicator the whole time.
           </>
         }
       />
@@ -387,6 +394,18 @@ export function AmbientVoiceSettingsCard() {
           value={settings?.outputDevice ?? ""}
         />
 
+        {SPEECH_ROLES.map((role) => (
+          <AmbientSpeechBackendRow
+            key={role}
+            onChange={(next) => {
+              if (!settings) return;
+              void persist(withSpeechBackend(settings, role, next));
+            }}
+            role={role}
+            value={settings?.[role] ?? LOCAL_SPEECH_BACKEND}
+          />
+        ))}
+
         <SettingsOptionRow>
           <div className="min-w-0">
             <p className="text-sm font-medium">Mute</p>
@@ -452,8 +471,9 @@ export function AmbientVoiceSettingsCard() {
           <div className="min-w-0">
             <p className="text-sm font-medium">Voice models</p>
             <p className="text-sm font-normal text-muted-foreground">
-              All three run on this computer. Until every one is ready the
-              session is either deaf or silent.
+              The wake word always runs on this computer. The other two are used
+              whenever their role above is set to this computer — and speech to
+              text also stands in for a server that fails.
             </p>
           </div>
           <div
