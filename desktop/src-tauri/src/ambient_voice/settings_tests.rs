@@ -29,6 +29,9 @@ fn defaults_are_off_with_no_wake_word() {
     assert_eq!(settings.tts.backend, SpeechBackend::Local);
     assert!(settings.input_device_id.is_none());
     assert!(settings.output_device.is_none());
+    // No stored indicator position: the frontend's default corner applies
+    // until the user drags the pill somewhere else.
+    assert!(settings.indicator_position.is_none());
     assert!(!settings.is_runnable());
 }
 
@@ -54,9 +57,73 @@ fn settings_survive_a_save_load_round_trip() {
         tts: SpeechBackendSettings::default(),
         input_device_id: Some("mic-abc".to_string()),
         output_device: Some("Speakers (Realtek)".to_string()),
+        indicator_position: Some(IndicatorPosition {
+            x: 1180.0,
+            y: 690.5,
+        }),
     };
     save_to_path(&path, &settings).expect("save");
     assert_eq!(load_from_path(&path).expect("load"), settings);
+}
+
+#[test]
+fn a_dragged_indicator_survives_a_restart() {
+    // The pill is dragged in the webview; the only thing that carries it
+    // across a restart is this file, and it is read back before the first
+    // paint of the indicator.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join(SETTINGS_FILE);
+    let parked = IndicatorPosition { x: 42.0, y: 17.25 };
+    save_to_path(
+        &path,
+        &AmbientVoiceSettings {
+            indicator_position: Some(parked),
+            ..AmbientVoiceSettings::default()
+        },
+    )
+    .expect("save");
+    assert_eq!(
+        load_from_path(&path).expect("load").indicator_position,
+        Some(parked)
+    );
+
+    let value: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).expect("read")).expect("json");
+    assert_eq!(value["indicatorPosition"]["x"], 42.0);
+    assert_eq!(value["indicatorPosition"]["y"], 17.25);
+}
+
+#[test]
+fn an_unusable_indicator_position_is_forgotten_rather_than_fatal() {
+    // A hand-edited file must not cost the user their wake binding, and a
+    // non-finite value cannot be encoded at all — it has to be refused where
+    // the caller can see it rather than as a JSON error on the whole file.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join(SETTINGS_FILE);
+    std::fs::write(
+        &path,
+        format!(
+            r#"{{"version":1,"enabled":true,"indicatorPosition":null,
+                "wakeBindings":[{{"wakeWord":"hey hermes","agentPubkey":"{AGENT}"}}]}}"#
+        ),
+    )
+    .expect("fixture write");
+    let settings = load_from_path(&path).expect("load");
+    assert!(settings.indicator_position.is_none());
+    assert_eq!(settings.wake_bindings, vec![binding()]);
+
+    let error = save_to_path(
+        &path,
+        &AmbientVoiceSettings {
+            indicator_position: Some(IndicatorPosition {
+                x: f64::NAN,
+                y: 0.0,
+            }),
+            ..AmbientVoiceSettings::default()
+        },
+    )
+    .expect_err("non-finite position");
+    assert!(error.contains("finite pixel offset"), "{error}");
 }
 
 #[test]

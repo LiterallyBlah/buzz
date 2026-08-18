@@ -23,7 +23,8 @@
 //!   "stt": { "backend": "local", "endpointUrl": null },
 //!   "tts": { "backend": "local", "endpointUrl": null },
 //!   "inputDeviceId": null,
-//!   "outputDevice": null
+//!   "outputDevice": null,
+//!   "indicatorPosition": null    // null → the frontend's default corner
 //! }
 //! ```
 //!
@@ -68,6 +69,32 @@ pub struct SpeechBackendSettings {
     pub endpoint_url: Option<String>,
 }
 
+/// Where the user parked the listening indicator, in CSS pixels from the top
+/// left of the viewport.
+///
+/// Stored raw rather than as a corner or a fraction because the pill is
+/// free-dragged, not snapped. It is the frontend that clamps this back into
+/// the window on restore and on resize — the window size is not knowable here,
+/// and a value saved on a large display must not be discarded merely because
+/// the app reopened on a small one.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IndicatorPosition {
+    pub x: f64,
+    pub y: f64,
+}
+
+impl IndicatorPosition {
+    /// Whether this is a position that can be written and read back.
+    ///
+    /// `serde_json` refuses to encode NaN and infinities, so an unchecked
+    /// value would fail the whole settings write with a JSON error rather than
+    /// something a caller can act on.
+    fn is_storable(&self) -> bool {
+        self.x.is_finite() && self.y.is_finite()
+    }
+}
+
 /// One wake word bound to one agent and one destination.
 ///
 /// `destination` is `None` for "the DM with `agent_pubkey`" — the M1 default
@@ -82,7 +109,9 @@ pub struct WakeBinding {
     pub destination: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+// Not `Eq`: the indicator position is measured in CSS pixels, which are
+// fractional on a scaled display.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AmbientVoiceSettings {
     pub version: u32,
@@ -108,6 +137,10 @@ pub struct AmbientVoiceSettings {
     /// Persisted rodio output device name, matching `set_audio_output_device`.
     #[serde(default)]
     pub output_device: Option<String>,
+    /// Where the user dragged the listening indicator. `None` until they move
+    /// it, which is what makes the frontend default apply to everyone else.
+    #[serde(default)]
+    pub indicator_position: Option<IndicatorPosition>,
 }
 
 impl Default for AmbientVoiceSettings {
@@ -122,6 +155,7 @@ impl Default for AmbientVoiceSettings {
             tts: SpeechBackendSettings::default(),
             input_device_id: None,
             output_device: None,
+            indicator_position: None,
         }
     }
 }
@@ -218,6 +252,13 @@ pub(crate) fn load_from_path(path: &Path) -> Result<AmbientVoiceSettings, String
         .wake_bindings
         .retain(|binding| validate_binding_shape(binding).is_ok());
     settings.wake_bindings.truncate(MAX_WAKE_BINDINGS);
+
+    // A hand-edited or truncated file can carry a position no window could
+    // ever show. Forgetting it falls back to the default corner, which is
+    // strictly better than an indicator the user cannot find.
+    settings.indicator_position = settings
+        .indicator_position
+        .filter(IndicatorPosition::is_storable);
     Ok(settings)
 }
 
@@ -261,6 +302,11 @@ pub(crate) fn save_to_path(path: &Path, settings: &AmbientVoiceSettings) -> Resu
     }
     for binding in &settings.wake_bindings {
         validate_binding_shape(binding)?;
+    }
+    if let Some(position) = settings.indicator_position {
+        if !position.is_storable() {
+            return Err("Indicator position must be a finite pixel offset".to_string());
+        }
     }
     let payload = serde_json::to_vec_pretty(settings)
         .map_err(|error| format!("could not encode ambient voice settings: {error}"))?;

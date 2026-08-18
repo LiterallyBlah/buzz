@@ -172,6 +172,10 @@ pub struct AmbientVoiceStatusReport {
     /// this changes, so a device chosen in settings takes effect without a
     /// restart.
     pub input_device_id: Option<String>,
+    /// Where the user parked the indicator, or `None` for the default corner.
+    /// Carried on the report so the pill can restore itself from the same
+    /// snapshot it already fetches, rather than a second settings read.
+    pub indicator_position: Option<settings::IndicatorPosition>,
     /// Set when settings could not be loaded; writes are refused meanwhile.
     pub load_error: Option<String>,
 }
@@ -215,6 +219,7 @@ fn build_report(state: &AppState) -> Result<AmbientVoiceStatusReport, String> {
             .primary_binding()
             .map(|binding| binding.wake_word.clone()),
         input_device_id: settings.input_device_id.clone(),
+        indicator_position: settings.indicator_position,
         load_error: ambient
             .load_error
             .lock()
@@ -605,12 +610,31 @@ fn ensure_writable(state: &AppState) -> Result<(), String> {
     Ok(())
 }
 
+/// Protect the dragged indicator position from a whole-object settings write.
+///
+/// The settings screen loads its `AmbientVoiceSettings` once and posts the
+/// whole object back on every change, so a copy fetched before the user
+/// dragged the pill would otherwise put it back where it was.
+/// [`set_ambient_indicator_position`] is the only writer of this field, and
+/// `stored` is what it last wrote.
+fn keep_stored_indicator_position(
+    mut next: AmbientVoiceSettings,
+    stored: Option<settings::IndicatorPosition>,
+) -> AmbientVoiceSettings {
+    next.indicator_position = stored.or(next.indicator_position);
+    next
+}
+
 async fn persist_and_reconcile(
     app: &AppHandle,
     state: &AppState,
     next: AmbientVoiceSettings,
 ) -> Result<AmbientVoiceStatusReport, String> {
     ensure_writable(state)?;
+    let next = keep_stored_indicator_position(
+        next,
+        state.ambient_voice.settings_snapshot()?.indicator_position,
+    );
     settings::save_to_path(&settings::settings_path(app)?, &next)?;
     state
         .ambient_voice
@@ -692,6 +716,32 @@ pub async fn set_ambient_voice_muted(
         }
     }
     persist_and_reconcile(&app, &state, next).await
+}
+
+/// Remember where the user dragged the listening indicator.
+///
+/// Its own command rather than a `set_ambient_voice_settings` round trip for
+/// two reasons: dragging a pill must not take the session transition lock or
+/// run reconciliation, and the settings screen holds a settings object it
+/// fetched before the drag, so a whole-object write from there would clobber
+/// the position. Nothing about the running session changes, so no state event
+/// is emitted — the caller already has the answer in the returned report.
+#[tauri::command]
+pub fn set_ambient_indicator_position(
+    position: Option<settings::IndicatorPosition>,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<AmbientVoiceStatusReport, String> {
+    ensure_writable(&state)?;
+    let mut next = state.ambient_voice.settings_snapshot()?;
+    next.indicator_position = position;
+    settings::save_to_path(&settings::settings_path(&app)?, &next)?;
+    *state
+        .ambient_voice
+        .settings
+        .lock()
+        .map_err(|error| format!("ambient voice settings lock poisoned: {error}"))? = next;
+    build_report(&state)
 }
 
 /// Current runtime status, for the indicator and the reply watcher.

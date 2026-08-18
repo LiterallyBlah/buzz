@@ -860,6 +860,7 @@ pub fn run() {
             ambient_voice::set_ambient_voice_enabled,
             ambient_voice::set_ambient_voice_muted,
             ambient_voice::get_ambient_voice_status,
+            ambient_voice::set_ambient_indicator_position,
             ambient_voice::get_ambient_model_status,
             ambient_voice::check_ambient_hotstart,
             ambient_voice::check_ambient_wake_word,

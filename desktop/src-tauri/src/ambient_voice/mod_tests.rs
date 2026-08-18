@@ -166,8 +166,37 @@ fn the_status_report_serialises_with_the_keys_the_frontend_reads() {
         "agentPubkey",
         "wakeWord",
         "inputDeviceId",
+        "indicatorPosition",
         "loadError",
     ] {
         assert!(value.get(key).is_some(), "missing {key} in {value}");
     }
+}
+
+#[test]
+fn a_settings_write_cannot_move_the_indicator_back() {
+    // The settings screen fetches the whole settings object once and posts it
+    // back on every change. A copy taken before the user dragged the pill
+    // would otherwise silently undo the drag on the next device change.
+    use crate::ambient_voice::settings::IndicatorPosition;
+    let parked = IndicatorPosition { x: 900.0, y: 40.0 };
+    let stale = AmbientVoiceSettings {
+        indicator_position: Some(IndicatorPosition { x: 12.0, y: 700.0 }),
+        ..bound(true)
+    };
+    assert_eq!(
+        keep_stored_indicator_position(stale, Some(parked)).indicator_position,
+        Some(parked)
+    );
+
+    // Nothing stored yet: whatever the caller carries is kept, so the very
+    // first write is not thrown away.
+    let first = AmbientVoiceSettings {
+        indicator_position: Some(parked),
+        ..bound(true)
+    };
+    assert_eq!(
+        keep_stored_indicator_position(first, None).indicator_position,
+        Some(parked)
+    );
 }
