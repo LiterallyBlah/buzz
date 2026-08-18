@@ -317,6 +317,114 @@ fn a_late_capture_failure_cannot_resurrect_a_stopped_session() {
 }
 
 #[test]
+fn a_capture_failure_paces_the_automatic_retry() {
+    // A microphone the webview cannot open fails again the instant a session
+    // exists to fail against, and the hot-start poll runs every three seconds:
+    // unpaced, a device left unplugged rebuilt the session — two ONNX model
+    // loads — ten times a minute, with the indicator flashing "Starting…" each
+    // time and settling back on the error.
+    let now = Instant::now();
+    let failed = AmbientStatus::Error("The microphone was disconnected".to_string());
+    assert!(capture_failure_is_pacing(&failed, Some(now), now));
+
+    // The window expires and the next poll re-arms, so a device that was
+    // plugged back in recovers without the user touching anything.
+    let expired = now
+        .checked_sub(CAPTURE_ERROR_BACKOFF + Duration::from_secs(1))
+        .expect("an instant before the backoff window");
+    assert!(!capture_failure_is_pacing(&failed, Some(expired), now));
+
+    // A failure that was never reported paces nothing — this is what keeps a
+    // start that failed for any other reason (a corrupt model, an engine
+    // failure) on the three-second recovery it has always had.
+    assert!(!capture_failure_is_pacing(&failed, None, now));
+
+    // And nothing outside the error state is paced, so a session that started,
+    // a mute, or a huddle suspension all take the ordinary path.
+    for status in [
+        AmbientStatus::Off,
+        AmbientStatus::Suspended,
+        AmbientStatus::Muted,
+        AmbientStatus::Starting,
+        AmbientStatus::Listening,
+    ] {
+        assert!(
+            !capture_failure_is_pacing(&status, Some(now), now),
+            "{status:?}"
+        );
+    }
+}
+
+#[test]
+fn a_new_capture_failure_reopens_the_pacing_window() {
+    // Each report is paced from itself. A retry that got through and failed
+    // again must wait afresh rather than inherit what was left of an older
+    // window — otherwise the loop reopens at full speed after the first
+    // thirty seconds.
+    let now = Instant::now();
+    let failed = AmbientStatus::Error("The microphone stopped".to_string());
+    let stale = now
+        .checked_sub(CAPTURE_ERROR_BACKOFF * 2)
+        .expect("an instant well before the backoff window");
+
+    assert!(!capture_failure_is_pacing(&failed, Some(stale), now));
+    assert!(capture_failure_is_pacing(&failed, Some(now), now));
+}
+
+#[test]
+fn a_stop_does_not_forget_the_last_capture_failure() {
+    // `stop_session` clears everything about the session that ended, and the
+    // pacing timestamp deliberately survives it: the microphone is what failed,
+    // not the session, and a stop that reset it would let the very next poll
+    // rebuild immediately — the loop this pacing exists to stop.
+    let state = crate::app_state::build_app_state();
+    let reported_at = Instant::now();
+    state
+        .ambient_voice
+        .runtime()
+        .expect("runtime")
+        .last_capture_error = Some(reported_at);
+
+    stop_session(&state, AmbientStatus::Off).expect("stop");
+
+    assert_eq!(
+        state
+            .ambient_voice
+            .runtime()
+            .expect("runtime")
+            .last_capture_error,
+        Some(reported_at)
+    );
+}
+
+#[tokio::test]
+async fn what_the_user_does_is_never_paced_by_a_capture_failure() {
+    // The pacing lives in `check_ambient_hotstart` alone. Everything the user
+    // reaches — the Experiments toggle, a device change, mute — funnels through
+    // `reconcile` directly, and must take effect on the spot even while a
+    // capture failure is still holding off the automatic retry. Here the
+    // settings say the feature is off, so a reconcile that ran settles the
+    // runtime to `Off`; one that had been paced would have left the error in
+    // place.
+    let state = crate::app_state::build_app_state();
+    state
+        .ambient_voice
+        .set_status(AmbientStatus::Error("The microphone stopped".to_string()));
+    state
+        .ambient_voice
+        .runtime()
+        .expect("runtime")
+        .last_capture_error = Some(Instant::now());
+
+    reconcile(&state).await.expect("reconcile");
+
+    assert_eq!(
+        build_report(&state).expect("report").status,
+        AmbientStatus::Off
+    );
+}
+
+#[test]
 fn the_status_report_serialises_with_the_keys_the_frontend_reads() {
     let state = crate::app_state::build_app_state();
     let report = build_report(&state).expect("report");

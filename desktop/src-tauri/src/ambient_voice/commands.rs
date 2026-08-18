@@ -6,16 +6,16 @@
 //! funnels through [`super::reconcile`], which remains the only place a session
 //! is created.
 
-use std::sync::atomic::Ordering;
+use std::{sync::atomic::Ordering, time::Instant};
 
 use tauri::{AppHandle, State};
 
 use crate::app_state::AppState;
 
 use super::{
-    build_report, models, publish_report, reconcile, settings, status::AmbientStatus, stop_session,
-    wake_word, AmbientVoiceSettings, AmbientVoiceStatusReport, MAX_AUDIO_BATCH_BYTES,
-    MAX_CAPTURE_ERROR_CHARS,
+    build_report, capture_failure_is_pacing, models, publish_report, reconcile, settings,
+    status::AmbientStatus, stop_session, wake_word, AmbientVoiceSettings, AmbientVoiceStatusReport,
+    MAX_AUDIO_BATCH_BYTES, MAX_CAPTURE_ERROR_CHARS,
 };
 use wake_word::{WakeWordTokenizer, MAX_WAKE_WORD_CHARS};
 
@@ -206,6 +206,11 @@ pub fn get_ambient_model_status() -> Result<models::AmbientModelStatus, String> 
 /// huddles use for `check_pipeline_hotstart`; it is also what recovers a worker
 /// that exited (a corrupt model, an engine failure). No-op unless a session
 /// should be running and is not.
+///
+/// The one retry it paces is a reported capture failure, by
+/// `CAPTURE_ERROR_BACKOFF`: a microphone the webview cannot open fails again as
+/// soon as this rebuilds a session, and at a three-second poll that is two ONNX
+/// model loads every three seconds for as long as the device stays broken.
 #[tauri::command]
 pub async fn check_ambient_hotstart(
     state: State<'_, AppState>,
@@ -224,6 +229,16 @@ pub async fn check_ambient_hotstart(
         .as_ref()
         .is_some_and(|session| !session.is_finished());
     if alive || !(just_ready || models::is_kws_ready()) {
+        return build_report(&state);
+    }
+    // Read the timestamp out before the predicate so no runtime guard is held
+    // across the await below.
+    let last_capture_error = ambient.runtime()?.last_capture_error;
+    if capture_failure_is_pacing(
+        &ambient.current_status(),
+        last_capture_error,
+        Instant::now(),
+    ) {
         return build_report(&state);
     }
     reconcile(&state).await?;
@@ -348,6 +363,9 @@ pub(super) fn apply_capture_error(state: &AppState, message: &str) -> Result<(),
         return Ok(());
     }
     stop_session(state, AmbientStatus::Error(capture_error_detail(message)))?;
+    // Recorded after the stop, which deliberately leaves it alone: this paces
+    // the automatic retry, and the session that just ended is not what failed.
+    state.ambient_voice.runtime()?.last_capture_error = Some(Instant::now());
     publish_report(state);
     Ok(())
 }
@@ -364,7 +382,10 @@ pub(super) fn apply_capture_error(state: &AppState, message: &str) -> Result<(),
 /// reasons: nothing is reaching it, and a stopped session is what
 /// [`check_ambient_hotstart`] re-arms once the device comes back or the user
 /// picks another one — the same recovery a worker that exited already gets, so
-/// the webview needs no retry loop of its own.
+/// the webview needs no retry loop of its own. That automatic re-arm is paced
+/// by `CAPTURE_ERROR_BACKOFF`, so a device that stays broken costs one session
+/// rebuild every thirty seconds rather than one per poll; anything the user
+/// does reaches [`super::reconcile`] directly and is never paced.
 #[tauri::command]
 pub async fn report_ambient_capture_error(
     message: String,

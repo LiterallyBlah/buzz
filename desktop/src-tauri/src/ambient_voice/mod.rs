@@ -42,9 +42,12 @@ pub mod status;
 pub mod utterance;
 pub mod wake_word;
 
-use std::sync::{
-    atomic::{AtomicBool, AtomicU64, Ordering},
-    Arc, Mutex,
+use std::{
+    sync::{
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        Arc, Mutex,
+    },
+    time::{Duration, Instant},
 };
 
 use tauri::{AppHandle, Emitter, Manager};
@@ -72,6 +75,18 @@ const MAX_AUDIO_BATCH_BYTES: usize = 1024 * 1024;
 /// verbatim on the indicator, which is one short line wide.
 const MAX_CAPTURE_ERROR_CHARS: usize = 200;
 
+/// How long a reported capture failure paces the automatic re-arm.
+///
+/// The microphone lives in the webview, so a device it cannot open fails again
+/// the moment a session exists to fail against — and the hot-start poll rebuilds
+/// one every three seconds, at two ONNX model loads a rebuild. Thirty seconds is
+/// the trade: a device plugged back in recovers on its own within about half a
+/// minute rather than three seconds, and one that stays broken costs a single
+/// rebuild every thirty seconds rather than ten. Nothing the user does waits on
+/// it — settings, mute and the Experiments toggle all call [`reconcile`]
+/// directly.
+const CAPTURE_ERROR_BACKOFF: Duration = Duration::from_secs(30);
+
 // ── Runtime state ────────────────────────────────────────────────────────────
 
 /// Live session objects. Everything here is torn down together.
@@ -83,6 +98,12 @@ pub struct AmbientRuntime {
     /// What [`start_session`] built the live session from, or `None` when no
     /// session is running.
     session_config: Option<SessionConfig>,
+    /// When the webview last reported that it could not hold the microphone.
+    ///
+    /// Deliberately outlives the session it ended — [`stop_session`] does not
+    /// clear it — because it describes the device, not the session, and it is
+    /// what paces the hot-start retry.
+    last_capture_error: Option<Instant>,
     /// Set when a huddle claimed the microphone; the session resumes on
     /// huddle teardown without the user touching anything.
     suspended_by_huddle: bool,
@@ -307,6 +328,27 @@ fn session_needs_restart(
     settings: &AmbientVoiceSettings,
 ) -> bool {
     started_with != Some(&SessionConfig::of(settings))
+}
+
+/// Whether a reported capture failure is still pacing the hot-start retry.
+///
+/// Pure, with `now` passed in, so the window is testable without a clock to
+/// mock. Only [`commands::check_ambient_hotstart`] consults it: the automatic
+/// retry is the only caller that would otherwise rebuild a session every three
+/// seconds against a microphone the webview has just said it cannot open.
+///
+/// Scoped to [`AmbientStatus::Error`] because the timestamp is only ever
+/// written by a capture failure that stopped a session; once anything else has
+/// moved the runtime out of the error state there is nothing left to pace.
+fn capture_failure_is_pacing(
+    status: &AmbientStatus,
+    last_capture_error: Option<Instant>,
+    now: Instant,
+) -> bool {
+    matches!(status, AmbientStatus::Error(_))
+        && last_capture_error
+            .and_then(|reported_at| now.checked_duration_since(reported_at))
+            .is_some_and(|elapsed| elapsed < CAPTURE_ERROR_BACKOFF)
 }
 
 /// Stop the worker, the TTS pipeline and any in-flight publisher.
