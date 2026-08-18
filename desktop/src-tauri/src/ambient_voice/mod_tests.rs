@@ -7,8 +7,10 @@
 //! is false no worker thread exists to consume audio and
 //! `push_ambient_audio_pcm` has nowhere to put frames.
 
+use super::commands::*;
 use super::*;
 use crate::ambient_voice::settings::WakeBinding;
+use crate::ambient_voice::wake_word::MAX_WAKE_WORD_CHARS;
 
 const AGENT: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
