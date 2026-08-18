@@ -74,9 +74,46 @@ pub struct AmbientRuntime {
     session: Option<AmbientSession>,
     tts: Option<Arc<TtsPipeline>>,
     destination: Option<Arc<AmbientDestination>>,
+    /// What [`start_session`] built the live session from, or `None` when no
+    /// session is running.
+    session_config: Option<SessionConfig>,
     /// Set when a huddle claimed the microphone; the session resumes on
     /// huddle teardown without the user touching anything.
     suspended_by_huddle: bool,
+}
+
+/// The settings a live session was built from.
+///
+/// The keyword payload, the resolved destination and the TTS pipeline are all
+/// bound once, at start. [`reconcile`] otherwise leaves a healthy session
+/// alone, so without this record a wake word, agent, destination, microphone
+/// or speaker chosen while the session is up would only take effect after the
+/// feature was switched off and on again.
+///
+/// Mute is deliberately absent: [`set_ambient_voice_muted`] applies it to the
+/// live worker, and a restart to close a microphone the worker can close
+/// itself would drop the destination and reload two ONNX models. So is the
+/// indicator position, which no session reads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SessionConfig {
+    /// The one binding M1's runtime arms: wake word, agent and destination.
+    binding: Option<settings::WakeBinding>,
+    /// Consumed by the AudioWorklet in the webview, which re-acquires the
+    /// device from the status report — but a session started against one
+    /// microphone must not go on claiming another one's frames.
+    input_device_id: Option<String>,
+    /// Consumed by `start_ambient_tts` when it builds the pipeline.
+    output_device: Option<String>,
+}
+
+impl SessionConfig {
+    fn of(settings: &AmbientVoiceSettings) -> Self {
+        Self {
+            binding: settings.primary_binding().cloned(),
+            input_device_id: settings.input_device_id.clone(),
+            output_device: settings.output_device.clone(),
+        }
+    }
 }
 
 /// The `AppState`-held ambient feature state.
@@ -252,6 +289,20 @@ pub fn should_run(settings: &AmbientVoiceSettings, huddle_active: bool) -> bool 
     settings.is_runnable() && !huddle_active
 }
 
+/// Whether a live session has to be rebuilt for `settings` to take effect.
+///
+/// Split out as a pure predicate for the same reason as [`should_run`]: this
+/// is the whole of "a wake word changed in settings applies to the session
+/// that is already running", and it is testable without models, a relay or a
+/// microphone. An unrecorded configuration cannot be shown to match, so it
+/// restarts — the next start records one, so it cannot loop.
+fn session_needs_restart(
+    started_with: Option<&SessionConfig>,
+    settings: &AmbientVoiceSettings,
+) -> bool {
+    started_with != Some(&SessionConfig::of(settings))
+}
+
 /// Stop the worker, the TTS pipeline and any in-flight publisher.
 ///
 /// Locks are never held across the thread joins: pipeline `Drop` joins worker
@@ -262,6 +313,7 @@ fn stop_session(state: &AppState, next: AmbientStatus) -> Result<(), String> {
     let (session, tts) = {
         let mut runtime = ambient.runtime()?;
         runtime.destination = None;
+        runtime.session_config = None;
         (runtime.session.take(), runtime.tts.take())
     };
     if let Some(ref session) = session {
@@ -316,15 +368,21 @@ pub async fn reconcile(state: &AppState) -> Result<(), String> {
         return Ok(());
     }
 
-    // Already running and healthy — nothing to do.
+    // Already running and healthy — nothing to do, unless what it was built
+    // from has changed since. A new wake word, agent, destination or device
+    // only reaches the engines through a fresh session.
     let alive = ambient
         .runtime()?
         .session
         .as_ref()
         .is_some_and(|session| !session.is_finished());
     if alive {
-        publish_report(state);
-        return Ok(());
+        let started_with = ambient.runtime()?.session_config.clone();
+        if !session_needs_restart(started_with.as_ref(), &settings) {
+            publish_report(state);
+            return Ok(());
+        }
+        stop_session(state, AmbientStatus::Starting)?;
     }
     if ambient.runtime()?.session.is_some() {
         // A worker that exited (bad model, engine failure) must be cleared
@@ -406,6 +464,7 @@ async fn start_session(state: &AppState, settings: &AmbientVoiceSettings) -> Res
         runtime.session = Some(session);
         runtime.tts = tts;
         runtime.destination = Some(destination);
+        runtime.session_config = Some(SessionConfig::of(settings));
     }
     Ok(())
 }

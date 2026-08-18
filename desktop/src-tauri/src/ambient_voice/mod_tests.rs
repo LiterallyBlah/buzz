@@ -206,7 +206,75 @@ fn a_settings_save_cannot_flip_mute_or_enablement() {
     };
     let merged = merge_client_settings(&current, stale);
     assert!(merged.muted, "a stale save cleared mute: {merged:?}");
-    assert!(!merged.enabled, "a stale save re-enabled capture: {merged:?}");
+    assert!(
+        !merged.enabled,
+        "a stale save re-enabled capture: {merged:?}"
+    );
+}
+
+#[test]
+fn a_configuration_change_restarts_the_running_session() {
+    // `reconcile` used to leave any healthy session alone, so a wake word,
+    // agent, destination, microphone or speaker changed while ambient voice
+    // was running took effect only after the user switched the feature off and
+    // on again — every one of them is bound once, when the session starts: the
+    // keyword payload is tokenised, the destination is resolved and the TTS
+    // pipeline is built against the chosen speaker.
+    let running = bound(true);
+    let started_with = SessionConfig::of(&running);
+    assert!(!session_needs_restart(Some(&started_with), &running));
+
+    let mut renamed = running.clone();
+    renamed.wake_bindings[0].wake_word = "hey buzz".to_string();
+    assert!(session_needs_restart(Some(&started_with), &renamed));
+
+    let mut rebound = running.clone();
+    rebound.wake_bindings[0].agent_pubkey = "f".repeat(64);
+    assert!(session_needs_restart(Some(&started_with), &rebound));
+
+    let mut rerouted = running.clone();
+    rerouted.wake_bindings[0].destination =
+        Some("11111111-1111-4111-8111-111111111111".to_string());
+    assert!(session_needs_restart(Some(&started_with), &rerouted));
+
+    let microphone = AmbientVoiceSettings {
+        input_device_id: Some("mic-abc".to_string()),
+        ..running.clone()
+    };
+    assert!(session_needs_restart(Some(&started_with), &microphone));
+
+    let speaker = AmbientVoiceSettings {
+        output_device: Some("Studio Display".to_string()),
+        ..running.clone()
+    };
+    assert!(session_needs_restart(Some(&started_with), &speaker));
+
+    // A session whose configuration was not recorded cannot be shown to match
+    // what the user now wants, so it is rebuilt rather than trusted.
+    assert!(session_needs_restart(None, &running));
+}
+
+#[test]
+fn mute_and_the_indicator_position_never_cost_a_restart() {
+    // Mute is applied to the live worker in place, and every reconcile runs
+    // through the same predicate: rebuilding the session to close a microphone
+    // the worker closes itself would drop the resolved destination and reload
+    // two ONNX models. The pill's parked position is not something any session
+    // reads at all.
+    let running = bound(true);
+    let started_with = SessionConfig::of(&running);
+
+    let muted = AmbientVoiceSettings {
+        muted: true,
+        ..running.clone()
+    };
+    assert!(!session_needs_restart(Some(&started_with), &muted));
+
+    let dragged = AmbientVoiceSettings {
+        indicator_position: Some(settings::IndicatorPosition { x: 12.0, y: 700.0 }),
+        ..running.clone()
+    };
+    assert!(!session_needs_restart(Some(&started_with), &dragged));
 }
 
 #[test]
