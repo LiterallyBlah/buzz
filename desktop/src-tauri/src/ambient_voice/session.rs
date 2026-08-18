@@ -26,7 +26,7 @@
 use std::{
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc::{self, Receiver, SyncSender},
         Arc, Mutex,
     },
@@ -125,6 +125,70 @@ impl StatusSink {
     }
 }
 
+// ── Audio arrival ────────────────────────────────────────────────────────────
+
+/// When audio last reached the worker, and how much of it has.
+///
+/// `capturing` in the status report only ever meant "the worker thread is
+/// alive" — it says nothing about frames arriving, and the shipped deafness bug
+/// is exactly that gap: a pill reading "Listening for the wake word" while the
+/// spotter is fed nothing at all. This is the missing half. The worker stamps
+/// every batch it takes off the queue, so [`super::build_report`] can tell a
+/// live session from a deaf one.
+///
+/// Written from the audio thread and read from command threads, so it is
+/// atomics rather than a mutex: a status report must never be able to block the
+/// worker, and a millisecond of skew between the two fields cannot matter to a
+/// five-second staleness window.
+#[derive(Debug)]
+pub struct AudioFlow {
+    started_at: Instant,
+    batches: AtomicU64,
+    /// Milliseconds from `started_at` to the last batch. Zero until one
+    /// arrives, which is why `batches` is what distinguishes "none yet" from
+    /// "one arrived in the first millisecond".
+    last_batch_ms: AtomicU64,
+}
+
+/// One read of [`AudioFlow`], for one status report.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AudioFlowSnapshot {
+    /// Batches the worker has taken off the queue since the session started.
+    pub batches: u64,
+    /// Since the last batch reached the worker — or since the session started,
+    /// when none ever has. The session start is the right zero point: a session
+    /// that has never been fed is precisely the state being watched for.
+    pub since_last_batch: Duration,
+}
+
+impl AudioFlow {
+    fn new() -> Self {
+        Self {
+            started_at: Instant::now(),
+            batches: AtomicU64::new(0),
+            last_batch_ms: AtomicU64::new(0),
+        }
+    }
+
+    /// Record that `batches` arrived from the webview, now.
+    fn record(&self, batches: u64) {
+        self.batches.fetch_add(batches, Ordering::Release);
+        self.last_batch_ms.store(
+            self.started_at.elapsed().as_millis() as u64,
+            Ordering::Release,
+        );
+    }
+
+    pub fn snapshot(&self) -> AudioFlowSnapshot {
+        let elapsed = self.started_at.elapsed().as_millis() as u64;
+        let last_batch_ms = self.last_batch_ms.load(Ordering::Acquire);
+        AudioFlowSnapshot {
+            batches: self.batches.load(Ordering::Acquire),
+            since_last_batch: Duration::from_millis(elapsed.saturating_sub(last_batch_ms)),
+        }
+    }
+}
+
 /// A running ambient session.
 ///
 /// Not `Clone` — the owner is `AmbientVoiceRuntime` in `AppState`. Dropping it
@@ -135,6 +199,7 @@ pub struct AmbientSession {
     shutdown: Arc<AtomicBool>,
     muted: Arc<AtomicBool>,
     status: Arc<Mutex<AmbientStatus>>,
+    flow: Arc<AudioFlow>,
     thread: Option<thread::JoinHandle<()>>,
 }
 
@@ -176,10 +241,23 @@ impl AmbientSession {
         let muted = Arc::clone(&config.muted);
         let status = Arc::clone(&config.status);
         let shutdown_worker = Arc::clone(&shutdown);
+        // Built here rather than taken from the caller: the clock starts when
+        // the worker does, and "nothing has arrived since the session started"
+        // is only meaningful against that instant.
+        let flow = Arc::new(AudioFlow::new());
+        let flow_worker = Arc::clone(&flow);
 
         let handle = thread::Builder::new()
             .name("ambient-voice-worker".into())
-            .spawn(move || ambient_worker(config, audio_rx, transcript_tx, shutdown_worker))
+            .spawn(move || {
+                ambient_worker(
+                    config,
+                    audio_rx,
+                    transcript_tx,
+                    shutdown_worker,
+                    flow_worker,
+                )
+            })
             .map_err(|e| format!("failed to spawn ambient-voice-worker thread: {e}"))?;
 
         Ok((
@@ -188,6 +266,7 @@ impl AmbientSession {
                 shutdown,
                 muted,
                 status,
+                flow,
                 thread: Some(handle),
             },
             transcript_rx,
@@ -238,6 +317,11 @@ impl AmbientSession {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone()
+    }
+
+    /// What the worker has been fed since it started.
+    pub fn audio_flow(&self) -> AudioFlowSnapshot {
+        self.flow.snapshot()
     }
 }
 
@@ -360,6 +444,7 @@ fn ambient_worker(
     audio_rx: Receiver<Vec<u8>>,
     transcript_tx: tokio_mpsc::Sender<String>,
     shutdown: Arc<AtomicBool>,
+    flow: Arc<AudioFlow>,
 ) {
     let AmbientSessionConfig {
         kws_model_dir,
@@ -382,7 +467,7 @@ fn ambient_worker(
         Err(error) => {
             eprintln!("buzz-desktop: ambient wake-word engine unavailable: {error}");
             status.set(AmbientStatus::Error(error));
-            drain_until_shutdown(audio_rx, &shutdown);
+            drain_until_shutdown(audio_rx, &shutdown, &flow);
             return;
         }
     };
@@ -391,7 +476,7 @@ fn ambient_worker(
         Err(error) => {
             eprintln!("buzz-desktop: ambient speech recognizer unavailable: {error}");
             status.set(AmbientStatus::Error(error));
-            drain_until_shutdown(audio_rx, &shutdown);
+            drain_until_shutdown(audio_rx, &shutdown, &flow);
             return;
         }
     };
@@ -401,7 +486,7 @@ fn ambient_worker(
         Err(error) => {
             eprintln!("buzz-desktop: ambient resampler init failed: {error}");
             status.set(AmbientStatus::Error(error));
-            drain_until_shutdown(audio_rx, &shutdown);
+            drain_until_shutdown(audio_rx, &shutdown, &flow);
             return;
         }
     };
@@ -433,6 +518,10 @@ fn ambient_worker(
         while let Ok(more) = audio_rx.try_recv() {
             batch.push(more);
         }
+        // Stamped before the mute check, and before anything can drop a batch:
+        // this records that the webview is feeding us, not what we did with the
+        // audio. Everything below may legitimately discard it.
+        flow.record(batch.len() as u64);
 
         // Mute is a hard stop: nothing is spotted, nothing is captured, and a
         // half-captured utterance is abandoned rather than resumed later.
@@ -541,10 +630,15 @@ fn transcribe(
 
 /// Keep draining until shutdown so a dead worker cannot back-pressure the
 /// webview. Mirrors `huddle::drain_until_shutdown`.
-fn drain_until_shutdown(audio_rx: Receiver<Vec<u8>>, shutdown: &Arc<AtomicBool>) {
+///
+/// Arrivals are stamped here too. This runs when the engines could not be built,
+/// and "the webview is feeding us, the engine is what died" is a materially
+/// different bug report from "nothing is arriving at all" — the status already
+/// carries the engine failure, so the counter is free to describe the audio.
+fn drain_until_shutdown(audio_rx: Receiver<Vec<u8>>, shutdown: &Arc<AtomicBool>, flow: &AudioFlow) {
     while !shutdown.load(Ordering::Acquire) {
         match audio_rx.recv_timeout(RECV_TIMEOUT) {
-            Ok(_) => {}
+            Ok(_) => flow.record(1),
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }

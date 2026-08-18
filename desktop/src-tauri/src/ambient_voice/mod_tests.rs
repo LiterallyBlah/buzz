@@ -425,6 +425,103 @@ async fn what_the_user_does_is_never_paced_by_a_capture_failure() {
 }
 
 #[test]
+fn a_capturing_session_that_is_fed_nothing_is_not_listening() {
+    // `capturing` has only ever meant "the worker thread is alive". The shipped
+    // bug is the gap that leaves: after an update relaunch the pill said
+    // "Listening for the wake word" while zero audio reached the spotter, for
+    // the whole run, and a settings off/on — which rebuilds the capture
+    // pipeline — always fixed it. Nothing in the report could tell the two
+    // states apart, so the indicator could not either.
+    let fed = AudioFlowSnapshot {
+        batches: 120,
+        since_last_batch: Duration::from_millis(80),
+    };
+    let deaf = AudioFlowSnapshot {
+        batches: 0,
+        since_last_batch: STALE_AUDIO_AFTER + Duration::from_secs(1),
+    };
+    let listening = AmbientStatus::Listening;
+    assert!(!audio_is_stale(true, false, &listening, Some(fed)));
+    assert!(audio_is_stale(true, false, &listening, Some(deaf)));
+
+    // Audio that flowed and then stopped is the same fault: a device pulled
+    // from under a session the webview has not yet noticed losing.
+    let stopped = AudioFlowSnapshot {
+        batches: 4_000,
+        since_last_batch: STALE_AUDIO_AFTER,
+    };
+    assert!(audio_is_stale(true, false, &listening, Some(stopped)));
+
+    // Muted releases the microphone in the webview by design, so silence is
+    // what the user asked for. Saying "no audio is arriving" there would
+    // replace a true state with an alarming one.
+    assert!(!audio_is_stale(true, true, &listening, Some(deaf)));
+
+    // And with no session there is nothing for audio to arrive at.
+    assert!(!audio_is_stale(false, false, &listening, Some(deaf)));
+    assert!(!audio_is_stale(true, false, &listening, None));
+}
+
+#[test]
+fn a_state_that_already_explains_itself_is_not_overwritten_with_deafness() {
+    // A worker whose engines could not be built keeps its thread alive draining
+    // the queue, so `capturing` stays true and no audio is consumed — the exact
+    // shape of a deaf session, with a completely different cause that the status
+    // already names. Replacing "the wake-word model is incomplete" with "no
+    // audio arriving from the microphone" would bury the fault under a symptom.
+    let deaf = AudioFlowSnapshot {
+        batches: 0,
+        since_last_batch: STALE_AUDIO_AFTER * 4,
+    };
+    for status in [
+        AmbientStatus::Error("wake-word model is incomplete".to_string()),
+        AmbientStatus::Starting,
+        AmbientStatus::Muted,
+        AmbientStatus::Suspended,
+        AmbientStatus::Off,
+    ] {
+        assert!(
+            !audio_is_stale(true, false, &status, Some(deaf)),
+            "{status:?}"
+        );
+    }
+    // Every state that does claim to be processing audio is fair game — the
+    // spotter is fed through playback too, so a session that goes quiet while
+    // speaking is just as deaf.
+    for status in [
+        AmbientStatus::Listening,
+        AmbientStatus::Heard,
+        AmbientStatus::Capturing,
+        AmbientStatus::Transcribing,
+        AmbientStatus::Speaking,
+    ] {
+        assert!(
+            audio_is_stale(true, false, &status, Some(deaf)),
+            "{status:?}"
+        );
+    }
+}
+
+#[test]
+fn a_session_that_starts_is_given_the_grace_period_before_it_counts_as_deaf() {
+    // The webview opens the microphone and builds its worklet *after* the
+    // session starts, so a report built in the first moments of a session must
+    // not call it deaf — that would be a false state of its own, and (with the
+    // frontend's paced retry on the other end) a rebuild of a pipeline that was
+    // still coming up.
+    let starting = AudioFlowSnapshot {
+        batches: 0,
+        since_last_batch: STALE_AUDIO_AFTER - Duration::from_millis(1),
+    };
+    assert!(!audio_is_stale(
+        true,
+        false,
+        &AmbientStatus::Listening,
+        Some(starting)
+    ));
+}
+
+#[test]
 fn the_status_report_serialises_with_the_keys_the_frontend_reads() {
     let state = crate::app_state::build_app_state();
     let report = build_report(&state).expect("report");
@@ -441,9 +538,103 @@ fn the_status_report_serialises_with_the_keys_the_frontend_reads() {
         "inputDeviceId",
         "indicatorPosition",
         "loadError",
+        "audioStale",
+        "audioBatchesReceived",
+        "msSinceLastAudio",
+        "webviewCapture",
+        "launch",
     ] {
         assert!(value.get(key).is_some(), "missing {key} in {value}");
     }
+    // With nothing running the two "how is the audio doing" fields say so
+    // rather than inventing a number.
+    assert_eq!(
+        value.get("msSinceLastAudio"),
+        Some(&serde_json::Value::Null)
+    );
+    assert_eq!(value.get("audioStale"), Some(&serde_json::json!(false)));
+}
+
+#[test]
+fn the_audio_diagnostics_serialise_in_the_shape_the_frontend_parses() {
+    // The labels bug: a frontend written against an invented shape renders
+    // "undefined" in every row and nothing fails. These fields exist to be read
+    // during the next occurrence of a bug we cannot reproduce, so their wire
+    // form is pinned from the producing side, as `AmbientModelStatus` is. If
+    // this breaks, `AmbientVoiceStatusReport` in `ambientVoiceApi.ts` and its
+    // test fixtures change in the same commit.
+    let state = crate::app_state::build_app_state();
+    state
+        .ambient_voice
+        .runtime()
+        .expect("runtime")
+        .webview_capture = Some(WebviewCaptureFlow {
+        batches_pushed: 128,
+        capture_ready: true,
+    });
+    *state.ambient_voice.launch.lock().expect("launch") = Some(launch::diagnose(
+        "0.5.8-unified.11",
+        Some("0.5.8-unified.10".to_string()),
+        vec!["--updated".to_string()],
+    ));
+    let value = serde_json::to_value(build_report(&state).expect("report")).expect("json");
+
+    assert_eq!(
+        value.get("webviewCapture"),
+        Some(&serde_json::json!({ "batchesPushed": 128, "captureReady": true }))
+    );
+    assert_eq!(
+        value.get("launch"),
+        Some(&serde_json::json!({
+            "version": "0.5.8-unified.11",
+            "previousVersion": "0.5.8-unified.10",
+            "firstLaunchAfterUpdate": true,
+            "args": ["--updated"],
+        }))
+    );
+}
+
+#[test]
+fn what_was_announced_about_the_audio_follows_what_was_published() {
+    // Staleness is announced on its edges — a quiet session must not re-emit the
+    // same report to every window every five seconds — so the record of what was
+    // announced has to be exactly what the windows were last told. A stop or a
+    // mute while a session was deaf publishes a report that is no longer stale,
+    // and if the record kept saying "stale" the *next* deaf session would find
+    // no edge to announce and the pill would go on claiming to listen: the
+    // original bug, reintroduced by its own fix.
+    let state = crate::app_state::build_app_state();
+    state
+        .ambient_voice
+        .stale_announced
+        .store(true, Ordering::Release);
+
+    publish_report(&state);
+
+    assert!(!state.ambient_voice.stale_announced.load(Ordering::Acquire));
+}
+
+#[test]
+fn a_stop_forgets_what_the_webview_counted() {
+    // The webview's counters describe one capture pipeline. The session they
+    // were reported against is gone, so carrying them into the next one would
+    // answer the wrong question at exactly the moment someone is reading them.
+    let state = crate::app_state::build_app_state();
+    state
+        .ambient_voice
+        .runtime()
+        .expect("runtime")
+        .webview_capture = Some(WebviewCaptureFlow {
+        batches_pushed: 4_096,
+        capture_ready: true,
+    });
+
+    stop_session(&state, AmbientStatus::Off).expect("stop");
+
+    assert!(build_report(&state)
+        .expect("report")
+        .webview_capture
+        .is_none());
 }
 
 #[test]

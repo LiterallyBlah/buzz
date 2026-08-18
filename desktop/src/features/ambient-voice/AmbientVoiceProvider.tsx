@@ -11,6 +11,7 @@ import {
   ambientCaptureErrorMessage,
   ambientReplyChannel,
   shouldCaptureAmbientAudio,
+  AMBIENT_AUDIO_FLOW_INTERVAL_MS,
   AMBIENT_CAPTURE_LOST_MESSAGE,
   AMBIENT_HOTSTART_INTERVAL_MS,
 } from "./lib/ambientCapture";
@@ -18,6 +19,7 @@ import {
   AMBIENT_STATE_CHANGED_EVENT,
   checkAmbientHotstart,
   getAmbientVoiceStatus,
+  reportAmbientAudioFlow,
   reportAmbientCaptureError,
   type AmbientVoiceStatusReport,
 } from "./lib/ambientVoiceApi";
@@ -57,6 +59,11 @@ export function AmbientVoiceProvider({
   const selfPubkeyRef = React.useRef<string | null>(null);
   const workletRef = React.useRef<AudioWorkletHandle | null>(null);
   const streamRef = React.useRef<MediaStream | null>(null);
+  // Whether the pipeline below is actually built. Distinct from `shouldCapture`,
+  // which is only what the native report asks for: the gap between the two is
+  // where a `getUserMedia` still waiting on a permission prompt lives, and a
+  // report that never says `captureReady` is itself the diagnosis.
+  const [captureReady, setCaptureReady] = React.useState(false);
 
   // ── Native state: listen first, then snapshot ────────────────────────────
   //
@@ -158,6 +165,7 @@ export function AmbientVoiceProvider({
       workletRef.current = null;
       releaseTracks(streamRef.current);
       streamRef.current = null;
+      setCaptureReady(false);
       return;
     }
 
@@ -222,6 +230,7 @@ export function AmbientVoiceProvider({
         localWorklet = worklet;
         workletRef.current = worklet;
         streamRef.current = stream;
+        setCaptureReady(true);
       } catch (error) {
         // Always release the device on any failure path, so a failed setup
         // cannot leave the OS microphone indicator lit.
@@ -237,8 +246,39 @@ export function AmbientVoiceProvider({
       releaseTracks(localStream);
       if (workletRef.current === localWorklet) workletRef.current = null;
       if (streamRef.current === localStream) streamRef.current = null;
+      setCaptureReady(false);
     };
   }, [shouldCapture, inputDeviceId]);
+
+  // ── Audio flow ───────────────────────────────────────────────────────────
+  //
+  // Tell the native side what this webview has pushed, slowly. It is the half
+  // of the audio path nothing else can see — batches pushed that never arrive
+  // and batches never pushed at all look identical from the native side — and
+  // it is also what makes a session that has gone quiet visible: staleness
+  // moves with the clock rather than with a transition, so nothing else would
+  // ever emit it.
+  React.useEffect(() => {
+    if (!shouldCapture) return;
+    let disposed = false;
+    const tick = () => {
+      void reportAmbientAudioFlow(
+        workletRef.current?.pushedBatches() ?? 0,
+        captureReady,
+      )
+        .then((next) => {
+          if (!disposed) setReport(next);
+        })
+        .catch((error) => {
+          console.debug("[ambient] audio flow report failed:", error);
+        });
+    };
+    const id = window.setInterval(tick, AMBIENT_AUDIO_FLOW_INTERVAL_MS);
+    return () => {
+      disposed = true;
+      window.clearInterval(id);
+    };
+  }, [shouldCapture, captureReady]);
 
   // ── Replies ──────────────────────────────────────────────────────────────
   useAmbientReplySubscription(

@@ -1,6 +1,7 @@
 import type {
   AmbientModelStatus,
   AmbientVoiceSettings,
+  AmbientVoiceStatusReport,
   ModelStatus,
   WakeBinding,
   WakeWordCheck,
@@ -146,6 +147,52 @@ export function ambientModelRows(
     { key: "stt", label: "Speech to text", status: models.stt },
     { key: "tts", label: "Voice", status: models.tts },
   ];
+}
+
+/**
+ * One line describing the audio actually moving through the session.
+ *
+ * The settings section is where someone looks when the app is not hearing them,
+ * and until now everything it could say was about configuration. These are the
+ * two counts that decide where a deaf session broke: what this webview pushed,
+ * and what the native worker received. `null` when there is no session to
+ * describe — an empty row would be its own small lie.
+ */
+export function ambientAudioFlowLine(
+  report: AmbientVoiceStatusReport | null,
+): string | null {
+  if (!report?.capturing) return null;
+  const pushed = report.webviewCapture
+    ? `${report.webviewCapture.batchesPushed} sent by this window`
+    : "nothing reported by this window yet";
+  const received = `${report.audioBatchesReceived} received`;
+  if (!report.audioStale) return `Audio: ${received}, ${pushed}`;
+  const quietFor =
+    report.msSinceLastAudio === null
+      ? ""
+      : ` for ${Math.round(report.msSinceLastAudio / 1000)}s`;
+  const pipeline =
+    report.webviewCapture?.captureReady === false
+      ? "; this window has no microphone open"
+      : "";
+  return `Audio: none received${quietFor} (${received}, ${pushed})${pipeline}`;
+}
+
+/**
+ * One line naming the build, and whether the previous launch ran another one.
+ *
+ * Both reports of a deaf wake word were the first start after an in-app update.
+ * Nothing in the process says "the updater started me" (see
+ * `ambient_voice::launch`), so this says what is actually known and nothing
+ * more — the version, and whether it changed since the last launch.
+ */
+export function ambientLaunchLine(
+  report: AmbientVoiceStatusReport | null,
+): string | null {
+  const launch = report?.launch;
+  if (!launch) return null;
+  if (!launch.firstLaunchAfterUpdate) return `Launch: ${launch.version}`;
+  return `Launch: ${launch.version}, first start after ${launch.previousVersion ?? "another build"}`;
 }
 
 /** Progress copy for a local model download. */

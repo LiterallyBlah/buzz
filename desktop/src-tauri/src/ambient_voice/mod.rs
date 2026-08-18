@@ -11,6 +11,7 @@
 //! |---|---|
 //! | [`commands`] | the Tauri command surface the frontend calls |
 //! | [`settings`] | versioned `ambient-voice-settings.json` |
+//! | [`launch`] | what kind of launch this is (update-relaunch diagnostics) |
 //! | [`wake_word`] | tokenisation + the strict validation the engine needs |
 //! | [`utterance`] | the capture state machine (pure, clock-injected) |
 //! | [`session`] | the audio worker: spotter → barge-in → VAD → recogniser |
@@ -34,6 +35,7 @@
 //! **no** HTTP code here.
 
 pub mod commands;
+pub mod launch;
 pub mod models;
 pub mod publish;
 pub mod session;
@@ -56,8 +58,9 @@ use uuid::Uuid;
 use crate::app_state::AppState;
 use crate::huddle::{state::HuddlePhase, tts::TtsPipeline, tts_settings};
 
+use launch::LaunchDiagnostics;
 use publish::{AmbientDestination, AmbientPublisher};
-use session::{AmbientSession, AmbientSessionConfig};
+use session::{AmbientSession, AmbientSessionConfig, AudioFlowSnapshot};
 use settings::AmbientVoiceSettings;
 use status::AmbientStatus;
 use wake_word::WakeWordTokenizer;
@@ -87,6 +90,16 @@ const MAX_CAPTURE_ERROR_CHARS: usize = 200;
 /// directly.
 const CAPTURE_ERROR_BACKOFF: Duration = Duration::from_secs(30);
 
+/// How long a capturing session may receive nothing before it is called deaf.
+///
+/// The shipped bug is a session that reports `capturing` — worker alive — while
+/// no audio reaches it at all, so the indicator says "Listening for the wake
+/// word" and the wake word is never heard. Five seconds is comfortably longer
+/// than the webview needs to open a microphone and build its worklet after a
+/// session starts, and short enough that the user reads the truth rather than a
+/// lie for the rest of the run.
+const STALE_AUDIO_AFTER: Duration = Duration::from_secs(5);
+
 // ── Runtime state ────────────────────────────────────────────────────────────
 
 /// Live session objects. Everything here is torn down together.
@@ -104,9 +117,33 @@ pub struct AmbientRuntime {
     /// clear it — because it describes the device, not the session, and it is
     /// what paces the hot-start retry.
     last_capture_error: Option<Instant>,
+    /// What the webview last said about its own half of the audio path.
+    ///
+    /// Cleared with the session it described: the counters are per capture
+    /// pipeline, and a count from the pipeline that fed a session which has
+    /// since been torn down would answer the wrong question.
+    webview_capture: Option<WebviewCaptureFlow>,
     /// Set when a huddle claimed the microphone; the session resumes on
     /// huddle teardown without the user touching anything.
     suspended_by_huddle: bool,
+}
+
+/// What the webview reports about the audio it believes it is sending.
+///
+/// The two halves of the path are in different processes, and the shipped
+/// deafness bug is somewhere between them: this is the webview's own count, so
+/// the next occurrence says which link dropped — batches pushed but none
+/// received is an IPC or session-lifetime fault, none pushed is the microphone,
+/// the worklet or the AudioContext.
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WebviewCaptureFlow {
+    /// PCM batches the worklet has handed the main thread to push.
+    pub batches_pushed: u64,
+    /// Whether the webview currently holds a built capture pipeline. False
+    /// while `getUserMedia` or the worklet setup is still in flight — which is
+    /// itself the answer, if it never becomes true.
+    pub capture_ready: bool,
 }
 
 /// The settings a live session was built from.
@@ -159,6 +196,14 @@ pub struct AmbientVoiceState {
     reported: Arc<Mutex<AmbientStatus>>,
     /// Invalidates in-flight publisher tasks from a previous session.
     generation: Arc<AtomicU64>,
+    /// Whether the last report announced to the frontend said the audio was
+    /// stale. The staleness of a running session changes with the clock, not
+    /// with a transition, so [`commands::report_ambient_audio_flow`] is what
+    /// notices — and it announces the two edges rather than re-emitting the
+    /// same report to every window every few seconds.
+    stale_announced: AtomicBool,
+    /// What kind of launch this is. Recorded once, by [`hydrate_at_boot`].
+    launch: Mutex<Option<LaunchDiagnostics>>,
 }
 
 impl Default for AmbientVoiceState {
@@ -173,6 +218,8 @@ impl Default for AmbientVoiceState {
             muted: Arc::new(AtomicBool::new(false)),
             reported: Arc::new(Mutex::new(AmbientStatus::Off)),
             generation: Arc::new(AtomicU64::new(0)),
+            stale_announced: AtomicBool::new(false),
+            launch: Mutex::new(None),
         }
     }
 }
@@ -242,6 +289,49 @@ pub struct AmbientVoiceStatusReport {
     pub indicator_position: Option<settings::IndicatorPosition>,
     /// Set when settings could not be loaded; writes are refused meanwhile.
     pub load_error: Option<String>,
+    /// A session is running and unmuted, and nothing has reached its worker for
+    /// [`STALE_AUDIO_AFTER`]. Deliberately separate from `capturing`, which
+    /// only ever meant "the worker thread is alive": this is what the indicator
+    /// needs to stop claiming to listen while it is deaf.
+    pub audio_stale: bool,
+    /// Batches the worker has taken off the queue since the session started.
+    pub audio_batches_received: u64,
+    /// Milliseconds since the last batch reached the worker, or since the
+    /// session started when none has. `None` when no session is running.
+    pub ms_since_last_audio: Option<u64>,
+    /// The webview's own view of the same audio path, as of its last report.
+    /// `None` until it sends one.
+    pub webview_capture: Option<WebviewCaptureFlow>,
+    /// What kind of launch this is. `None` before boot hydration has run.
+    pub launch: Option<LaunchDiagnostics>,
+}
+
+/// Whether a session is running and being fed nothing.
+///
+/// Pure, with the snapshot passed in, so every edge is testable without a
+/// microphone. Four gates, each load-bearing:
+///
+/// * `capturing` — with no worker there is nothing for audio to arrive at.
+/// * `muted` — a muted session releases the device in the webview by design, so
+///   silence is what was asked for, not a fault.
+/// * `status.is_live()` — this replaces one true statement with another only
+///   where the current one is false. A worker whose engines failed keeps its
+///   thread alive draining the queue, and answering "no audio arriving" over
+///   "the wake-word model is incomplete" would bury the fault that matters.
+///   `Starting` is excluded by the same rule.
+/// * the window — the webview needs a moment after a session starts to open the
+///   microphone and build its worklet, and calling that deaf would be its own
+///   false state.
+fn audio_is_stale(
+    capturing: bool,
+    muted: bool,
+    status: &AmbientStatus,
+    flow: Option<AudioFlowSnapshot>,
+) -> bool {
+    capturing
+        && !muted
+        && status.is_live()
+        && flow.is_some_and(|flow| flow.since_last_batch >= STALE_AUDIO_AFTER)
 }
 
 fn emit_state_changed(app: Option<&AppHandle>, report: &AmbientVoiceStatusReport) {
@@ -259,16 +349,22 @@ fn build_report(state: &AppState) -> Result<AmbientVoiceStatusReport, String> {
     let settings = ambient.settings_snapshot()?;
     let runtime = ambient.runtime()?;
     let destination = runtime.destination.clone();
-    let capturing = runtime
+    let live_session = runtime
         .session
         .as_ref()
-        .is_some_and(|session| !session.is_finished());
+        .filter(|session| !session.is_finished());
+    let capturing = live_session.is_some();
+    let flow = live_session.map(AmbientSession::audio_flow);
+    let webview_capture = runtime.webview_capture;
     let suspended_by_huddle = runtime.suspended_by_huddle;
     drop(runtime);
     let status = ambient.current_status();
+    let muted = ambient.muted.load(Ordering::Acquire);
+    // Before the struct literal, which moves `status`.
+    let audio_stale = audio_is_stale(capturing, muted, &status, flow);
     Ok(AmbientVoiceStatusReport {
         enabled: settings.enabled,
-        muted: ambient.muted.load(Ordering::Acquire),
+        muted,
         suspended_by_huddle,
         capturing,
         live: status.is_live(),
@@ -289,12 +385,33 @@ fn build_report(state: &AppState) -> Result<AmbientVoiceStatusReport, String> {
             .lock()
             .map(|error| error.clone())
             .unwrap_or(None),
+        audio_stale,
+        audio_batches_received: flow.map(|flow| flow.batches).unwrap_or(0),
+        ms_since_last_audio: flow.map(|flow| flow.since_last_batch.as_millis() as u64),
+        webview_capture,
+        launch: ambient
+            .launch
+            .lock()
+            .map(|launch| launch.clone())
+            .unwrap_or(None),
     })
 }
 
 fn publish_report(state: &AppState) {
     match build_report(state) {
-        Ok(report) => emit_state_changed(app_handle(state).as_ref(), &report),
+        Ok(report) => {
+            // Every emit is an announcement, so every emit is what the edge in
+            // `commands::report_ambient_audio_flow` is measured against. Without
+            // this the flag drifts from what the windows were actually told —
+            // a session that was stale when the user muted it, or when it was
+            // stopped, would leave the flag set, and the next deaf session
+            // would find no edge to announce and go on saying "listening".
+            state
+                .ambient_voice
+                .stale_announced
+                .store(report.audio_stale, Ordering::Release);
+            emit_state_changed(app_handle(state).as_ref(), &report);
+        }
         Err(error) => eprintln!("buzz-desktop: ambient state report failed: {error}"),
     }
 }
@@ -362,6 +479,10 @@ fn stop_session(state: &AppState, next: AmbientStatus) -> Result<(), String> {
         let mut runtime = ambient.runtime()?;
         runtime.destination = None;
         runtime.session_config = None;
+        // Unlike `last_capture_error`, these counters describe the capture
+        // pipeline that fed the session that is ending. Carrying them into the
+        // next one would answer a question nobody asked.
+        runtime.webview_capture = None;
         (runtime.session.take(), runtime.tts.take())
     };
     if let Some(ref session) = session {
@@ -674,7 +795,8 @@ pub fn resume_after_huddle(state: &AppState) {
 
 // ── Boot hydration ───────────────────────────────────────────────────────────
 
-/// Load persisted settings into `AppState` at launch.
+/// Load persisted settings into `AppState` at launch, and record what kind of
+/// launch this is.
 ///
 /// Does **not** start a session. The frontend provider does that, by polling
 /// [`commands::check_ambient_hotstart`] once the relay and identity are usable
@@ -682,6 +804,12 @@ pub fn resume_after_huddle(state: &AppState) {
 /// authoritative over a stale `enabled` on disk. Enablement, devices and the
 /// wake binding all come from here, which is what makes them survive restart.
 pub fn hydrate_at_boot(app: &AppHandle, state: &AppState) {
+    // Before anything else can fail: the breadcrumb this leaves behind is what
+    // the *next* launch compares itself against, and both deafness reports were
+    // a first launch after an update.
+    if let Ok(mut guard) = state.ambient_voice.launch.lock() {
+        *guard = Some(launch::detect(app));
+    }
     let (loaded, error) = settings::load_for_app(app);
     if let Ok(mut guard) = state.ambient_voice.settings.lock() {
         *guard = loaded.clone();

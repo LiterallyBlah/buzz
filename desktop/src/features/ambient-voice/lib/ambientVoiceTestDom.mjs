@@ -154,7 +154,15 @@ export function setViewport(dom, { width, height }) {
   }
 }
 
-/** A status report with every field the components read. */
+/**
+ * A status report with every field the components read.
+ *
+ * The audio-flow fields describe a healthy session on purpose: they are what
+ * separates "listening" from "alive but deaf", so a fixture that left them out
+ * would let the deafness copy pass a test that never exercised it. Their shape
+ * is pinned from the producing side by
+ * `the_audio_diagnostics_serialise_in_the_shape_the_frontend_parses`.
+ */
 export function ambientReport(overrides = {}) {
   return {
     enabled: true,
@@ -169,6 +177,27 @@ export function ambientReport(overrides = {}) {
     inputDeviceId: null,
     indicatorPosition: null,
     loadError: null,
+    audioStale: false,
+    audioBatchesReceived: 640,
+    msSinceLastAudio: 96,
+    webviewCapture: { batchesPushed: 642, captureReady: true },
+    launch: {
+      version: "0.5.8-unified.11",
+      previousVersion: "0.5.8-unified.11",
+      firstLaunchAfterUpdate: false,
+      args: [],
+    },
     ...overrides,
   };
+}
+
+/** The report a session that is running but receiving nothing produces. */
+export function deafAmbientReport(overrides = {}) {
+  return ambientReport({
+    audioStale: true,
+    audioBatchesReceived: 0,
+    msSinceLastAudio: 12_000,
+    webviewCapture: { batchesPushed: 0, captureReady: true },
+    ...overrides,
+  });
 }

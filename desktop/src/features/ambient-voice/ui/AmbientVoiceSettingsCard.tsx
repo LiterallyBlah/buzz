@@ -20,7 +20,7 @@ import { Input } from "@/shared/ui/input";
 import { Switch } from "@/shared/ui/switch";
 import {
   AMBIENT_STATE_CHANGED_EVENT,
-  ambientStatusLabel,
+  ambientReportLabel,
   checkAmbientWakeWord,
   getAmbientModelStatus,
   getAmbientVoiceSettings,
@@ -33,6 +33,8 @@ import {
   type WakeWordCheck,
 } from "../lib/ambientVoiceApi";
 import {
+  ambientAudioFlowLine,
+  ambientLaunchLine,
   ambientModelRows,
   ambientSaveBlock,
   mergeAgentOptions,
@@ -246,6 +248,8 @@ export function AmbientVoiceSettingsCard() {
   }, [settings, block, agentPubkey, wakeWord, persist]);
 
   const selectedAgent = agents.find((agent) => agent.pubkey === agentPubkey);
+  const audioFlowLine = ambientAudioFlowLine(report);
+  const launchLine = ambientLaunchLine(report);
 
   return (
     <section className="min-w-0" data-testid="settings-ambient-voice">
@@ -420,8 +424,27 @@ export function AmbientVoiceSettingsCard() {
               className="text-sm font-normal text-muted-foreground"
               data-testid="ambient-status"
             >
-              {report ? ambientStatusLabel(report.status) : "Not started"}
+              {ambientReportLabel(report)}
             </p>
+            {/* The evidence behind that line. A session can be alive and deaf,
+                and these two counts are what say where it broke — worth being
+                on screen where someone reporting it can read them out. */}
+            {audioFlowLine ? (
+              <p
+                className="text-2xs text-muted-foreground"
+                data-testid="ambient-audio-flow"
+              >
+                {audioFlowLine}
+              </p>
+            ) : null}
+            {launchLine ? (
+              <p
+                className="text-2xs text-muted-foreground"
+                data-testid="ambient-launch"
+              >
+                {launchLine}
+              </p>
+            ) : null}
           </div>
         </SettingsOptionRow>
 

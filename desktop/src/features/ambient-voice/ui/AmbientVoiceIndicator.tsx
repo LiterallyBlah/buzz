@@ -6,7 +6,7 @@ import { useFeatureEnabled } from "@/shared/features";
 import { cn } from "@/shared/lib/cn";
 import {
   AMBIENT_STATE_CHANGED_EVENT,
-  ambientStatusLabel,
+  ambientReportLabel,
   getAmbientVoiceStatus,
   setAmbientIndicatorPosition,
   setAmbientVoiceMuted,
@@ -160,7 +160,13 @@ export function AmbientVoiceIndicator({ className }: { className?: string }) {
     position ??
     persistedPosition ??
     defaultIndicatorPosition(viewport(), FALLBACK_INDICATOR_BOX);
-  const label = ambientStatusLabel(report.status);
+  // The whole report, not just the status: a worker that is alive reports
+  // "listening" even when nothing is reaching it, and this pill exists to say
+  // what is happening to the audio. The live affordance follows the same fact —
+  // truthful copy beside a lit microphone would still read as "it is hearing
+  // me".
+  const label = ambientReportLabel(report);
+  const live = report.live && !report.audioStale;
 
   const positionFrom = (
     drag: IndicatorDrag,
@@ -180,7 +186,7 @@ export function AmbientVoiceIndicator({ className }: { className?: string }) {
       aria-label={report.muted ? "Unmute ambient voice" : "Mute ambient voice"}
       className={cn(
         "fixed flex touch-none select-none items-center gap-1.5 rounded-full border border-border/50 px-2.5 py-1 text-2xs text-muted-foreground transition-colors hover:text-foreground",
-        report.live && "text-foreground",
+        live && "text-foreground",
         dragging ? "cursor-grabbing" : "cursor-grab",
         className,
       )}
@@ -255,7 +261,7 @@ export function AmbientVoiceIndicator({ className }: { className?: string }) {
       {report.muted ? (
         <MicOff className="h-3.5 w-3.5" />
       ) : (
-        <Mic className={cn("h-3.5 w-3.5", report.live && "text-primary")} />
+        <Mic className={cn("h-3.5 w-3.5", live && "text-primary")} />
       )}
       <span className="truncate">{label}</span>
     </button>

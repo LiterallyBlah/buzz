@@ -25,6 +25,16 @@ export type AudioWorkletHandle = {
   setMode: (mode: "push_to_talk" | "voice_activity") => void;
   /** Set mic input gain (0–1). Adjusts the GainNode between source and worklet. */
   setGain: (value: number) => void;
+  /**
+   * PCM batches handed to the sink command since setup.
+   *
+   * The push is fire-and-forget by design (the Rust side drops on
+   * backpressure), so nothing downstream can say whether this half of the path
+   * ever ran. The ambient session reports this count to the native side, which
+   * is what separates "the webview pushed and nothing arrived" from "the
+   * webview never pushed" the next time a session goes deaf.
+   */
+  pushedBatches: () => number;
 };
 
 /** Optional overrides for a second consumer of the same worklet. */
@@ -109,8 +119,10 @@ export async function setupAudioWorklet(
 
   // Forward PCM batches to Rust via raw binary invoke.
   // Direction: worklet→main (receives PCM data from worklet processor).
+  let pushedBatches = 0;
   workletNode.port.onmessage = (event: MessageEvent<Float32Array>) => {
     const float32 = event.data;
+    pushedBatches += 1;
     // Fire-and-forget — Rust side uses try_send which drops on backpressure.
     // No await: prevents main-thread backpressure from slow Rust processing.
     // Create a zero-copy Uint8Array view over the same underlying buffer.
@@ -164,5 +176,6 @@ export async function setupAudioWorklet(
     setGain: (value: number) => {
       gainNode.gain.value = value;
     },
+    pushedBatches: () => pushedBatches,
   };
 }

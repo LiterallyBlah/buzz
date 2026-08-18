@@ -13,9 +13,10 @@ use tauri::{AppHandle, State};
 use crate::app_state::AppState;
 
 use super::{
-    build_report, capture_failure_is_pacing, models, publish_report, reconcile, settings,
-    status::AmbientStatus, stop_session, wake_word, AmbientVoiceSettings, AmbientVoiceStatusReport,
-    MAX_AUDIO_BATCH_BYTES, MAX_CAPTURE_ERROR_CHARS,
+    app_handle, build_report, capture_failure_is_pacing, emit_state_changed, models,
+    publish_report, reconcile, settings, status::AmbientStatus, stop_session, wake_word,
+    AmbientVoiceSettings, AmbientVoiceStatusReport, WebviewCaptureFlow, MAX_AUDIO_BATCH_BYTES,
+    MAX_CAPTURE_ERROR_CHARS,
 };
 use wake_word::{WakeWordTokenizer, MAX_WAKE_WORD_CHARS};
 
@@ -337,6 +338,43 @@ pub fn push_ambient_audio_pcm(
         return Ok(());
     };
     session.push_audio(bytes.to_vec())
+}
+
+/// The webview's own count of the audio it has pushed.
+///
+/// Called on a slow cadence while the webview holds a capture pipeline. Two
+/// jobs, both diagnostic:
+///
+/// 1. It carries the other half of the audio path into the report. "Capturing
+///    but deaf" has two very different causes — batches pushed that never
+///    arrive, or batches never pushed at all — and only the webview can count
+///    the second.
+/// 2. It is what notices that a running session has gone quiet. Staleness moves
+///    with the clock rather than with a session transition, so nothing else
+///    would ever emit it; the announcement is edge-triggered so a quiet session
+///    does not re-emit the same report to every window every few seconds.
+///
+/// Recording a count is not a lifecycle event: nothing here starts, stops or
+/// paces a session.
+#[tauri::command]
+pub fn report_ambient_audio_flow(
+    pushed: u64,
+    capture_ready: bool,
+    state: State<'_, AppState>,
+) -> Result<AmbientVoiceStatusReport, String> {
+    state.ambient_voice.runtime()?.webview_capture = Some(WebviewCaptureFlow {
+        batches_pushed: pushed,
+        capture_ready,
+    });
+    let report = build_report(&state)?;
+    let was_stale = state
+        .ambient_voice
+        .stale_announced
+        .swap(report.audio_stale, Ordering::AcqRel);
+    if was_stale != report.audio_stale {
+        emit_state_changed(app_handle(&state).as_ref(), &report);
+    }
+    Ok(report)
 }
 
 /// Make a webview-supplied failure fit to show.

@@ -68,6 +68,17 @@ export function ambientReplyChannel(
  */
 export const AMBIENT_HOTSTART_INTERVAL_MS = 3_000;
 
+/**
+ * How often the webview tells the native side what it has pushed.
+ *
+ * Slow on purpose: this is a diagnostic heartbeat, not a data path. It matches
+ * the native staleness window (`STALE_AUDIO_AFTER`), so a session that goes
+ * quiet is noticed within about one tick of the truth — and since the native
+ * side only learns of staleness when it is asked, this is also the tick that
+ * makes a deaf session visible at all.
+ */
+export const AMBIENT_AUDIO_FLOW_INTERVAL_MS = 5_000;
+
 /** Sent when a device that was working disappears mid-session. */
 export const AMBIENT_CAPTURE_LOST_MESSAGE =
   "The microphone stopped — reconnect it or choose another one in settings";

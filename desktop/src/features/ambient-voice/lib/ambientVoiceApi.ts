@@ -27,7 +27,34 @@ export type AmbientStatus =
  */
 export type AmbientIndicatorPosition = { x: number; y: number };
 
-/** Mirrors `ambient_voice::AmbientVoiceStatusReport`. */
+/** Mirrors `ambient_voice::WebviewCaptureFlow` — our own last report. */
+export type AmbientWebviewCapture = {
+  batchesPushed: number;
+  captureReady: boolean;
+};
+
+/** Mirrors `ambient_voice::launch::LaunchDiagnostics`. */
+export type AmbientLaunchDiagnostics = {
+  version: string;
+  previousVersion: string | null;
+  /**
+   * The previous launch ran a different build. Both reports of a deaf wake word
+   * were a first launch after an in-app update; the updater itself leaves
+   * nothing in the process to detect, so this is the best available signal and
+   * it cannot tell an updater relaunch from the user opening the new build.
+   */
+  firstLaunchAfterUpdate: boolean;
+  args: string[];
+};
+
+/**
+ * Mirrors `ambient_voice::AmbientVoiceStatusReport`.
+ *
+ * The shape is pinned from the producing side by
+ * `the_status_report_serialises_with_the_keys_the_frontend_reads` and
+ * `the_audio_diagnostics_serialise_in_the_shape_the_frontend_parses` in
+ * `ambient_voice/mod_tests.rs`; those tests and this type change together.
+ */
 export type AmbientVoiceStatusReport = {
   enabled: boolean;
   muted: boolean;
@@ -42,6 +69,20 @@ export type AmbientVoiceStatusReport = {
   /** `null` until the user drags the pill; the default corner applies. */
   indicatorPosition: AmbientIndicatorPosition | null;
   loadError: string | null;
+  /**
+   * A session is running, unmuted, and nothing has reached its worker for five
+   * seconds. `capturing` only ever meant "the worker thread is alive", which is
+   * why a deaf session could go on claiming to listen.
+   */
+  audioStale: boolean;
+  /** Batches the native worker has taken off its queue this session. */
+  audioBatchesReceived: number;
+  /** Since the last batch reached the worker, or since the session started. */
+  msSinceLastAudio: number | null;
+  /** What this webview last reported pushing. `null` until it reports. */
+  webviewCapture: AmbientWebviewCapture | null;
+  /** `null` before native boot hydration has run. */
+  launch: AmbientLaunchDiagnostics | null;
 };
 
 /** Mirrors `ambient_voice::settings::WakeBinding`. */
@@ -143,6 +184,42 @@ export const ambientSpeak = (text: string) =>
  */
 export const reportAmbientCaptureError = (message: string) =>
   invoke<AmbientVoiceStatusReport>("report_ambient_capture_error", { message });
+
+/**
+ * Tell the native side how much audio this webview believes it has sent.
+ *
+ * The two halves of the audio path live in different processes and the deafness
+ * bug is somewhere between them: batches pushed but never received is an IPC or
+ * session-lifetime fault, none pushed at all is the microphone, the worklet or
+ * the AudioContext. Only the webview can count the second, so it says so on a
+ * slow cadence — and that call is also what makes the native side notice that a
+ * running session has gone quiet.
+ */
+export const reportAmbientAudioFlow = (pushed: number, captureReady: boolean) =>
+  invoke<AmbientVoiceStatusReport>("report_ambient_audio_flow", {
+    pushed,
+    captureReady,
+  });
+
+/**
+ * What the indicator and the settings section say about a whole report.
+ *
+ * Not `ambientStatusLabel(report.status)`: a session whose worker is alive
+ * reports `listening` whatever the microphone is doing, so a webview that never
+ * pushed a frame read as "Listening for the wake word" for the rest of the run.
+ * The audio counters are the only thing that can tell those apart, and a pill
+ * that lies about the one thing it exists to say is the harm being fixed.
+ */
+export function ambientReportLabel(
+  report: AmbientVoiceStatusReport | null,
+): string {
+  if (!report) return "Not started";
+  if (report.audioStale) return AMBIENT_NO_AUDIO_MESSAGE;
+  return ambientStatusLabel(report.status);
+}
+
+/** Shown in place of "Listening for the wake word" when nothing arrives. */
+export const AMBIENT_NO_AUDIO_MESSAGE = "No audio arriving from the microphone";
 
 /** Human-readable label for the listening indicator. */
 export function ambientStatusLabel(status: AmbientStatus): string {

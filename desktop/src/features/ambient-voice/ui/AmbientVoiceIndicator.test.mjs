@@ -21,6 +21,7 @@ import test from "node:test";
 
 import {
   ambientReport,
+  deafAmbientReport,
   setViewport,
   withAmbientDom,
 } from "../lib/ambientVoiceTestDom.mjs";
@@ -197,6 +198,31 @@ test("a press that barely moves is still a click on mute", async () => {
     );
     // And it did not move.
     assert.equal(pill().style.left, BOTTOM_RIGHT.left);
+  });
+});
+
+test('a session that is hearing nothing says so instead of "listening"', async () => {
+  // The shipped bug, as the user meets it: the native session is alive, so the
+  // status is `listening`, and not one frame of audio has reached it. The pill
+  // said "Listening for the wake word" for the whole run while the wake word
+  // was deaf — the one thing this control exists to be honest about.
+  await mountIndicator({ report: deafAmbientReport() }, async ({ pill }) => {
+    assert.equal(
+      pill().textContent,
+      "No audio arriving from the microphone",
+      "the pill claimed to be listening while nothing was arriving",
+    );
+    // And it does not look live either: truthful copy beside a lit
+    // microphone still reads as "it is hearing me".
+    assert.equal(pill().querySelector(".text-primary"), null);
+  });
+});
+
+test("a session that is being fed keeps the ordinary listening copy", async () => {
+  // The control: the deafness copy must not appear on a working session, or it
+  // would train users to ignore it.
+  await mountIndicator({}, async ({ pill }) => {
+    assert.equal(pill().textContent, "Listening for the wake word");
   });
 });
 

@@ -212,6 +212,55 @@ fn the_worker_announces_the_transitions_it_makes() {
     );
 }
 
+#[test]
+fn the_worker_stamps_the_audio_it_takes_off_the_queue() {
+    // The whole watchdog rests on this: `capturing` means "the worker thread is
+    // alive", and only a stamp taken where the queue is consumed can say
+    // whether anything is arriving at it. Driven through the production
+    // `AmbientSession` — pushing into the real channel and reading the real
+    // handle — because a counter that is correct but never called is exactly
+    // the failure this feature already shipped once.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let (session, _transcripts) = AmbientSession::new(AmbientSessionConfig {
+        kws_model_dir: dir.path().to_path_buf(),
+        stt_model_dir: dir.path().to_path_buf(),
+        keywords_buf: "\u{2581}HE Y\n".to_string(),
+        tts_active: Arc::new(AtomicBool::new(false)),
+        tts_cancel: Arc::new(AtomicBool::new(false)),
+        muted: Arc::new(AtomicBool::new(false)),
+        status: Arc::new(Mutex::new(AmbientStatus::Starting)),
+        on_status_change: None,
+        input_sample_rate: 16_000,
+    })
+    .expect("session");
+
+    // A session nobody has fed reports exactly that, and its silence is
+    // measured from the moment it started rather than from an absent batch.
+    let fresh = session.audio_flow();
+    assert_eq!(fresh.batches, 0);
+    assert!(fresh.since_last_batch < Duration::from_secs(1), "{fresh:?}");
+
+    for _ in 0..3 {
+        session
+            .push_audio(f32_bytes(&[0.0; VAD_FRAME_SAMPLES]))
+            .expect("push");
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut flow = session.audio_flow();
+    while flow.batches == 0 && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(10));
+        flow = session.audio_flow();
+    }
+    session.shutdown();
+
+    assert!(
+        flow.batches > 0,
+        "audio reached the worker and was never stamped: {flow:?}"
+    );
+    assert!(flow.since_last_batch < Duration::from_secs(1), "{flow:?}");
+}
+
 // ── Fixture-driven tests through the real engine ─────────────────────────────
 
 fn model_dir_from_env() -> PathBuf {

@@ -16,7 +16,11 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { AMBIENT_STATE_CHANGED_EVENT } from "../lib/ambientVoiceApi.ts";
-import { ambientReport, withAmbientDom } from "../lib/ambientVoiceTestDom.mjs";
+import {
+  ambientReport,
+  deafAmbientReport,
+  withAmbientDom,
+} from "../lib/ambientVoiceTestDom.mjs";
 
 const SETTINGS = {
   version: 1,
@@ -174,6 +178,55 @@ test("mute and status follow the runtime, not the snapshot taken at mount", asyn
       "true",
     );
     assert.equal(view.getByTestId("ambient-status").textContent, "Muted");
+  });
+});
+
+test("a session that hears nothing is called deaf here too, with the counts", async () => {
+  // The settings section is where someone looks when the app is not hearing
+  // them, so it must not be the last place still saying "Listening for the wake
+  // word". The two counts below it are what the next occurrence needs: nothing
+  // pushed by this window and nothing received says the break is on this side
+  // of the IPC, and the launch line says whether this is the first start after
+  // an update — which both reports were.
+  await mountSettings(READY_MODELS, async ({ announce, view }) => {
+    await announce(
+      deafAmbientReport({
+        launch: {
+          version: "0.5.8-unified.11",
+          previousVersion: "0.5.8-unified.10",
+          firstLaunchAfterUpdate: true,
+          args: [],
+        },
+      }),
+    );
+
+    assert.equal(
+      view.getByTestId("ambient-status").textContent,
+      "No audio arriving from the microphone",
+    );
+    assert.equal(
+      view.getByTestId("ambient-audio-flow").textContent,
+      "Audio: none received for 12s (0 received, 0 sent by this window)",
+    );
+    assert.equal(
+      view.getByTestId("ambient-launch").textContent,
+      "Launch: 0.5.8-unified.11, first start after 0.5.8-unified.10",
+    );
+  });
+});
+
+test("a healthy session reports what is flowing rather than an alarm", async () => {
+  await mountSettings(READY_MODELS, async ({ announce, view }) => {
+    await announce(ambientReport());
+
+    assert.equal(
+      view.getByTestId("ambient-status").textContent,
+      "Listening for the wake word",
+    );
+    assert.equal(
+      view.getByTestId("ambient-audio-flow").textContent,
+      "Audio: 640 received, 642 sent by this window",
+    );
   });
 });
 
