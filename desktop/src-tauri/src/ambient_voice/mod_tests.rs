@@ -447,6 +447,38 @@ fn the_status_report_serialises_with_the_keys_the_frontend_reads() {
 }
 
 #[test]
+fn ambient_model_status_serialises_the_shape_the_frontend_parses() {
+    // `modelStatusLabel` in `ambientSettingsLogic.ts` parses exactly this —
+    // the enum's externally-tagged snake_case form, where unit variants are
+    // plain strings and data-carrying variants a single-key object. The first
+    // frontend shipped against an invented `{status: "…"}` shape instead, and
+    // every model row in settings rendered "undefined". If this assertion
+    // breaks, the TS `ModelStatus` type and its test fixtures must change in
+    // the same commit.
+    use crate::huddle::models::ModelStatus;
+    let value = serde_json::to_value(models::AmbientModelStatus {
+        kws: ModelStatus::Ready,
+        stt: ModelStatus::Downloading {
+            progress_percent: 42,
+        },
+        tts: ModelStatus::Error("checksum mismatch".to_string()),
+    })
+    .expect("json");
+    assert_eq!(
+        value,
+        serde_json::json!({
+            "kws": "ready",
+            "stt": { "downloading": { "progress_percent": 42 } },
+            "tts": { "error": "checksum mismatch" },
+        })
+    );
+    assert_eq!(
+        serde_json::to_value(ModelStatus::NotDownloaded).expect("json"),
+        serde_json::json!("not_downloaded")
+    );
+}
+
+#[test]
 fn a_settings_write_cannot_move_the_indicator_back() {
     // The settings screen fetches the whole settings object once and posts it
     // back on every change. A copy taken before the user dragged the pill

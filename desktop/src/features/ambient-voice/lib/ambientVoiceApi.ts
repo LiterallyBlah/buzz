@@ -77,11 +77,18 @@ export type WakeWordCheck = {
   checkedAgainstModel: boolean;
 };
 
+/**
+ * One model's download state, exactly as the Rust `ModelStatus` enum
+ * serialises (externally tagged, snake_case): unit variants are plain
+ * strings, data-carrying variants a single-key object. `HuddleBar` parses
+ * the same shape, and `ambient_model_status_serialises_the_shape_the_frontend_parses`
+ * in `ambient_voice/mod_tests.rs` pins it from the producing side.
+ */
 export type ModelStatus =
-  | { status: "not_downloaded" }
-  | { status: "downloading"; progress_percent: number }
-  | { status: "ready" }
-  | { status: "failed"; error: string };
+  | "not_downloaded"
+  | "ready"
+  | { downloading: { progress_percent: number } }
+  | { error: string };
 
 export type AmbientModelStatus = {
   kws: ModelStatus;

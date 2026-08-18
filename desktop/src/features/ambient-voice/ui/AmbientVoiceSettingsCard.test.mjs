@@ -99,11 +99,16 @@ async function mountSettings(models, body, { report = ambientReport() } = {}) {
 }
 
 test("every local model's readiness is listed, not just the wake word", async () => {
+  // These fixtures are the exact serialisation of the Rust `ModelStatus` enum
+  // (externally tagged, snake_case), pinned from the producing side by
+  // `ambient_model_status_serialises_the_shape_the_frontend_parses`. The
+  // first version of this test invented an internally-tagged shape instead,
+  // and every row shipped rendering "undefined".
   await mountSettings(
     {
-      kws: { status: "ready" },
-      stt: { status: "downloading", progress_percent: 42 },
-      tts: { status: "failed", error: "checksum mismatch" },
+      kws: "ready",
+      stt: { downloading: { progress_percent: 42 } },
+      tts: { error: "checksum mismatch" },
     },
     async ({ view }) => {
       assert.equal(
@@ -127,9 +132,9 @@ test("every local model's readiness is listed, not just the wake word", async ()
 test("a model that was never downloaded says so rather than staying blank", async () => {
   await mountSettings(
     {
-      kws: { status: "ready" },
-      stt: { status: "ready" },
-      tts: { status: "not_downloaded" },
+      kws: "ready",
+      stt: "ready",
+      tts: "not_downloaded",
     },
     async ({ view }) => {
       assert.equal(
@@ -141,9 +146,9 @@ test("a model that was never downloaded says so rather than staying blank", asyn
 });
 
 const READY_MODELS = {
-  kws: { status: "ready" },
-  stt: { status: "ready" },
-  tts: { status: "ready" },
+  kws: "ready",
+  stt: "ready",
+  tts: "ready",
 };
 
 test("mute and status follow the runtime, not the snapshot taken at mount", async () => {

@@ -150,14 +150,10 @@ export function ambientModelRows(
 
 /** Progress copy for a local model download. */
 export function modelStatusLabel(status: ModelStatus): string {
-  switch (status.status) {
-    case "not_downloaded":
-      return "Not downloaded";
-    case "downloading":
-      return `Downloading… ${status.progress_percent}%`;
-    case "ready":
-      return "Ready";
-    case "failed":
-      return `Failed: ${status.error}`;
+  if (status === "not_downloaded") return "Not downloaded";
+  if (status === "ready") return "Ready";
+  if ("downloading" in status) {
+    return `Downloading… ${status.downloading.progress_percent}%`;
   }
+  return `Failed: ${status.error}`;
 }

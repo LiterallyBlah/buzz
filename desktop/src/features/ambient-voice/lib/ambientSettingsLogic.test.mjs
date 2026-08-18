@@ -116,19 +116,18 @@ test("editing the first binding preserves later ones", () => {
 });
 
 test("model status reads as progress, not as a state name", () => {
+  // Fixtures are the Rust `ModelStatus` enum's real serialisation (externally
+  // tagged, snake_case), pinned from the producing side by
+  // `ambient_model_status_serialises_the_shape_the_frontend_parses`. This
+  // test's first version invented a `{status: "…"}` shape, and every model
+  // row shipped rendering "undefined".
+  assert.equal(modelStatusLabel("not_downloaded"), "Not downloaded");
   assert.equal(
-    modelStatusLabel({ status: "not_downloaded" }),
-    "Not downloaded",
-  );
-  assert.equal(
-    modelStatusLabel({ status: "downloading", progress_percent: 42 }),
+    modelStatusLabel({ downloading: { progress_percent: 42 } }),
     "Downloading… 42%",
   );
-  assert.equal(modelStatusLabel({ status: "ready" }), "Ready");
-  assert.equal(
-    modelStatusLabel({ status: "failed", error: "network" }),
-    "Failed: network",
-  );
+  assert.equal(modelStatusLabel("ready"), "Ready");
+  assert.equal(modelStatusLabel({ error: "network" }), "Failed: network");
 });
 
 test("all three local models are listed, in the order the session needs them", () => {
@@ -136,9 +135,9 @@ test("all three local models are listed, in the order the session needs them", (
   // makes the session deaf and a missing voice makes it mute, and neither
   // failure surfaces anywhere else in the app.
   const models = {
-    kws: { status: "ready" },
-    stt: { status: "downloading", progress_percent: 7 },
-    tts: { status: "failed", error: "checksum mismatch" },
+    kws: "ready",
+    stt: { downloading: { progress_percent: 7 } },
+    tts: { error: "checksum mismatch" },
   };
   assert.deepEqual(
     ambientModelRows(models).map((row) => [
