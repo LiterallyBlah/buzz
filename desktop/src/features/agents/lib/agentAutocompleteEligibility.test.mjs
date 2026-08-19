@@ -102,6 +102,30 @@ test("relayAgentIsSharedWithUser: accepts verified same-owner agents across mach
   );
 });
 
+test("relayAgentIsSharedWithUser: owner-only fails closed without a verified viewer or owner", () => {
+  const agent = {
+    ownerPubkey: CURRENT_PUBKEY,
+    respondTo: "owner-only",
+    respondToAllowlist: [],
+    channelIds: ["general"],
+  };
+  const sharedChannelIds = new Set(["general"]);
+
+  assert.equal(
+    relayAgentIsSharedWithUser(agent, sharedChannelIds, null),
+    false,
+  );
+  assert.equal(relayAgentIsSharedWithUser(agent, sharedChannelIds), false);
+  assert.equal(
+    relayAgentIsSharedWithUser(
+      { ...agent, ownerPubkey: null },
+      sharedChannelIds,
+      CURRENT_PUBKEY,
+    ),
+    false,
+  );
+});
+
 test("relayAgentIsSharedWithUser: accepts allowlist agents for the current user", () => {
   const sharedChannelIds = new Set(["general"]);
 
@@ -209,19 +233,88 @@ test("relayAgentCanRespondInChannel: channel membership stands in for a stale ch
     ),
     false,
   );
+});
 
-  // Membership does not promote a respond_to mode that was never eligible.
+test("relayAgentCanRespondInChannel: owner-only agents answer exactly their verified owner", () => {
   const ownerOnlyAgent = {
+    ownerPubkey: OWNER_PUBKEY,
     respondTo: "owner-only",
-    respondToAllowlist: [CURRENT_PUBKEY],
+    respondToAllowlist: [],
     channelIds: ["general"],
   };
+
+  // Matching owner in a channel the agent lists itself.
+  assert.equal(
+    relayAgentCanRespondInChannel(ownerOnlyAgent, "general", OWNER_PUBKEY),
+    true,
+  );
+  // The owner comparison is normalized on both sides.
+  assert.equal(
+    relayAgentCanRespondInChannel(
+      { ...ownerOnlyAgent, ownerPubkey: OWNER_PUBKEY.toUpperCase() },
+      "general",
+      OWNER_PUBKEY,
+    ),
+    true,
+  );
+  // Matching owner admitted through actual membership when the agent's own
+  // channelIds snapshot predates the channel.
+  assert.equal(
+    relayAgentCanRespondInChannel(
+      { ...ownerOnlyAgent, channelIds: ["some-other-channel"] },
+      "general",
+      OWNER_PUBKEY,
+      true,
+    ),
+    true,
+  );
+  // Membership widens presence, never `respond_to`: a different viewer stays
+  // rejected even when the agent is a member.
   assert.equal(
     relayAgentCanRespondInChannel(
       ownerOnlyAgent,
       "general",
       CURRENT_PUBKEY,
       true,
+    ),
+    false,
+  );
+  // An allowlist entry does not promote an owner-only agent either.
+  assert.equal(
+    relayAgentCanRespondInChannel(
+      { ...ownerOnlyAgent, respondToAllowlist: [CURRENT_PUBKEY] },
+      "general",
+      CURRENT_PUBKEY,
+      true,
+    ),
+    false,
+  );
+  // Fail closed without a verified viewer or a verified owner.
+  assert.equal(
+    relayAgentCanRespondInChannel(ownerOnlyAgent, "general", null, true),
+    false,
+  );
+  assert.equal(
+    relayAgentCanRespondInChannel(ownerOnlyAgent, "general", undefined, true),
+    false,
+  );
+  assert.equal(
+    relayAgentCanRespondInChannel(
+      { ...ownerOnlyAgent, ownerPubkey: null },
+      "general",
+      OWNER_PUBKEY,
+      true,
+    ),
+    false,
+  );
+  // Presence is still required: the owner cannot summon the agent into a
+  // channel it neither lists nor belongs to.
+  assert.equal(
+    relayAgentCanRespondInChannel(
+      { ...ownerOnlyAgent, channelIds: ["some-other-channel"] },
+      "general",
+      OWNER_PUBKEY,
+      false,
     ),
     false,
   );
@@ -304,6 +397,54 @@ test("getMentionableAgentPubkeys: channel scope admits member agents with a stal
       },
     }),
     new Set([PUB_A]),
+  );
+});
+
+test("getMentionableAgentPubkeys: channel scope admits owner-only agents for their verified owner", () => {
+  const ownerOnly = (pubkey, overrides = {}) => ({
+    pubkey,
+    ownerPubkey: CURRENT_PUBKEY,
+    respondTo: "owner-only",
+    respondToAllowlist: [],
+    channelIds: ["general"],
+    ...overrides,
+  });
+  const base = {
+    currentPubkey: CURRENT_PUBKEY,
+    managedAgentPubkeys: [],
+    sharedChannelIds: new Set(["general"]),
+  };
+
+  // PUB_A lists the channel; PUB_B is a member whose channelIds snapshot
+  // predates the channel; PUB_C belongs to a different owner; PUB_D has no
+  // verified owner at all.
+  assert.deepEqual(
+    getMentionableAgentPubkeys({
+      ...base,
+      relayAgents: [
+        ownerOnly(PUB_A),
+        ownerOnly(PUB_B, { channelIds: ["some-other-channel"] }),
+        ownerOnly(PUB_C, { ownerPubkey: OTHER_OWNER_PUBKEY }),
+        ownerOnly(PUB_D, { ownerPubkey: null }),
+      ],
+      eligibilityScope: {
+        type: "channel",
+        channelId: "general",
+        memberPubkeys: new Set([PUB_B]),
+      },
+    }),
+    new Set([PUB_A, PUB_B]),
+  );
+
+  // Without a verified current user every owner-only agent fails closed.
+  assert.deepEqual(
+    getMentionableAgentPubkeys({
+      ...base,
+      currentPubkey: null,
+      relayAgents: [ownerOnly(PUB_A)],
+      eligibilityScope: { type: "channel", channelId: "general" },
+    }),
+    new Set(),
   );
 });
 

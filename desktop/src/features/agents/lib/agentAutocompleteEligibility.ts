@@ -10,12 +10,26 @@ export function getSharedChannelIds(channels: readonly Channel[] | undefined) {
 }
 
 // The `respond_to` half of eligibility: will this agent answer *us*, ignoring
-// which channel we are in. Sole producer of the allowlist rule, so the channel
-// and community paths cannot drift apart on who an agent talks to.
+// which channel we are in. Sole producer of the whole respond_to rule — all
+// three modes — so the channel and community paths cannot drift apart on who
+// an agent talks to.
 function relayAgentRespondsToUser(
-  agent: Pick<RelayAgent, "respondTo" | "respondToAllowlist">,
+  agent: Pick<RelayAgent, "ownerPubkey" | "respondTo" | "respondToAllowlist">,
   currentPubkey?: string | null,
 ) {
+  if (agent.respondTo === "owner-only") {
+    // Only a verified same-owner pair is admitted: an unverified viewer or an
+    // unattributed agent fails closed.
+    const normalizedCurrentPubkey = currentPubkey
+      ? normalizePubkey(currentPubkey)
+      : null;
+    return (
+      normalizedCurrentPubkey !== null &&
+      !!agent.ownerPubkey &&
+      normalizePubkey(agent.ownerPubkey) === normalizedCurrentPubkey
+    );
+  }
+
   if (agent.respondTo === "allowlist") {
     const normalizedCurrentPubkey = currentPubkey
       ? normalizePubkey(currentPubkey)
@@ -39,23 +53,12 @@ export function relayAgentIsSharedWithUser(
   sharedChannelIds: ReadonlySet<string>,
   currentPubkey?: string | null,
 ) {
-  const normalizedCurrentPubkey = currentPubkey
-    ? normalizePubkey(currentPubkey)
-    : null;
-
-  if (
-    agent.respondTo === "owner-only" &&
-    normalizedCurrentPubkey &&
-    agent.ownerPubkey
-  ) {
-    return normalizePubkey(agent.ownerPubkey) === normalizedCurrentPubkey;
-  }
-
-  // The allowlist rule is produced once, in `relayAgentRespondsToUser`, so the
-  // community and channel paths cannot drift on who an agent talks to. It is
-  // the same predicate this branch used to spell out inline: an allowlist agent
-  // answers only a normalized current pubkey that appears in its allowlist.
-  if (agent.respondTo === "allowlist") {
+  // The respond_to rule is produced once, in `relayAgentRespondsToUser`, so
+  // the community and channel paths cannot drift on who an agent talks to. An
+  // owner-only agent is shared exactly with its verified owner, an allowlist
+  // agent with its listed pubkeys — neither needs a shared channel. Only an
+  // "anyone" agent is scoped to the channels it actually shares with us.
+  if (agent.respondTo === "owner-only" || agent.respondTo === "allowlist") {
     return relayAgentRespondsToUser(agent, currentPubkey);
   }
 
@@ -85,7 +88,8 @@ export function relayAgentCanRespondInChannel(
 
   // The `respond_to` half is unchanged: membership widens who Desktop will
   // offer, never who an agent will answer. An agent whose allowlist excludes
-  // the current user stays hidden even when it is a member.
+  // the current user stays hidden even when it is a member, and an owner-only
+  // agent stays hidden from everyone but its verified owner.
   return isPresentInChannel && relayAgentRespondsToUser(agent, currentPubkey);
 }
 
