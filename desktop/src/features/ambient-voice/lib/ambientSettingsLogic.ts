@@ -119,6 +119,43 @@ export function withPrimaryBinding(
   return { ...settings, wakeBindings: [binding, ...rest] };
 }
 
+// ── The pause that ends what you are saying ──────────────────────────────────
+//
+// The bounds mirror `MIN_SILENCE_HOLD_MS` / `MAX_SILENCE_HOLD_MS` /
+// `DEFAULT_SILENCE_HOLD_MS` in `ambient_voice::utterance`, which clamps to the
+// same range on load. Duplicated rather than fetched because the slider has to
+// render before any native call answers, and pinned from the producing side by
+// `a_hold_no_slider_could_produce_is_clamped_on_load_and_refused_on_save`.
+
+export const SILENCE_HOLD_MIN_MS = 300;
+export const SILENCE_HOLD_MAX_MS = 10_000;
+export const SILENCE_HOLD_DEFAULT_MS = 800;
+
+/** 100 ms steps: fine enough to tune by ear, coarse enough to land on a value. */
+export const SILENCE_HOLD_STEP_MS = 100;
+
+/**
+ * Hold a slider value to what the native side will accept.
+ *
+ * A save outside the range is refused there, and the refusal reaches the user
+ * as a red banner over a setting they moved with a mouse — so it is clamped
+ * here instead. A value that is not a number at all (an empty or half-typed
+ * field) falls back to the default rather than to `NaN`.
+ */
+export function clampSilenceHoldMs(ms: number): number {
+  if (!Number.isFinite(ms)) return SILENCE_HOLD_DEFAULT_MS;
+  return Math.min(
+    SILENCE_HOLD_MAX_MS,
+    Math.max(SILENCE_HOLD_MIN_MS, Math.round(ms)),
+  );
+}
+
+/** What the row shows beside the slider: "0.3s", "0.8s", "10s". */
+export function silenceHoldLabel(ms: number): string {
+  const seconds = clampSilenceHoldMs(ms) / 1000;
+  return `${seconds.toFixed(1).replace(/\.0$/, "")}s`;
+}
+
 /** One local model, as listed in the settings section. */
 export type AmbientModelRow = {
   /** Field on `AmbientModelStatus`; also the row's React key. */

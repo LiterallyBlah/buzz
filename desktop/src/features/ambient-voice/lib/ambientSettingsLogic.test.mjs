@@ -4,9 +4,15 @@ import test from "node:test";
 import {
   ambientModelRows,
   ambientSaveBlock,
+  clampSilenceHoldMs,
   mergeAgentOptions,
   modelStatusLabel,
+  silenceHoldLabel,
   withPrimaryBinding,
+  SILENCE_HOLD_DEFAULT_MS,
+  SILENCE_HOLD_MAX_MS,
+  SILENCE_HOLD_MIN_MS,
+  SILENCE_HOLD_STEP_MS,
 } from "./ambientSettingsLogic.ts";
 
 const AGENT = "a".repeat(64);
@@ -113,6 +119,40 @@ test("editing the first binding preserves later ones", () => {
   assert.equal(next.wakeBindings[1].wakeWord, "hey archivist");
   // Unrelated fields are carried through untouched.
   assert.equal(next.enabled, true);
+});
+
+test("the slider offers the range the native side accepts, and no more", () => {
+  // These bounds are duplicated from `ambient_voice::utterance`, which clamps
+  // to the same range on load and refuses a save outside it. A slider that
+  // could produce a value the save refuses would put a red banner in front of
+  // someone who only dragged a handle.
+  assert.equal(SILENCE_HOLD_MIN_MS, 300);
+  assert.equal(SILENCE_HOLD_MAX_MS, 10_000);
+  assert.equal(SILENCE_HOLD_DEFAULT_MS, 800);
+  // A step that divides the range and lands on the default.
+  assert.equal(SILENCE_HOLD_DEFAULT_MS % SILENCE_HOLD_STEP_MS, 0);
+  assert.equal(
+    (SILENCE_HOLD_MAX_MS - SILENCE_HOLD_MIN_MS) % SILENCE_HOLD_STEP_MS,
+    0,
+  );
+});
+
+test("a hold outside the range is clamped rather than sent", () => {
+  assert.equal(clampSilenceHoldMs(0), SILENCE_HOLD_MIN_MS);
+  assert.equal(clampSilenceHoldMs(-1), SILENCE_HOLD_MIN_MS);
+  assert.equal(clampSilenceHoldMs(999_999), SILENCE_HOLD_MAX_MS);
+  assert.equal(clampSilenceHoldMs(2_500), 2_500);
+  // A settings file with no stored key arrives here as `undefined`; falling
+  // through to NaN would render an empty slider and post one back.
+  assert.equal(clampSilenceHoldMs(Number.NaN), SILENCE_HOLD_DEFAULT_MS);
+  assert.equal(clampSilenceHoldMs(undefined), SILENCE_HOLD_DEFAULT_MS);
+});
+
+test("the hold is shown in seconds, in the plainest form it has", () => {
+  assert.equal(silenceHoldLabel(SILENCE_HOLD_MIN_MS), "0.3s");
+  assert.equal(silenceHoldLabel(SILENCE_HOLD_DEFAULT_MS), "0.8s");
+  assert.equal(silenceHoldLabel(2_500), "2.5s");
+  assert.equal(silenceHoldLabel(SILENCE_HOLD_MAX_MS), "10s");
 });
 
 test("model status reads as progress, not as a state name", () => {

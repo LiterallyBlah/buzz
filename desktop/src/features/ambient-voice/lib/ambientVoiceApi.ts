@@ -135,6 +135,19 @@ export type AmbientVoiceSettings = {
   stt: SpeechBackendSettings;
   /** Where the agent's replies are turned into speech. */
   tts: SpeechBackendSettings;
+  /**
+   * How long a pause must last before it ends what you are saying.
+   *
+   * Read with a serde default on the native side, so a settings file written
+   * before this existed loads `SILENCE_HOLD_DEFAULT_MS` rather than zero.
+   */
+  silenceHoldMs: number;
+  /**
+   * Optional phrase that ends a capture the moment it is heard. `null` — and a
+   * blank string — mean none is armed. It goes onto the same keyword spotter as
+   * the wake word, so it is held to the same validation.
+   */
+  stopPhrase: string | null;
   inputDeviceId: string | null;
   outputDevice: string | null;
   /**

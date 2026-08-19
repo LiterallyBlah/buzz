@@ -31,6 +31,8 @@ const SETTINGS = {
   ],
   stt: { backend: "local", endpointUrl: null },
   tts: { backend: "local", endpointUrl: null },
+  silenceHoldMs: 800,
+  stopPhrase: null,
   inputDeviceId: null,
   outputDevice: null,
   indicatorPosition: null,
@@ -276,6 +278,161 @@ test("a session that fails after mount is shown here, not left as listening", as
     assert.equal(
       view.getByTestId("ambient-status").textContent,
       "The microphone was disconnected",
+    );
+  });
+});
+
+// ── The pause, and the phrase that skips it ──────────────────────────────────
+
+test("the pause slider renders bound to the stored hold", async () => {
+  await mountSettings(
+    READY_MODELS,
+    async ({ view }) => {
+      const slider = view.getByTestId("ambient-silence-hold");
+      assert.equal(slider.type, "range");
+      assert.equal(slider.min, "300");
+      assert.equal(slider.max, "10000");
+      assert.equal(slider.step, "100");
+      // Bound to the file, not to the default.
+      assert.equal(slider.value, "2500");
+      assert.equal(
+        view.getByTestId("ambient-silence-hold-value").textContent,
+        "2.5s",
+      );
+    },
+    { settings: { ...SETTINGS, silenceHoldMs: 2500 } },
+  );
+});
+
+test("a settings file with no stored hold shows the default rather than zero", async () => {
+  // What every existing install looks like: the key was added after this
+  // feature shipped, and the native side answers with its serde default. A
+  // slider that rendered `undefined` would post a broken value back on the
+  // first drag.
+  await mountSettings(
+    READY_MODELS,
+    async ({ view }) => {
+      assert.equal(view.getByTestId("ambient-silence-hold").value, "800");
+      assert.equal(
+        view.getByTestId("ambient-silence-hold-value").textContent,
+        "0.8s",
+      );
+    },
+    { settings: { ...SETTINGS, silenceHoldMs: 800 } },
+  );
+});
+
+test("moving the slider persists the hold once, when it is let go", async () => {
+  // Dragging reports every step. Persisting each one would post a settings
+  // write — and therefore a session restart, at two ONNX model loads — per
+  // pixel, so only the committed value is written.
+  await mountSettings(READY_MODELS, async ({ act, calls, testing, view }) => {
+    const slider = view.getByTestId("ambient-silence-hold");
+
+    await act(() => {
+      testing.fireEvent.change(slider, { target: { value: "1500" } });
+      testing.fireEvent.change(slider, { target: { value: "3200" } });
+    });
+    // The label follows the handle immediately …
+    assert.equal(
+      view.getByTestId("ambient-silence-hold-value").textContent,
+      "3.2s",
+    );
+    // … and nothing has been written yet.
+    assert.equal(
+      calls.filter((call) => call.command === "set_ambient_voice_settings")
+        .length,
+      0,
+    );
+
+    await act(() => {
+      testing.fireEvent.pointerUp(slider);
+    });
+    const saved = calls.filter(
+      (call) => call.command === "set_ambient_voice_settings",
+    );
+    assert.equal(saved.length, 1, "the hold was never persisted");
+    assert.equal(saved[0].args.settings.silenceHoldMs, 3200);
+    // The rest of the payload is carried through untouched.
+    assert.deepEqual(
+      saved[0].args.settings.wakeBindings,
+      SETTINGS.wakeBindings,
+    );
+    assert.equal(saved[0].args.settings.stopPhrase, null);
+  });
+});
+
+test("the stop phrase field renders bound to the stored phrase", async () => {
+  await mountSettings(
+    READY_MODELS,
+    async ({ view }) => {
+      assert.equal(view.getByTestId("ambient-stop-phrase").value, "buzz stop");
+    },
+    { settings: { ...SETTINGS, stopPhrase: "buzz stop" } },
+  );
+});
+
+test("an empty stop phrase field is how the feature is switched off", async () => {
+  await mountSettings(READY_MODELS, async ({ view }) => {
+    assert.equal(view.getByTestId("ambient-stop-phrase").value, "");
+  });
+});
+
+test("a stop phrase typed into the field is saved trimmed", async () => {
+  await mountSettings(READY_MODELS, async ({ act, calls, testing, view }) => {
+    const field = view.getByTestId("ambient-stop-phrase");
+    await act(() => {
+      testing.fireEvent.change(field, { target: { value: "  that's all  " } });
+      testing.fireEvent.blur(field);
+    });
+
+    const saved = calls.filter(
+      (call) => call.command === "set_ambient_voice_settings",
+    );
+    assert.equal(saved.length, 1, "the stop phrase was never persisted");
+    assert.equal(saved[0].args.settings.stopPhrase, "that's all");
+    // And nothing else moved: the hold and the binding are what they were.
+    assert.equal(saved[0].args.settings.silenceHoldMs, 800);
+    assert.deepEqual(
+      saved[0].args.settings.wakeBindings,
+      SETTINGS.wakeBindings,
+    );
+  });
+});
+
+test("clearing the stop phrase writes null rather than an empty string", async () => {
+  // `null` is what an install that never set one has, so clearing has to land
+  // back on the same file rather than on a second representation of "none".
+  await mountSettings(
+    READY_MODELS,
+    async ({ act, calls, testing, view }) => {
+      const field = view.getByTestId("ambient-stop-phrase");
+      await act(() => {
+        testing.fireEvent.change(field, { target: { value: "   " } });
+        testing.fireEvent.blur(field);
+      });
+      const saved = calls.filter(
+        (call) => call.command === "set_ambient_voice_settings",
+      );
+      assert.equal(saved.length, 1);
+      assert.equal(saved[0].args.settings.stopPhrase, null);
+    },
+    { settings: { ...SETTINGS, stopPhrase: "buzz stop" } },
+  );
+});
+
+test("leaving either field untouched writes nothing at all", async () => {
+  // Every write restarts the session. Blurring a field the user only looked at
+  // must not cost them two ONNX model loads.
+  await mountSettings(READY_MODELS, async ({ act, calls, testing, view }) => {
+    await act(() => {
+      testing.fireEvent.blur(view.getByTestId("ambient-stop-phrase"));
+      testing.fireEvent.pointerUp(view.getByTestId("ambient-silence-hold"));
+    });
+    assert.equal(
+      calls.filter((call) => call.command === "set_ambient_voice_settings")
+        .length,
+      0,
     );
   });
 });

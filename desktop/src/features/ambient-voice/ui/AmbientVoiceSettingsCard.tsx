@@ -37,9 +37,15 @@ import {
   ambientLaunchLine,
   ambientModelRows,
   ambientSaveBlock,
+  clampSilenceHoldMs,
   mergeAgentOptions,
   modelStatusLabel,
+  silenceHoldLabel,
   withPrimaryBinding,
+  SILENCE_HOLD_DEFAULT_MS,
+  SILENCE_HOLD_MAX_MS,
+  SILENCE_HOLD_MIN_MS,
+  SILENCE_HOLD_STEP_MS,
   type AmbientAgentOption,
 } from "../lib/ambientSettingsLogic";
 import {
@@ -68,6 +74,14 @@ export function AmbientVoiceSettingsCard() {
   const [models, setModels] = React.useState<AmbientModelStatus | null>(null);
   const [agents, setAgents] = React.useState<AmbientAgentOption[]>([]);
   const [wakeWord, setWakeWord] = React.useState("");
+  const [stopPhrase, setStopPhrase] = React.useState("");
+  // The slider's own position while it is being dragged. Persisting on every
+  // pointer move would post a settings write — and therefore a session restart,
+  // at two ONNX model loads — for each pixel, so the committed value is the one
+  // the user let go of.
+  const [silenceHoldMs, setSilenceHoldMs] = React.useState(
+    SILENCE_HOLD_DEFAULT_MS,
+  );
   const [agentPubkey, setAgentPubkey] = React.useState<string | null>(null);
   const [check, setCheck] = React.useState<WakeWordCheck | null>(null);
   const [error, setError] = React.useState<string | null>(null);
@@ -84,6 +98,8 @@ export function AmbientVoiceSettingsCard() {
         setSettings(loaded);
         const binding = loaded.wakeBindings[0];
         setWakeWord(binding?.wakeWord ?? "");
+        setStopPhrase(loaded.stopPhrase ?? "");
+        setSilenceHoldMs(clampSilenceHoldMs(loaded.silenceHoldMs));
         setAgentPubkey(binding?.agentPubkey ?? null);
       } catch (loadError) {
         if (!disposed) {
@@ -253,6 +269,23 @@ export function AmbientVoiceSettingsCard() {
     );
   }, [settings, block, agentPubkey, wakeWord, persist]);
 
+  /** Write the slider's committed position, if it moved. */
+  const saveSilenceHold = React.useCallback(() => {
+    const next = clampSilenceHoldMs(silenceHoldMs);
+    if (!settings || settings.silenceHoldMs === next) return;
+    void persist({ ...settings, silenceHoldMs: next });
+  }, [persist, settings, silenceHoldMs]);
+
+  const saveStopPhrase = React.useCallback(() => {
+    // Blank means "no stop phrase", which the native side reads from `null`
+    // as readily as from an empty string — but `null` is what an untouched
+    // install has, so writing it back keeps the file identical either way.
+    const trimmed = stopPhrase.trim();
+    const next = trimmed.length === 0 ? null : trimmed;
+    if (!settings || (settings.stopPhrase ?? null) === next) return;
+    void persist({ ...settings, stopPhrase: next });
+  }, [persist, settings, stopPhrase]);
+
   const selectedAgent = agents.find((agent) => agent.pubkey === agentPubkey);
   const audioFlowLine = ambientAudioFlowLine(report);
   const launchLine = ambientLaunchLine(report);
@@ -362,6 +395,64 @@ export function AmbientVoiceSettingsCard() {
               </DropdownMenuRadioGroup>
             </DropdownMenuContent>
           </DropdownMenu>
+        </SettingsOptionRow>
+
+        <SettingsOptionRow>
+          <div className="min-w-0">
+            <p className="text-sm font-medium">
+              Pause before it stops listening
+            </p>
+            <p className="text-sm font-normal text-muted-foreground">
+              How long a silence has to last before Buzz decides you have
+              finished. Longer lets you think mid-sentence without being cut
+              off.
+            </p>
+          </div>
+          <div className="flex w-48 shrink-0 items-center gap-2">
+            <input
+              aria-label="Pause before it stops listening"
+              aria-valuetext={silenceHoldLabel(silenceHoldMs)}
+              className="h-1.5 w-full cursor-pointer appearance-none rounded-full bg-muted accent-foreground"
+              data-testid="ambient-silence-hold"
+              disabled={saving}
+              max={SILENCE_HOLD_MAX_MS}
+              min={SILENCE_HOLD_MIN_MS}
+              // Dragging reports every step; only letting go, tabbing away, or
+              // finishing an arrow-key nudge writes the setting.
+              onBlur={saveSilenceHold}
+              onChange={(event) => setSilenceHoldMs(Number(event.target.value))}
+              onKeyUp={saveSilenceHold}
+              onPointerUp={saveSilenceHold}
+              step={SILENCE_HOLD_STEP_MS}
+              type="range"
+              value={silenceHoldMs}
+            />
+            <span
+              className="w-10 text-right text-xs text-muted-foreground"
+              data-testid="ambient-silence-hold-value"
+            >
+              {silenceHoldLabel(silenceHoldMs)}
+            </span>
+          </div>
+        </SettingsOptionRow>
+
+        <SettingsOptionRow>
+          <div className="min-w-0">
+            <p className="text-sm font-medium">Stop phrase</p>
+            <p className="text-sm font-normal text-muted-foreground">
+              Say this to send what you have said so far without waiting for the
+              pause. The phrase itself is not sent. Leave it empty for none.
+            </p>
+          </div>
+          <Input
+            aria-label="Stop phrase"
+            className="max-w-56"
+            data-testid="ambient-stop-phrase"
+            onBlur={saveStopPhrase}
+            onChange={(event) => setStopPhrase(event.target.value)}
+            placeholder="that's all"
+            value={stopPhrase}
+          />
         </SettingsOptionRow>
 
         <DevicePickerRow
