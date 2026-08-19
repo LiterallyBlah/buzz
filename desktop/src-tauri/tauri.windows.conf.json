@@ -7,5 +7,6 @@
       "binaries/git-credential-nostr",
       "binaries/buzz"
     ]
-  }
+  },
+  "version": "0.5.18-unified.1"
 }

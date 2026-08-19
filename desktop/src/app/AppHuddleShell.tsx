@@ -1,6 +1,10 @@
 import * as React from "react";
 import { AppHuddleBar } from "@/app/AppHuddleBar";
 import * as BuzzTheme from "@/app/BuzzThemeSurfaces";
+import {
+  AmbientVoiceIndicator,
+  AmbientVoiceProvider,
+} from "@/features/ambient-voice";
 import { HuddleProvider, useHuddle } from "@/features/huddle";
 import { HUDDLE_SHORTCUT_EVENT } from "@/shared/lib/keyboard-shortcuts";
 import { RemindMeLaterProvider } from "@/features/reminders/ui/RemindMeLaterProvider";
@@ -65,6 +69,10 @@ export function AppHuddleShell({
       onShowHuddleInMainApp={isRoom ? undefined : onShowHuddleInMainApp}
       onViewHuddleChannel={isRoom ? undefined : onViewHuddleChannel}
     >
+      {/* Inside HuddleProvider so it can see the active huddle, and gated on
+          audio-session ownership so the dedicated huddle window never opens a
+          second microphone. Renders nothing while the flag is off. */}
+      <AmbientVoiceArbitration ownsAudioSession={!isRoom} />
       <HuddleShortcutHandler>
         <RemindMeLaterProvider pubkey={currentPubkey}>
           <div
@@ -104,5 +112,40 @@ export function AppHuddleShell({
         </RemindMeLaterProvider>
       </HuddleShortcutHandler>
     </HuddleProvider>
+  );
+}
+
+/**
+ * Reads the live huddle state and hands it to the ambient session.
+ *
+ * A separate component because `useHuddle` needs a consumer *inside* the
+ * provider. The native side also suspends the ambient session from the huddle
+ * start/join paths — this is the webview half of the same arbitration, and it
+ * is what releases the microphone device rather than merely ignoring its
+ * frames.
+ */
+function AmbientVoiceArbitration({
+  ownsAudioSession,
+}: {
+  ownsAudioSession: boolean;
+}) {
+  const { activeEphemeralChannelId, isStarting } = useHuddle();
+  return (
+    <>
+      <AmbientVoiceProvider
+        activeHuddleChannelId={
+          isStarting ? "starting" : activeEphemeralChannelId
+        }
+        ownsAudioSession={ownsAudioSession}
+      />
+      {/* The indicator renders nothing unless the feature is on and
+          configured. While it is, the OS microphone light is permanently lit,
+          so the app owes the user a visible state and a one-click mute.
+          It positions itself: the pill is draggable and remembers where it was
+          left, so the corner is its own business rather than the shell's. */}
+      {ownsAudioSession ? (
+        <AmbientVoiceIndicator className="pointer-events-auto z-50 max-w-64 bg-background/90 backdrop-blur-sm" />
+      ) : null}
+    </>
   );
 }

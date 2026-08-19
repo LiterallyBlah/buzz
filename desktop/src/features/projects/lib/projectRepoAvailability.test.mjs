@@ -27,6 +27,17 @@ test("classifies authentication failures before generic availability errors", ()
   );
 });
 
+test("classifies the relay's owner-only unbound repository remediation", () => {
+  assert.equal(
+    projectRepoUnavailableReason(
+      new Error(
+        'remote: run: buzz repos bind --id buzz --channel <channel-uuid> — repository "buzz" has no channel binding, so the relay cannot authorize access\nfatal: unable to access repository: The requested URL returned error: 404',
+      ),
+    ),
+    "unbound",
+  );
+});
+
 test("classifies branch and network failures", () => {
   assert.equal(
     projectRepoUnavailableReason(

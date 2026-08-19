@@ -1,9 +1,12 @@
 import type * as React from "react";
 
+import type { AgentEligibilityScope } from "@/features/agents/lib/agentAutocompleteEligibility";
 import type { UserProfileLookup } from "@/features/profile/lib/identity";
 import type { ChannelMember, ChannelType } from "@/shared/api/types";
 
 export type ForumComposerProps = {
+  /** Explicit eligibility for project and other non-standard work surfaces. */
+  agentEligibilityScope?: AgentEligibilityScope;
   channelId?: string | null;
   /** Known channel type for channel-backed composers; omitted uses fail closed. */
   channelType?: ChannelType | null;

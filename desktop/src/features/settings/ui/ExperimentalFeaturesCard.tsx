@@ -1,3 +1,4 @@
+import { setAmbientVoiceEnabled } from "@/features/ambient-voice";
 import { setAgentManagedProfiles } from "@/shared/api/tauri";
 import { desktopFeatures, useFeatureToggle } from "@/shared/features";
 import type { FeatureDefinition } from "@/shared/features";
@@ -31,6 +32,14 @@ function FeatureRow({ feature }: { feature: FeatureDefinition }) {
                 "Failed to apply agent-managed profiles setting:",
                 error,
               );
+            });
+          }
+          if (feature.id === "ambientVoice") {
+            // The flag alone cannot stop a running microphone: the session
+            // lives in the native runtime, so switching the feature off has to
+            // tell it to shut down, not merely hide the UI.
+            void setAmbientVoiceEnabled(value).catch((error) => {
+              console.error("Failed to apply ambient voice setting:", error);
             });
           }
         }}

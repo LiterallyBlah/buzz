@@ -30,6 +30,12 @@
       "name": "Agent-managed profiles",
       "description": "Let agents manage their own relay name and avatar instead of restoring the desktop copy",
       "platforms": ["desktop"]
+    },
+    {
+      "id": "ambientVoice",
+      "name": "Ambient voice",
+      "description": "Hands-free wake-word conversations with agents. While enabled the microphone stays open, so your operating system shows its microphone indicator.",
+      "platforms": ["desktop"]
     }
   ]
 }

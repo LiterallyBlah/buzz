@@ -189,6 +189,57 @@ fn boundary_huddle_stt_blocks_ncryptsec() {
     assert!(crate::huddle::pipeline::sign_and_guard_stt_body(builder, &keys).is_ok());
 }
 
+/// Boundary 9: ambient voice publisher (`ambient_voice/publish.rs`).
+///
+/// The `ambientVoice` preview feature posts transcripts and its kind-48106
+/// guidelines straight to `/events` rather than through the boundary-1 funnel,
+/// so it needs its own guard call — and its own injection test.
+#[test]
+fn boundary_ambient_voice_blocks_ncryptsec() {
+    let keys = nostr::Keys::generate();
+    let channel = uuid::Uuid::new_v4();
+
+    // A transcript carrying key-backup material must never reach the socket.
+    let builder = crate::events::build_message(
+        channel,
+        NCRYPTSEC,
+        None,
+        &[],
+        &[],
+        &[],
+        &[],
+        &[],
+        None,
+        &crate::relay::relay_api_base_url(),
+    )
+    .unwrap();
+    let err =
+        crate::ambient_voice::publish::sign_and_guard_ambient_body(builder, &keys).unwrap_err();
+    assert_guard_error(&err);
+
+    // The guidelines event goes through the same seam.
+    let builder = crate::events::build_voice_guidelines(&channel.to_string(), NCRYPTSEC).unwrap();
+    let err =
+        crate::ambient_voice::publish::sign_and_guard_ambient_body(builder, &keys).unwrap_err();
+    assert_guard_error(&err);
+
+    // Ordinary speech passes through unchanged.
+    let builder = crate::events::build_message(
+        channel,
+        "what is on my calendar",
+        None,
+        &[],
+        &[],
+        &[],
+        &[],
+        &[],
+        None,
+        &crate::relay::relay_api_base_url(),
+    )
+    .unwrap();
+    assert!(crate::ambient_voice::publish::sign_and_guard_ambient_body(builder, &keys).is_ok());
+}
+
 /// Boundary 8: native websocket send loop — the single choke point for all
 /// webview-originated relay websocket frames.
 #[tokio::test]
@@ -268,6 +319,7 @@ const EVENTS_INVENTORY: &[(&str, usize, usize)] = &[
     ("src/commands/team_snapshot.rs", 1, 1),            // boundary 6
     ("src/commands/personas/snapshot/import.rs", 2, 1), // boundary 7 + its in-file injection-test fixture URL
     ("src/native_websocket.rs", 0, 2),                  // boundary 8 (WS frames; no events URL)
+    ("src/ambient_voice/publish.rs", 1, 1),             // boundary 9
     // Test-only fixtures — no production egress, no guard:
     ("src/relay_admission.rs", 1, 0),
     ("src/archive/mod_tests.rs", 1, 0),

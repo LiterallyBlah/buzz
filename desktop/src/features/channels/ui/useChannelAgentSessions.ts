@@ -136,8 +136,6 @@ export function getChannelAgentSessionAgents({
     const normalizedPubkey = normalizePubkey(agent.pubkey);
     const channelIds = agent.channelIds ?? [];
     const channels = agent.channels ?? [];
-    const hasDeclaredChannelScope =
-      channelIds.length > 0 || channels.length > 0;
     const matchesDeclaredChannel =
       channelIds.includes(activeChannelId) ||
       channels.includes(activeChannel.name);
@@ -154,9 +152,19 @@ export function getChannelAgentSessionAgents({
       return true;
     }
 
-    return (
-      !hasDeclaredChannelScope && Boolean(memberPubkeys?.has(normalizedPubkey))
-    );
+    // A relay agent's `channelIds`/`channels` comes from its own kind:10100
+    // directory entry, which is a snapshot taken when the agent last
+    // published: nothing republishes it when the agent is later added to a
+    // channel. So an agent that *is* a member of this channel can be absent
+    // from its own list, and an agent that declares *some* channels is no
+    // more current than one that declares none. Actual membership therefore
+    // stands in for the self-declared list unconditionally — the same
+    // substitution `relayAgentCanRespondInChannel` makes for mentions.
+    //
+    // This widens which agents get a session/activity surface in a channel
+    // they already belong to. It does not widen who an agent will answer:
+    // that is `respond_to`, enforced separately in agent eligibility.
+    return Boolean(memberPubkeys?.has(normalizedPubkey));
   });
 }
 

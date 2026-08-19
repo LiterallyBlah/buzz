@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  deriveProfileChannels,
   parseProfilePanelTab,
   parseProfilePanelView,
   personaManagedAgentUpdate,
@@ -243,4 +244,78 @@ test("profile target identity stays stable while a requested pubkey is canonical
     profilePanelTargetKey(undefined, "requested-persona"),
     "persona:requested-persona",
   );
+});
+
+// ── deriveProfileChannels ───────────────────────────────────────────────────
+
+const AGENT_PUBKEY = "aa".repeat(32);
+
+function channel(id, name, memberPubkeys = []) {
+  return { id, name, memberPubkeys };
+}
+
+function relayAgent(channels, channelIds) {
+  return { pubkey: AGENT_PUBKEY, name: "Fable", channels, channelIds };
+}
+
+test("deriveProfileChannels unions membership into a relay agent's stale list", () => {
+  // The agent's kind:10100 snapshot predates `new-chan`, which it is now a
+  // member of. The tab must show both, not just the self-reported one.
+  const links = deriveProfileChannels(
+    AGENT_PUBKEY,
+    relayAgent(["buzz"], ["chan-buzz"]),
+    undefined,
+    [
+      channel("chan-buzz", "buzz", [AGENT_PUBKEY]),
+      channel("chan-new", "new-chan", [AGENT_PUBKEY]),
+    ],
+  );
+
+  assert.deepEqual(links, [
+    { id: "chan-buzz", name: "buzz" },
+    { id: "chan-new", name: "new-chan" },
+  ]);
+});
+
+test("deriveProfileChannels does not duplicate a channel in both lists", () => {
+  const links = deriveProfileChannels(
+    AGENT_PUBKEY,
+    relayAgent(["buzz"], ["chan-buzz"]),
+    undefined,
+    [channel("chan-buzz", "buzz", [AGENT_PUBKEY])],
+  );
+
+  assert.deepEqual(links, [{ id: "chan-buzz", name: "buzz" }]);
+});
+
+test("deriveProfileChannels keeps a declared channel the viewer cannot see", () => {
+  // The viewer is not in `private-chan`, so it is absent from their channel
+  // list; the agent's own declaration is the only evidence and must survive.
+  const links = deriveProfileChannels(
+    AGENT_PUBKEY,
+    relayAgent(["private-chan"], ["chan-private"]),
+    undefined,
+    [channel("chan-buzz", "buzz", [])],
+  );
+
+  assert.deepEqual(links, [{ id: "chan-private", name: "private-chan" }]);
+});
+
+test("deriveProfileChannels ignores membership for a non-agent pubkey", () => {
+  const links = deriveProfileChannels(AGENT_PUBKEY, undefined, undefined, [
+    channel("chan-buzz", "buzz", [AGENT_PUBKEY]),
+  ]);
+
+  assert.deepEqual(links, []);
+});
+
+test("deriveProfileChannels matches membership case-insensitively", () => {
+  const links = deriveProfileChannels(
+    AGENT_PUBKEY,
+    relayAgent([], []),
+    undefined,
+    [channel("chan-new", "new-chan", [AGENT_PUBKEY.toUpperCase()])],
+  );
+
+  assert.deepEqual(links, [{ id: "chan-new", name: "new-chan" }]);
 });
