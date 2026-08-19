@@ -93,6 +93,7 @@ function baseProps(overrides = {}) {
     onRestartAgent: () => {},
     onStartAgent: () => {},
     onStartPersona: () => {},
+    ownedRelayAgents: [],
     personas: [],
     personasError: null,
     personaFeedbackErrorMessage: null,
