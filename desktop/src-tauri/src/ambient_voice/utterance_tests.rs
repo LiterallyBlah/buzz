@@ -222,7 +222,69 @@ fn the_cap_leaves_room_for_the_pauses_the_hold_allows() {
     assert_eq!(machine.phase(), UtterancePhase::Idle);
 }
 
-// ── Everything the silence hold did not change ───────────────────────────────
+// ── The stop phrase ──────────────────────────────────────────────────────────
+
+#[test]
+fn the_stop_phrase_finalises_the_capture_at_once() {
+    // Said mid-sentence, with the silence hold nowhere near expiring: the point
+    // of the phrase is not waiting for the pause.
+    let mut machine = machine_holding(MAX_SILENCE_HOLD_MS);
+    let now = t0();
+    start_speaking(&mut machine, now);
+    assert_eq!(machine.phase(), UtterancePhase::Capturing);
+    assert_eq!(machine.on_stop_phrase(), FrameOutcome::Decode);
+    assert_eq!(machine.phase(), UtterancePhase::Idle);
+    // And exactly like a silence-close, one wake word still admits only one
+    // utterance: speaking again without waking must not be captured.
+    for outcome in feed(&mut machine, 100, true, false, now) {
+        assert_eq!(outcome, FrameOutcome::Idle);
+    }
+}
+
+#[test]
+fn the_stop_phrase_takes_the_same_exit_as_a_silence_close() {
+    // Too little voice to be worth transcribing is dropped rather than sent,
+    // by the same rule and the same threshold that a silence-close applies.
+    let mut machine = machine_holding(MAX_SILENCE_HOLD_MS);
+    let now = t0();
+    machine.on_wake(now);
+    feed(&mut machine, MIN_VOICED_FRAMES - 1, true, false, now);
+    assert_eq!(machine.on_stop_phrase(), FrameOutcome::Drop);
+    assert_eq!(machine.phase(), UtterancePhase::Idle);
+}
+
+#[test]
+fn the_stop_phrase_is_a_no_op_while_nothing_is_being_captured() {
+    // The dangerous failure: a phrase that woke, armed, or otherwise moved an
+    // idle machine would turn a stop word into a second wake word, and the
+    // microphone is always open.
+    let mut machine = UtteranceMachine::default();
+    let now = t0();
+    assert_eq!(machine.phase(), UtterancePhase::Idle);
+    assert_eq!(machine.on_stop_phrase(), FrameOutcome::Idle);
+    assert_eq!(machine.phase(), UtterancePhase::Idle);
+    // Still deaf afterwards: speech that follows is not captured.
+    for outcome in feed(&mut machine, 50, true, false, now) {
+        assert_eq!(outcome, FrameOutcome::Idle);
+    }
+    assert_eq!(machine.phase(), UtterancePhase::Idle);
+}
+
+#[test]
+fn the_stop_phrase_leaves_an_armed_wake_word_alone() {
+    // Armed is "a wake word fired, nothing said yet". There is no capture to
+    // finalise, and cancelling the window would be a state change on a user who
+    // has not spoken.
+    let mut machine = UtteranceMachine::default();
+    let now = t0();
+    machine.on_wake(now);
+    assert_eq!(machine.on_stop_phrase(), FrameOutcome::Idle);
+    assert_eq!(machine.phase(), UtterancePhase::Armed);
+    assert_eq!(machine.on_frame(true, false, now), FrameOutcome::Buffer);
+    assert_eq!(machine.phase(), UtterancePhase::Capturing);
+}
+
+// ── Everything the two new settings did not change ───────────────────────────
 
 #[test]
 fn a_short_blip_is_dropped_rather_than_transcribed() {

@@ -220,8 +220,17 @@ pub struct AmbientSessionConfig {
     pub stt_endpoint: Option<String>,
     /// Pre-validated, pre-tokenised keyword payload. **Must** come from
     /// [`super::wake_word::WakeWordTokenizer::keywords_buf`] — raw text here
-    /// kills the process.
+    /// kills the process. Carries the wake word and, when one is configured,
+    /// the stop phrase: both are armed on this one spotter.
     pub keywords_buf: String,
+    /// Which of the armed keywords ends a capture rather than starting one, in
+    /// the form the engine reports (see
+    /// [`super::wake_word::engine_keyword`]). `None` when no stop phrase is
+    /// configured, in which case every detection is a wake word.
+    pub stop_keyword: Option<String>,
+    /// The phrase as the user typed it, for trimming it back out of the
+    /// transcript it inevitably ends up in.
+    pub stop_phrase: Option<String>,
     /// How long a pause closes an utterance, in milliseconds.
     pub silence_hold_ms: u32,
     /// Shared with the ambient TTS pipeline: true while it is playing.
@@ -443,6 +452,8 @@ fn ambient_worker(
         stt_model_dir,
         stt_endpoint,
         keywords_buf,
+        stop_keyword,
+        stop_phrase,
         silence_hold_ms,
         tts_active,
         tts_cancel,
@@ -542,6 +553,30 @@ fn ambient_worker(
                     // `start_time` is always 0.00, so the only trustworthy
                     // clock is ours.
                     let now = Instant::now();
+                    if is_stop_keyword(stop_keyword.as_deref(), &keyword) {
+                        // Deliberately none of the wake-word side effects: no
+                        // barge-in, no arming, no `Heard`. Outside a capture
+                        // the machine answers `Idle` and this is a no-op.
+                        eprintln!("buzz-desktop: ambient stop phrase fired ({keyword})");
+                        match machine.on_stop_phrase() {
+                            FrameOutcome::Decode => finish_capture(
+                                &transcriber,
+                                &mut speech_buf,
+                                &transcript_tx,
+                                &status,
+                                stop_phrase.as_deref(),
+                            ),
+                            FrameOutcome::Drop => {
+                                speech_buf.clear();
+                                status.set(current_idle_status(
+                                    &machine,
+                                    tts_active.load(Ordering::Acquire),
+                                ));
+                            }
+                            FrameOutcome::Idle | FrameOutcome::Buffer => {}
+                        }
+                        continue;
+                    }
                     eprintln!("buzz-desktop: ambient wake word fired ({keyword})");
 
                     // Barge-in: stop whatever the agent is saying before the
@@ -576,7 +611,13 @@ fn ambient_worker(
                         }
                         FrameOutcome::Decode => {
                             speech_buf.extend_from_slice(&frame);
-                            finish_capture(&transcriber, &mut speech_buf, &transcript_tx, &status);
+                            finish_capture(
+                                &transcriber,
+                                &mut speech_buf,
+                                &transcript_tx,
+                                &status,
+                                None,
+                            );
                         }
                     }
                 }
@@ -611,15 +652,28 @@ fn current_idle_status(machine: &UtteranceMachine, tts_playing: bool) -> Ambient
     }
 }
 
+/// Whether a detection is the configured stop phrase rather than the wake word.
+///
+/// The engine reports the keyword in its own uppercase, space-joined form, so
+/// the comparison is against [`super::wake_word::engine_keyword`]'s output and
+/// not against what the user typed.
+fn is_stop_keyword(stop_keyword: Option<&str>, fired: &str) -> bool {
+    stop_keyword.is_some_and(|stop| fired.trim().eq_ignore_ascii_case(stop))
+}
+
 /// Transcribe, publish, and clear — the tail every close shares.
+///
+/// `trim` is the stop phrase when one ended this capture, so the phrase the
+/// user said to stop talking is not itself sent to the agent.
 fn finish_capture(
     transcriber: &Transcriber,
     speech_buf: &mut Vec<f32>,
     transcript_tx: &tokio_mpsc::Sender<String>,
     status: &StatusSink,
+    trim: Option<&str>,
 ) {
     status.set(AmbientStatus::Transcribing);
-    let outcome = transcribe(transcriber, speech_buf, transcript_tx);
+    let outcome = transcribe(transcriber, speech_buf, transcript_tx, trim);
     speech_buf.clear();
     status.set(status_after_decode(outcome));
 }
@@ -629,16 +683,22 @@ fn finish_capture(
 /// The error is the transcriber's own — already logged there, and returned
 /// here so the caller can leave it on the indicator. Audio that carried no
 /// words is `Ok`: an utterance the recogniser found nothing in is an ordinary
-/// outcome, not a fault to report.
+/// outcome, not a fault to report. That includes an utterance which was only
+/// the stop phrase, and is therefore empty once trimmed.
 fn transcribe(
     transcriber: &Transcriber,
     speech_buf: &[f32],
     transcript_tx: &tokio_mpsc::Sender<String>,
+    trim: Option<&str>,
 ) -> Result<(), String> {
     if speech_buf.is_empty() {
         return Ok(());
     }
     let text = transcriber.transcribe(speech_buf)?;
+    let text = match trim {
+        Some(stop_phrase) => strip_trailing_phrase(&text, stop_phrase),
+        None => text,
+    };
     if text.is_empty() {
         return Ok(());
     }
@@ -646,6 +706,51 @@ fn transcribe(
         eprintln!("buzz-desktop: ambient transcript channel closed: {error}");
     }
     Ok(())
+}
+
+/// Drop `phrase` from the end of `text`, if that is where it is.
+///
+/// The stop phrase is what *ended* the capture, so its audio is already in the
+/// buffer the recogniser was handed — the spotter only emits a keyword a couple
+/// of trailing blank frames after the phrase finishes. Trimming the audio
+/// instead would need the keyword's position in the buffer, and the engine does
+/// not give one that can be used: `KeywordResult::start_time` is always 0.00,
+/// and `timestamps` are measured from the spotter's last internal reset, which
+/// is a clock this crate would have to shadow and which was measured 0.1–0.2 s
+/// away from the true phrase boundary. Cutting audio on that estimate would
+/// take the user's last word about as often as it took the stop phrase.
+///
+/// Words are compared on their letters and digits alone, so "Buzz, stop." ends
+/// on the same match as "buzz stop", and only a whole-word run at the very end
+/// is removed — a sentence that merely mentions the phrase keeps it.
+fn strip_trailing_phrase(text: &str, phrase: &str) -> String {
+    let phrase_keys: Vec<String> = phrase.split_whitespace().map(word_key).collect();
+    let phrase_keys: Vec<&String> = phrase_keys.iter().filter(|key| !key.is_empty()).collect();
+    if phrase_keys.is_empty() {
+        return text.trim().to_string();
+    }
+    let words: Vec<&str> = text.split_whitespace().collect();
+    if words.len() < phrase_keys.len() {
+        return text.trim().to_string();
+    }
+    let tail = &words[words.len() - phrase_keys.len()..];
+    if !tail
+        .iter()
+        .zip(&phrase_keys)
+        .all(|(word, key)| word_key(word) == **key)
+    {
+        return text.trim().to_string();
+    }
+    words[..words.len() - phrase_keys.len()].join(" ")
+}
+
+/// One spoken word reduced to what two transcriptions of it must share:
+/// uppercase letters and digits, with punctuation dropped.
+fn word_key(word: &str) -> String {
+    word.chars()
+        .filter(|c| c.is_alphanumeric())
+        .flat_map(char::to_uppercase)
+        .collect()
 }
 
 /// Keep draining until shutdown so a dead worker cannot back-pressure the

@@ -124,6 +124,75 @@ fn an_utterance_that_could_not_be_transcribed_stays_on_the_indicator() {
     assert_eq!(status_after_decode(Ok(())), AmbientStatus::Listening);
 }
 
+// ── Telling the two armed keywords apart ─────────────────────────────────────
+
+#[test]
+fn only_the_configured_stop_phrase_reads_as_a_stop() {
+    // The engine reports keywords in its own uppercase, space-joined form
+    // (measured: `KeywordResult::keyword` came back as "LOVELY CHILD" for a
+    // phrase typed "lovely child"), so the comparison is against that form.
+    let stop = crate::ambient_voice::wake_word::engine_keyword("  buzz   Stop  ");
+    assert_eq!(stop, "BUZZ STOP");
+    assert!(is_stop_keyword(Some(&stop), "BUZZ STOP"));
+    assert!(is_stop_keyword(Some(&stop), "buzz stop"));
+    // The wake word firing on the same spotter must not be mistaken for it.
+    assert!(!is_stop_keyword(Some(&stop), "HEY HERMES"));
+    // With no stop phrase configured every detection is a wake word.
+    assert!(!is_stop_keyword(None, "BUZZ STOP"));
+}
+
+// ── Trimming the stop phrase back out of the transcript ──────────────────────
+
+#[test]
+fn the_stop_phrase_is_trimmed_off_the_end_of_the_transcript() {
+    // It is what ended the capture, so it is in the audio the recogniser was
+    // given. Sending it to the agent would mean every hands-free message
+    // finished with the words the user said to stop talking.
+    assert_eq!(
+        strip_trailing_phrase("remind me to buy milk buzz stop", "buzz stop"),
+        "remind me to buy milk"
+    );
+    // Casing and punctuation are the recogniser's to choose, not the user's.
+    assert_eq!(
+        strip_trailing_phrase("Remind me to buy milk. Buzz, stop.", "buzz stop"),
+        "Remind me to buy milk."
+    );
+    assert_eq!(
+        strip_trailing_phrase("  remind me   BUZZ STOP  ", "  Buzz   Stop "),
+        "remind me"
+    );
+}
+
+#[test]
+fn an_utterance_that_was_only_the_stop_phrase_leaves_nothing_to_send() {
+    assert_eq!(strip_trailing_phrase("buzz stop", "buzz stop"), "");
+}
+
+#[test]
+fn a_transcript_that_merely_mentions_the_phrase_keeps_it() {
+    // Only a whole-word run at the very end is removed. Anything else would
+    // quietly edit the user's message.
+    assert_eq!(
+        strip_trailing_phrase("buzz stop asking me that", "buzz stop"),
+        "buzz stop asking me that"
+    );
+    assert_eq!(
+        strip_trailing_phrase("tell me when to stop", "buzz stop"),
+        "tell me when to stop"
+    );
+    // A partial match at the end is not a match.
+    assert_eq!(strip_trailing_phrase("stop", "buzz stop"), "stop");
+}
+
+#[test]
+fn a_transcript_closed_by_silence_is_never_trimmed() {
+    // The trim only applies to the close that put the phrase in the buffer.
+    // `None` here is the silence-close and the cap, which have no phrase to
+    // remove and must not lose the user's last words to one.
+    assert_eq!(strip_trailing_phrase("buzz stop", ""), "buzz stop");
+    assert_eq!(strip_trailing_phrase("buzz stop", "   "), "buzz stop");
+}
+
 // ── Status announcements ─────────────────────────────────────────────────────
 
 /// A shared, thread-safe list of the statuses a notifier was handed.
@@ -201,6 +270,8 @@ fn the_worker_announces_the_transitions_it_makes() {
         stt_model_dir: dir.path().to_path_buf(),
         stt_endpoint: None,
         keywords_buf: "\u{2581}HE Y\n".to_string(),
+        stop_keyword: None,
+        stop_phrase: None,
         silence_hold_ms: super::super::utterance::DEFAULT_SILENCE_HOLD_MS,
         tts_active: Arc::new(AtomicBool::new(false)),
         tts_cancel: Arc::new(AtomicBool::new(false)),
@@ -243,6 +314,8 @@ fn the_worker_stamps_the_audio_it_takes_off_the_queue() {
         stt_model_dir: dir.path().to_path_buf(),
         stt_endpoint: None,
         keywords_buf: "\u{2581}HE Y\n".to_string(),
+        stop_keyword: None,
+        stop_phrase: None,
         silence_hold_ms: super::super::utterance::DEFAULT_SILENCE_HOLD_MS,
         tts_active: Arc::new(AtomicBool::new(false)),
         tts_cancel: Arc::new(AtomicBool::new(false)),
@@ -342,6 +415,43 @@ fn a_wake_word_that_is_not_spoken_does_not_fire() {
         &model_dir.join("test_wavs/0.wav"),
     );
     assert!(fired.is_empty(), "unexpected detections: {fired:?}");
+}
+
+#[test]
+#[ignore = "needs the downloaded KWS model; set BUZZ_AMBIENT_KWS_MODEL_DIR"]
+fn a_wake_word_and_a_stop_phrase_both_fire_from_one_spotter() {
+    // The stop phrase is armed beside the wake word on the *same* spotter
+    // session rather than on a second engine — a second spotter would be a
+    // second ONNX model load and a second copy of every frame. This is the
+    // check that one engine really does answer for both: 1.wav says "lovely
+    // child" and, later, "for ever", and both come back distinguishable by
+    // `KeywordResult::keyword` alone. A third armed phrase that is not spoken
+    // in this fixture is the control against "everything fires".
+    let model_dir = model_dir_from_env();
+    let fired = detections_for(
+        &model_dir,
+        &["lovely child", "for ever", "light up"],
+        &model_dir.join("test_wavs/1.wav"),
+    );
+    assert!(
+        fired.iter().any(|k| k.eq_ignore_ascii_case("LOVELY CHILD")),
+        "the wake word did not fire: {fired:?}"
+    );
+    assert!(
+        fired.iter().any(|k| k.eq_ignore_ascii_case("FOR EVER")),
+        "the second armed keyword did not fire: {fired:?}"
+    );
+    assert!(
+        !fired.iter().any(|k| k.eq_ignore_ascii_case("LIGHT UP")),
+        "an armed keyword that was never spoken fired: {fired:?}"
+    );
+    // And the form the worker matches on is the form the engine reports.
+    for keyword in &fired {
+        assert_eq!(
+            keyword.trim(),
+            crate::ambient_voice::wake_word::engine_keyword(keyword)
+        );
+    }
 }
 
 #[test]

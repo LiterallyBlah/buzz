@@ -28,6 +28,9 @@ fn defaults_are_off_with_no_wake_word() {
     assert_eq!(settings.stt.backend, SpeechBackend::Local);
     assert_eq!(settings.tts.backend, SpeechBackend::Local);
     assert_eq!(settings.silence_hold_ms, DEFAULT_SILENCE_HOLD_MS);
+    // No stop phrase by default: the second keyword is opt-in, like the first.
+    assert!(settings.stop_phrase.is_none());
+    assert!(settings.armed_stop_phrase().is_none());
     assert!(settings.input_device_id.is_none());
     assert!(settings.output_device.is_none());
     // No stored indicator position: the frontend's default corner applies
@@ -57,6 +60,7 @@ fn settings_survive_a_save_load_round_trip() {
         stt: SpeechBackendSettings::default(),
         tts: SpeechBackendSettings::default(),
         silence_hold_ms: 2_500,
+        stop_phrase: Some("buzz stop".to_string()),
         input_device_id: Some("mic-abc".to_string()),
         output_device: Some("Speakers (Realtek)".to_string()),
         indicator_position: Some(IndicatorPosition {
@@ -150,9 +154,9 @@ fn the_persisted_file_uses_the_documented_camel_case_schema() {
     assert_eq!(value["inputDeviceId"], "mic-abc");
 }
 
-// ── The silence hold ─────────────────────────────────────────────────────────
+// ── The silence hold and the stop phrase ─────────────────────────────────────
 
-/// A v1 file exactly as builds before this setting existed wrote it.
+/// A v1 file exactly as builds before these two settings existed wrote it.
 fn legacy_file() -> String {
     format!(
         r#"{{"version":1,"enabled":true,"muted":false,
@@ -183,19 +187,21 @@ fn a_file_written_before_these_settings_existed_gets_the_defaults() {
     // stored key, no breakage, and the documented default rather than a zero.
     let value = reloaded_json(&legacy_file());
     assert_eq!(value["silenceHoldMs"], 800);
+    assert!(value["stopPhrase"].is_null());
     // And nothing the file did carry was lost on the way through.
     assert_eq!(value["wakeBindings"][0]["wakeWord"], "hey hermes");
     assert_eq!(value["enabled"], true);
 }
 
 #[test]
-fn a_chosen_hold_survives_a_restart() {
+fn a_chosen_hold_and_stop_phrase_survive_a_restart() {
     let value = reloaded_json(&format!(
         r#"{{"version":1,"enabled":true,
             "wakeBindings":[{{"wakeWord":"hey hermes","agentPubkey":"{AGENT}"}}],
-            "silenceHoldMs":2500}}"#
+            "silenceHoldMs":2500,"stopPhrase":"buzz stop"}}"#
     ));
     assert_eq!(value["silenceHoldMs"], 2500);
+    assert_eq!(value["stopPhrase"], "buzz stop");
 }
 
 #[test]
@@ -226,6 +232,74 @@ fn a_hold_no_slider_could_produce_is_clamped_on_load_and_refused_on_save() {
         .expect_err("out-of-range hold");
         assert!(error.contains("between 0.3 and 10 seconds"), "{error}");
     }
+}
+
+#[test]
+fn a_blank_stop_phrase_arms_nothing() {
+    // The field is written as the user types. Half a word must not become a
+    // keyword, and an empty one is "switched off" rather than an error.
+    for stored in [None, Some(String::new()), Some("   ".to_string())] {
+        let settings = AmbientVoiceSettings {
+            stop_phrase: stored.clone(),
+            ..AmbientVoiceSettings::default()
+        };
+        assert!(
+            settings.armed_stop_phrase().is_none(),
+            "{stored:?} armed a keyword"
+        );
+    }
+    let typed = AmbientVoiceSettings {
+        stop_phrase: Some("  buzz stop  ".to_string()),
+        ..AmbientVoiceSettings::default()
+    };
+    assert_eq!(typed.armed_stop_phrase(), Some("buzz stop"));
+}
+
+#[test]
+fn saving_refuses_a_stop_phrase_the_spotter_could_not_arm() {
+    // It is armed on the same spotter as the wake word, and a phrase the model
+    // cannot encode terminates the process rather than erroring. The same gate,
+    // therefore, and one more: a stop phrase equal to the wake word would arm
+    // one keyword twice with no answer to which job a detection is doing.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join(SETTINGS_FILE);
+    for (phrase, expected) in [
+        ("the", "fire constantly"),
+        ("x", "at least"),
+        ("hey hermes", "different from the wake word"),
+        ("HEY   HERMES", "different from the wake word"),
+    ] {
+        let settings = AmbientVoiceSettings {
+            enabled: true,
+            wake_bindings: vec![binding()],
+            stop_phrase: Some(phrase.to_string()),
+            ..AmbientVoiceSettings::default()
+        };
+        let error = save_to_path(&path, &settings).expect_err(phrase);
+        assert!(error.contains(expected), "{phrase}: {error}");
+    }
+    let too_long = AmbientVoiceSettings {
+        enabled: true,
+        wake_bindings: vec![binding()],
+        stop_phrase: Some("x".repeat(MAX_WAKE_WORD_CHARS + 1)),
+        ..AmbientVoiceSettings::default()
+    };
+    assert!(save_to_path(&path, &too_long)
+        .expect_err("over-long stop phrase")
+        .contains("too long"));
+}
+
+#[test]
+fn an_unusable_stop_phrase_is_dropped_on_load_rather_than_armed() {
+    // A hand-edited file must cost the user one setting, not the whole file —
+    // and must never hand the engine a phrase that would kill the process.
+    let value = reloaded_json(&format!(
+        r#"{{"version":1,"enabled":true,
+            "wakeBindings":[{{"wakeWord":"hey hermes","agentPubkey":"{AGENT}"}}],
+            "stopPhrase":"the"}}"#
+    ));
+    assert!(value["stopPhrase"].is_null());
+    assert_eq!(value["wakeBindings"][0]["wakeWord"], "hey hermes");
 }
 
 #[test]

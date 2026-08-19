@@ -201,6 +201,10 @@ struct SessionConfig {
     /// How long a pause closes an utterance. The capture machine derives both
     /// of its limits from this once, when the worker thread starts.
     silence_hold_ms: u32,
+    /// The phrase that ends a capture, armed on the same spotter as the wake
+    /// word — so adding, changing or clearing it is a new keyword set, which
+    /// only exists at construction.
+    stop_phrase: Option<String>,
 }
 
 impl SessionConfig {
@@ -212,6 +216,7 @@ impl SessionConfig {
             stt: settings.stt.clone(),
             tts: settings.tts.clone(),
             silence_hold_ms: settings.silence_hold_ms,
+            stop_phrase: settings.armed_stop_phrase().map(str::to_string),
         }
     }
 }
@@ -623,11 +628,24 @@ async fn start_session(state: &AppState, settings: &AmbientVoiceSettings) -> Res
         "the speech-to-text model is still downloading — ambient voice will start when it is ready",
     )?;
 
-    // Strict validation, always, before anything reaches the engine.
+    // Strict validation, always, before anything reaches the engine — for the
+    // stop phrase exactly as for the wake word, since both are armed on the one
+    // spotter and either can kill the process.
     let tokenizer = WakeWordTokenizer::load(&kws_dir)?;
+    let stop_phrase = settings
+        .armed_stop_phrase()
+        // A stop phrase equal to the wake word would arm one keyword twice and
+        // leave no answer to which job a detection is doing. Saving one is
+        // refused; a file that carries one anyway simply does not arm it.
+        .filter(|phrase| {
+            wake_word::engine_keyword(phrase) != wake_word::engine_keyword(&binding.wake_word)
+        })
+        .map(str::to_string);
+    let mut phrases = vec![binding.wake_word.clone()];
+    phrases.extend(stop_phrase.clone());
     let keywords_buf = tokenizer
-        .keywords_buf(std::slice::from_ref(&binding.wake_word))
-        .map_err(|(phrase, error)| format!("wake word \"{phrase}\" cannot be used: {error}"))?;
+        .keywords_buf(&phrases)
+        .map_err(|(phrase, error)| format!("the phrase \"{phrase}\" cannot be used: {error}"))?;
 
     let destination_channel =
         publish::resolve_destination(state, &binding.agent_pubkey, binding.destination.as_deref())
@@ -643,6 +661,8 @@ async fn start_session(state: &AppState, settings: &AmbientVoiceSettings) -> Res
         stt_model_dir: stt_dir,
         stt_endpoint: settings.stt.http_base_url().map(str::to_string),
         keywords_buf,
+        stop_keyword: stop_phrase.as_deref().map(wake_word::engine_keyword),
+        stop_phrase,
         silence_hold_ms: settings.silence_hold_ms,
         tts_active: Arc::clone(&ambient.tts_active),
         tts_cancel: Arc::clone(&ambient.tts_cancel),

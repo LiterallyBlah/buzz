@@ -24,16 +24,18 @@
 //!            "endpointUrl": null },        // base URL when "http"
 //!   "tts": { "backend": "local", "endpointUrl": null },
 //!   "silenceHoldMs": 800,        // pause that closes an utterance
+//!   "stopPhrase": null,          // null/blank → no stop phrase is armed
 //!   "inputDeviceId": null,
 //!   "outputDevice": null,
 //!   "indicatorPosition": null    // null → the frontend's default corner
 //! }
 //! ```
 //!
-//! `silenceHoldMs` was added after v1 shipped and is read with a serde default
-//! rather than a version bump: an install without the key gets the default
-//! hold, which is exactly the pause it was already using. A version bump would
-//! have made every existing file unreadable to the build that wrote it.
+//! `silenceHoldMs` and `stopPhrase` were added after v1 shipped and are read
+//! with serde defaults rather than a version bump: an install with neither key
+//! gets the default hold and no stop phrase, which is exactly what it was
+//! already doing. A version bump would have made every existing file
+//! unreadable to the build that wrote it.
 //!
 //! `wakeBindings` is a LIST in v1 even though M1's runtime and UI use exactly
 //! one binding. Keeping the list shape now means per-agent wake words (M2)
@@ -47,7 +49,7 @@ use tauri::{AppHandle, Manager};
 use crate::managed_agents::storage::atomic_write_json_restricted;
 
 use super::utterance::{DEFAULT_SILENCE_HOLD_MS, MAX_SILENCE_HOLD_MS, MIN_SILENCE_HOLD_MS};
-use super::wake_word::{validate_wake_word, WakeWordError, MAX_WAKE_WORD_CHARS};
+use super::wake_word::{engine_keyword, validate_wake_word, WakeWordError, MAX_WAKE_WORD_CHARS};
 
 pub(crate) const SETTINGS_FILE: &str = "ambient-voice-settings.json";
 pub(crate) const CURRENT_VERSION: u32 = 1;
@@ -175,6 +177,15 @@ pub struct AmbientVoiceSettings {
     /// the capture machine for a hold it will not honour.
     #[serde(default = "default_silence_hold_ms")]
     pub silence_hold_ms: u32,
+    /// Optional phrase that ends a capture the moment it is heard. `None`, and
+    /// a blank string, both mean none is armed.
+    ///
+    /// It is armed as a second keyword on the same spotter as the wake word, so
+    /// it is held to exactly the same validation: a phrase the model cannot
+    /// encode terminates the process rather than erroring (see
+    /// [`super::wake_word`]).
+    #[serde(default)]
+    pub stop_phrase: Option<String>,
     /// Persisted `getUserMedia` input device id. Closes the existing gap where
     /// huddle device choices do not survive restart.
     #[serde(default)]
@@ -199,6 +210,7 @@ impl Default for AmbientVoiceSettings {
             stt: SpeechBackendSettings::default(),
             tts: SpeechBackendSettings::default(),
             silence_hold_ms: DEFAULT_SILENCE_HOLD_MS,
+            stop_phrase: None,
             input_device_id: None,
             output_device: None,
             indicator_position: None,
@@ -219,6 +231,18 @@ impl AmbientVoiceSettings {
     /// unused.
     pub fn primary_binding(&self) -> Option<&WakeBinding> {
         self.wake_bindings.first()
+    }
+
+    /// The stop phrase to arm, or `None` when the feature is switched off.
+    ///
+    /// A blank field reads as "switched off" rather than as an error for the
+    /// same reason a blank speech URL does: it is written as the user types,
+    /// and half a word must not become a keyword.
+    pub fn armed_stop_phrase(&self) -> Option<&str> {
+        self.stop_phrase
+            .as_deref()
+            .map(str::trim)
+            .filter(|phrase| !phrase.is_empty())
     }
 
     /// Whether the runtime has everything it needs to arm the spotter.
@@ -258,6 +282,33 @@ pub(crate) fn validate_binding_shape(binding: &WakeBinding) -> Result<(), String
         if uuid::Uuid::parse_str(destination).is_err() {
             return Err("Destination must be a channel id".to_string());
         }
+    }
+    Ok(())
+}
+
+/// Validate the stop phrase for persistence.
+///
+/// It reaches the keyword spotter beside the wake word, so it passes the same
+/// checks — and one more: a stop phrase identical to the wake word would arm
+/// the same keyword twice, and there would be no answer to which of the two
+/// jobs a detection was doing.
+pub(crate) fn validate_stop_phrase(settings: &AmbientVoiceSettings) -> Result<(), String> {
+    let Some(phrase) = settings.armed_stop_phrase() else {
+        return Ok(());
+    };
+    if phrase.chars().count() > MAX_WAKE_WORD_CHARS {
+        return Err(format!(
+            "Stop phrase is too long (max {MAX_WAKE_WORD_CHARS} characters)"
+        ));
+    }
+    // Named, because the shared validator's words are about the phrase and not
+    // about which field it came from, and this file has two phrase fields.
+    validate_wake_word(phrase).map_err(|error: WakeWordError| format!("Stop phrase: {error}"))?;
+    let clashes = settings
+        .primary_binding()
+        .is_some_and(|binding| engine_keyword(&binding.wake_word) == engine_keyword(phrase));
+    if clashes {
+        return Err("The stop phrase must be different from the wake word".to_string());
     }
     Ok(())
 }
@@ -304,6 +355,12 @@ pub(crate) fn load_from_path(path: &Path) -> Result<AmbientVoiceSettings, String
         .retain(|binding| validate_binding_shape(binding).is_ok());
     settings.wake_bindings.truncate(MAX_WAKE_BINDINGS);
 
+    // Same forgiveness, for the same reason: a stop phrase the spotter could
+    // not be given must never reach it, and dropping it costs the user one
+    // setting rather than the whole file.
+    if validate_stop_phrase(&settings).is_err() {
+        settings.stop_phrase = None;
+    }
     settings.silence_hold_ms = settings
         .silence_hold_ms
         .clamp(MIN_SILENCE_HOLD_MS, MAX_SILENCE_HOLD_MS);
@@ -360,6 +417,7 @@ pub(crate) fn save_to_path(path: &Path, settings: &AmbientVoiceSettings) -> Resu
     for binding in &settings.wake_bindings {
         validate_binding_shape(binding)?;
     }
+    validate_stop_phrase(settings)?;
     if !(MIN_SILENCE_HOLD_MS..=MAX_SILENCE_HOLD_MS).contains(&settings.silence_hold_ms) {
         return Err(format!(
             "The pause before Buzz stops listening must be between \

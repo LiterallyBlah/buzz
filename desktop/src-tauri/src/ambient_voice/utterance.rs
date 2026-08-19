@@ -10,8 +10,9 @@
 //!   Idle ──────────────────────► Armed ──── speech starts ───► Capturing
 //!    ▲                             │                               │
 //!    │                             │ nothing said in ARM_TIMEOUT   │ the silence
-//!    │                             ▼                               │ hold or the cap
-//!    └───────────── Drop ──────────┴───────────── Decode ──────────┘
+//!    │                             ▼                               │ hold, the cap,
+//!    └───────────── Drop ──────────┴───────────── Decode ──────────┘ or the stop
+//!                                                                     phrase
 //! ```
 //!
 //! ## Barge-in and echo gating are both honoured here
@@ -220,6 +221,30 @@ impl UtteranceMachine {
         self.voiced_frames = 0;
         self.buffered_samples = 0;
         had_buffer
+    }
+
+    /// The stop phrase fired. Close whatever is being captured, right now.
+    ///
+    /// Takes the same exit as a silence-close — `Decode` when enough of the
+    /// utterance was voice, `Drop` when it was not — so the caller has one
+    /// downstream path rather than two.
+    ///
+    /// Outside `Capturing` this changes nothing at all and reports `Idle`.
+    /// `Idle` is where the machine spends almost all its time and a phrase
+    /// heard there must never wake or arm it; `Armed` has heard a wake word but
+    /// has nothing captured to close, and cancelling it would be the same kind
+    /// of state change on a user who has not spoken yet.
+    pub fn on_stop_phrase(&mut self) -> FrameOutcome {
+        if self.phase != UtterancePhase::Capturing {
+            return FrameOutcome::Idle;
+        }
+        let enough_voice = self.voiced_frames >= MIN_VOICED_FRAMES;
+        self.reset();
+        if enough_voice {
+            FrameOutcome::Decode
+        } else {
+            FrameOutcome::Drop
+        }
     }
 
     /// Abandon whatever is in flight and return to `Idle`.
