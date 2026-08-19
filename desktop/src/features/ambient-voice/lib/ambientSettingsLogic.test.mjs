@@ -41,7 +41,7 @@ test("a channel bot with no name falls back to a readable pubkey stub", () => {
     [],
     [{ pubkey: "f".repeat(64), name: "  " }],
   );
-  assert.equal(option.name, "ffffffff…");
+  assert.equal(option.name, "ffffffff…ffff");
 });
 
 test("an unchecked wake word is never saveable", () => {

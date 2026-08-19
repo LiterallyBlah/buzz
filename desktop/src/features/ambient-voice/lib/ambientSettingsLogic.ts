@@ -6,6 +6,7 @@ import type {
   WakeBinding,
   WakeWordCheck,
 } from "./ambientVoiceApi";
+import { truncatePubkey } from "@/shared/lib/pubkey";
 
 /** Agent as offered by the picker, from either source. */
 export type AmbientAgentOption = {
@@ -52,7 +53,7 @@ export function mergeAgentOptions(
     seen.add(bot.pubkey);
     options.push({
       pubkey: bot.pubkey,
-      name: bot.name?.trim() || `${bot.pubkey.slice(0, 8)}…`,
+      name: bot.name?.trim() || truncatePubkey(bot.pubkey),
       source: "channel",
     });
   }
