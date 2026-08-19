@@ -28,12 +28,21 @@ export type ProjectIssue = {
   originAgentName: string | null;
   labels: string[];
   recipients: string[];
+  assignees: string[];
+  assigneeOperationHeads: Record<string, string>;
   status: ProjectIssueStatus;
   statusEventId: string | null;
   statusCreatedAt: number | null;
   updatedAt: number;
   comments: ProjectIssueComment[];
 };
+
+export const ISSUE_ASSIGNMENT_LABEL: "assignment";
+export const ISSUE_UNASSIGNMENT_LABEL: "unassignment";
+export function isProjectIssueAssignmentOperation(
+  event: RelayEvent,
+  issueId: string,
+): boolean;
 
 export const PROJECT_ISSUE_STATUS: {
   TRIAGE: "Triage";

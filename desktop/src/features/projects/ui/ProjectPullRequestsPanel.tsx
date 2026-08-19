@@ -11,6 +11,7 @@ import * as React from "react";
 import { toast } from "sonner";
 
 import { useIsManagedAgent } from "@/features/agent-memory/hooks";
+import { DiscussedInChannels } from "./DiscussionChannels";
 import { ProjectOriginReference } from "./ProjectOriginReference";
 import { ForumComposer } from "@/features/forum/ui/ForumComposer";
 import { useCreateProjectPullRequestCommentMutation } from "@/features/projects/commentMutations";
@@ -19,6 +20,8 @@ import type {
   ProjectPullRequestCommentAnchor,
   Repository as Project,
 } from "@/features/projects/hooks";
+import { entityDiscussionQuery } from "@/features/projects/lib/discussionChannels";
+import { pullRequestShareLink } from "@/features/projects/lib/projectShareLinks";
 import {
   formatExactTimestamp,
   relativeTime,
@@ -49,6 +52,7 @@ import { ProjectRichContent } from "./ProjectRichContent";
 import { ProjectRootAgentsSection } from "./ProjectRootAgentsSection";
 import { ProjectWorkItemDescription } from "./ProjectWorkItemDescription";
 import { PullRequestReviewersRow } from "./PullRequestReviewersRow";
+import { ShareLinkButton } from "./ShareLinkButton";
 
 function pluralize(count: number, singular: string, plural = `${singular}s`) {
   return `${count} ${count === 1 ? singular : plural}`;
@@ -186,10 +190,7 @@ function PullRequestCommitRow({
           />
           <span className="truncate">
             <ProfileAuthorName pubkey={author}>{authorLabel}</ProfileAuthorName>{" "}
-            authored{" "}
-            <span title={formatExactTimestamp(createdAt)}>
-              {relativeTime(createdAt)}
-            </span>
+            authored
           </span>
           {branch ? (
             <span className="inline-flex min-w-0 items-center gap-1 rounded-full border border-border/60 px-1.5 py-0.5 font-mono text-2xs">
@@ -203,16 +204,25 @@ function PullRequestCommitRow({
       testId="project-pull-request-commit-row"
       title={message}
       trailing={
-        hash ? (
-          <ProjectFeedRowCluster>
-            <ProjectFeedRowMonoCell
-              label={hash.slice(0, 7)}
-              onClick={openCommit}
-              title={`View commit ${hash.slice(0, 7)}`}
-            />
-            <CopyCommitHashButton hash={hash} />
-          </ProjectFeedRowCluster>
-        ) : undefined
+        <>
+          {hash ? (
+            <ProjectFeedRowCluster>
+              <ProjectFeedRowMonoCell
+                label={hash.slice(0, 7)}
+                onClick={openCommit}
+                title={`View commit ${hash.slice(0, 7)}`}
+              />
+              <CopyCommitHashButton hash={hash} />
+            </ProjectFeedRowCluster>
+          ) : null}
+          <span
+            className="hidden w-20 shrink-0 text-right text-xs text-muted-foreground sm:block"
+            data-testid="project-pull-request-commit-row-date"
+            title={formatExactTimestamp(createdAt)}
+          >
+            {relativeTime(createdAt)}
+          </span>
+        </>
       }
     />
   );
@@ -255,10 +265,7 @@ function PullRequestRow({
             <ProfileAuthorName pubkey={pullRequest.author}>
               {authorLabel}
             </ProfileAuthorName>{" "}
-            created this pull request{" "}
-            <span title={formatExactTimestamp(pullRequest.createdAt)}>
-              {relativeTime(pullRequest.createdAt)}
-            </span>
+            created this pull request
           </span>
           {pullRequest.branchName ? (
             <span className="inline-flex min-w-0 items-center gap-1 rounded-full border border-border/60 px-1.5 py-0.5 font-mono text-2xs">
@@ -309,6 +316,13 @@ function PullRequestRow({
             testId={`pull-request-${pullRequest.id}`}
             title={pullRequest.title}
           />
+          <span
+            className="hidden w-20 shrink-0 text-right text-xs text-muted-foreground sm:block"
+            data-testid="project-pull-request-row-date"
+            title={formatExactTimestamp(pullRequest.createdAt)}
+          >
+            {relativeTime(pullRequest.createdAt)}
+          </span>
         </>
       }
     />
@@ -321,9 +335,11 @@ export type PullRequestPanelMode = "conversation" | "commits" | "checks";
  * card. Status, branches, and dates live in the right-hand meta rail. */
 export function PullRequestDetailHeader({
   profiles,
+  project,
   pullRequest,
 }: {
   profiles?: UserProfileLookup;
+  project?: Project;
   pullRequest: ProjectPullRequest;
 }) {
   const authorLabel = labelForPubkey(pullRequest.author, profiles);
@@ -335,10 +351,34 @@ export function PullRequestDetailHeader({
         <span className="font-normal text-muted-foreground">
           #{pullRequest.id.slice(0, 8)}
         </span>
+        <ShareLinkButton
+          className="ml-1 inline-flex h-7 w-7 align-text-bottom"
+          label="Copy pull request link"
+          link={pullRequestShareLink(pullRequest)}
+          testId="project-pull-request-copy-link"
+        />
+        {project ? (
+          <ProjectItemDeleteMenu
+            author={pullRequest.author}
+            label={`More options for ${pullRequest.title}`}
+            project={project}
+            rootId={pullRequest.id}
+            subject="pull request"
+            targetId={pullRequest.id}
+            testId={`pull-request-detail-${pullRequest.id}`}
+            title={pullRequest.title}
+          />
+        ) : null}
       </h3>
-      <p className="flex items-center gap-1 text-xs font-medium text-muted-foreground">
-        <GitPullRequest className="h-3.5 w-3.5" />
-        <span className="flex min-w-0 items-center gap-1">
+      <p
+        className="flex flex-wrap items-center gap-x-1 gap-y-1 text-xs font-medium text-muted-foreground"
+        data-testid="project-pull-request-detail-metadata"
+      >
+        <GitPullRequest className="h-3.5 w-3.5 shrink-0" />
+        <span
+          className="flex min-w-0 items-center gap-1"
+          data-project-metadata-phrase
+        >
           <AuthorIdentity
             avatarSize="xs"
             profiles={profiles}
@@ -349,7 +389,11 @@ export function PullRequestDetailHeader({
             {authorLabel}
           </ProfileAuthorName>
         </span>
-        <span title={formatExactTimestamp(pullRequest.createdAt)}>
+        <span
+          className="shrink-0 whitespace-nowrap"
+          data-project-metadata-phrase
+          title={formatExactTimestamp(pullRequest.createdAt)}
+        >
           created {relativeTime(pullRequest.createdAt)}
         </span>
         <ProjectOriginReference
@@ -649,6 +693,11 @@ export function ProjectPullRequestDetail({
       ) : null}
 
       <section className="space-y-3 p-4">
+        <DiscussedInChannels
+          entityLabel="this pull request"
+          query={entityDiscussionQuery(pullRequest.id)}
+          testId="pull-request-discussed-in"
+        />
         <PullRequestReviewTimeline
           onOpenInlineComment={onOpenInlineComment}
           onOpenTerminal={onOpenTerminal}

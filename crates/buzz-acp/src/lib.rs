@@ -1855,6 +1855,7 @@ fn handle_relay_observer_control_event(
     owner_pubkey_hex: &str,
     drain: &mut drain::DrainState,
     drain_bound: Duration,
+    event_publisher: RelayEventPublisher,
 ) -> Option<drain::DrainOnset> {
     // Defense-in-depth: verify signature even though the relay already checked.
     if let Err(e) = buzz_core::verify_event(&event) {
@@ -1925,6 +1926,15 @@ fn handle_relay_observer_control_event(
         // and keep serving; new ones honour it. This arm is the reason drain is
         // a new `type` rather than a new kind, tag or subscription — each of
         // which an old binary would have had to be taught to ignore.
+        Some("publish_project_owner_announcements") => {
+            handle_publish_project_owner_announcements_control(
+                &payload,
+                keys,
+                observer,
+                event_publisher,
+            );
+            None
+        }
         _ => {
             tracing::debug!(payload = %payload, "ignoring unknown observer control frame");
             None
@@ -2153,6 +2163,149 @@ fn admit_channel_event(
     queue.push(event)
 }
 
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ProjectOwnerAnnouncementControl {
+    request_id: String,
+    announcements: Vec<ProjectOwnerAnnouncementTemplate>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ProjectOwnerAnnouncementTemplate {
+    kind: u16,
+    content: String,
+    created_at: Option<u64>,
+    tags: Vec<Vec<String>>,
+}
+
+fn handle_publish_project_owner_announcements_control(
+    payload: &serde_json::Value,
+    keys: &nostr::Keys,
+    observer: Option<&observer::ObserverHandle>,
+    publisher: RelayEventPublisher,
+) {
+    let Ok(control) = serde_json::from_value::<ProjectOwnerAnnouncementControl>(payload.clone())
+    else {
+        tracing::warn!("project announcement control frame has an invalid payload");
+        return;
+    };
+    if Uuid::parse_str(&control.request_id).is_err()
+        || control.announcements.is_empty()
+        || control.announcements.len() > 2
+    {
+        tracing::warn!("project announcement control frame has invalid request metadata");
+        return;
+    }
+
+    let keys = keys.clone();
+    let observer = observer.cloned();
+    tokio::spawn(async move {
+        let events = match build_project_owner_announcement_events(control.announcements, &keys) {
+            Ok(events) => events,
+            Err(error) => {
+                emit_project_owner_control_result(
+                    observer.as_ref(),
+                    &control.request_id,
+                    "error",
+                    &[],
+                    Some(error.to_string()),
+                );
+                return;
+            }
+        };
+        let mut published_events = Vec::with_capacity(events.len());
+        for event in events {
+            if let Err(error) = publisher.publish_event(event.clone()).await {
+                emit_project_owner_control_result(
+                    observer.as_ref(),
+                    &control.request_id,
+                    "error",
+                    &published_events,
+                    Some(format!("publish project announcement: {error}")),
+                );
+                return;
+            }
+            published_events.push(event);
+        }
+        emit_project_owner_control_result(
+            observer.as_ref(),
+            &control.request_id,
+            "ok",
+            &published_events,
+            None,
+        );
+    });
+}
+
+fn build_project_owner_announcement_events(
+    announcements: Vec<ProjectOwnerAnnouncementTemplate>,
+    keys: &nostr::Keys,
+) -> Result<Vec<nostr::Event>> {
+    let now = nostr::Timestamp::now().as_secs();
+    announcements
+        .into_iter()
+        .map(|template| {
+            if !matches!(template.kind, 30_617 | 30_621) {
+                anyhow::bail!("unsupported project announcement kind");
+            }
+            if !template.tags.iter().any(|tag| {
+                tag.first().is_some_and(|value| value == "d")
+                    && tag.get(1).is_some_and(|value| !value.trim().is_empty())
+            }) {
+                anyhow::bail!("project announcement is missing its address");
+            }
+            let tags = template
+                .tags
+                .into_iter()
+                .map(|tag| {
+                    nostr::Tag::parse(tag)
+                        .map_err(|error| anyhow::anyhow!("invalid project tag: {error}"))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let created_at = template.created_at.unwrap_or(now);
+            if created_at > now.saturating_add(300) {
+                anyhow::bail!("project announcement timestamp is too far in the future");
+            }
+            nostr::EventBuilder::new(nostr::Kind::Custom(template.kind), template.content)
+                .tags(tags)
+                .custom_created_at(nostr::Timestamp::from(created_at))
+                .sign_with_keys(keys)
+                .map_err(|error| anyhow::anyhow!("sign project announcement: {error}"))
+        })
+        .collect()
+}
+
+fn emit_project_owner_control_result(
+    observer: Option<&observer::ObserverHandle>,
+    request_id: &str,
+    status: &str,
+    events: &[nostr::Event],
+    error: Option<String>,
+) {
+    let Some(observer) = observer else {
+        return;
+    };
+    observer.emit(
+        "control_result",
+        None,
+        &observer::ObserverContext {
+            channel_id: None,
+            session_id: None,
+            turn_id: None,
+            started_at: None,
+            project: None,
+        },
+        serde_json::json!({
+            "type": "publish_project_owner_announcements",
+            "requestId": request_id,
+            "status": status,
+            "events": events,
+            "error": error,
+        }),
+    );
+}
+
 /// Handle a `cancel_turn` control frame: signal the in-flight task to cancel.
 fn handle_cancel_turn_control(
     payload: &serde_json::Value,
@@ -2217,6 +2370,13 @@ fn handle_switch_model_control(
         tracing::warn!("observer switch_model control frame missing modelId");
         return;
     };
+    // Opaque per-pick correlator, echoed on every result frame so the Desktop
+    // can ignore a replayed result for an earlier pick. Optional: absent on
+    // older Desktop clients, in which case the frames simply carry no id.
+    let request_id = payload
+        .get("requestId")
+        .and_then(|value| value.as_str())
+        .map(str::to_string);
 
     // A turn is in flight for this channel iff a task_map entry exists. The
     // agent is moved out of the pool during a turn, so the control oneshot is
@@ -2233,7 +2393,10 @@ fn handle_switch_model_control(
         if signal_in_flight_task(
             pool,
             channel_id,
-            ControlSignal::SwitchModel(model_id.to_string()),
+            ControlSignal::SwitchModel {
+                model_id: model_id.to_string(),
+                request_id: request_id.clone(),
+            },
         ) {
             "sent"
         } else {
@@ -2241,7 +2404,7 @@ fn handle_switch_model_control(
         }
     } else {
         // Idle path: validate against the cached catalog before invalidating.
-        match pool.switch_idle_agent_model(channel_id, model_id) {
+        match pool.switch_idle_agent_model(channel_id, model_id, request_id.clone()) {
             IdleSwitchResult::Switched => "switched",
             IdleSwitchResult::UnsupportedModel => "unsupported_model",
             IdleSwitchResult::NoIdleAgent => "no_active_turn",
@@ -2263,6 +2426,9 @@ fn handle_switch_model_control(
                 "type": "switch_model",
                 "status": status,
                 "modelId": model_id,
+                // Echo the correlator on the immediate ack so a `sent` /
+                // `turn_ending` / idle-path terminal frame matches the pick.
+                "requestId": request_id,
             }),
         );
     }
@@ -2501,6 +2667,33 @@ fn inactivity_expired(
     !bound.is_zero() && !turn_in_flight && now.duration_since(last_activity) >= bound
 }
 
+/// Whether a woken lazy pool may be torn back down to the empty-slot state.
+///
+/// True only when the pool is ready, the idle bound has elapsed with no
+/// dispatched turn or heartbeat in flight and no in-flight prompt tasks, no
+/// work is queued, and no wake/respawn task is running. The queue and task
+/// gates make teardown race-safe with enqueue/wake: an event that landed in
+/// the queue (or a wake/respawn already in flight) blocks this decision, so a
+/// queued batch is never stranded — the caller's next loop iteration will
+/// dispatch or wake it instead.
+#[allow(clippy::too_many_arguments)]
+fn idle_pool_sleep_due(
+    pool_ready: bool,
+    last_activity: tokio::time::Instant,
+    now: tokio::time::Instant,
+    bound: Duration,
+    turn_in_flight: bool,
+    prompt_tasks_in_flight: bool,
+    work_queued: bool,
+    wake_or_respawn_in_flight: bool,
+) -> bool {
+    pool_ready
+        && !work_queued
+        && !prompt_tasks_in_flight
+        && !wake_or_respawn_in_flight
+        && inactivity_expired(last_activity, now, bound, turn_in_flight)
+}
+
 #[cfg(test)]
 mod inactivity_tests {
     use super::*;
@@ -2542,6 +2735,179 @@ mod inactivity_tests {
             Duration::from_secs(60),
             false
         ));
+    }
+}
+
+#[cfg(test)]
+mod idle_pool_sleep_tests {
+    use super::*;
+
+    // The all-clear baseline: pool ready, bound elapsed, nothing busy or
+    // queued. Every negative case below flips exactly one gate off this.
+    fn ready_after_bound() -> (tokio::time::Instant, tokio::time::Instant, Duration) {
+        let started = tokio::time::Instant::now();
+        (
+            started,
+            started + Duration::from_secs(61),
+            Duration::from_secs(60),
+        )
+    }
+
+    #[test]
+    fn sleeps_when_ready_idle_and_quiet() {
+        let (last, now, bound) = ready_after_bound();
+        assert!(idle_pool_sleep_due(
+            true, last, now, bound, false, false, false, false
+        ));
+    }
+
+    #[test]
+    fn zero_bound_never_sleeps() {
+        let (last, now, _) = ready_after_bound();
+        assert!(!idle_pool_sleep_due(
+            true,
+            last,
+            now,
+            Duration::ZERO,
+            false,
+            false,
+            false,
+            false
+        ));
+    }
+
+    #[test]
+    fn not_ready_never_sleeps() {
+        // A still-sleeping (or waking) pool must not "re-sleep".
+        let (last, now, bound) = ready_after_bound();
+        assert!(!idle_pool_sleep_due(
+            false, last, now, bound, false, false, false, false
+        ));
+    }
+
+    #[test]
+    fn active_turn_defers_sleep() {
+        let (last, now, bound) = ready_after_bound();
+        assert!(!idle_pool_sleep_due(
+            true, last, now, bound, true, false, false, false
+        ));
+    }
+
+    #[test]
+    fn in_flight_prompt_task_defers_sleep() {
+        let (last, now, bound) = ready_after_bound();
+        assert!(!idle_pool_sleep_due(
+            true, last, now, bound, false, true, false, false
+        ));
+    }
+
+    #[test]
+    fn queued_work_at_boundary_defers_sleep() {
+        // Enqueue-at-teardown protection: a batch sitting in the queue blocks
+        // teardown so it is never stranded — the loop dispatches it instead.
+        let (last, now, bound) = ready_after_bound();
+        assert!(!idle_pool_sleep_due(
+            true, last, now, bound, false, false, true, false
+        ));
+    }
+
+    #[test]
+    fn wake_or_respawn_in_flight_defers_sleep() {
+        let (last, now, bound) = ready_after_bound();
+        assert!(!idle_pool_sleep_due(
+            true, last, now, bound, false, false, false, true
+        ));
+    }
+
+    #[test]
+    fn recent_activity_defers_sleep() {
+        // Activity 50s ago under a 60s bound: not yet idle.
+        let started = tokio::time::Instant::now();
+        let recent = started + Duration::from_secs(50);
+        let now = started + Duration::from_secs(59);
+        assert!(!idle_pool_sleep_due(
+            true,
+            recent,
+            now,
+            Duration::from_secs(60),
+            false,
+            false,
+            false,
+            false
+        ));
+    }
+
+    fn slot(respawn_in_flight: bool) -> SlotCircuit {
+        SlotCircuit {
+            crash_times: Vec::new(),
+            open_until: None,
+            respawn_in_flight,
+        }
+    }
+
+    // The call-site signal for the `wake_or_respawn_in_flight` gate is
+    // `any_respawn_in_flight(&crash_history)`, NOT `!respawn_tasks.is_empty()`.
+    // Regression for the PR #5682 review blocker: completed respawn tasks are
+    // never joined from the `respawn_tasks` JoinSet (their payloads arrive
+    // out-of-band via `respawn_rx`), so `!is_empty()` stays true forever after
+    // the first refill/crash recovery and the pool could never re-sleep. The
+    // authoritative signal clears per-slot when the payload is received.
+    #[test]
+    fn respawn_in_flight_signal_gates_then_clears_for_sleep() {
+        let (last, now, bound) = ready_after_bound();
+
+        // A respawn in flight for any slot defers sleep.
+        let busy = [slot(false), slot(true), slot(false)];
+        assert!(any_respawn_in_flight(&busy));
+        assert!(!idle_pool_sleep_due(
+            true,
+            last,
+            now,
+            bound,
+            false,
+            false,
+            false,
+            any_respawn_in_flight(&busy),
+        ));
+
+        // Once the respawn completes (payload received → flag cleared), the
+        // signal goes false and the otherwise-quiet pool becomes sleep-eligible
+        // — even though a naive `!JoinSet.is_empty()` would still be stuck true.
+        let quiet = [slot(false), slot(false), slot(false)];
+        assert!(!any_respawn_in_flight(&quiet));
+        assert!(idle_pool_sleep_due(
+            true,
+            last,
+            now,
+            bound,
+            false,
+            false,
+            false,
+            any_respawn_in_flight(&quiet),
+        ));
+    }
+
+    // The reaper (`respawn_tasks.join_next().now_or_never()` loop) must drain
+    // completed handles so the JoinSet does not grow without bound and so
+    // `!respawn_tasks.is_empty()` cannot become a permanent busy bit if anyone
+    // ever reintroduces it as the gate signal.
+    #[tokio::test]
+    async fn completed_respawn_tasks_are_reaped_from_the_joinset() {
+        let mut respawn_tasks: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
+        respawn_tasks.spawn(async {});
+        respawn_tasks.spawn(async {});
+        // Let both tasks run to completion.
+        tokio::task::yield_now().await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        // The reaper drains finished handles non-blockingly.
+        while respawn_tasks.join_next().now_or_never().flatten().is_some() {}
+
+        assert!(
+            respawn_tasks.is_empty(),
+            "completed respawn tasks must be reaped so the set does not wedge \
+             the idle-sleep gate or grow unbounded"
+        );
     }
 }
 
@@ -2776,6 +3142,19 @@ async fn tokio_main() -> Result<()> {
                  project activity will not be published"
             );
         }
+    }
+
+    // Relay `self` pubkey (NIP-11), used to recognize relay-signed workflow
+    // messages in the inbound author gate. Best-effort: `None` simply means
+    // workflow messages get no attributed-author exemption (pre-fix behavior),
+    // so a fetch failure degrades gracefully instead of blocking startup.
+    let relay_self: Option<String> = relay.rest_client().fetch_relay_self().await;
+    match &relay_self {
+        Some(pk) => tracing::info!("relay self pubkey: {pk}"),
+        None => tracing::warn!(
+            "relay self pubkey unavailable (NIP-11 fetch failed or no stable relay key) — \
+             relay-signed workflow messages will be dropped by the author gate"
+        ),
     }
 
     let mut relay_observer_control_rx = None;
@@ -3027,6 +3406,26 @@ async fn tokio_main() -> Result<()> {
     // cut short by the drain that is waiting for it.
     let mut drain = drain::DrainState::open();
     let drain_bound = drain::drain_bound(config.max_turn_duration_secs);
+    // Idle pool re-sleep: tear a woken lazy pool back down to the empty-slot
+    // state after `idle_pool_sleep_bound` of quiet, releasing worker
+    // subprocesses. The next accepted event re-wakes it through the same lazy
+    // path. Only meaningful under `lazy_pool`; the tick arm additionally gates
+    // on `pool_ready`, so a still-sleeping pool never re-sleeps. Reuses the
+    // `last_activity` clock the dispatch path already maintains.
+    let idle_pool_sleep_bound = if config.lazy_pool {
+        Duration::from_secs(config.idle_pool_sleep_secs)
+    } else {
+        Duration::ZERO
+    };
+    let mut idle_pool_sleep_reaper = if idle_pool_sleep_bound.is_zero() {
+        None
+    } else {
+        let interval = idle_pool_sleep_bound.min(Duration::from_secs(30));
+        Some(tokio::time::interval_at(
+            tokio::time::Instant::now() + interval,
+            interval,
+        ))
+    };
 
     // Runs at the TOP of every loop iteration via Instant check — cannot be
     // starved by the biased select. Slot refill spawns background tasks so
@@ -3343,6 +3742,9 @@ async fn tokio_main() -> Result<()> {
                         model_capabilities: None,
                         desired_model: config.model.clone(),
                         model_overridden: false,
+                        desired_model_request_id: None,
+                        desired_model_pending_ack: false,
+                        startup_effort: config.effort_level.clone(),
                         agent_name,
                         goose_system_prompt_supported: None,
                         protocol_version,
@@ -3357,6 +3759,17 @@ async fn tokio_main() -> Result<()> {
                 }
             }
         }
+        // Reap completed respawn handles from the JoinSet. Payloads are
+        // delivered out-of-band through `respawn_rx` (drained above), so the
+        // JoinSet is never joined by the normal flow — Tokio retains finished
+        // tasks until `join_next`, so without this the set grows on every
+        // refill/crash recovery and `!respawn_tasks.is_empty()` would stay true
+        // forever. Non-blocking (`now_or_never`), same pattern as
+        // `drain_ready_join_results` for `pool.join_set`. The authoritative
+        // in-flight signal is `any_respawn_in_flight(&crash_history)` (each
+        // slot's `respawn_in_flight` is cleared when its payload is received),
+        // not JoinSet occupancy.
+        while respawn_tasks.join_next().now_or_never().flatten().is_some() {}
         // Flush requeued events that were waiting for a live agent. Without
         // this, batches requeued during crash recovery sit idle until the
         // next relay event arrives — which can be minutes on quiet channels.
@@ -3465,6 +3878,7 @@ async fn tokio_main() -> Result<()> {
                                     owner_hex,
                                     &mut drain,
                                     drain_bound,
+                                    relay.event_publisher(),
                                 );
                                 if onset == Some(drain::DrainOnset::Started) {
                                     // Telemetry first: NIP-AO consumers project
@@ -3905,7 +4319,31 @@ async fn tokio_main() -> Result<()> {
                             // explicit pubkey list on top, for external people;
                             // it never revokes same-owner team bots.
                             {
-                                let author = buzz_event.event.pubkey.to_hex();
+                                // Relay-signed workflow messages (workflow
+                                // `send_message` actions) are authored by the
+                                // relay keypair, not the workflow owner — the
+                                // plain author gate would drop them and the
+                                // scheduled @mention would silently never wake
+                                // the agent. Gate them on their *attributed*
+                                // author (the `buzz:workflow-owner` tag — the
+                                // pubkey that created the workflow) instead.
+                                // See `workflow_attributed_author`
+                                // for the recognition + trust argument.
+                                let author = match workflow_attributed_author(
+                                    &buzz_event.event,
+                                    relay_self.as_deref(),
+                                ) {
+                                    Some(attributed) => {
+                                        tracing::debug!(
+                                            channel_id = %buzz_event.channel_id,
+                                            relay_author = %buzz_event.event.pubkey.to_hex(),
+                                            attributed_author = %attributed,
+                                            "relay-signed workflow message — gating on attributed author"
+                                        );
+                                        attributed
+                                    }
+                                    None => buzz_event.event.pubkey.to_hex(),
+                                };
                                 // DM hardening: resolve channel type (fail-closed
                                 // to DM) so allowlist/anyone modes cannot be
                                 // exercised by non-owner authors inside DMs.
@@ -4062,6 +4500,56 @@ async fn tokio_main() -> Result<()> {
                             "inactivity bound reached — exiting gracefully"
                         );
                         let _ = shutdown_tx.send(());
+                    }
+                    None
+                }
+                _ = async {
+                    match idle_pool_sleep_reaper.as_mut() {
+                        Some(timer) => timer.tick().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    let _ = result_rx; // end split borrow before touching pool
+                    // A wake in flight (pool not yet ready) is covered by the
+                    // pool_ready gate; respawn tasks and in-flight prompt tasks
+                    // are the remaining "busy" signals. Never sleep mid-work:
+                    // `has_undispatched_work()` (not `has_flushable_work()`)
+                    // keeps `work_queued` true for a retry-throttled batch too,
+                    // so a failed turn awaiting backoff is never stranded — the
+                    // next iteration dispatches or re-wakes it.
+                    if idle_pool_sleep_due(
+                        pool_ready,
+                        last_activity,
+                        tokio::time::Instant::now(),
+                        idle_pool_sleep_bound,
+                        queue.has_in_flight() || heartbeat_in_flight,
+                        !pool.join_set.is_empty(),
+                        queue.has_undispatched_work(),
+                        !wake_tasks.is_empty()
+                            || any_respawn_in_flight(&crash_history),
+                    ) {
+                        tracing::info!(
+                            idle_pool_sleep_seconds = config.idle_pool_sleep_secs,
+                            "idle pool sleep bound reached — tearing pool back to lazy state"
+                        );
+                        shutdown_agent_pool(&mut pool).await;
+                        // Return to the exact pre-wake lazy state: empty slots,
+                        // Listening lifecycle. The top-of-loop wake path re-wakes
+                        // on the next accepted event. No second lifecycle.
+                        pool = AgentPool::from_slots(
+                            (0..config.agents).map(|_| None).collect(),
+                        );
+                        pool_ready = false;
+                        pool_lifecycle = PoolLifecycle::listening();
+                        last_activity = tokio::time::Instant::now();
+                        emit_runtime_lifecycle(
+                            observer.as_ref(),
+                            &runtime_start_nonce,
+                            &pubkey_hex,
+                            &config.relay_url,
+                            "listening",
+                            None,
+                        );
                     }
                     None
                 }
@@ -4287,7 +4775,7 @@ async fn tokio_main() -> Result<()> {
                 //     treat as PromptCompletedNeutral to avoid leaking
                 //     the withheld event in `withheld_native_steer`.
                 let (release_withheld, drop_withheld, signal_fallback) = match &ack {
-                    Ok(pool::SteerAck::Success) => (false, true, false),
+                    Ok(pool::SteerAck::Success { .. }) => (false, true, false),
                     // -32601 = method_not_found: agent does not implement the
                     // steer extension. Fire cancel+merge so the message still
                     // reaches the agent.
@@ -4320,8 +4808,19 @@ async fn tokio_main() -> Result<()> {
                     signal_fallback,
                     "non-cancelling steer ack received"
                 );
-                if matches!(ack, Ok(pool::SteerAck::Success)) {
+                if let Ok(pool::SteerAck::Success { session_id }) = &ack {
                     queue.extend_in_flight_deadline(channel_id, config.max_turn_duration_secs);
+                    if !pool.record_successful_steer(
+                        channel_id,
+                        event_id.clone(),
+                        session_id.clone(),
+                    ) {
+                        tracing::warn!(
+                            channel = %channel_id,
+                            event_id = %event_id,
+                            "successful steer lost its in-flight delivery ledger"
+                        );
+                    }
                 }
                 if drop_withheld {
                     queue.remove_event(channel_id, &event_id);
@@ -5973,6 +6472,90 @@ fn event_mentions_agent(event: &nostr::Event, agent_pubkey_hex: &str) -> bool {
     })
 }
 
+/// If `event` is a relay-signed workflow message, return its *attributed*
+/// author for inbound author gating; otherwise `None`.
+///
+/// Workflow `send_message` actions are signed by the **relay keypair**
+/// (`event.pubkey` = the relay's NIP-11 `self` key), not by the human who owns
+/// the workflow — so the plain author gate would drop them even though they
+/// carry `p` tags meant to wake mentioned agents. The relay attributes the
+/// message to the **workflow owner** (the pubkey that created the workflow,
+/// `workflow.owner_pubkey` relay-side) via the explicit `buzz:workflow-owner`
+/// tag emitted by `workflow_sink.rs`, and it has already verified that owner's
+/// access to the destination channel before emitting the event.
+///
+/// Recognition requires ALL of the following, failing closed otherwise:
+/// 1. kind `9` (stream message) — the only kind the workflow sink emits;
+/// 2. a known, syntactically valid relay `self` pubkey (fetched from NIP-11
+///    at startup) — no `relay_self`, no exemption;
+/// 3. `event.pubkey` == relay `self`, with a **valid event signature**
+///    verified here. The relay verifies signatures on submission, but this
+///    gate re-checks locally so the exemption never rests on an upstream
+///    guarantee it can't see;
+/// 4. **exactly one** tag exactly equal to `["buzz:workflow", "true"]` — no
+///    duplicates, no extra fields, no other value;
+/// 5. **exactly one** tag exactly equal to `["buzz:workflow-owner", <pubkey>]`
+///    where the owner parses as a full pubkey — no duplicates, no extra
+///    fields. Mention `p` tags are never used for attribution, so who is
+///    @mentioned in the message text has no bearing on whose authority the
+///    gate evaluates.
+///
+/// The returned pubkey is gated exactly like a direct author: owner/sibling
+/// under `owner-only`, plus the explicit list under `allowlist`. A workflow
+/// owned by a random channel member therefore still cannot wake an
+/// owner-only agent.
+fn workflow_attributed_author(event: &nostr::Event, relay_self: Option<&str>) -> Option<String> {
+    // 1. Kind gate first — cheapest check, and everything below only makes
+    //    sense for the kind:9 messages the workflow sink emits.
+    if event.kind.as_u16() as u32 != KIND_STREAM_MESSAGE {
+        return None;
+    }
+
+    // 2. Relay identity must be known AND syntactically valid.
+    let relay_self = nostr::PublicKey::from_hex(relay_self?).ok()?;
+    if event.pubkey != relay_self {
+        return None;
+    }
+
+    // 4. Exactly one marker tag, exactly ["buzz:workflow", "true"]. Collect
+    //    every tag with the marker key so duplicates or shape/value mismatches
+    //    (extra fields, wrong value) disqualify instead of being skipped over.
+    let markers: Vec<&[String]> = event
+        .tags
+        .iter()
+        .map(|t| t.as_slice())
+        .filter(|s| s.first().map(|k| k.as_str()) == Some("buzz:workflow"))
+        .collect();
+    if markers.len() != 1 || markers[0] != ["buzz:workflow", "true"] {
+        return None;
+    }
+
+    // 5. Exactly one owner tag, exactly ["buzz:workflow-owner", <pubkey>].
+    //    The owner must parse as a full pubkey — not merely look hex-ish —
+    //    before it is fed into the owner/sibling/allowlist comparison.
+    let owners: Vec<&[String]> = event
+        .tags
+        .iter()
+        .map(|t| t.as_slice())
+        .filter(|s| s.first().map(|k| k.as_str()) == Some("buzz:workflow-owner"))
+        .collect();
+    let [owner_tag] = owners.as_slice() else {
+        return None;
+    };
+    let [_, owner_value] = owner_tag else {
+        return None;
+    };
+    let owner = nostr::PublicKey::from_hex(owner_value).ok()?;
+
+    // 3. Signature check last — it is the most expensive step, so only pay
+    //    for it once every structural requirement has already passed.
+    if event.verify().is_err() {
+        return None;
+    }
+
+    Some(owner.to_hex())
+}
+
 fn is_owner_control_command(
     event: &nostr::Event,
     kind_u32: u32,
@@ -6268,6 +6851,7 @@ fn dispatch_pending(
                 recoverable_batch,
                 control_tx: Some(control_tx),
                 steer_tx,
+                successful_steer_deliveries: HashSet::new(),
             },
         );
         // A typing indicator is a channel-scoped NIP-29 write: it carries an
@@ -6706,9 +7290,30 @@ fn handle_prompt_result(
         .iter()
         .find_map(|(task_id, meta)| (meta.agent_index == agent_index).then_some(*task_id))
         .expect("prompt result has registered task metadata");
+    let successful_steer_deliveries = pool
+        .task_map()
+        .get(&task_id)
+        .map(|meta| meta.successful_steer_deliveries.clone())
+        .unwrap_or_default();
+
     pool.task_map_mut().remove(&task_id);
     let cancel_all_cutoff = pool.take_cancel_all_cutoff(task_id);
     debug_assert_eq!(before, pool.task_map().len() + 1);
+
+    if let PromptSource::Channel(channel_id) = &result.source {
+        // Do not resurrect delivery state for an invalidated session. A
+        // replacement session must receive fresh standing context and history.
+        if let Some(live_session_id) = result.agent.state.sessions.get(channel_id).cloned() {
+            let event_ids = successful_steer_deliveries
+                .into_iter()
+                .filter(|delivery| delivery.session_id == live_session_id)
+                .map(|delivery| delivery.event_id);
+            result
+                .agent
+                .state
+                .mark_channel_delivery_success(*channel_id, false, event_ids);
+        }
+    }
 
     if cancel_all_cutoff {
         if let Some(batch) = result.batch.take() {
@@ -7362,6 +7967,7 @@ fn dispatch_heartbeat(
             recoverable_batch: None,
             control_tx: None,
             steer_tx: None,
+            successful_steer_deliveries: HashSet::new(),
         },
     );
     *heartbeat_in_flight = true;
@@ -9854,6 +10460,9 @@ mod agent_draft_prompt_tests {
     #[test]
     fn shared_base_prompt_teaches_single_command_mentions_and_preflight() {
         let prompt = include_str!("base_prompt.md");
+        assert!(prompt.contains("use the person's **exact display name as shown in Buzz**"));
+        assert!(prompt.contains("Do not expand a short display name, infer a surname"));
+        assert!(prompt.contains("Preserve it exactly; do not infer, expand, or look up a surname"));
         assert!(prompt.contains("--mention <hex-or-npub>"));
         assert!(prompt.contains("every presentation-only name that should notify"));
         assert!(
@@ -9865,6 +10474,18 @@ mod agent_draft_prompt_tests {
         assert!(prompt
             .contains("add them explicitly with `buzz channels add-member` only when authorized"));
         assert!(prompt.contains("never changes membership automatically"));
+    }
+    #[test]
+    fn shared_base_prompt_teaches_repo_context_and_learning_loop() {
+        let prompt = include_str!("base_prompt.md");
+        assert!(prompt.contains("read its root `AGENTS.md`"));
+        assert!(prompt.contains("path-local `AGENTS.md`"));
+        assert!(
+            prompt.contains("product, architecture, and vision documents as design constraints")
+        );
+        assert!(prompt.contains("CI and live workflow evidence answer different questions"));
+        assert!(prompt.contains("record the invariant in the same session"));
+        assert!(prompt.contains("update the team's shared guidance"));
     }
 }
 
@@ -10015,6 +10636,7 @@ struct PoolStartup {
     extra_env: Vec<(String, String)>,
     has_generated_codex_config: bool,
     model: Option<String>,
+    effort_level: Option<String>,
     observer: Option<observer::ObserverHandle>,
 }
 
@@ -10027,6 +10649,7 @@ impl PoolStartup {
             extra_env: config.persona_env_vars.clone(),
             has_generated_codex_config: config.has_generated_codex_config,
             model: config.model.clone(),
+            effort_level: config.effort_level.clone(),
             observer,
         }
     }
@@ -10101,6 +10724,9 @@ async fn initialize_agent_pool(
                             model_capabilities: None,
                             desired_model: startup.model.clone(),
                             model_overridden: false,
+                            desired_model_request_id: None,
+                            desired_model_pending_ack: false,
+                            startup_effort: startup.effort_level.clone(),
                             agent_name,
                             goose_system_prompt_supported: None,
                             protocol_version,
@@ -10554,7 +11180,11 @@ mod heartbeat_base_prompt_tests {
         // protocol_version 1 + Some(base_prompt): heartbeat prompt is prefixed
         // with the [Base] section exactly as the legacy session/new path would.
         let prompt = "[System: Heartbeat]\nrun feed get";
-        let composed = pool::prepend_base_for_legacy(1, Some("you are a helpful agent"), prompt);
+        let standing = queue::StandingContext {
+            base_prompt: Some("you are a helpful agent"),
+            ..Default::default()
+        };
+        let composed = pool::prepend_standing_for_legacy(1, &standing, prompt);
         assert_eq!(
             composed,
             "[Base]\nyou are a helpful agent\n\n[System: Heartbeat]\nrun feed get"
@@ -10567,7 +11197,11 @@ mod heartbeat_base_prompt_tests {
         // protocol_version 2 gets base_prompt via session/new; the heartbeat
         // prompt is sent verbatim.
         let prompt = "[System: Heartbeat]\nrun feed get";
-        let composed = pool::prepend_base_for_legacy(2, Some("you are a helpful agent"), prompt);
+        let standing = queue::StandingContext {
+            base_prompt: Some("you are a helpful agent"),
+            ..Default::default()
+        };
+        let composed = pool::prepend_standing_for_legacy(2, &standing, prompt);
         assert_eq!(composed, prompt);
     }
 }
@@ -10678,6 +11312,7 @@ mod owner_control_command_tests {
                 recoverable_batch: None,
                 control_tx: Some(control_tx),
                 steer_tx: None,
+                successful_steer_deliveries: HashSet::new(),
             },
         );
 
@@ -10756,8 +11391,9 @@ mod drain_control_tests {
     ) -> Option<drain::DrainOnset> {
         let mut pool = AgentPool::from_slots(vec![]);
         let mut queue = EventQueue::new(DedupMode::Queue);
+        let (publisher, _published) = RelayEventPublisher::test_pair();
         handle_relay_observer_control_event(
-            agent, event, &mut pool, &mut queue, None, owner_hex, drain, BOUND,
+            agent, event, &mut pool, &mut queue, None, owner_hex, drain, BOUND, publisher,
         )
     }
 
@@ -10957,6 +11593,7 @@ mod drain_control_tests {
                     recoverable_batch: None,
                     control_tx: Some(tx),
                     steer_tx: None,
+                    successful_steer_deliveries: HashSet::new(),
                 },
             );
             receivers.push(rx);
@@ -11024,8 +11661,8 @@ mod drain_control_tests {
         assert_eq!(ack.payload["queuedEvents"], 0);
     }
 
-    #[test]
-    fn cancel_all_uses_the_same_owner_and_freshness_gate() {
+    #[tokio::test]
+    async fn cancel_all_uses_the_same_owner_and_freshness_gate() {
         let owner = Keys::generate();
         let stranger = Keys::generate();
         let agent = Keys::generate();
@@ -11052,6 +11689,7 @@ mod drain_control_tests {
                 Some(stale),
             ),
         ] {
+            let (publisher, _published) = RelayEventPublisher::test_pair();
             assert_eq!(
                 handle_relay_observer_control_event(
                     &agent,
@@ -11062,6 +11700,7 @@ mod drain_control_tests {
                     &owner.public_key().to_hex(),
                     &mut drain,
                     BOUND,
+                    publisher,
                 ),
                 None
             );
@@ -11073,8 +11712,8 @@ mod drain_control_tests {
         assert!(drain.admits_new_work());
     }
 
-    #[test]
-    fn owner_cancel_all_is_routed_and_acknowledged() {
+    #[tokio::test]
+    async fn owner_cancel_all_is_routed_and_acknowledged() {
         let owner = Keys::generate();
         let agent = Keys::generate();
         let bus = observer::ObserverHandle::in_process();
@@ -11082,6 +11721,7 @@ mod drain_control_tests {
         let mut pool = AgentPool::from_slots(vec![]);
         let mut queue = EventQueue::new(DedupMode::Queue);
         let mut drain = drain::DrainState::open();
+        let (publisher, _published) = RelayEventPublisher::test_pair();
 
         assert_eq!(
             handle_relay_observer_control_event(
@@ -11098,6 +11738,7 @@ mod drain_control_tests {
                 &owner.public_key().to_hex(),
                 &mut drain,
                 BOUND,
+                publisher,
             ),
             None
         );
@@ -11105,6 +11746,56 @@ mod drain_control_tests {
         assert_eq!(ack.payload["type"], "cancel_all");
         assert_eq!(ack.payload["status"], "no_work");
         assert!(drain.admits_new_work(), "cancel_all must not drain or exit");
+    }
+
+    #[tokio::test]
+    async fn owner_announcement_control_does_not_mask_a_later_drain() {
+        let owner = Keys::generate();
+        let agent = Keys::generate();
+        let owner_hex = owner.public_key().to_hex();
+        let mut pool = AgentPool::from_slots(vec![]);
+        let mut queue = EventQueue::new(DedupMode::Queue);
+        let mut drain = drain::DrainState::open();
+        let (publisher, _published) = RelayEventPublisher::test_pair();
+
+        let announcement = control_frame(
+            &owner,
+            &agent,
+            serde_json::json!({
+                "type": "publish_project_owner_announcements",
+                "requestId": "test-request",
+                "announcements": [{
+                    "kind": 30_621,
+                    "content": "",
+                    "tags": [["d", "test-project"]]
+                }]
+            }),
+            None,
+        );
+        assert_eq!(
+            handle_relay_observer_control_event(
+                &agent,
+                announcement,
+                &mut pool,
+                &mut queue,
+                None,
+                &owner_hex,
+                &mut drain,
+                BOUND,
+                publisher,
+            ),
+            None
+        );
+        assert!(drain.admits_new_work());
+
+        let onset = route(
+            &agent,
+            &owner_hex,
+            control_frame(&owner, &agent, serde_json::json!({"type": "drain"}), None),
+            &mut drain,
+        );
+        assert_eq!(onset, Some(drain::DrainOnset::Started));
+        assert!(!drain.admits_new_work());
     }
 
     /// The owner is acknowledged on the observer bus, so a deployer can see the
@@ -11129,6 +11820,65 @@ mod drain_control_tests {
             assert_eq!(event.payload["status"], expected);
             assert_eq!(event.payload["reason"], "swap");
         }
+    }
+}
+
+#[cfg(test)]
+mod project_owner_announcement_control_tests {
+    use super::*;
+    use nostr::Keys;
+
+    #[test]
+    fn project_owner_control_signs_only_addressable_project_events() {
+        let keys = Keys::generate();
+        let events = build_project_owner_announcement_events(
+            vec![
+                ProjectOwnerAnnouncementTemplate {
+                    kind: 30_621,
+                    content: String::new(),
+                    created_at: Some(1),
+                    tags: vec![vec!["d".to_string(), "project".to_string()]],
+                },
+                ProjectOwnerAnnouncementTemplate {
+                    kind: 30_617,
+                    content: String::new(),
+                    created_at: Some(1),
+                    tags: vec![vec!["d".to_string(), "repository".to_string()]],
+                },
+            ],
+            &keys,
+        )
+        .expect("valid project events");
+
+        assert_eq!(events.len(), 2);
+        assert!(events.iter().all(|event| event.pubkey == keys.public_key()));
+        assert!(events.iter().all(|event| event.verify().is_ok()));
+    }
+
+    #[test]
+    fn project_owner_control_rejects_arbitrary_or_unaddressed_events() {
+        let keys = Keys::generate();
+        let arbitrary = build_project_owner_announcement_events(
+            vec![ProjectOwnerAnnouncementTemplate {
+                kind: 1,
+                content: String::new(),
+                created_at: None,
+                tags: vec![vec!["d".to_string(), "project".to_string()]],
+            }],
+            &keys,
+        );
+        assert!(arbitrary.is_err());
+
+        let unaddressed = build_project_owner_announcement_events(
+            vec![ProjectOwnerAnnouncementTemplate {
+                kind: 30_621,
+                content: String::new(),
+                created_at: None,
+                tags: vec![],
+            }],
+            &keys,
+        );
+        assert!(unaddressed.is_err());
     }
 }
 
@@ -11397,6 +12147,7 @@ mod author_gate_tests {
                 relay::ChannelInfo {
                     name: "dm".into(),
                     channel_type: "dm".into(),
+                    description: None,
                 },
             ),
             (
@@ -11404,6 +12155,7 @@ mod author_gate_tests {
                 relay::ChannelInfo {
                     name: "stream".into(),
                     channel_type: "stream".into(),
+                    description: None,
                 },
             ),
         ]);
@@ -11420,6 +12172,7 @@ mod author_gate_tests {
             relay::ChannelInfo {
                 name: "unknown".into(),
                 channel_type: "unknown".into(),
+                description: None,
             },
         )]);
         assert!(
@@ -11524,6 +12277,273 @@ mod author_gate_tests {
             is_dm_channel(Uuid::new_v4(), &resolver(HashMap::new())).await,
             "an unresolvable channel type must be treated as a DM"
         );
+    }
+}
+
+#[cfg(test)]
+mod workflow_attributed_author_tests {
+    use super::*;
+    use nostr::{EventBuilder, Keys, Kind, Tag};
+
+    /// Build a kind:9 event signed by `signer` with the given extra tags.
+    fn make_event(signer: &Keys, tags: Vec<Tag>) -> nostr::Event {
+        EventBuilder::new(Kind::from(KIND_STREAM_MESSAGE as u16), "wake up")
+            .tags(tags)
+            .sign_with_keys(signer)
+            .expect("sign test event")
+    }
+
+    fn workflow_tags(owner_hex: &str, mention_hex: &str) -> Vec<Tag> {
+        vec![
+            Tag::parse(["p", owner_hex]).unwrap(),
+            Tag::parse(["h", "3204e3f9-fd09-4e95-b749-76966794c287"]).unwrap(),
+            Tag::parse(["buzz:workflow", "true"]).unwrap(),
+            Tag::parse(["buzz:workflow-owner", owner_hex]).unwrap(),
+            Tag::parse(["p", mention_hex]).unwrap(),
+        ]
+    }
+
+    #[test]
+    fn relay_signed_workflow_message_attributes_to_workflow_owner_tag() {
+        let relay = Keys::generate();
+        let owner = Keys::generate().public_key().to_hex();
+        let agent = Keys::generate().public_key().to_hex();
+        let event = make_event(&relay, workflow_tags(&owner, &agent));
+        assert_eq!(
+            workflow_attributed_author(&event, Some(&relay.public_key().to_hex())),
+            Some(owner),
+            "a relay-signed buzz:workflow event must attribute to the \
+             buzz:workflow-owner tag, not any mentioned agent"
+        );
+    }
+
+    #[test]
+    fn attribution_ignores_p_tags_entirely() {
+        // Only the explicit buzz:workflow-owner tag attributes; p tags
+        // (owner attribution + mentions) must have no effect on the gate.
+        let relay = Keys::generate();
+        let someone = Keys::generate().public_key().to_hex();
+        let event = make_event(
+            &relay,
+            vec![
+                Tag::parse(["p", &someone]).unwrap(),
+                Tag::parse(["buzz:workflow", "true"]).unwrap(),
+            ],
+        );
+        assert_eq!(
+            workflow_attributed_author(&event, Some(&relay.public_key().to_hex())),
+            None,
+            "without a buzz:workflow-owner tag there is no attributed author, \
+             even when p tags are present"
+        );
+    }
+
+    #[test]
+    fn malformed_owner_tag_value_attributes_to_no_one() {
+        let relay = Keys::generate();
+        let event = make_event(
+            &relay,
+            vec![
+                Tag::parse(["buzz:workflow", "true"]).unwrap(),
+                Tag::parse(["buzz:workflow-owner", "not-a-pubkey"]).unwrap(),
+            ],
+        );
+        assert_eq!(
+            workflow_attributed_author(&event, Some(&relay.public_key().to_hex())),
+            None,
+            "a buzz:workflow-owner value that is not 64-hex must be rejected"
+        );
+    }
+
+    #[test]
+    fn no_relay_self_means_no_exemption() {
+        let relay = Keys::generate();
+        let owner = Keys::generate().public_key().to_hex();
+        let agent = Keys::generate().public_key().to_hex();
+        let event = make_event(&relay, workflow_tags(&owner, &agent));
+        assert_eq!(
+            workflow_attributed_author(&event, None),
+            None,
+            "without a known relay self pubkey the exemption must not apply (fail closed)"
+        );
+    }
+
+    #[test]
+    fn non_relay_author_gets_no_exemption_even_with_workflow_tag() {
+        // A member forging the buzz:workflow tag on their own event must not
+        // be able to attribute it to someone else via a p tag.
+        let forger = Keys::generate();
+        let relay = Keys::generate();
+        let owner = Keys::generate().public_key().to_hex();
+        let agent = Keys::generate().public_key().to_hex();
+        let event = make_event(&forger, workflow_tags(&owner, &agent));
+        assert_eq!(
+            workflow_attributed_author(&event, Some(&relay.public_key().to_hex())),
+            None,
+            "a buzz:workflow tag on a non-relay-signed event must be ignored"
+        );
+    }
+
+    #[test]
+    fn relay_signed_message_without_workflow_tag_gets_no_exemption() {
+        let relay = Keys::generate();
+        let owner = Keys::generate().public_key().to_hex();
+        let event = make_event(&relay, vec![Tag::parse(["p", &owner]).unwrap()]);
+        assert_eq!(
+            workflow_attributed_author(&event, Some(&relay.public_key().to_hex())),
+            None,
+            "relay-signed events without the buzz:workflow tag keep the plain author gate"
+        );
+    }
+
+    #[test]
+    fn workflow_message_without_owner_tag_attributes_to_no_one() {
+        let relay = Keys::generate();
+        let event = make_event(&relay, vec![Tag::parse(["buzz:workflow", "true"]).unwrap()]);
+        assert_eq!(
+            workflow_attributed_author(&event, Some(&relay.public_key().to_hex())),
+            None,
+            "a workflow message with no buzz:workflow-owner tag has no attributed \
+             author and must fall through to the plain (relay-pubkey) author gate"
+        );
+    }
+
+    #[test]
+    fn duplicate_marker_tags_disqualify() {
+        let relay = Keys::generate();
+        let owner = Keys::generate().public_key().to_hex();
+        let event = make_event(
+            &relay,
+            vec![
+                Tag::parse(["buzz:workflow", "true"]).unwrap(),
+                Tag::parse(["buzz:workflow", "true"]).unwrap(),
+                Tag::parse(["buzz:workflow-owner", &owner]).unwrap(),
+            ],
+        );
+        assert_eq!(
+            workflow_attributed_author(&event, Some(&relay.public_key().to_hex())),
+            None,
+            "more than one buzz:workflow marker tag must fail closed"
+        );
+    }
+
+    #[test]
+    fn marker_value_mismatch_disqualifies() {
+        let relay = Keys::generate();
+        let owner = Keys::generate().public_key().to_hex();
+        for bad_marker in [
+            Tag::parse(["buzz:workflow", "false"]).unwrap(),
+            Tag::parse(["buzz:workflow"]).unwrap(),
+            Tag::parse(["buzz:workflow", "true", "extra"]).unwrap(),
+        ] {
+            let event = make_event(
+                &relay,
+                vec![
+                    bad_marker.clone(),
+                    Tag::parse(["buzz:workflow-owner", &owner]).unwrap(),
+                ],
+            );
+            assert_eq!(
+                workflow_attributed_author(&event, Some(&relay.public_key().to_hex())),
+                None,
+                "marker tag {:?} is not exactly [\"buzz:workflow\", \"true\"] and must fail closed",
+                bad_marker.as_slice()
+            );
+        }
+    }
+
+    #[test]
+    fn duplicate_owner_tags_disqualify() {
+        // Two owner tags — even with identical values — are ambiguous
+        // provenance and must not attribute to anyone.
+        let relay = Keys::generate();
+        let owner = Keys::generate().public_key().to_hex();
+        let other = Keys::generate().public_key().to_hex();
+        for second_owner in [&owner, &other] {
+            let event = make_event(
+                &relay,
+                vec![
+                    Tag::parse(["buzz:workflow", "true"]).unwrap(),
+                    Tag::parse(["buzz:workflow-owner", &owner]).unwrap(),
+                    Tag::parse(["buzz:workflow-owner", second_owner]).unwrap(),
+                ],
+            );
+            assert_eq!(
+                workflow_attributed_author(&event, Some(&relay.public_key().to_hex())),
+                None,
+                "duplicate buzz:workflow-owner tags must fail closed"
+            );
+        }
+    }
+
+    #[test]
+    fn owner_tag_with_extra_fields_disqualifies() {
+        let relay = Keys::generate();
+        let owner = Keys::generate().public_key().to_hex();
+        let event = make_event(
+            &relay,
+            vec![
+                Tag::parse(["buzz:workflow", "true"]).unwrap(),
+                Tag::parse(["buzz:workflow-owner", &owner, "extra"]).unwrap(),
+            ],
+        );
+        assert_eq!(
+            workflow_attributed_author(&event, Some(&relay.public_key().to_hex())),
+            None,
+            "an owner tag with extra fields is not the exact shape the relay \
+             emits and must fail closed"
+        );
+    }
+
+    #[test]
+    fn wrong_kind_disqualifies() {
+        let relay = Keys::generate();
+        let owner = Keys::generate().public_key().to_hex();
+        let agent = Keys::generate().public_key().to_hex();
+        let event = EventBuilder::new(Kind::from(1u16), "wake up")
+            .tags(workflow_tags(&owner, &agent))
+            .sign_with_keys(&relay)
+            .expect("sign test event");
+        assert_eq!(
+            workflow_attributed_author(&event, Some(&relay.public_key().to_hex())),
+            None,
+            "only kind:9 stream messages may use the workflow exemption"
+        );
+    }
+
+    #[test]
+    fn tampered_event_fails_signature_check() {
+        // Alter the content after signing: pubkey still matches relay_self
+        // and the tags are pristine, but the signature no longer covers the
+        // event — the local verify must reject it.
+        let relay = Keys::generate();
+        let owner = Keys::generate().public_key().to_hex();
+        let agent = Keys::generate().public_key().to_hex();
+        let event = make_event(&relay, workflow_tags(&owner, &agent));
+        let mut json = serde_json::to_value(&event).expect("event to JSON");
+        json["content"] = serde_json::Value::String("tampered".into());
+        let tampered: nostr::Event = serde_json::from_value(json).expect("tampered event parses");
+        assert_eq!(
+            workflow_attributed_author(&tampered, Some(&relay.public_key().to_hex())),
+            None,
+            "a tampered event must fail the local signature check"
+        );
+    }
+
+    #[test]
+    fn syntactically_invalid_relay_self_means_no_exemption() {
+        let relay = Keys::generate();
+        let owner = Keys::generate().public_key().to_hex();
+        let agent = Keys::generate().public_key().to_hex();
+        let event = make_event(&relay, workflow_tags(&owner, &agent));
+        let long_not_hex = "zz".repeat(32);
+        for bad_self in ["", "not-hex", long_not_hex.as_str()] {
+            assert_eq!(
+                workflow_attributed_author(&event, Some(bad_self)),
+                None,
+                "an invalid NIP-11 self value {bad_self:?} must disable the exemption"
+            );
+        }
     }
 }
 
@@ -12649,6 +13669,7 @@ mod build_mcp_servers_tests {
             typing_enabled: true,
             memory_enabled: false,
             model: None,
+            effort_level: None,
             session_title: None,
             permission_mode: config::PermissionMode::DontAsk,
             respond_to: config::RespondTo::Anyone,
@@ -12661,6 +13682,7 @@ mod build_mcp_servers_tests {
             lazy_pool: false,
             project_routing_enabled: false,
             peer_agents: HashSet::new(),
+            idle_pool_sleep_secs: 0,
             agent_owner: None,
             no_base_prompt: false,
             base_prompt_content: None,
@@ -12876,6 +13898,7 @@ mod error_outcome_emission_tests {
             typing_enabled: true,
             memory_enabled: false,
             model: None,
+            effort_level: None,
             session_title: None,
             permission_mode: config::PermissionMode::DontAsk,
             respond_to: config::RespondTo::Anyone,
@@ -12888,6 +13911,7 @@ mod error_outcome_emission_tests {
             lazy_pool: false,
             project_routing_enabled: false,
             peer_agents: HashSet::new(),
+            idle_pool_sleep_secs: 0,
             agent_owner: None,
             no_base_prompt: false,
             base_prompt_content: None,
@@ -12923,12 +13947,272 @@ mod error_outcome_emission_tests {
             model_capabilities: None,
             desired_model: None,
             model_overridden: false,
+            desired_model_request_id: None,
+            desired_model_pending_ack: false,
+            startup_effort: None,
             agent_name: "unknown".into(),
             goose_system_prompt_supported: None,
             // Error branches under test never read this; 1 is the legacy
             // non-systemPrompt path, the simplest valid value.
             protocol_version: 1,
         }
+    }
+
+    #[tokio::test]
+    async fn successful_native_steer_is_transferred_to_live_session_delivery_state() {
+        let channel_id = Uuid::new_v4();
+        let steer_event_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let mut agent = dummy_agent(0).await;
+        agent
+            .state
+            .sessions
+            .insert(channel_id, "live-session".into());
+        agent
+            .state
+            .deliveries
+            .insert(channel_id, Default::default());
+
+        let mut pool = AgentPool::from_slots(vec![None]);
+        let task_id = pool.join_set.spawn(async {}).id();
+        pool.task_map_mut().insert(
+            task_id,
+            crate::pool::TaskMeta {
+                agent_index: 0,
+                channel_id: Some(channel_id),
+                turn_id: "test-turn-id".into(),
+                recoverable_batch: None,
+                control_tx: None,
+                steer_tx: None,
+                successful_steer_deliveries: HashSet::from([
+                    crate::pool::SuccessfulSteerDelivery {
+                        event_id: steer_event_id.into(),
+                        session_id: "live-session".into(),
+                    },
+                ]),
+            },
+        );
+
+        let mut queue = EventQueue::new(config::DedupMode::Queue);
+        let config = test_config();
+        let mut heartbeat_in_flight = false;
+        let removed_channels = HashSet::new();
+        let mut crash_history = vec![SlotCircuit {
+            crash_times: Vec::new(),
+            open_until: None,
+            respawn_in_flight: false,
+        }];
+        let (respawn_tx, _respawn_rx) = mpsc::channel(8);
+        let mut respawn_tasks = tokio::task::JoinSet::new();
+        let result = PromptResult {
+            agent,
+            source: PromptSource::Channel(channel_id),
+            turn_id: "test-turn-id".into(),
+            outcome: PromptOutcome::Ok(crate::acp::StopReason::EndTurn),
+            batch: None,
+        };
+
+        handle_prompt_result(
+            &mut pool,
+            &mut queue,
+            &config,
+            result,
+            &mut heartbeat_in_flight,
+            &removed_channels,
+            &mut crash_history,
+            &respawn_tx,
+            &mut respawn_tasks,
+            None,
+            None,
+        );
+
+        let returned = pool.agents_mut()[0].as_ref().expect("returned agent");
+        assert!(returned.state.deliveries[&channel_id]
+            .delivered_event_ids
+            .contains(steer_event_id));
+    }
+
+    #[tokio::test]
+    async fn in_flight_stale_native_steer_ack_cannot_update_replacement_session() {
+        let channel_id = Uuid::new_v4();
+        let mut agent = dummy_agent(0).await;
+        agent
+            .state
+            .sessions
+            .insert(channel_id, "replacement-session".into());
+        agent
+            .state
+            .deliveries
+            .insert(channel_id, Default::default());
+
+        let mut pool = AgentPool::from_slots(vec![None]);
+        let task_id = pool.join_set.spawn(async {}).id();
+        pool.task_map_mut().insert(
+            task_id,
+            crate::pool::TaskMeta {
+                agent_index: 0,
+                channel_id: Some(channel_id),
+                turn_id: "test-turn-id".into(),
+                recoverable_batch: None,
+                control_tx: None,
+                steer_tx: None,
+                successful_steer_deliveries: HashSet::from([
+                    crate::pool::SuccessfulSteerDelivery {
+                        event_id: "stale-event".into(),
+                        session_id: "old-session".into(),
+                    },
+                ]),
+            },
+        );
+
+        let mut queue = EventQueue::new(config::DedupMode::Queue);
+        let config = test_config();
+        let mut heartbeat_in_flight = false;
+        let removed_channels = HashSet::new();
+        let mut crash_history = vec![SlotCircuit {
+            crash_times: Vec::new(),
+            open_until: None,
+            respawn_in_flight: false,
+        }];
+        let (respawn_tx, _respawn_rx) = mpsc::channel(8);
+        let mut respawn_tasks = tokio::task::JoinSet::new();
+        let result = PromptResult {
+            agent,
+            source: PromptSource::Channel(channel_id),
+            turn_id: "test-turn-id".into(),
+            outcome: PromptOutcome::Ok(crate::acp::StopReason::EndTurn),
+            batch: None,
+        };
+
+        handle_prompt_result(
+            &mut pool,
+            &mut queue,
+            &config,
+            result,
+            &mut heartbeat_in_flight,
+            &removed_channels,
+            &mut crash_history,
+            &respawn_tx,
+            &mut respawn_tasks,
+            None,
+            None,
+        );
+
+        let returned = pool.agents_mut()[0].as_ref().expect("returned agent");
+        assert!(returned.state.deliveries[&channel_id]
+            .delivered_event_ids
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn successful_native_steer_ack_after_task_return_updates_matching_live_session() {
+        let channel_id = Uuid::new_v4();
+        let steer_event_id = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let mut agent = dummy_agent(0).await;
+        agent
+            .state
+            .sessions
+            .insert(channel_id, "live-session".into());
+        agent
+            .state
+            .deliveries
+            .insert(channel_id, Default::default());
+        let mut pool = AgentPool::from_slots(vec![Some(agent)]);
+
+        assert!(pool.record_successful_steer(
+            channel_id,
+            steer_event_id.into(),
+            "live-session".into(),
+        ));
+        let returned = pool.agents_mut()[0].as_ref().expect("idle returned agent");
+        assert!(returned.state.deliveries[&channel_id]
+            .delivered_event_ids
+            .contains(steer_event_id));
+    }
+
+    #[tokio::test]
+    async fn late_native_steer_ack_cannot_update_replacement_session() {
+        let channel_id = Uuid::new_v4();
+        let mut agent = dummy_agent(0).await;
+        agent
+            .state
+            .sessions
+            .insert(channel_id, "replacement-session".into());
+        agent
+            .state
+            .deliveries
+            .insert(channel_id, Default::default());
+        let mut pool = AgentPool::from_slots(vec![Some(agent)]);
+
+        assert!(!pool.record_successful_steer(
+            channel_id,
+            "stale-event".into(),
+            "old-session".into(),
+        ));
+        let returned = pool.agents_mut()[0].as_ref().expect("replacement agent");
+        assert!(returned.state.deliveries[&channel_id]
+            .delivered_event_ids
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn invalidated_session_does_not_resurrect_successful_steer_delivery_state() {
+        let channel_id = Uuid::new_v4();
+        let agent = dummy_agent(0).await;
+        // No live session: simulates the prompt task invalidating before return.
+        let mut pool = AgentPool::from_slots(vec![None]);
+        let task_id = pool.join_set.spawn(async {}).id();
+        pool.task_map_mut().insert(
+            task_id,
+            crate::pool::TaskMeta {
+                agent_index: 0,
+                channel_id: Some(channel_id),
+                turn_id: "test-turn-id".into(),
+                recoverable_batch: None,
+                control_tx: None,
+                steer_tx: None,
+                successful_steer_deliveries: HashSet::from([
+                    crate::pool::SuccessfulSteerDelivery {
+                        event_id: "stale-event".into(),
+                        session_id: "invalidated-session".into(),
+                    },
+                ]),
+            },
+        );
+        let mut queue = EventQueue::new(config::DedupMode::Queue);
+        let config = test_config();
+        let mut heartbeat_in_flight = false;
+        let removed_channels = HashSet::new();
+        let mut crash_history = vec![SlotCircuit {
+            crash_times: Vec::new(),
+            open_until: None,
+            respawn_in_flight: false,
+        }];
+        let (respawn_tx, _respawn_rx) = mpsc::channel(8);
+        let mut respawn_tasks = tokio::task::JoinSet::new();
+        let result = PromptResult {
+            agent,
+            source: PromptSource::Channel(channel_id),
+            turn_id: "test-turn-id".into(),
+            outcome: PromptOutcome::Ok(crate::acp::StopReason::EndTurn),
+            batch: None,
+        };
+
+        handle_prompt_result(
+            &mut pool,
+            &mut queue,
+            &config,
+            result,
+            &mut heartbeat_in_flight,
+            &removed_channels,
+            &mut crash_history,
+            &respawn_tx,
+            &mut respawn_tasks,
+            None,
+            None,
+        );
+
+        let returned = pool.agents_mut()[0].as_ref().expect("returned agent");
+        assert!(!returned.state.deliveries.contains_key(&channel_id));
     }
 
     /// Drive one error outcome through `handle_prompt_result` and return how
@@ -12951,6 +14235,7 @@ mod error_outcome_emission_tests {
                 recoverable_batch: None,
                 control_tx: None,
                 steer_tx: None,
+                successful_steer_deliveries: HashSet::new(),
             },
         );
 
@@ -13031,6 +14316,7 @@ mod error_outcome_emission_tests {
                 recoverable_batch: Some(batch.clone()),
                 control_tx: None,
                 steer_tx: None,
+                successful_steer_deliveries: HashSet::new(),
             },
         );
 
@@ -13118,6 +14404,7 @@ mod error_outcome_emission_tests {
                 recoverable_batch: None,
                 control_tx: None,
                 steer_tx: None,
+                successful_steer_deliveries: HashSet::new(),
             },
         );
         started_rx.await.unwrap();
@@ -13210,6 +14497,7 @@ mod error_outcome_emission_tests {
                     recoverable_batch: None,
                     control_tx: None,
                     steer_tx: None,
+                    successful_steer_deliveries: HashSet::new(),
                 },
             );
             let mut queue = EventQueue::new(config::DedupMode::Queue);
@@ -13302,6 +14590,7 @@ mod error_outcome_emission_tests {
                     recoverable_batch: None,
                     control_tx: None,
                     steer_tx: None,
+                    successful_steer_deliveries: HashSet::new(),
                 },
             );
             let mut queue = EventQueue::new(config::DedupMode::Queue);
@@ -13408,6 +14697,7 @@ mod error_outcome_emission_tests {
                     recoverable_batch: None,
                     control_tx: None,
                     steer_tx: None,
+                    successful_steer_deliveries: HashSet::new(),
                 },
             );
             let mut queue = EventQueue::new(config::DedupMode::Queue);
@@ -13484,6 +14774,7 @@ mod error_outcome_emission_tests {
                 recoverable_batch: None,
                 control_tx: None,
                 steer_tx: None,
+                successful_steer_deliveries: HashSet::new(),
             },
         );
         let mut queue = EventQueue::new(config::DedupMode::Queue);
@@ -13579,6 +14870,7 @@ mod error_outcome_emission_tests {
                 recoverable_batch: None,
                 control_tx: None,
                 steer_tx: None,
+                successful_steer_deliveries: HashSet::new(),
             },
         );
         let config = test_config();
@@ -13697,6 +14989,7 @@ mod error_outcome_emission_tests {
                 recoverable_batch: None,
                 control_tx: None,
                 steer_tx: None,
+                successful_steer_deliveries: HashSet::new(),
             },
         );
         let mut queue = EventQueue::new(config::DedupMode::Queue);
@@ -13837,6 +15130,7 @@ mod error_outcome_emission_tests {
                 recoverable_batch: None,
                 control_tx: None,
                 steer_tx: None,
+                successful_steer_deliveries: HashSet::new(),
             },
         );
         let mut queue = EventQueue::new(config::DedupMode::Queue);
@@ -14039,6 +15333,7 @@ mod error_outcome_emission_tests {
                 recoverable_batch: None,
                 control_tx: None,
                 steer_tx: None,
+                successful_steer_deliveries: HashSet::new(),
             },
         );
         let temp = tempfile::tempdir().expect("temp dir");
@@ -14136,6 +15431,7 @@ mod error_outcome_emission_tests {
                 recoverable_batch: None,
                 control_tx: None,
                 steer_tx: None,
+                successful_steer_deliveries: HashSet::new(),
             },
         );
         let mut queue = EventQueue::new(config::DedupMode::Queue);
@@ -14245,6 +15541,7 @@ mod error_outcome_emission_tests {
                     recoverable_batch: None,
                     control_tx: None,
                     steer_tx: None,
+                    successful_steer_deliveries: HashSet::new(),
                 },
             );
 
@@ -14621,6 +15918,7 @@ mod error_outcome_emission_tests {
                     recoverable_batch: None,
                     control_tx: None,
                     steer_tx: None,
+                    successful_steer_deliveries: HashSet::new(),
                 },
             );
             let mut heartbeat_in_flight = false;
@@ -16837,6 +18135,9 @@ for line in sys.stdin:
                 model_capabilities: None,
                 desired_model: None,
                 model_overridden: false,
+                desired_model_request_id: None,
+                desired_model_pending_ack: false,
+                startup_effort: None,
                 agent_name: "unknown".into(),
                 goose_system_prompt_supported: None,
                 protocol_version: 1,

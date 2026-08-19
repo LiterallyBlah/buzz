@@ -10,6 +10,7 @@ export const KIND_NIP29_DELETE_EVENT = 9005;
 // Tag shapes are pinned by buzz-sdk builders + relay moderation_commands.rs.
 export const KIND_REPORT = 1984;
 export const KIND_PRODUCT_FEEDBACK = 42000;
+export const KIND_IA_ARCHIVE_REQUEST = 9035;
 export const KIND_MODERATION_BAN = 9040;
 export const KIND_MODERATION_UNBAN = 9041;
 export const KIND_MODERATION_TIMEOUT = 9042;
@@ -33,6 +34,7 @@ export const KIND_FORUM_COMMENT = 45003;
 export const KIND_APPROVAL_REQUEST = 46010;
 export const KIND_MEMBER_ADDED_NOTIFICATION = 44100;
 export const KIND_MEMBER_REMOVED_NOTIFICATION = 44101;
+export const KIND_PRESENCE_UPDATE = 20001;
 export const KIND_TYPING_INDICATOR = 20002;
 // NIP-PA: ephemeral agent activity on a project issue or pull request. Bound to
 // the repository `a` and the root `e`; carries no `h`, because an issue is not

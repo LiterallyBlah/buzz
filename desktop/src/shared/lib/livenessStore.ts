@@ -438,6 +438,7 @@ export function createLivenessStore<Entry>(config: LivenessStoreConfig<Entry>) {
   let state = map.empty;
   const listeners = new Set<() => void>();
   let timer: ReturnType<typeof setInterval> | null = null;
+  let suspendedAt: number | null = null;
 
   // Snapshot caches. React reads a snapshot before it subscribes, so these are
   // maintained whether or not anyone is listening.
@@ -468,7 +469,8 @@ export function createLivenessStore<Entry>(config: LivenessStoreConfig<Entry>) {
    * timer restarts the moment the first entry lands.
    */
   function syncTimer() {
-    const wanted = listeners.size > 0 && map.size(state) > 0;
+    const wanted =
+      suspendedAt === null && listeners.size > 0 && map.size(state) > 0;
     if (wanted && !timer) {
       timer = setInterval(() => {
         if (sweep()) notify();
@@ -513,6 +515,7 @@ export function createLivenessStore<Entry>(config: LivenessStoreConfig<Entry>) {
   }
 
   function sweep(nowMs: number = Date.now()): boolean {
+    if (suspendedAt !== null) return false;
     const pausedGroups = new Map<string, boolean>();
     const next = map.prune(state, nowMs, (group) => {
       let paused = pausedGroups.get(group);
@@ -600,6 +603,35 @@ export function createLivenessStore<Entry>(config: LivenessStoreConfig<Entry>) {
       state = map.empty;
       cadenceByGroup.clear();
       invalidate(groups);
+      syncTimer();
+    },
+
+    /**
+     * Suspend expiry while a consumer cannot observe foreground evidence.
+     * Hidden time is removed from every tracked deadline on resume, and from
+     * the cadence's last-frame clock so the first post-resume heartbeat is not
+     * mistaken for a slower producer interval.
+     */
+    setSuspended(suspended: boolean, nowMs: number = Date.now()): void {
+      if (suspended) {
+        if (suspendedAt !== null) return;
+        suspendedAt = nowMs;
+        syncTimer();
+        return;
+      }
+      if (suspendedAt === null) return;
+
+      const elapsed = Math.max(0, nowMs - suspendedAt);
+      suspendedAt = null;
+      if (elapsed > 0) {
+        for (const record of Object.values(state)) {
+          record.refreshedAt += elapsed;
+          record.baseAt += elapsed;
+        }
+        for (const samples of cadenceByGroup.values()) {
+          if (samples.lastFrameAt !== null) samples.lastFrameAt += elapsed;
+        }
+      }
       syncTimer();
     },
 
@@ -692,6 +724,11 @@ export function createLivenessStore<Entry>(config: LivenessStoreConfig<Entry>) {
     /** Whether a prune timer is currently held. Diagnostics and tests. */
     isSweeping(): boolean {
       return timer !== null;
+    },
+
+    /** Whether deadline accounting is currently suspended. */
+    isSuspended(): boolean {
+      return suspendedAt !== null;
     },
   };
 }

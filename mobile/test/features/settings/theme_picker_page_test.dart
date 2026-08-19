@@ -172,7 +172,11 @@ void main() {
     testWidgets('settings hides accent navigation for Buzz', (tester) async {
       await _pumpPicker(
         tester,
-        const SettingsPage(profileHeader: SizedBox.shrink()),
+        SettingsPage(
+          profileHeader: const SizedBox.shrink(),
+          invitePageBuilder: (_) => const SizedBox.shrink(),
+          identityRecoveryPageBuilder: (_) => const SizedBox.shrink(),
+        ),
         prefs: {'buzz_color_scheme': 'buzz', 'buzz_accent_color': 4},
       );
 
@@ -184,7 +188,11 @@ void main() {
     ) async {
       await _pumpPicker(
         tester,
-        const SettingsPage(profileHeader: SizedBox.shrink()),
+        SettingsPage(
+          profileHeader: const SizedBox.shrink(),
+          invitePageBuilder: (_) => const SizedBox.shrink(),
+          identityRecoveryPageBuilder: (_) => const SizedBox.shrink(),
+        ),
         prefs: {
           'buzz_theme_mode': 'light',
           'buzz_color_scheme': 'github-light',

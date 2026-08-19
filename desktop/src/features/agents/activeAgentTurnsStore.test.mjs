@@ -12,11 +12,16 @@ import {
   restoreActiveAgentTurnsForCommunity,
   clearSavedCommunitySnapshot,
   clearActiveTurnsForAgent,
+  createActiveAgentTurnsObserverListener,
 } from "./activeAgentTurnsStore.ts";
 import {
   injectObserverEventsForE2E,
   getAgentObserverSnapshot,
+  getAgentTranscript,
+  subscribeAgentObserverStore,
+  subscribeAgentManagementRequests,
   resetAgentObserverStore,
+  _testProcessLiveObserverEvents,
 } from "./observerRelayStore.ts";
 import { formatElapsed } from "./ui/agentSessionUtils.ts";
 
@@ -1098,6 +1103,69 @@ describe("activeAgentTurnsStore", () => {
     });
   });
 
+  describe("document visibility suspension", () => {
+    const EPOCH = Date.parse("2024-01-01T00:00:00Z");
+    let originalDocumentDescriptor;
+    let visibilityTarget;
+    let unsubscribe;
+
+    beforeEach(() => {
+      mock.timers.enable({ apis: ["setInterval", "Date"], now: EPOCH });
+      originalDocumentDescriptor = Object.getOwnPropertyDescriptor(
+        globalThis,
+        "document",
+      );
+      visibilityTarget = new EventTarget();
+      Object.defineProperty(visibilityTarget, "visibilityState", {
+        configurable: true,
+        value: "hidden",
+        writable: true,
+      });
+      Object.defineProperty(globalThis, "document", {
+        configurable: true,
+        value: visibilityTarget,
+      });
+      unsubscribe = subscribeActiveAgentTurns(() => {});
+    });
+
+    afterEach(() => {
+      unsubscribe();
+      if (originalDocumentDescriptor) {
+        Object.defineProperty(
+          globalThis,
+          "document",
+          originalDocumentDescriptor,
+        );
+      } else {
+        delete globalThis.document;
+      }
+      mock.timers.reset();
+    });
+
+    it("does not expire an active turn while hidden and excludes hidden time after resume", () => {
+      syncAgentTurnsFromEvents(AGENT, [
+        makeEvent({
+          seq: 1,
+          turnId: "t1",
+          channelId: "c1",
+          timestamp: new Date(EPOCH).toISOString(),
+        }),
+      ]);
+
+      mock.timers.tick(5 * 60_000);
+      assert.equal(getActiveTurnsForAgent(AGENT).length, 1);
+
+      visibilityTarget.visibilityState = "visible";
+      visibilityTarget.dispatchEvent(new Event("visibilitychange"));
+      mock.timers.tick(20_000);
+      assert.equal(
+        getActiveTurnsForAgent(AGENT).length,
+        1,
+        "five hidden minutes must not consume the foreground expiry window",
+      );
+    });
+  });
+
   /**
    * The removal bound is derived from the cadence the harness is ACTUALLY
    * emitting at, not from an assumed 10s. This is a deliberate change to
@@ -1729,6 +1797,191 @@ describe("observer → active-turns bridge sync", () => {
       0,
       "derived liveness must clear when the raw feed shows turn_completed",
     );
+  });
+
+  it("publishes only newly admitted events for the changed agent", () => {
+    const updates = [];
+    const unsubscribeObserver = subscribeAgentObserverStore((update) => {
+      updates.push(update);
+    });
+    const retained = makeEvent({ seq: 1, kind: "turn_started" });
+    const admitted = makeEvent({
+      seq: 2,
+      kind: "acp_write",
+      timestamp: "2024-01-01T00:00:01Z",
+    });
+
+    injectObserverEventsForE2E(AGENT, [retained]);
+    injectObserverEventsForE2E(AGENT, [retained, admitted]);
+    unsubscribeObserver();
+
+    assert.equal(updates.length, 2);
+    assert.equal(updates[1].agentPubkey, AGENT);
+    assert.deepEqual(
+      updates[1].events.map((event) => event.seq),
+      [2],
+      "the publication must omit retained and duplicate history",
+    );
+  });
+
+  it("steady-state listener processes the changed active agent only", () => {
+    const listener = createActiveAgentTurnsObserverListener([
+      { pubkey: AGENT, status: "deployed" },
+      { pubkey: AGENT_2, status: "stopped" },
+    ]);
+
+    listener({
+      agentPubkey: AGENT,
+      events: [makeEvent({ seq: 1, turnId: "active-turn" })],
+    });
+    listener({
+      agentPubkey: AGENT_2,
+      events: [
+        makeEvent({
+          seq: 1,
+          turnId: "stopped-turn",
+          channelId: "stopped-channel",
+        }),
+      ],
+    });
+
+    assert.equal(getActiveTurnsForAgent(AGENT).length, 1);
+    assert.equal(
+      getActiveTurnsForAgent(AGENT_2).length,
+      0,
+      "an unrelated stopped agent update must not enter turn state",
+    );
+  });
+
+  it("incremental terminal update clears a hydrated turn without replay", () => {
+    injectObserverEventsForE2E(AGENT, [
+      makeEvent({ seq: 1, kind: "turn_started" }),
+    ]);
+    syncActiveAgentTurnsFromObserver(bridgeAgents);
+    assert.equal(getActiveTurnsForAgent(AGENT).length, 1);
+
+    const listener = createActiveAgentTurnsObserverListener(bridgeAgents);
+    listener({
+      agentPubkey: AGENT,
+      events: [
+        makeEvent({
+          seq: 2,
+          kind: "turn_completed",
+          timestamp: "2024-01-01T00:00:05Z",
+        }),
+      ],
+    });
+
+    assert.equal(getActiveTurnsForAgent(AGENT).length, 0);
+  });
+
+  it("publishes one observer update for a batch while preserving outcomes", () => {
+    let observerNotifications = 0;
+    const unsubscribeObserver = subscribeAgentObserverStore(() => {
+      observerNotifications += 1;
+    });
+    const events = [
+      makeEvent({ seq: 1, kind: "turn_started" }),
+      ...Array.from({ length: 98 }, (_, index) =>
+        makeEvent({
+          seq: index + 2,
+          kind: "acp_write",
+          timestamp: new Date(
+            Date.parse("2024-01-01T00:00:00Z") + (index + 1) * 1_000,
+          ).toISOString(),
+        }),
+      ),
+      makeEvent({
+        seq: 100,
+        kind: "turn_completed",
+        timestamp: "2024-01-01T00:02:00Z",
+      }),
+    ];
+
+    injectObserverEventsForE2E(AGENT, events);
+    unsubscribeObserver();
+
+    assert.equal(
+      observerNotifications,
+      1,
+      "one harness envelope must produce one external-store publication",
+    );
+    assert.equal(getAgentObserverSnapshot(AGENT, true).events.length, 100);
+    assert.ok(
+      getAgentTranscript(AGENT, true).length > 0,
+      "the batched events must still build transcript state",
+    );
+    syncActiveAgentTurnsFromObserver(bridgeAgents);
+    assert.equal(
+      getActiveTurnsForAgent(AGENT).length,
+      0,
+      "the terminal event must still clear derived liveness",
+    );
+  });
+
+  it("makes the triggering frame visible before management callbacks", () => {
+    const managementFrame = makeEvent({
+      seq: 2,
+      kind: "acp_message",
+      timestamp: "2024-01-01T00:00:01Z",
+      payload: {
+        type: "agent_management_request",
+        action: "create",
+        requestId: "request-1",
+        request: {
+          channelId: "chan-1",
+          displayName: "Fleet Observer",
+          systemPrompt: "Observe the fleet.",
+        },
+      },
+    });
+    let visibleSeqs = [];
+    let observerNotifications = 0;
+    const unsubscribeObserver = subscribeAgentObserverStore(() => {
+      observerNotifications += 1;
+    });
+    const unsubscribeManagement = subscribeAgentManagementRequests(
+      (agentPubkey) => {
+        assert.equal(agentPubkey, AGENT);
+        visibleSeqs = getAgentObserverSnapshot(AGENT, true).events.map(
+          (event) => event.seq,
+        );
+        assert.equal(
+          observerNotifications,
+          0,
+          "the global publication must remain deferred until callbacks finish",
+        );
+      },
+    );
+
+    _testProcessLiveObserverEvents(AGENT, [
+      makeEvent({ seq: 1, kind: "turn_started" }),
+      managementFrame,
+    ]);
+    unsubscribeManagement();
+    unsubscribeObserver();
+
+    assert.deepEqual(
+      visibleSeqs,
+      [1, 2],
+      "management callback must observe its triggering frame and prior envelope frames",
+    );
+    assert.equal(observerNotifications, 1);
+  });
+
+  it("does not publish when a replay batch is entirely duplicate", () => {
+    const events = [makeEvent({ seq: 1, kind: "turn_started" })];
+    injectObserverEventsForE2E(AGENT, events);
+
+    let observerNotifications = 0;
+    const unsubscribeObserver = subscribeAgentObserverStore(() => {
+      observerNotifications += 1;
+    });
+    injectObserverEventsForE2E(AGENT, events);
+    unsubscribeObserver();
+
+    assert.equal(observerNotifications, 0);
+    assert.equal(getAgentObserverSnapshot(AGENT, true).events.length, 1);
   });
 
   it("skips agents that are neither running nor deployed", () => {

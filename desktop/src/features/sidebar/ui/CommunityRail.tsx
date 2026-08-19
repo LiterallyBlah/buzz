@@ -133,10 +133,17 @@ function CommunityButton({
               {...dragAttributes}
               {...dragListeners}
             >
+              {isActive ? (
+                <span
+                  aria-hidden="true"
+                  className="absolute -left-2.5 h-5 w-1 rounded-r-full bg-primary"
+                  data-testid={`community-rail-active-${community.id}`}
+                />
+              ) : null}
               <span
                 className={cn(
                   "flex h-9 w-9 items-center justify-center overflow-hidden rounded-xl bg-sidebar-accent/60 text-xs font-semibold text-sidebar-foreground/80 outline-2 outline-offset-2 outline-primary/0 transition-[outline-color]",
-                  isActive ? "outline-primary" : "hover:outline-primary/50",
+                  !isActive && "hover:outline-primary/50",
                 )}
               >
                 {iconUrl ? (
@@ -367,7 +374,7 @@ export function CommunityRail({
   return (
     <nav
       aria-label="Communities"
-      className="relative z-0 flex w-14 shrink-0 flex-col items-center gap-2.5 overflow-y-auto bg-sidebar px-2.5 pb-5 pt-[calc(var(--buzz-top-chrome-height,40px)+7px)]"
+      className="relative z-20 flex w-14 shrink-0 flex-col items-center gap-2.5 overflow-y-auto bg-sidebar px-2.5 pb-5 pt-[calc(var(--buzz-top-chrome-height,40px)+7px)]"
       data-testid="community-rail"
     >
       <DndContext

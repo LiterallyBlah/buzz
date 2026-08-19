@@ -4,6 +4,7 @@ import * as React from "react";
 import { createLiveSubscriptionSet } from "@/shared/api/liveSubscriptionSet";
 import { relayClient } from "@/shared/api/relayClient";
 import { createTrailingDebounce } from "@/shared/lib/trailingDebounce";
+import { isProjectIssueAssignmentOperation } from "./projectIssues.mjs";
 import { useClearProjectUnreadWhileOpen } from "./projectUnreadStore";
 import {
   applyProjectRootEvent,
@@ -79,7 +80,12 @@ export function useLiveProjectRoot(
         if (!role) return;
 
         applyProjectRootEvent(queryClient, { event, projectId, rootId });
-        if (role !== "comment") refresh.trigger();
+        if (
+          role !== "comment" ||
+          isProjectIssueAssignmentOperation(event, rootId)
+        ) {
+          refresh.trigger();
+        }
       },
       onError: (error) => {
         console.error(

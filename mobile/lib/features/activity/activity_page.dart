@@ -14,6 +14,7 @@ import '../../shared/theme/theme.dart';
 import '../../shared/utils/string_utils.dart';
 import '../../shared/widgets/avatar_image.dart';
 import '../../shared/widgets/anchored_popover_menu.dart';
+import '../../shared/widgets/bee_refresh_indicator.dart';
 import '../../shared/widgets/buzz_loading_indicator.dart';
 import '../../shared/widgets/frosted_app_bar.dart';
 import '../../shared/widgets/frosted_scaffold.dart';
@@ -112,7 +113,6 @@ class ActivityPage extends HookConsumerWidget {
     final readState = ref.watch(readStateProvider);
     final localState = ref.watch(inboxLocalStateProvider);
     final drafts = ref.watch(composeDraftsProvider);
-    final dueReminderCount = ref.watch(dueReminderCountProvider);
     final allItems = ref.watch(inboxItemsProvider);
     final myPk = ref.watch(myPubkeyProvider);
 
@@ -220,6 +220,8 @@ class ActivityPage extends HookConsumerWidget {
             channel: channel,
             initialMessageId: target.id,
             initialThreadRootId: threadRootId,
+            initialThreadRouteBehavior:
+                InitialThreadRouteBehavior.replaceCurrentRoute,
           ),
         ),
       );
@@ -240,6 +242,8 @@ class ActivityPage extends HookConsumerWidget {
           builder: (_) => ChannelDetailPage(
             channel: channel,
             initialThreadRootId: draft.threadHeadId,
+            initialThreadRouteBehavior:
+                InitialThreadRouteBehavior.replaceCurrentRoute,
           ),
         ),
       );
@@ -318,7 +322,7 @@ class ActivityPage extends HookConsumerWidget {
           : -1;
 
       bodyRidesOverTopSection = true;
-      body = RefreshIndicator(
+      body = BeeRefreshIndicator(
         edgeOffset: topSectionHeight,
         onRefresh: refresh,
         child: CustomScrollView(
@@ -379,8 +383,6 @@ class ActivityPage extends HookConsumerWidget {
         actions: [
           _ActivityActionsPill(
             filter: filter.value,
-            dueReminderCount: dueReminderCount,
-            draftCount: drafts.length,
             unreadOnly: unreadOnly.value,
             unreadCount: unreadVisibleCount,
             onFilterChanged: (f) => filter.value = f,

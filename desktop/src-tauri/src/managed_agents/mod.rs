@@ -9,8 +9,10 @@ pub(crate) use agent_env::{
     baked_build_env, build_buzz_agent_provider_defaults, discovery_env_with_baked_floor,
 };
 mod backend;
+pub(crate) mod claude_config;
 pub(crate) mod config_bridge;
 pub(crate) mod custom_harnesses;
+mod definition_validation;
 mod discovery;
 pub(crate) mod effective_config;
 mod env_vars;
@@ -38,6 +40,7 @@ pub(crate) mod spawn_snapshot;
 pub(crate) mod storage;
 pub(crate) mod team_events;
 mod team_repair;
+pub(crate) use team_repair::team_persona_key;
 mod teams;
 mod types;
 
@@ -51,6 +54,9 @@ pub(crate) fn lock_path_mutex() -> std::sync::MutexGuard<'static, ()> {
 }
 
 pub use backend::*;
+pub(crate) use definition_validation::{
+    validate_agent_definition_text, validate_managed_agent_definition_text,
+};
 pub use discovery::*;
 pub use env_vars::*;
 #[cfg(windows)]

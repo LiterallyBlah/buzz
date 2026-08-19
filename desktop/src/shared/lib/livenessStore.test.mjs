@@ -390,6 +390,34 @@ describe("createLivenessStore", () => {
       assert.equal(notified, 1, "the sweep is the one mutator that broadcasts");
       assert.equal(store.isSweeping(), false, "no work left, no timer");
     });
+
+    it("stops while suspended and shifts deadlines and cadence on resume", () => {
+      mock.timers.enable({ apis: ["setInterval", "Date"], now: 15_000 });
+      const store = makeStore();
+      const unsubscribe = store.subscribe(() => {});
+      store.upsert("a|1", { group: "a", id: "1" }, { nowMs: 0 });
+      store.observeCadence("a", 0);
+      store.observeCadence("a", 15_000);
+      assert.equal(store.cadenceMs("a"), 15_000);
+      assert.equal(store.isSweeping(), true);
+
+      store.setSuspended(true, 15_000);
+      assert.equal(store.isSuspended(), true);
+      assert.equal(store.isSweeping(), false, "hidden stores hold no timer");
+      assert.equal(store.sweep(315_000), false, "hidden time cannot prune");
+
+      store.setSuspended(false, 315_000);
+      assert.equal(store.isSuspended(), false);
+      assert.equal(store.isSweeping(), true);
+      assert.equal(store.sweep(337_499), false, "the deadline moved by 5m");
+      assert.equal(store.sweep(337_500), true);
+
+      // The last producer-frame clock moved by the same hidden interval, so a
+      // normal 15s heartbeat after resume remains a 15s cadence sample.
+      store.observeCadence("a", 330_000);
+      assert.equal(store.cadenceMs("a"), 15_000);
+      unsubscribe();
+    });
   });
 
   describe("clearing", () => {

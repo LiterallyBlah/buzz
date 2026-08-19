@@ -8,6 +8,7 @@ import {
 import * as React from "react";
 import { toast } from "sonner";
 
+import { useIsManagedAgent } from "@/features/agent-memory/hooks";
 import { ForumComposer } from "@/features/forum/ui/ForumComposer";
 import { useCreateProjectIssueCommentMutation } from "@/features/projects/commentMutations";
 import {
@@ -34,6 +35,8 @@ import {
   type UserProfileLookup,
 } from "@/features/profile/lib/identity";
 import { workingAgentsKey } from "@/features/projects/lib/projectThreadPin";
+import { entityDiscussionQuery } from "@/features/projects/lib/discussionChannels";
+import { issueShareLink } from "@/features/projects/lib/projectShareLinks";
 import type { ProjectAgentActivity } from "@/features/projects/projectAgentActivity";
 import { relativeTime } from "@/features/projects/lib/projectsViewHelpers";
 import { useProjectAgentActivity } from "@/features/projects/useProjectAgentActivity";
@@ -41,12 +44,14 @@ import type { ChannelMember } from "@/shared/api/types";
 import { useElementWidthBreakpoint } from "@/shared/hooks/use-mobile";
 import { cn } from "@/shared/lib/cn";
 import { normalizePubkey } from "@/shared/lib/pubkey";
+import { IssueAssigneeFacepile, IssueAssigneesRow } from "./IssueAssigneesRow";
 import {
   ProjectFeedRow,
   ProjectFeedRowCluster,
   ProjectFeedRowMonoCell,
 } from "./ProjectFeedRow";
 import { ProjectItemDeleteMenu } from "./ProjectItemDeleteMenu";
+import { DiscussedInChannels } from "./DiscussionChannels";
 import { ProjectOriginReference } from "./ProjectOriginReference";
 import { OverviewRailSection } from "./ProjectOverviewPanel";
 import { ProfileIdentityButton } from "./ProjectProfileIdentity";
@@ -54,6 +59,7 @@ import { ProjectRichContent } from "./ProjectRichContent";
 import { ProjectRootAgentsSection } from "./ProjectRootAgentsSection";
 import { ProjectWorkItemDescription } from "./ProjectWorkItemDescription";
 import { useProjectThreadPin } from "./useProjectThreadPin";
+import { ShareLinkButton } from "./ShareLinkButton";
 
 export function issueStatusClassName(status: ProjectIssue["status"]) {
   if (status === "Done") return "text-purple-400";
@@ -153,7 +159,7 @@ function IssueRow({
           />
           <span className="truncate text-foreground/80">
             <span className="font-medium">{authorLabel}</span> created this
-            issue {relativeTime(issue.createdAt)}
+            issue
           </span>
           <span>·</span>
           <span>{issue.status}</span>
@@ -175,6 +181,10 @@ function IssueRow({
       title={issue.title}
       trailing={
         <>
+          <IssueAssigneeFacepile
+            assignees={issue.assignees}
+            profiles={profiles}
+          />
           {issue.comments.length > 0 ? (
             <button
               aria-label={`View ${issue.comments.length} comments`}
@@ -461,10 +471,26 @@ function IssueThreadHeader({
           <span className="font-normal text-muted-foreground">
             #{issue.id.slice(0, 8)}
           </span>
+          <ShareLinkButton
+            className="ml-1 inline-flex h-6 w-6 align-text-bottom"
+            label="Copy issue link"
+            link={issueShareLink(issue)}
+            testId="project-issue-copy-link"
+          />
         </h3>
         <div className="flex shrink-0 items-center gap-2">
           {showStatusChip ? <IssueStatusChip status={issue.status} /> : null}
           <ProjectIssueStatusControls issue={issue} project={project} />
+          <ProjectItemDeleteMenu
+            author={issue.author}
+            label={`More options for ${issue.title}`}
+            project={project}
+            rootId={issue.id}
+            subject="issue"
+            targetId={issue.id}
+            testId={`issue-detail-${issue.id}`}
+            title={issue.title}
+          />
         </div>
       </div>
     </header>
@@ -623,6 +649,11 @@ export function ProjectIssueDetail({
             <IssueBody issue={issue} />
           </div>
           <section className="space-y-3 p-4">
+            <DiscussedInChannels
+              entityLabel="this issue"
+              query={entityDiscussionQuery(issue.id)}
+              testId="issue-discussed-in"
+            />
             <h4 className="flex items-center gap-1.5 text-sm font-semibold text-foreground">
               <MessageSquare className="h-3.5 w-3.5" />
               Conversation
@@ -639,6 +670,7 @@ export function ProjectIssueDetail({
         <IssueMetaRail
           issue={issue}
           profiles={profiles}
+          project={project}
           stacked={stackMetaRail}
         />
       </div>
@@ -669,6 +701,7 @@ export function ProjectIssueDetail({
       issue={issue}
       live={liveActivity}
       profiles={profiles}
+      project={project}
     />
   );
 
@@ -719,6 +752,11 @@ export function ProjectIssueDetail({
                 <MessageSquare className="h-3.5 w-3.5" />
                 Conversation
               </h4>
+              <DiscussedInChannels
+                entityLabel="this issue"
+                query={entityDiscussionQuery(issue.id)}
+                testId="issue-discussed-in"
+              />
             </div>
             <IssueComments
               issue={issue}
@@ -775,6 +813,7 @@ function IssueMetaRail({
   issue,
   live,
   profiles,
+  project,
   stacked = false,
 }: {
   /** Layout override for the pinned layout, which places the rail itself. */
@@ -787,10 +826,19 @@ function IssueMetaRail({
    */
   live?: readonly ProjectAgentActivity[];
   profiles?: UserProfileLookup;
+  project: Project;
   stacked?: boolean;
 }) {
+  const identityQuery = useIdentityQuery();
   const authorProfile = profiles?.[normalizePubkey(issue.author)];
   const authorLabel = resolveUserLabel({ profiles, pubkey: issue.author });
+  const viewerPubkey = identityQuery.data?.pubkey;
+  const viewer = viewerPubkey ? normalizePubkey(viewerPubkey) : null;
+  const isAuthor = viewer === normalizePubkey(issue.author);
+  const isOwner = viewer === normalizePubkey(project.owner);
+  const isManagedAgentOwner = useIsManagedAgent(project.owner) === true;
+  const canAssignOthers =
+    Boolean(viewer) && (isAuthor || isOwner || isManagedAgentOwner);
 
   return (
     <aside
@@ -804,6 +852,18 @@ function IssueMetaRail({
       <OverviewRailSection title="Status">
         <IssueStatusChip status={issue.status} />
       </OverviewRailSection>
+      {issue.assignees.length > 0 || viewer ? (
+        <OverviewRailSection title="Assignees">
+          <IssueAssigneesRow
+            canAssignOthers={canAssignOthers}
+            issue={issue}
+            profiles={profiles}
+            project={project}
+            signAsManagedOwner={isManagedAgentOwner && !isOwner}
+            viewerPubkey={viewer}
+          />
+        </OverviewRailSection>
+      ) : null}
       <OverviewRailSection title="Author">
         <ProfileIdentityButton
           align="center"

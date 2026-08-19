@@ -72,8 +72,13 @@ import {
   resolveProjectDefaultBranch,
 } from "@/features/projects/lib/projectBranches";
 import { normalizeRepositoryUrl } from "@/features/projects/lib/projectsViewHelpers";
+import {
+  shareTabForWorkspaceTab,
+  workspaceTabForShareTab,
+} from "@/features/projects/lib/projectShareLinks";
 import { selectProjectRepository } from "@/features/projects/projectModels";
 import { KIND_REPO_ANNOUNCEMENT } from "@/shared/constants/kinds";
+import type { EntityLinkTab } from "@/shared/lib/entityLink";
 import { useProjectRepoPresentation } from "@/features/projects/useProjectRepoHost";
 import { WorkspaceTabs } from "./ProjectWorkspaceTabs";
 import type { RepoSourceHeaderControls } from "./ProjectRepositorySource";
@@ -85,8 +90,7 @@ import {
 import type { CreateIssueDialogInput } from "./CreateIssueDialog";
 import { ProjectBranchActionDialogs } from "./ProjectBranchActionDialogs";
 import { ProjectDetailChrome } from "./ProjectDetailChrome";
-import { ProjectDetailHero } from "./ProjectDetailHero";
-import { ProjectRepositoryManagement } from "./ProjectRepositoryManagement";
+import { ProjectDetailChromeActions } from "./ProjectDetailChromeActions";
 import { UnavailableProjectRepositories } from "./UnavailableProjectRepositories";
 import {
   PROJECT_TAB_CRUMB_LABELS,
@@ -97,10 +101,13 @@ import {
 
 type ProjectDetailScreenProps = {
   commitHash?: string;
+  entityNavigationId?: string;
   projectId: string;
   pullRequestId?: string;
   issueId?: string;
   repositoryId?: string;
+  /** Workspace tab requested by a share link (link vocabulary). */
+  tab?: EntityLinkTab;
 };
 
 const PROJECT_DETAIL_PANEL_SEARCH_KEYS = [
@@ -121,7 +128,15 @@ const PROJECT_REPOSITORY_SEARCH_KEYS = [
 ] as const;
 
 export function ProjectDetailScreen(props: ProjectDetailScreenProps) {
-  const { commitHash, projectId, pullRequestId, issueId, repositoryId } = props;
+  const {
+    commitHash,
+    entityNavigationId,
+    projectId,
+    pullRequestId,
+    issueId,
+    repositoryId,
+    tab,
+  } = props;
   const { goChannel, goProject, goProjects } = useAppNavigation();
   const { activeCommunity } = useCommunities();
   const mainInsetRef = useMainInsetRef();
@@ -179,14 +194,14 @@ export function ProjectDetailScreen(props: ProjectDetailScreenProps) {
   const [selectedPullRequestId, setSelectedPullRequestId] = React.useState<
     string | null
   >(pullRequestId ?? null);
-  React.useEffect(
-    () => setSelectedPullRequestId(pullRequestId ?? null),
-    [pullRequestId],
-  );
   const [selectedIssueId, setSelectedIssueId] = React.useState<string | null>(
     issueId ?? null,
   );
-  React.useEffect(() => setSelectedIssueId(issueId ?? null), [issueId]);
+  // biome-ignore lint/correctness/useExhaustiveDependencies: the transient request ID deliberately reapplies an unchanged entity selection.
+  React.useEffect(() => {
+    setSelectedPullRequestId(pullRequestId ?? null);
+    setSelectedIssueId(issueId ?? null);
+  }, [entityNavigationId, issueId, pullRequestId]);
   const [selectedCommitHash, setSelectedCommitHash] = React.useState<
     string | null
   >(commitHash ?? null);
@@ -194,9 +209,14 @@ export function ProjectDetailScreen(props: ProjectDetailScreenProps) {
     () => setSelectedCommitHash(commitHash ?? null),
     [commitHash],
   );
-  // Bumped when breadcrumb navigation should land on the project Overview
-  // tab; remounts WorkspaceTabs, which owns the selected-tab state.
+  // Remounts WorkspaceTabs when breadcrumb navigation should open Overview.
   const [tabsResetKey, setTabsResetKey] = React.useState(0);
+  // Local state lets breadcrumb and repository resets drop a share-link tab.
+  const [requestedTab, setRequestedTab] = React.useState<
+    EntityLinkTab | undefined
+  >(tab);
+  // biome-ignore lint/correctness/useExhaustiveDependencies: the transient request ID deliberately reapplies an unchanged share-link tab.
+  React.useEffect(() => setRequestedTab(tab), [entityNavigationId, tab]);
   // Mirror of the WorkspaceTabs selection so the breadcrumb can name the
   // active sub-tab. The Overview (readme) tab is "home" and gets no crumb.
   const [activeTab, setActiveTab] = React.useState("overview");
@@ -509,6 +529,7 @@ export function ProjectDetailScreen(props: ProjectDetailScreenProps) {
     const issuePubkeys = (issuesQuery.data ?? []).flatMap((issue) => [
       issue.author,
       ...issue.recipients,
+      ...issue.assignees,
       ...issue.comments.map((comment) => comment.author),
     ]);
     return [
@@ -920,6 +941,7 @@ export function ProjectDetailScreen(props: ProjectDetailScreenProps) {
     setSelectedPullRequestId(null);
     setSelectedIssueId(null);
     setSelectedCommitHash(null);
+    setRequestedTab(undefined);
     // Remount the workspace tabs so the project page opens on Overview
     // instead of whatever tab the work item left behind.
     setTabsResetKey((key) => key + 1);
@@ -934,17 +956,12 @@ export function ProjectDetailScreen(props: ProjectDetailScreenProps) {
     setSelectedPullRequestId(null);
     setSelectedIssueId(null);
     setSelectedCommitHash(null);
+    setRequestedTab(undefined);
     setRepoSource("remote");
     setTabsResetKey((key) => key + 1);
   };
 
   return (
-    // The activity indicator on an issue or pull request calls
-    // `openAgentActivity(pubkey)` from useOpenAgentActivity, which prefers this
-    // context handler over navigating anywhere. Providing it here is what makes
-    // the pane open in place; without it the hook falls back to finding a
-    // channel the agent works in, and a project turn is scoped to an issue
-    // root, not to any channel, so on this route there is nothing to find.
     <AgentSessionProvider onOpenAgentSession={handleOpenAgentSession}>
       <ProfilePanelProvider onOpenProfilePanel={handleOpenProfilePanel}>
         <ProjectBranchActionDialogs
@@ -959,24 +976,21 @@ export function ProjectDetailScreen(props: ProjectDetailScreenProps) {
               activeTabCrumb={activeTabCrumb}
               activeWorkItemCrumb={activeWorkItemCrumb}
               chromeRef={projectDetailHeaderChromeRef}
-              onGoChannel={(channelId) => {
-                void goChannel(channelId);
-              }}
               onGoProjectHome={handleGoToProjectHome}
               onGoProjects={() => {
                 void goProjects();
               }}
               project={project}
+              shareTab={
+                activeWorkItemCrumb
+                  ? undefined
+                  : shareTabForWorkspaceTab(activeTab)
+              }
             />
 
             <div
               className={cn(
                 "flex min-h-0 min-w-0 flex-1 flex-col px-4 pb-4",
-                // With an issue open the thread owns the scroll region, so the
-                // page must stop being one. Two nested scrollers here is what
-                // produced the original complaint: the conversation could only
-                // be reached by scrolling a page whose header, hero and tab
-                // strip were all above it.
                 issueOwnsScroll ? "overflow-hidden" : "overflow-y-auto",
               )}
             >
@@ -988,36 +1002,15 @@ export function ProjectDetailScreen(props: ProjectDetailScreenProps) {
                     : "space-y-3",
                 )}
               >
-                {/* Hidden for the same reason the hero was: with the thread
-                    owning the scroll region, anything above the tab strip
-                    pushes the conversation off the screen it was opened to
-                    show. The breadcrumb still leads back to the project, and
-                    the repository picker is reachable from there. */}
-                {issueOwnsScroll ? null : (
-                  <ProjectDetailHero
-                    name={project.name}
-                    repositoryPicker={
-                      <ProjectRepositoryManagement
-                        identityPubkey={identityQuery.data?.pubkey}
-                        onChange={handleRepositoryChange}
-                        project={project}
-                        projects={projectsQuery.data ?? []}
-                        repository={repository}
-                      />
-                    }
-                    webUrl={
-                      repoRemote.webUrl &&
-                      (repoRemote.host.kind !== "external" ||
-                        repoSource === "local")
-                        ? repoRemote.webUrl
-                        : null
-                    }
-                  />
-                )}
-
                 <WorkspaceTabs
                   key={`${project.id}:${repository.id}:${tabsResetKey}`}
                   fillHeight={issueOwnsScroll}
+                  initialTab={
+                    requestedTab
+                      ? workspaceTabForShareTab(requestedTab)
+                      : undefined
+                  }
+                  initialTabRequestKey={entityNavigationId}
                   commitDiff={commitDiffQuery.data}
                   commitDiffError={commitDiffQuery.error}
                   commitDiffLoading={commitDiffQuery.isLoading}
@@ -1060,6 +1053,15 @@ export function ProjectDetailScreen(props: ProjectDetailScreenProps) {
                   onSelectedTabChange={setActiveTab}
                   profiles={profiles}
                   project={repository}
+                  repositoryControls={
+                    <ProjectDetailChromeActions
+                      identityPubkey={identityQuery.data?.pubkey}
+                      onRepositoryChange={handleRepositoryChange}
+                      project={project}
+                      projects={projectsQuery.data ?? []}
+                      repository={repository}
+                    />
+                  }
                   projectId={project.id}
                   repoDiff={displayedRepoDiff}
                   repoDiffError={displayedRepoDiffError}
