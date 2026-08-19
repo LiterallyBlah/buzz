@@ -23,11 +23,17 @@
 //!   "stt": { "backend": "local",           // or "http"
 //!            "endpointUrl": null },        // base URL when "http"
 //!   "tts": { "backend": "local", "endpointUrl": null },
+//!   "silenceHoldMs": 800,        // pause that closes an utterance
 //!   "inputDeviceId": null,
 //!   "outputDevice": null,
 //!   "indicatorPosition": null    // null → the frontend's default corner
 //! }
 //! ```
+//!
+//! `silenceHoldMs` was added after v1 shipped and is read with a serde default
+//! rather than a version bump: an install without the key gets the default
+//! hold, which is exactly the pause it was already using. A version bump would
+//! have made every existing file unreadable to the build that wrote it.
 //!
 //! `wakeBindings` is a LIST in v1 even though M1's runtime and UI use exactly
 //! one binding. Keeping the list shape now means per-agent wake words (M2)
@@ -40,6 +46,7 @@ use tauri::{AppHandle, Manager};
 
 use crate::managed_agents::storage::atomic_write_json_restricted;
 
+use super::utterance::{DEFAULT_SILENCE_HOLD_MS, MAX_SILENCE_HOLD_MS, MIN_SILENCE_HOLD_MS};
 use super::wake_word::{validate_wake_word, WakeWordError, MAX_WAKE_WORD_CHARS};
 
 pub(crate) const SETTINGS_FILE: &str = "ambient-voice-settings.json";
@@ -159,6 +166,15 @@ pub struct AmbientVoiceSettings {
     pub stt: SpeechBackendSettings,
     #[serde(default)]
     pub tts: SpeechBackendSettings,
+    /// How long a pause must last before it closes an utterance.
+    ///
+    /// Absent from every file written before this setting existed, which is why
+    /// it carries a serde default rather than a migration: those installs get
+    /// [`DEFAULT_SILENCE_HOLD_MS`] and nothing about them breaks. Clamped to
+    /// the slider's range on load, so a hand-edited or newer file cannot ask
+    /// the capture machine for a hold it will not honour.
+    #[serde(default = "default_silence_hold_ms")]
+    pub silence_hold_ms: u32,
     /// Persisted `getUserMedia` input device id. Closes the existing gap where
     /// huddle device choices do not survive restart.
     #[serde(default)]
@@ -182,11 +198,17 @@ impl Default for AmbientVoiceSettings {
             wake_bindings: Vec::new(),
             stt: SpeechBackendSettings::default(),
             tts: SpeechBackendSettings::default(),
+            silence_hold_ms: DEFAULT_SILENCE_HOLD_MS,
             input_device_id: None,
             output_device: None,
             indicator_position: None,
         }
     }
+}
+
+/// The hold a file with no stored value loads with. Serde needs a function.
+fn default_silence_hold_ms() -> u32 {
+    DEFAULT_SILENCE_HOLD_MS
 }
 
 impl AmbientVoiceSettings {
@@ -282,6 +304,10 @@ pub(crate) fn load_from_path(path: &Path) -> Result<AmbientVoiceSettings, String
         .retain(|binding| validate_binding_shape(binding).is_ok());
     settings.wake_bindings.truncate(MAX_WAKE_BINDINGS);
 
+    settings.silence_hold_ms = settings
+        .silence_hold_ms
+        .clamp(MIN_SILENCE_HOLD_MS, MAX_SILENCE_HOLD_MS);
+
     // A hand-edited or truncated file can carry a position no window could
     // ever show. Forgetting it falls back to the default corner, which is
     // strictly better than an indicator the user cannot find.
@@ -333,6 +359,14 @@ pub(crate) fn save_to_path(path: &Path, settings: &AmbientVoiceSettings) -> Resu
     }
     for binding in &settings.wake_bindings {
         validate_binding_shape(binding)?;
+    }
+    if !(MIN_SILENCE_HOLD_MS..=MAX_SILENCE_HOLD_MS).contains(&settings.silence_hold_ms) {
+        return Err(format!(
+            "The pause before Buzz stops listening must be between \
+             {:.1} and {:.0} seconds",
+            f64::from(MIN_SILENCE_HOLD_MS) / 1000.0,
+            f64::from(MAX_SILENCE_HOLD_MS) / 1000.0
+        ));
     }
     if let Some(position) = settings.indicator_position {
         if !position.is_storable() {

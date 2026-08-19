@@ -323,6 +323,24 @@ fn a_speech_backend_change_restarts_the_running_session() {
 }
 
 #[test]
+fn the_silence_hold_restarts_the_running_session() {
+    // The hold is bound once, when the worker thread starts: the capture
+    // machine derives both of its limits from it at construction. Without it in
+    // the recorded configuration, a slider moved while ambient voice was running
+    // would take effect only after the whole feature was switched off and on
+    // again — exactly the defect that put the wake word in here.
+    let running = bound(true);
+    let started_with = SessionConfig::of(&running);
+    assert!(!session_needs_restart(Some(&started_with), &running));
+
+    let held_longer = AmbientVoiceSettings {
+        silence_hold_ms: 2_500,
+        ..running.clone()
+    };
+    assert!(session_needs_restart(Some(&started_with), &held_longer));
+}
+
+#[test]
 fn mute_and_the_indicator_position_never_cost_a_restart() {
     // Mute is applied to the live worker in place, and every reconcile runs
     // through the same predicate: rebuilding the session to close a microphone

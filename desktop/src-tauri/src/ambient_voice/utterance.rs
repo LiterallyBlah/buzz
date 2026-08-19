@@ -9,8 +9,8 @@
 //!            wake word fires
 //!   Idle ──────────────────────► Armed ──── speech starts ───► Capturing
 //!    ▲                             │                               │
-//!    │                             │ nothing said in ARM_TIMEOUT   │ 300 ms silence
-//!    │                             ▼                               │ or 30 s cap
+//!    │                             │ nothing said in ARM_TIMEOUT   │ the silence
+//!    │                             ▼                               │ hold or the cap
 //!    └───────────── Drop ──────────┴───────────── Decode ──────────┘
 //! ```
 //!
@@ -27,22 +27,52 @@
 //! of the same PCM stream.
 //!
 //! Constants deliberately match `huddle::stt`, which is tuned against real
-//! huddle audio; diverging would mean re-tuning from scratch.
+//! huddle audio; diverging would mean re-tuning from scratch. The one
+//! exception is how long a pause is allowed to last, which is the user's to
+//! choose ([`UtteranceTiming`]) because it is the difference between "finish
+//! my sentence for me" and "let me think mid-sentence".
 
 use std::time::{Duration, Instant};
 
 /// earshot requires exactly 256 samples per frame at 16 kHz (16 ms).
 pub const VAD_FRAME_SAMPLES: usize = 256;
 
-/// 300 ms of silence ends an utterance (19 frames × 16 ms).
-pub const SILENCE_FLUSH_FRAMES: usize = 19;
+/// Milliseconds of audio in one VAD frame.
+const FRAME_MS: u32 = 1_000 * VAD_FRAME_SAMPLES as u32 / 16_000;
+
+/// Samples of 16 kHz audio in one millisecond.
+const SAMPLES_PER_MS: usize = 16;
+
+/// Shortest silence hold the settings slider offers.
+///
+/// The value this feature shipped with, and `huddle::stt`'s own tuning: quick
+/// enough to feel immediate, short enough to cut someone off mid-thought.
+pub const MIN_SILENCE_HOLD_MS: u32 = 300;
+
+/// Longest silence hold the settings slider offers.
+pub const MAX_SILENCE_HOLD_MS: u32 = 10_000;
+
+/// The hold an install with nothing stored gets.
+///
+/// Longer than the shipped 300 ms because dogfood kept losing the second half
+/// of a sentence to an ordinary breath, and short enough that a finished
+/// sentence still reaches the agent without a wait anyone would notice.
+pub const DEFAULT_SILENCE_HOLD_MS: u32 = 800;
+
+/// Base ceiling on one utterance, before the hold is accounted for.
+const BASE_CAP_MS: u32 = 30_000;
+
+/// How many silence holds of headroom the cap carries on top of that base.
+///
+/// The cap exists so a stuck VAD cannot grow the buffer without bound, but a
+/// long hold spends real time *inside* an utterance waiting for pauses to end.
+/// Leaving the ceiling fixed would mean the pauses the user asked for became
+/// the thing that truncated them.
+const CAP_HOLDS: u32 = 20;
 
 /// Minimum voiced frames before an utterance may be transcribed (~192 ms).
 /// Below this it is room noise, and transcribing it invites hallucinated text.
 pub const MIN_VOICED_FRAMES: usize = 12;
-
-/// 30 seconds at 16 kHz — hard cap so a stuck VAD cannot grow the buffer.
-pub const MAX_SPEECH_SAMPLES: usize = 16_000 * 30;
 
 /// How long after TTS stops before the microphone is trusted again.
 pub const TTS_COOLDOWN: Duration = Duration::from_millis(150);
@@ -52,6 +82,51 @@ pub const TTS_COOLDOWN: Duration = Duration::from_millis(150);
 /// Long enough to survive a false start ("hey hermes… um…"), short enough that
 /// a false-positive wake word cannot leave the transcriber armed indefinitely.
 pub const WAKE_ARM_TIMEOUT: Duration = Duration::from_secs(6);
+
+/// The two limits a session's silence hold decides.
+///
+/// Derived once, when the session is built, rather than recomputed per frame —
+/// and clamped here as well as in `settings`, so a machine constructed from a
+/// value that never went through the settings door is still safe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UtteranceTiming {
+    silence_flush_frames: usize,
+    max_speech_samples: usize,
+}
+
+impl Default for UtteranceTiming {
+    fn default() -> Self {
+        Self::from_silence_hold_ms(DEFAULT_SILENCE_HOLD_MS)
+    }
+}
+
+impl UtteranceTiming {
+    /// Derive both limits from the persisted hold.
+    pub fn from_silence_hold_ms(silence_hold_ms: u32) -> Self {
+        let hold_ms = silence_hold_ms.clamp(MIN_SILENCE_HOLD_MS, MAX_SILENCE_HOLD_MS);
+        let cap_ms = BASE_CAP_MS + CAP_HOLDS * hold_ms;
+        Self {
+            // Rounded up: quantising to whole frames must never make the hold
+            // shorter than the user asked for.
+            silence_flush_frames: hold_ms.div_ceil(FRAME_MS) as usize,
+            max_speech_samples: cap_ms as usize * SAMPLES_PER_MS,
+        }
+    }
+
+    /// Consecutive silent frames that end an utterance. Test-facing: the
+    /// machine reads the field, and the worker reads the [`FrameOutcome`].
+    #[cfg(test)]
+    pub fn silence_flush_frames(&self) -> usize {
+        self.silence_flush_frames
+    }
+
+    /// Hard ceiling on one utterance, in 16 kHz samples. Test-facing for the
+    /// same reason.
+    #[cfg(test)]
+    pub fn max_speech_samples(&self) -> usize {
+        self.max_speech_samples
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UtterancePhase {
@@ -79,6 +154,10 @@ pub enum FrameOutcome {
 
 #[derive(Debug)]
 pub struct UtteranceMachine {
+    /// The limits this session was built with. Fixed for the machine's life —
+    /// a hold changed in settings reaches the audio path through
+    /// `super::reconcile`, which builds a new session.
+    timing: UtteranceTiming,
     phase: UtterancePhase,
     /// When the arm window started. Refreshed while the microphone is gated so
     /// TTS playback does not consume the user's speaking window.
@@ -92,13 +171,14 @@ pub struct UtteranceMachine {
 
 impl Default for UtteranceMachine {
     fn default() -> Self {
-        Self::new()
+        Self::new(UtteranceTiming::default())
     }
 }
 
 impl UtteranceMachine {
-    pub fn new() -> Self {
+    pub fn new(timing: UtteranceTiming) -> Self {
         Self {
+            timing,
             phase: UtterancePhase::Idle,
             armed_at: None,
             silence_frames: 0,
@@ -111,6 +191,13 @@ impl UtteranceMachine {
 
     pub fn phase(&self) -> UtterancePhase {
         self.phase
+    }
+
+    /// The limits this machine is running with. Test-facing: production reads
+    /// them through the outcomes, never directly.
+    #[cfg(test)]
+    pub fn timing(&self) -> UtteranceTiming {
+        self.timing
     }
 
     /// Voiced frames accumulated in the current utterance. Test-facing: the
@@ -213,8 +300,8 @@ impl UtteranceMachine {
                     self.silence_frames += 1;
                 }
 
-                let ended = self.silence_frames >= SILENCE_FLUSH_FRAMES;
-                let capped = self.buffered_samples >= MAX_SPEECH_SAMPLES;
+                let ended = self.silence_frames >= self.timing.silence_flush_frames;
+                let capped = self.buffered_samples >= self.timing.max_speech_samples;
                 if !ended && !capped {
                     return FrameOutcome::Buffer;
                 }

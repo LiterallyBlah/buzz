@@ -198,6 +198,9 @@ struct SessionConfig {
     /// Which backend speaks the replies. Bound once for the same reason: the
     /// pipeline is built at start, against one endpoint or one local model.
     tts: settings::SpeechBackendSettings,
+    /// How long a pause closes an utterance. The capture machine derives both
+    /// of its limits from this once, when the worker thread starts.
+    silence_hold_ms: u32,
 }
 
 impl SessionConfig {
@@ -208,6 +211,7 @@ impl SessionConfig {
             output_device: settings.output_device.clone(),
             stt: settings.stt.clone(),
             tts: settings.tts.clone(),
+            silence_hold_ms: settings.silence_hold_ms,
         }
     }
 }
@@ -639,6 +643,7 @@ async fn start_session(state: &AppState, settings: &AmbientVoiceSettings) -> Res
         stt_model_dir: stt_dir,
         stt_endpoint: settings.stt.http_base_url().map(str::to_string),
         keywords_buf,
+        silence_hold_ms: settings.silence_hold_ms,
         tts_active: Arc::clone(&ambient.tts_active),
         tts_cancel: Arc::clone(&ambient.tts_cancel),
         muted: Arc::clone(&ambient.muted),

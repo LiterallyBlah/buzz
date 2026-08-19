@@ -42,7 +42,7 @@ use tokio::sync::mpsc as tokio_mpsc;
 
 use super::status::AmbientStatus;
 use super::transcriber::Transcriber;
-use super::utterance::{FrameOutcome, UtteranceMachine, VAD_FRAME_SAMPLES};
+use super::utterance::{FrameOutcome, UtteranceMachine, UtteranceTiming, VAD_FRAME_SAMPLES};
 
 /// Bounded audio queue capacity — same shape and reasoning as `huddle::stt`:
 /// 100 ms batches at 48 kHz ≈ 19 KB each, so 50 slots ≈ 5 s / ~1 MB.
@@ -222,6 +222,8 @@ pub struct AmbientSessionConfig {
     /// [`super::wake_word::WakeWordTokenizer::keywords_buf`] — raw text here
     /// kills the process.
     pub keywords_buf: String,
+    /// How long a pause closes an utterance, in milliseconds.
+    pub silence_hold_ms: u32,
     /// Shared with the ambient TTS pipeline: true while it is playing.
     pub tts_active: Arc<AtomicBool>,
     /// Shared with the ambient TTS pipeline: set to cancel playback.
@@ -441,6 +443,7 @@ fn ambient_worker(
         stt_model_dir,
         stt_endpoint,
         keywords_buf,
+        silence_hold_ms,
         tts_active,
         tts_cancel,
         muted,
@@ -486,7 +489,7 @@ fn ambient_worker(
     let mut vad = Detector::new(DefaultPredictor::new());
 
     let stream = spotter.create_stream();
-    let mut machine = UtteranceMachine::new();
+    let mut machine = UtteranceMachine::new(UtteranceTiming::from_silence_hold_ms(silence_hold_ms));
     let mut leftover_16k: Vec<f32> = Vec::new();
     let mut speech_buf: Vec<f32> = Vec::new();
 
@@ -573,10 +576,7 @@ fn ambient_worker(
                         }
                         FrameOutcome::Decode => {
                             speech_buf.extend_from_slice(&frame);
-                            status.set(AmbientStatus::Transcribing);
-                            let outcome = transcribe(&transcriber, &speech_buf, &transcript_tx);
-                            speech_buf.clear();
-                            status.set(status_after_decode(outcome));
+                            finish_capture(&transcriber, &mut speech_buf, &transcript_tx, &status);
                         }
                     }
                 }
@@ -609,6 +609,19 @@ fn current_idle_status(machine: &UtteranceMachine, tts_playing: bool) -> Ambient
         _ if tts_playing => AmbientStatus::Speaking,
         _ => AmbientStatus::Heard,
     }
+}
+
+/// Transcribe, publish, and clear — the tail every close shares.
+fn finish_capture(
+    transcriber: &Transcriber,
+    speech_buf: &mut Vec<f32>,
+    transcript_tx: &tokio_mpsc::Sender<String>,
+    status: &StatusSink,
+) {
+    status.set(AmbientStatus::Transcribing);
+    let outcome = transcribe(transcriber, speech_buf, transcript_tx);
+    speech_buf.clear();
+    status.set(status_after_decode(outcome));
 }
 
 /// Turn the captured utterance into a published transcript.

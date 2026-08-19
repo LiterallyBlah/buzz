@@ -27,6 +27,7 @@ fn defaults_are_off_with_no_wake_word() {
     assert!(settings.wake_bindings.is_empty());
     assert_eq!(settings.stt.backend, SpeechBackend::Local);
     assert_eq!(settings.tts.backend, SpeechBackend::Local);
+    assert_eq!(settings.silence_hold_ms, DEFAULT_SILENCE_HOLD_MS);
     assert!(settings.input_device_id.is_none());
     assert!(settings.output_device.is_none());
     // No stored indicator position: the frontend's default corner applies
@@ -55,6 +56,7 @@ fn settings_survive_a_save_load_round_trip() {
         wake_bindings: vec![binding()],
         stt: SpeechBackendSettings::default(),
         tts: SpeechBackendSettings::default(),
+        silence_hold_ms: 2_500,
         input_device_id: Some("mic-abc".to_string()),
         output_device: Some("Speakers (Realtek)".to_string()),
         indicator_position: Some(IndicatorPosition {
@@ -146,6 +148,84 @@ fn the_persisted_file_uses_the_documented_camel_case_schema() {
     assert!(value["wakeBindings"][0]["destination"].is_null());
     assert_eq!(value["stt"]["backend"], "local");
     assert_eq!(value["inputDeviceId"], "mic-abc");
+}
+
+// ── The silence hold ─────────────────────────────────────────────────────────
+
+/// A v1 file exactly as builds before this setting existed wrote it.
+fn legacy_file() -> String {
+    format!(
+        r#"{{"version":1,"enabled":true,"muted":false,
+            "wakeBindings":[{{"wakeWord":"hey hermes","agentPubkey":"{AGENT}","destination":null}}],
+            "stt":{{"backend":"local","endpointUrl":null}},
+            "tts":{{"backend":"local","endpointUrl":null}},
+            "inputDeviceId":null,"outputDevice":null,"indicatorPosition":null}}"#
+    )
+}
+
+/// Load `json`, save it back, and return the file the next launch would read.
+///
+/// Round-tripping through the file rather than asserting on the struct is the
+/// point: these settings are read at boot by a process that has only the bytes.
+fn reloaded_json(json: &str) -> serde_json::Value {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join(SETTINGS_FILE);
+    std::fs::write(&path, json).expect("fixture write");
+    let settings = load_from_path(&path).expect("load");
+    let out = dir.path().join("reloaded.json");
+    save_to_path(&out, &settings).expect("save");
+    serde_json::from_slice(&std::fs::read(&out).expect("read")).expect("json")
+}
+
+#[test]
+fn a_file_written_before_these_settings_existed_gets_the_defaults() {
+    // The upgrade path for every install that already has this feature on: no
+    // stored key, no breakage, and the documented default rather than a zero.
+    let value = reloaded_json(&legacy_file());
+    assert_eq!(value["silenceHoldMs"], 800);
+    // And nothing the file did carry was lost on the way through.
+    assert_eq!(value["wakeBindings"][0]["wakeWord"], "hey hermes");
+    assert_eq!(value["enabled"], true);
+}
+
+#[test]
+fn a_chosen_hold_survives_a_restart() {
+    let value = reloaded_json(&format!(
+        r#"{{"version":1,"enabled":true,
+            "wakeBindings":[{{"wakeWord":"hey hermes","agentPubkey":"{AGENT}"}}],
+            "silenceHoldMs":2500}}"#
+    ));
+    assert_eq!(value["silenceHoldMs"], 2500);
+}
+
+#[test]
+fn a_hold_no_slider_could_produce_is_clamped_on_load_and_refused_on_save() {
+    // Load is forgiving because the alternative is a file that will not open;
+    // save is strict because a client sending this is a defect, and a hold of
+    // zero would close every utterance on its first silent frame.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join(SETTINGS_FILE);
+    for (stored, clamped) in [(0, MIN_SILENCE_HOLD_MS), (999_999, MAX_SILENCE_HOLD_MS)] {
+        std::fs::write(
+            &path,
+            format!(r#"{{"version":1,"enabled":true,"silenceHoldMs":{stored}}}"#),
+        )
+        .expect("fixture write");
+        assert_eq!(
+            load_from_path(&path).expect("load").silence_hold_ms,
+            clamped
+        );
+
+        let error = save_to_path(
+            &path,
+            &AmbientVoiceSettings {
+                silence_hold_ms: stored,
+                ..AmbientVoiceSettings::default()
+            },
+        )
+        .expect_err("out-of-range hold");
+        assert!(error.contains("between 0.3 and 10 seconds"), "{error}");
+    }
 }
 
 #[test]
