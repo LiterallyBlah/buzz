@@ -34,10 +34,10 @@ test("project issue composer offers viewer-authorised relay agents outside the l
   });
   await openBuzzProject(page);
 
-  await page.getByRole("tab", { name: "Issues", exact: true }).click();
+  await page.getByRole("tab", { name: "Tasks", exact: true }).click();
   const issueRow = page.getByTestId("project-issue-row").first();
   await expect(issueRow).toBeVisible({ timeout: 10_000 });
-  await issueRow.getByTitle("View issue").click();
+  await issueRow.getByTitle("View task").click();
 
   const detail = page.getByTestId("project-issue-detail");
   await expect(detail).toBeVisible({ timeout: 10_000 });
