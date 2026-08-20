@@ -25,6 +25,31 @@ export type AudioWorkletHandle = {
   setMode: (mode: "push_to_talk" | "voice_activity") => void;
   /** Set mic input gain (0–1). Adjusts the GainNode between source and worklet. */
   setGain: (value: number) => void;
+  /**
+   * PCM batches handed to the sink command since setup.
+   *
+   * The push is fire-and-forget by design (the Rust side drops on
+   * backpressure), so nothing downstream can say whether this half of the path
+   * ever ran. The ambient session reports this count to the native side, which
+   * is what separates "the webview pushed and nothing arrived" from "the
+   * webview never pushed" the next time a session goes deaf.
+   */
+  pushedBatches: () => number;
+};
+
+/** Optional overrides for a second consumer of the same worklet. */
+export type AudioWorkletOptions = {
+  /**
+   * Tauri command the PCM batches are pushed to. Defaults to the huddle STT
+   * sink; the ambient-voice session passes its own parallel command.
+   */
+  command?: string;
+  /**
+   * Whether to forward the global push-to-talk shortcut to the worklet.
+   * Push-to-talk belongs to huddles — an ambient session is gated by its wake
+   * word and its own mute control, and must not open or close on Ctrl+Space.
+   */
+  pushToTalk?: boolean;
 };
 
 /**
@@ -47,12 +72,17 @@ export type AudioWorkletHandle = {
  * @param audioTrack - Mic track from LiveKit
  * @param initialMode - Whether the push-to-talk shortcut is enabled.
  * @param initiallyManuallyUnmuted - Initial state of the clickable mic control.
+ * @param options - Sink command and push-to-talk participation. Defaults keep
+ *   the huddle behaviour exactly as it was.
  */
 export async function setupAudioWorklet(
   audioTrack: MediaStreamTrack,
   initialMode: "push_to_talk" | "voice_activity" = "voice_activity",
   initiallyManuallyUnmuted = true,
+  options: AudioWorkletOptions = {},
 ): Promise<AudioWorkletHandle> {
+  const sinkCommand = options.command ?? "push_audio_pcm";
+  const pushToTalk = options.pushToTalk ?? true;
   const audioContext = new AudioContext({ sampleRate: 48000 });
 
   // Resume after user gesture (required by autoplay policy)
@@ -89,14 +119,16 @@ export async function setupAudioWorklet(
 
   // Forward PCM batches to Rust via raw binary invoke.
   // Direction: worklet→main (receives PCM data from worklet processor).
+  let pushedBatches = 0;
   workletNode.port.onmessage = (event: MessageEvent<Float32Array>) => {
     const float32 = event.data;
+    pushedBatches += 1;
     // Fire-and-forget — Rust side uses try_send which drops on backpressure.
     // No await: prevents main-thread backpressure from slow Rust processing.
     // Create a zero-copy Uint8Array view over the same underlying buffer.
     // Rust reinterprets the bytes as f32 on the other side.
     invokeRawBinary(
-      "push_audio_pcm",
+      sinkCommand,
       new Uint8Array(float32.buffer, float32.byteOffset, float32.byteLength),
     ).catch(() => {
       /* silently drop — Rust handles backpressure */
@@ -106,19 +138,21 @@ export async function setupAudioWorklet(
   // Listen for PTT state from Rust global shortcut (Ctrl+Space press/release).
   // Direction: Rust→main→worklet. The Tauri event carries a boolean payload.
   let pttUnlisten: UnlistenFn | null = null;
-  try {
-    pttUnlisten = await listen<boolean>("ptt-state", (event) => {
-      // Only forward PTT events to the worklet when in PTT mode.
-      // Manual unmute remains independent from the shortcut state.
-      if (currentMode === "push_to_talk") {
-        shortcutActive = event.payload;
-        syncTransmission();
-      }
-    });
-  } catch {
-    // PTT events not available — worklet stays in current transmit mode.
-    // This is fine for VAD mode (always transmitting) and degrades gracefully
-    // for PTT mode (user won't be able to transmit, but audio won't leak).
+  if (pushToTalk) {
+    try {
+      pttUnlisten = await listen<boolean>("ptt-state", (event) => {
+        // Only forward PTT events to the worklet when in PTT mode.
+        // Manual unmute remains independent from the shortcut state.
+        if (currentMode === "push_to_talk") {
+          shortcutActive = event.payload;
+          syncTransmission();
+        }
+      });
+    } catch {
+      // PTT events not available — worklet stays in current transmit mode.
+      // This is fine for VAD mode (always transmitting) and degrades gracefully
+      // for PTT mode (user won't be able to transmit, but audio won't leak).
+    }
   }
 
   return {
@@ -142,5 +176,6 @@ export async function setupAudioWorklet(
     setGain: (value: number) => {
       gainNode.gain.value = value;
     },
+    pushedBatches: () => pushedBatches,
   };
 }

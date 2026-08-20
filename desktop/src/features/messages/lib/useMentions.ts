@@ -21,10 +21,11 @@ import {
   getAgentIdentityPubkeys,
   getMentionableAgentPubkeys,
   getSharedChannelIds,
-  isAgentMentionChannelType,
   rememberSelectedAgentPubkeys,
+  resolveAgentEligibilityScope,
   shouldHideAgentFromMentions,
   uniqueAutocompleteLabels,
+  type AgentEligibilityScope,
 } from "@/features/agents/lib/agentAutocompleteEligibility";
 import {
   useInfiniteUserSearchQuery,
@@ -65,8 +66,20 @@ export type PersonaMentionTarget = {
   persona: AgentPersona;
 };
 type UseMentionsOptions = {
+  agentEligibilityScope?: AgentEligibilityScope;
   channelType?: ChannelType | null;
 };
+// One producer for "normalize a list of records into a pubkey Set", shared by
+// the managed-agent, relay-agent and channel-member memos below so they cannot
+// drift on normalization.
+function toNormalizedPubkeySet(
+  records: readonly { pubkey: string }[] | undefined,
+) {
+  return new Set(
+    (records ?? []).map((record) => normalizePubkey(record.pubkey)),
+  );
+}
+
 export function useMentions(
   channelId: string | null,
   externalMembers?: ChannelMember[],
@@ -158,12 +171,7 @@ export function useMentions(
     [managedAgentsQuery.data],
   );
   const managedAgentPubkeys = React.useMemo(
-    () =>
-      new Set(
-        (managedAgentsQuery.data ?? []).map((agent) =>
-          normalizePubkey(agent.pubkey),
-        ),
-      ),
+    () => toNormalizedPubkeySet(managedAgentsQuery.data),
     [managedAgentsQuery.data],
   );
   const relayAgentNamesByPubkey = React.useMemo(
@@ -180,16 +188,31 @@ export function useMentions(
     () => getSharedChannelIds(channelsQuery.data),
     [channelsQuery.data],
   );
-  const mentionChannelId = isAgentMentionChannelType(options?.channelType)
-    ? channelId
-    : null;
+  const memberPubkeys = React.useMemo(
+    () => toNormalizedPubkeySet(members),
+    [members],
+  );
+  const agentEligibilityScope = React.useMemo(() => {
+    const scope = resolveAgentEligibilityScope({
+      channelId,
+      channelType: options?.channelType,
+      explicitScope: options?.agentEligibilityScope,
+    });
+    // `memberPubkeys` is what lets a channel member be mentioned even when its
+    // own kind:10100 `channelIds` predates the channel. Only the channel scope
+    // consults it; community scope never looked at the channel to begin with.
+    return scope.type === "channel" ? { ...scope, memberPubkeys } : scope;
+  }, [
+    channelId,
+    memberPubkeys,
+    options?.agentEligibilityScope,
+    options?.channelType,
+  ]);
   const mentionableAgentPubkeys = React.useMemo(
     () =>
       getMentionableAgentPubkeys({
         currentPubkey,
-        eligibilityScope: mentionChannelId
-          ? { type: "channel", channelId: mentionChannelId }
-          : { type: "managed-only" },
+        eligibilityScope: agentEligibilityScope,
         managedAgentPubkeys,
         relayAgents: relayAgentsQuery.data,
         sharedChannelIds,
@@ -197,7 +220,7 @@ export function useMentions(
     [
       currentPubkey,
       managedAgentPubkeys,
-      mentionChannelId,
+      agentEligibilityScope,
       relayAgentsQuery.data,
       sharedChannelIds,
     ],
@@ -230,11 +253,6 @@ export function useMentions(
   const activePersonaIds = React.useMemo(
     () => new Set(activePersonas.map((persona) => persona.id)),
     [activePersonas],
-  );
-  const memberPubkeys = React.useMemo(
-    () =>
-      new Set((members ?? []).map((member) => normalizePubkey(member.pubkey))),
-    [members],
   );
   const agentIdentityPubkeys = React.useMemo(
     () =>
@@ -820,9 +838,12 @@ export function useMentions(
     agentPubkeys: agentIdentityPubkeys,
     getSelectedAgentPubkeys,
     currentPubkey,
-    eligibilityScope: mentionChannelId
-      ? { type: "channel", channelId: mentionChannelId }
-      : { type: "managed-only" },
+    // The same resolved scope the autocomplete used, so the send-boundary
+    // re-check cannot be stricter than what was offered: a community work
+    // surface stays community, and a channel scope carries `memberPubkeys` so a
+    // channel member with a stale kind:10100 `channelIds` is not stripped here
+    // after being legitimately offered above.
+    eligibilityScope: agentEligibilityScope,
     sharedChannelIds,
     ownerOnly: agentAccessOwnerOnlyQuery.data,
     ownerPolicyError: agentAccessOwnerOnlyQuery.error,

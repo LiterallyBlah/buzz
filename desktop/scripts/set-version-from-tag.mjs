@@ -17,6 +17,10 @@ if (!/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/.test(version)) {
 
 const packageJsonPath = resolve(process.cwd(), "package.json");
 const tauriConfigPath = resolve(process.cwd(), "src-tauri/tauri.conf.json");
+const tauriWindowsConfigPath = resolve(
+  process.cwd(),
+  "src-tauri/tauri.windows.conf.json",
+);
 const cargoTomlPath = resolve(process.cwd(), "src-tauri/Cargo.toml");
 
 const packageJson = JSON.parse(readFileSync(packageJsonPath, "utf8"));
@@ -28,6 +32,16 @@ const tauriConfig = JSON.parse(readFileSync(tauriConfigPath, "utf8"));
 tauriConfig.version = version;
 writeFileSync(tauriConfigPath, `${JSON.stringify(tauriConfig, null, 2)}\n`);
 console.log(`Set tauri.conf.json to ${version}`);
+
+const tauriWindowsConfig = JSON.parse(
+  readFileSync(tauriWindowsConfigPath, "utf8"),
+);
+tauriWindowsConfig.version = version;
+writeFileSync(
+  tauriWindowsConfigPath,
+  `${JSON.stringify(tauriWindowsConfig, null, 2)}\n`,
+);
+console.log(`Set tauri.windows.conf.json to ${version}`);
 
 const cargoToml = readFileSync(cargoTomlPath, "utf8");
 const updatedCargoToml = cargoToml.replace(

@@ -1,4 +1,4 @@
-import type { Channel, RelayAgent } from "@/shared/api/types";
+import type { Channel, ChannelType, RelayAgent } from "@/shared/api/types";
 import { normalizePubkey } from "@/shared/lib/pubkey";
 
 export function getSharedChannelIds(channels: readonly Channel[] | undefined) {
@@ -9,6 +9,42 @@ export function getSharedChannelIds(channels: readonly Channel[] | undefined) {
   );
 }
 
+// The `respond_to` half of eligibility: will this agent answer *us*, ignoring
+// which channel we are in. Sole producer of the whole respond_to rule — all
+// three modes — so the channel and community paths cannot drift apart on who
+// an agent talks to.
+function relayAgentRespondsToUser(
+  agent: Pick<RelayAgent, "ownerPubkey" | "respondTo" | "respondToAllowlist">,
+  currentPubkey?: string | null,
+) {
+  if (agent.respondTo === "owner-only") {
+    // Only a verified same-owner pair is admitted: an unverified viewer or an
+    // unattributed agent fails closed.
+    const normalizedCurrentPubkey = currentPubkey
+      ? normalizePubkey(currentPubkey)
+      : null;
+    return (
+      normalizedCurrentPubkey !== null &&
+      !!agent.ownerPubkey &&
+      normalizePubkey(agent.ownerPubkey) === normalizedCurrentPubkey
+    );
+  }
+
+  if (agent.respondTo === "allowlist") {
+    const normalizedCurrentPubkey = currentPubkey
+      ? normalizePubkey(currentPubkey)
+      : null;
+    return (
+      normalizedCurrentPubkey !== null &&
+      agent.respondToAllowlist
+        .map((pubkey) => normalizePubkey(pubkey))
+        .includes(normalizedCurrentPubkey)
+    );
+  }
+
+  return agent.respondTo === "anyone";
+}
+
 export function relayAgentIsSharedWithUser(
   agent: Pick<
     RelayAgent,
@@ -17,22 +53,13 @@ export function relayAgentIsSharedWithUser(
   sharedChannelIds: ReadonlySet<string>,
   currentPubkey?: string | null,
 ) {
-  const normalizedCurrentPubkey = currentPubkey
-    ? normalizePubkey(currentPubkey)
-    : null;
-
-  if (
-    agent.respondTo === "owner-only" &&
-    normalizedCurrentPubkey &&
-    agent.ownerPubkey
-  ) {
-    return normalizePubkey(agent.ownerPubkey) === normalizedCurrentPubkey;
-  }
-
-  if (agent.respondTo === "allowlist" && normalizedCurrentPubkey) {
-    return agent.respondToAllowlist
-      .map((pubkey) => normalizePubkey(pubkey))
-      .includes(normalizedCurrentPubkey);
+  // The respond_to rule is produced once, in `relayAgentRespondsToUser`, so
+  // the community and channel paths cannot drift on who an agent talks to. An
+  // owner-only agent is shared exactly with its verified owner, an allowlist
+  // agent with its listed pubkeys — neither needs a shared channel. Only an
+  // "anyone" agent is scoped to the channels it actually shares with us.
+  if (agent.respondTo === "owner-only" || agent.respondTo === "allowlist") {
+    return relayAgentRespondsToUser(agent, currentPubkey);
   }
 
   return (
@@ -48,17 +75,52 @@ export function relayAgentCanRespondInChannel(
   >,
   channelId: string,
   currentPubkey?: string | null,
+  // Real channel membership, from the channel's member list.
+  isChannelMember = false,
 ) {
-  return (
-    agent.channelIds.includes(channelId) &&
-    relayAgentIsSharedWithUser(agent, new Set([channelId]), currentPubkey)
-  );
+  // The channel half. An agent's `channelIds` comes from its own kind:10100
+  // directory entry, which is a snapshot taken when the agent last published:
+  // nothing republishes it when the agent is later added to a channel. So an
+  // agent that *is* a member of this channel can be absent from its own list.
+  // Actual membership therefore stands in for the self-declared list.
+  const isPresentInChannel =
+    isChannelMember || agent.channelIds.includes(channelId);
+
+  // The `respond_to` half is unchanged: membership widens who Desktop will
+  // offer, never who an agent will answer. An agent whose allowlist excludes
+  // the current user stays hidden even when it is a member, and an owner-only
+  // agent stays hidden from everyone but its verified owner.
+  return isPresentInChannel && relayAgentRespondsToUser(agent, currentPubkey);
 }
 
 export type AgentEligibilityScope =
   | { type: "community" }
-  | { type: "channel"; channelId: string }
+  | {
+      type: "channel";
+      channelId: string;
+      /** Pubkeys of the channel's current members, in any case/encoding. */
+      memberPubkeys?: ReadonlySet<string>;
+    }
   | { type: "managed-only" };
+
+export const COMMUNITY_AGENT_ELIGIBILITY_SCOPE = {
+  type: "community",
+} as const satisfies AgentEligibilityScope;
+
+export function resolveAgentEligibilityScope({
+  channelId,
+  channelType,
+  explicitScope,
+}: {
+  channelId?: string | null;
+  channelType?: ChannelType | null;
+  explicitScope?: AgentEligibilityScope;
+}): AgentEligibilityScope {
+  if (explicitScope) return explicitScope;
+  return channelId && isAgentMentionChannelType(channelType)
+    ? { type: "channel", channelId }
+    : { type: "managed-only" };
+}
 
 export function getMentionableAgentPubkeys({
   currentPubkey,
@@ -77,6 +139,15 @@ export function getMentionableAgentPubkeys({
     [...managedAgentPubkeys].map((pubkey) => normalizePubkey(pubkey)),
   );
 
+  const channelMemberPubkeys =
+    eligibilityScope.type === "channel" && eligibilityScope.memberPubkeys
+      ? new Set(
+          [...eligibilityScope.memberPubkeys].map((pubkey) =>
+            normalizePubkey(pubkey),
+          ),
+        )
+      : null;
+
   for (const agent of relayAgents ?? []) {
     const isAllowed =
       eligibilityScope.type === "managed-only"
@@ -87,6 +158,7 @@ export function getMentionableAgentPubkeys({
               agent,
               eligibilityScope.channelId,
               currentPubkey,
+              channelMemberPubkeys?.has(normalizePubkey(agent.pubkey)) === true,
             );
     if (isAllowed) {
       pubkeys.add(normalizePubkey(agent.pubkey));

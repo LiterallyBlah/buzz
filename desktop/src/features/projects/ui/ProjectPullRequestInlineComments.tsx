@@ -1,5 +1,6 @@
 import { FileCode2, MessageSquareText } from "lucide-react";
 
+import { COMMUNITY_AGENT_ELIGIBILITY_SCOPE } from "@/features/agents/lib/agentAutocompleteEligibility";
 import { ForumComposer } from "@/features/forum/ui/ForumComposer";
 import type { Repository as Project } from "@/features/projects/hooks";
 import type {
@@ -94,6 +95,7 @@ export function ProjectPullRequestInlineCommentThread({
       ) : null}
       {activeAnchor ? (
         <ForumComposer
+          agentEligibilityScope={COMMUNITY_AGENT_ELIGIBILITY_SCOPE}
           className="mt-2 border border-border/60 bg-background/70"
           disabled={isSending}
           header={

@@ -218,7 +218,6 @@ pub async fn start_huddle(
     let short_id = &ephemeral_channel_id[..8];
     let fallback_channel_name = format!("huddle-{short_id}");
     let channel_name = normalize_huddle_channel_name(channel_name, &fallback_channel_name);
-
     // Transition to Creating.
     let huddle_generation = {
         let mut hs = state.huddle()?;
@@ -234,8 +233,8 @@ pub async fn start_huddle(
         hs.ephemeral_channel_id = Some(ephemeral_channel_id.clone());
         generation
     };
+    crate::ambient_voice::suspend_for_huddle(&state);
     state.emit_huddle_state_changed();
-
     // All steps wrapped so we can roll back on ANY failure, including step 1.
     // channel_was_created tracks whether we need to archive on rollback.
     let mut channel_was_created = false;
@@ -259,7 +258,7 @@ pub async fn start_huddle(
         //    Best-effort: don't fail the huddle if this fails.
         let guidelines = agents::voice_mode_guidelines(&parent_channel_id);
         if let Ok(guidelines_builder) =
-            events::build_huddle_guidelines(&ephemeral_channel_id, &guidelines)
+            events::build_voice_guidelines(&ephemeral_channel_id, &guidelines)
         {
             if let Err(e) = submit_event(guidelines_builder, &state).await {
                 eprintln!("buzz-desktop: huddle guidelines (kind:48106) failed: {e}");
@@ -421,7 +420,7 @@ pub async fn join_huddle(
         hs.huddle_thread_event_id = huddle_thread_event_id;
         generation
     };
-
+    crate::ambient_voice::suspend_for_huddle(&state);
     // Seed participant list with own pubkey as a fallback until relay responds.
     let own_pubkey = state
         .keys
@@ -513,6 +512,7 @@ fn teardown_huddle(state: &AppState) -> Result<(), String> {
     // Drop the Arcs here (implicit) — triggers thread join via Drop.
     drop(old_stt);
     drop(old_tts);
+    crate::ambient_voice::resume_after_huddle(state);
     // Notify frontend that we're back to Idle.
     state.emit_huddle_state_changed();
     Ok(())

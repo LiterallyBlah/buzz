@@ -1,3 +1,4 @@
+import { isNoChannelBindingError } from "./projectBranchErrors";
 import type { ProjectRepoUnavailableReason } from "./projectRepoAvailability";
 
 export type ProjectGitErrorPresentation = {
@@ -33,6 +34,14 @@ export function projectCloneErrorPresentation(
         "You need access to the repository’s channel before you can clone it.",
     };
   }
+  if (isNoChannelBindingError(message)) {
+    return {
+      title: "Repository access channel required",
+      description:
+        "This older repository has no access channel. Open the project and use Set access to choose which channel may read it.",
+    };
+  }
+
   if (
     /\b(?:401|403)\b|authenticat|authoriz|permission denied|access denied|ssh certificate/.test(
       message,

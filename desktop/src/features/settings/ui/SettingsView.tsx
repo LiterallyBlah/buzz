@@ -48,7 +48,7 @@ type SettingsViewProps = SettingsPanelProps & {
   section: SettingsSection;
 };
 
-const settingsNavGroups: Array<{
+export const settingsNavGroups: Array<{
   label: string;
   sections: SettingsSection[];
 }> = [
@@ -59,6 +59,7 @@ const settingsNavGroups: Array<{
       "appearance",
       "notifications",
       "voice",
+      "ambient-voice",
       "shortcuts",
       "custom-emoji",
       "local-archive",

@@ -11,6 +11,7 @@ import {
   Keyboard,
   LayoutTemplate,
   MessagesSquare,
+  Mic,
   MonitorCog,
   Moon,
   ShieldAlert,
@@ -28,6 +29,7 @@ import type {
   NotificationSettings,
 } from "@/features/notifications/hooks";
 import type { SoundName, SoundSlot } from "@/features/notifications/lib/sound";
+import { AmbientVoiceSettingsCard } from "@/features/ambient-voice";
 import { CommunityMembersSettingsCard } from "@/features/community-members/ui/CommunityMembersSettingsCard";
 import { CustomEmojiSettingsCard } from "@/features/custom-emoji/ui/CustomEmojiSettingsCard";
 import { LocalArchiveSettingsCard } from "@/features/local-archive/ui/LocalArchiveSettingsCard";
@@ -85,6 +87,7 @@ export type SettingsSection =
   | "profile"
   | "notifications"
   | "voice"
+  | "ambient-voice"
   | "experimental"
   | "agents"
   | "channel-templates"
@@ -105,6 +108,7 @@ const SETTINGS_SECTION_VALUES: readonly SettingsSection[] = [
   "profile",
   "notifications",
   "voice",
+  "ambient-voice",
   "experimental",
   "agents",
   "channel-templates",
@@ -170,6 +174,12 @@ export const settingsSections: SettingsSectionDescriptor[] = [
     value: "voice",
     label: "Voice",
     icon: Volume2,
+  },
+  {
+    value: "ambient-voice",
+    label: "Ambient voice",
+    icon: Mic,
+    featureGate: "ambientVoice",
   },
   {
     value: "experimental",
@@ -830,6 +840,8 @@ export function renderSettingsSection(
       );
     case "voice":
       return <VoiceSettingsCard />;
+    case "ambient-voice":
+      return <AmbientVoiceSettingsCard />;
     case "experimental":
       return <ExperimentalFeaturesCard />;
     case "agents":

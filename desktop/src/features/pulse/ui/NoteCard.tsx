@@ -7,6 +7,7 @@ import {
 } from "lucide-react";
 import * as React from "react";
 
+import { COMMUNITY_AGENT_ELIGIBILITY_SCOPE } from "@/features/agents/lib/agentAutocompleteEligibility";
 import { ForumComposer } from "@/features/forum/ui/ForumComposer";
 import { useUserProfileQuery } from "@/features/profile/hooks";
 import { UserProfilePopover } from "@/features/profile/ui/UserProfilePopover";
@@ -290,6 +291,7 @@ export function NoteCard({
         {isReplyComposerOpen ? (
           <div className="mt-4 rounded-2xl border border-border/60 bg-background/60 p-3">
             <ForumComposer
+              agentEligibilityScope={COMMUNITY_AGENT_ELIGIBILITY_SCOPE}
               compact
               className="pulse-reply-composer border-0 bg-transparent p-0 shadow-none"
               disabled={!actions?.reply}

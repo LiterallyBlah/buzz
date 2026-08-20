@@ -1,4 +1,7 @@
+import { isNoChannelBindingError } from "./projectBranchErrors";
+
 export type ProjectRepoUnavailableReason =
+  | "unbound"
   | "missing"
   | "access"
   | "unbound"
@@ -72,6 +75,11 @@ export function projectRepoUnavailableReason(
         : "";
 
   if (!message) return "missing";
+  // The relay deliberately returns this owner-only remediation as a 404 so
+  // repository existence remains unprobeable. Its body also says it cannot
+  // "authorize access", so it must be recognised before the generic auth and
+  // missing-repository classifiers below.
+  if (isNoChannelBindingError(message)) return "unbound";
   if (
     /\b(?:401|403)\b|authenticat|authoriz|permission denied|access denied/.test(
       message,

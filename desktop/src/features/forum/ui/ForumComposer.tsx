@@ -35,6 +35,7 @@ import { ForumComposerMediaStatus } from "./ForumComposerMediaStatus";
 import { useCompactComposerInteractions } from "./useCompactComposerInteractions";
 
 export function ForumComposer({
+  agentEligibilityScope,
   channelId = null,
   channelType,
   members,
@@ -71,7 +72,10 @@ export function ForumComposer({
     if (compact) setIsCompactExpanded(true);
   }, [compact]);
 
-  const mentions = useMentions(channelId, members, profiles, { channelType });
+  const mentions = useMentions(channelId, members, profiles, {
+    agentEligibilityScope,
+    channelType,
+  });
   const channelLinks = useChannelLinks();
   const media = useMediaUpload();
   const { handlePaperclipClick, handleToolbarMouseDown, shouldIgnoreBlur } =

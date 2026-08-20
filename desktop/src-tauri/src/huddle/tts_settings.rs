@@ -319,6 +319,19 @@ pub fn load_for_app(app: &AppHandle) -> (TtsSettings, Option<String>) {
     }
 }
 
+pub fn hydrate_for_app(app: &AppHandle, state: &AppState) {
+    let (settings, load_error) = load_for_app(app);
+    if let Ok(mut guard) = state.huddle_audio.tts.lock() {
+        *guard = settings.clone();
+    }
+    if let Ok(mut guard) = state.huddle_audio.tts_load_error.lock() {
+        *guard = load_error;
+    }
+    if let Ok(mut huddle) = state.huddle_state.lock() {
+        huddle.tts_enabled = settings.agent_text_to_speech;
+    }
+}
+
 #[tauri::command]
 pub fn get_tts_settings(state: State<'_, AppState>) -> Result<TtsSettings, String> {
     if let Some(error) = state

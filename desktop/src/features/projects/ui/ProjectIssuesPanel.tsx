@@ -13,6 +13,7 @@ import * as React from "react";
 import { toast } from "sonner";
 
 import { useIsManagedAgent } from "@/features/agent-memory/hooks";
+import { COMMUNITY_AGENT_ELIGIBILITY_SCOPE } from "@/features/agents/lib/agentAutocompleteEligibility";
 import { ForumComposer } from "@/features/forum/ui/ForumComposer";
 import {
   type ProjectIssue,
@@ -425,6 +426,7 @@ export function ProjectIssueDetail({
         data-testid="project-issue-comment-composer"
       >
         <ForumComposer
+          agentEligibilityScope={COMMUNITY_AGENT_ELIGIBILITY_SCOPE}
           className="border border-border/60 bg-background/45"
           disabled={commentMutation.isPending}
           isSending={commentMutation.isPending}

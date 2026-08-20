@@ -32,6 +32,9 @@ use super::tts_voice_registry::POCKET_VOICES;
 #[path = "models_voice_upgrade.rs"]
 mod voice_upgrade;
 
+#[path = "models_kws.rs"]
+pub(crate) mod kws;
+
 // ── Integrity verification ────────────────────────────────────────────────────
 //
 // All model artifacts are verified against pinned SHA-256 hashes before
@@ -598,6 +601,7 @@ pub struct ModelManager {
     models_dir: PathBuf,
     stt: ModelSlot,
     tts: ModelSlot,
+    kws: ModelSlot,
 }
 
 impl ModelManager {
@@ -610,8 +614,10 @@ impl ModelManager {
             models_dir,
             stt: ModelSlot::new(STT_MODEL_DIR_NAME, STT_EXPECTED_FILES, STT_MODEL_VERSION),
             tts: tts_model_slot(),
+            kws: kws::kws_slot(),
         };
         manager.tts.recover_interrupted_install(&manager.models_dir);
+        manager.kws.recover_interrupted_install(&manager.models_dir);
         Some(manager)
     }
 

@@ -12,6 +12,7 @@ import {
   isAgentMentionChannelType,
   relayAgentCanRespondInChannel,
   relayAgentIsSharedWithUser,
+  resolveAgentEligibilityScope,
   shouldHideAgentFromMentions,
   uniqueAutocompleteLabels,
 } from "./agentAutocompleteEligibility.ts";
@@ -101,6 +102,30 @@ test("relayAgentIsSharedWithUser: accepts verified same-owner agents across mach
   );
 });
 
+test("relayAgentIsSharedWithUser: owner-only fails closed without a verified viewer or owner", () => {
+  const agent = {
+    ownerPubkey: CURRENT_PUBKEY,
+    respondTo: "owner-only",
+    respondToAllowlist: [],
+    channelIds: ["general"],
+  };
+  const sharedChannelIds = new Set(["general"]);
+
+  assert.equal(
+    relayAgentIsSharedWithUser(agent, sharedChannelIds, null),
+    false,
+  );
+  assert.equal(relayAgentIsSharedWithUser(agent, sharedChannelIds), false);
+  assert.equal(
+    relayAgentIsSharedWithUser(
+      { ...agent, ownerPubkey: null },
+      sharedChannelIds,
+      CURRENT_PUBKEY,
+    ),
+    false,
+  );
+});
+
 test("relayAgentIsSharedWithUser: accepts allowlist agents for the current user", () => {
   const sharedChannelIds = new Set(["general"]);
 
@@ -148,6 +173,310 @@ test("relayAgentCanRespondInChannel: requires exact channel membership and viewe
   assert.equal(
     relayAgentCanRespondInChannel(agent, "general", OTHER_OWNER_PUBKEY),
     false,
+  );
+});
+
+test("relayAgentCanRespondInChannel: channel membership stands in for a stale channelIds list", () => {
+  // The reported bug: an agent added to a channel after it last published its
+  // kind:10100 entry, so the channel is absent from its own `channelIds`.
+  const allowlistAgent = {
+    respondTo: "allowlist",
+    respondToAllowlist: [CURRENT_PUBKEY],
+    channelIds: ["some-other-channel"],
+  };
+
+  assert.equal(
+    relayAgentCanRespondInChannel(
+      allowlistAgent,
+      "general",
+      CURRENT_PUBKEY,
+      true,
+    ),
+    true,
+  );
+  // Membership widens who we offer, never who the agent answers.
+  assert.equal(
+    relayAgentCanRespondInChannel(
+      allowlistAgent,
+      "general",
+      OTHER_OWNER_PUBKEY,
+      true,
+    ),
+    false,
+  );
+  // Non-member that does not list the channel is still ineligible.
+  assert.equal(
+    relayAgentCanRespondInChannel(
+      allowlistAgent,
+      "general",
+      CURRENT_PUBKEY,
+      false,
+    ),
+    false,
+  );
+
+  const anyoneAgent = {
+    respondTo: "anyone",
+    respondToAllowlist: [],
+    channelIds: ["some-other-channel"],
+  };
+  assert.equal(
+    relayAgentCanRespondInChannel(anyoneAgent, "general", CURRENT_PUBKEY, true),
+    true,
+  );
+  assert.equal(
+    relayAgentCanRespondInChannel(
+      anyoneAgent,
+      "general",
+      CURRENT_PUBKEY,
+      false,
+    ),
+    false,
+  );
+});
+
+test("relayAgentCanRespondInChannel: owner-only agents answer exactly their verified owner", () => {
+  const ownerOnlyAgent = {
+    ownerPubkey: OWNER_PUBKEY,
+    respondTo: "owner-only",
+    respondToAllowlist: [],
+    channelIds: ["general"],
+  };
+
+  // Matching owner in a channel the agent lists itself.
+  assert.equal(
+    relayAgentCanRespondInChannel(ownerOnlyAgent, "general", OWNER_PUBKEY),
+    true,
+  );
+  // The owner comparison is normalized on both sides.
+  assert.equal(
+    relayAgentCanRespondInChannel(
+      { ...ownerOnlyAgent, ownerPubkey: OWNER_PUBKEY.toUpperCase() },
+      "general",
+      OWNER_PUBKEY,
+    ),
+    true,
+  );
+  // Matching owner admitted through actual membership when the agent's own
+  // channelIds snapshot predates the channel.
+  assert.equal(
+    relayAgentCanRespondInChannel(
+      { ...ownerOnlyAgent, channelIds: ["some-other-channel"] },
+      "general",
+      OWNER_PUBKEY,
+      true,
+    ),
+    true,
+  );
+  // Membership widens presence, never `respond_to`: a different viewer stays
+  // rejected even when the agent is a member.
+  assert.equal(
+    relayAgentCanRespondInChannel(
+      ownerOnlyAgent,
+      "general",
+      CURRENT_PUBKEY,
+      true,
+    ),
+    false,
+  );
+  // An allowlist entry does not promote an owner-only agent either.
+  assert.equal(
+    relayAgentCanRespondInChannel(
+      { ...ownerOnlyAgent, respondToAllowlist: [CURRENT_PUBKEY] },
+      "general",
+      CURRENT_PUBKEY,
+      true,
+    ),
+    false,
+  );
+  // Fail closed without a verified viewer or a verified owner.
+  assert.equal(
+    relayAgentCanRespondInChannel(ownerOnlyAgent, "general", null, true),
+    false,
+  );
+  assert.equal(
+    relayAgentCanRespondInChannel(ownerOnlyAgent, "general", undefined, true),
+    false,
+  );
+  assert.equal(
+    relayAgentCanRespondInChannel(
+      { ...ownerOnlyAgent, ownerPubkey: null },
+      "general",
+      OWNER_PUBKEY,
+      true,
+    ),
+    false,
+  );
+  // Presence is still required: the owner cannot summon the agent into a
+  // channel it neither lists nor belongs to.
+  assert.equal(
+    relayAgentCanRespondInChannel(
+      { ...ownerOnlyAgent, channelIds: ["some-other-channel"] },
+      "general",
+      OWNER_PUBKEY,
+      false,
+    ),
+    false,
+  );
+});
+
+test("getMentionableAgentPubkeys: channel scope admits member agents with a stale channelIds list", () => {
+  // PUB_B is the reported bug: a member whose directory entry predates the
+  // channel. PUB_C is a member whose allowlist excludes us. PUB_D is neither
+  // a member nor a self-declared participant.
+  const relayAgents = [
+    {
+      pubkey: PUB_B,
+      respondTo: "allowlist",
+      respondToAllowlist: [CURRENT_PUBKEY],
+      channelIds: ["some-other-channel"],
+    },
+    {
+      pubkey: PUB_C,
+      respondTo: "allowlist",
+      respondToAllowlist: [OTHER_OWNER_PUBKEY],
+      channelIds: ["some-other-channel"],
+    },
+    {
+      pubkey: PUB_D,
+      respondTo: "anyone",
+      respondToAllowlist: [],
+      channelIds: ["some-other-channel"],
+    },
+  ];
+  const base = {
+    currentPubkey: CURRENT_PUBKEY,
+    managedAgentPubkeys: [PUB_A],
+    relayAgents,
+    sharedChannelIds: new Set(["general"]),
+  };
+
+  assert.deepEqual(
+    getMentionableAgentPubkeys({
+      ...base,
+      eligibilityScope: {
+        type: "channel",
+        channelId: "general",
+        // Mixed case: the set is normalized before it is consulted.
+        memberPubkeys: new Set([PUB_B.toUpperCase(), PUB_C]),
+      },
+    }),
+    new Set([PUB_A, PUB_B]),
+  );
+
+  // Without a member set, channel scope behaves exactly as it did before.
+  assert.deepEqual(
+    getMentionableAgentPubkeys({
+      ...base,
+      eligibilityScope: { type: "channel", channelId: "general" },
+    }),
+    new Set([PUB_A]),
+  );
+
+  // An "anyone" agent that is a member but does not list the channel.
+  assert.deepEqual(
+    getMentionableAgentPubkeys({
+      ...base,
+      eligibilityScope: {
+        type: "channel",
+        channelId: "general",
+        memberPubkeys: new Set([PUB_D]),
+      },
+    }),
+    new Set([PUB_A, PUB_D]),
+  );
+
+  // Membership in some other channel does not leak into this one.
+  assert.deepEqual(
+    getMentionableAgentPubkeys({
+      ...base,
+      eligibilityScope: {
+        type: "channel",
+        channelId: "unrelated",
+        memberPubkeys: new Set(),
+      },
+    }),
+    new Set([PUB_A]),
+  );
+});
+
+test("getMentionableAgentPubkeys: channel scope admits owner-only agents for their verified owner", () => {
+  const ownerOnly = (pubkey, overrides = {}) => ({
+    pubkey,
+    ownerPubkey: CURRENT_PUBKEY,
+    respondTo: "owner-only",
+    respondToAllowlist: [],
+    channelIds: ["general"],
+    ...overrides,
+  });
+  const base = {
+    currentPubkey: CURRENT_PUBKEY,
+    managedAgentPubkeys: [],
+    sharedChannelIds: new Set(["general"]),
+  };
+
+  // PUB_A lists the channel; PUB_B is a member whose channelIds snapshot
+  // predates the channel; PUB_C belongs to a different owner; PUB_D has no
+  // verified owner at all.
+  assert.deepEqual(
+    getMentionableAgentPubkeys({
+      ...base,
+      relayAgents: [
+        ownerOnly(PUB_A),
+        ownerOnly(PUB_B, { channelIds: ["some-other-channel"] }),
+        ownerOnly(PUB_C, { ownerPubkey: OTHER_OWNER_PUBKEY }),
+        ownerOnly(PUB_D, { ownerPubkey: null }),
+      ],
+      eligibilityScope: {
+        type: "channel",
+        channelId: "general",
+        memberPubkeys: new Set([PUB_B]),
+      },
+    }),
+    new Set([PUB_A, PUB_B]),
+  );
+
+  // Without a verified current user every owner-only agent fails closed.
+  assert.deepEqual(
+    getMentionableAgentPubkeys({
+      ...base,
+      currentPubkey: null,
+      relayAgents: [ownerOnly(PUB_A)],
+      eligibilityScope: { type: "channel", channelId: "general" },
+    }),
+    new Set(),
+  );
+});
+
+test("getMentionableAgentPubkeys: member pubkeys never widen community or managed-only scope", () => {
+  const relayAgents = [
+    {
+      pubkey: PUB_B,
+      respondTo: "anyone",
+      respondToAllowlist: [],
+      channelIds: ["some-other-channel"],
+    },
+  ];
+  const base = {
+    currentPubkey: CURRENT_PUBKEY,
+    managedAgentPubkeys: [PUB_A],
+    relayAgents,
+    sharedChannelIds: new Set(["general"]),
+  };
+
+  assert.deepEqual(
+    getMentionableAgentPubkeys({
+      ...base,
+      eligibilityScope: { type: "community" },
+    }),
+    new Set([PUB_A]),
+  );
+  assert.deepEqual(
+    getMentionableAgentPubkeys({
+      ...base,
+      eligibilityScope: { type: "managed-only" },
+    }),
+    new Set([PUB_A]),
   );
 });
 
@@ -218,6 +547,41 @@ test("getMentionableAgentPubkeys: scopes channel composers and fails closed with
       eligibilityScope: { type: "managed-only" },
     }),
     new Set([PUB_A]),
+  );
+});
+
+test("resolveAgentEligibilityScope: project work surfaces explicitly use community eligibility", () => {
+  assert.deepEqual(
+    resolveAgentEligibilityScope({
+      explicitScope: { type: "community" },
+    }),
+    { type: "community" },
+  );
+  assert.deepEqual(
+    resolveAgentEligibilityScope({
+      channelId: "buzz",
+      channelType: "forum",
+      explicitScope: { type: "community" },
+    }),
+    { type: "community" },
+  );
+});
+
+test("resolveAgentEligibilityScope: ordinary channels retain exact channel eligibility", () => {
+  assert.deepEqual(
+    resolveAgentEligibilityScope({
+      channelId: "general",
+      channelType: "stream",
+    }),
+    { type: "channel", channelId: "general" },
+  );
+});
+
+test("resolveAgentEligibilityScope: absent or unsupported context stays managed-only", () => {
+  assert.deepEqual(resolveAgentEligibilityScope({}), { type: "managed-only" });
+  assert.deepEqual(
+    resolveAgentEligibilityScope({ channelId: "direct", channelType: "dm" }),
+    { type: "managed-only" },
   );
 });
 

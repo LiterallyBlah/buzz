@@ -83,6 +83,7 @@ export function ProjectRepositoryManagement({
   const canManageAccess =
     accessChannels.length > 0 &&
     identityPubkey?.toLowerCase() === repository.owner.toLowerCase();
+  const needsAccessChannel = !repository.channelId;
   const attachCandidates = React.useMemo(() => {
     const currentAddresses = new Set(project.repositoryAddresses);
     const candidates = new Map<string, Repository>();
@@ -182,14 +183,18 @@ export function ProjectRepositoryManagement({
               disabled={repairMutation.isPending}
               size={compact ? "icon" : "sm"}
               type="button"
-              variant={compact ? "ghost" : "outline"}
+              variant={
+                compact ? "ghost" : needsAccessChannel ? "default" : "outline"
+              }
             >
               <ShieldCheck className={compact ? "h-4 w-4" : "h-3.5 w-3.5"} />
               {compact
                 ? null
                 : repairMutation.isPending
                   ? "Updating…"
-                  : "Access"}
+                  : needsAccessChannel
+                    ? "Set access"
+                    : "Access"}
             </Button>
           </DropdownMenuTrigger>
           <DropdownMenuContent align="end" className="min-w-56">

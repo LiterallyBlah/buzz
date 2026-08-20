@@ -12,6 +12,7 @@ import {
 import * as React from "react";
 import { toast } from "sonner";
 
+import { COMMUNITY_AGENT_ELIGIBILITY_SCOPE } from "@/features/agents/lib/agentAutocompleteEligibility";
 import { DiscussedInChannels } from "./DiscussionChannels";
 import { ProjectOriginReference } from "./ProjectOriginReference";
 import { ForumComposer } from "@/features/forum/ui/ForumComposer";
@@ -862,6 +863,7 @@ export function ProjectPullRequestDetail({
         data-testid="project-pull-request-comment-composer"
       >
         <ForumComposer
+          agentEligibilityScope={COMMUNITY_AGENT_ELIGIBILITY_SCOPE}
           className="border border-border/60 bg-background/45"
           disabled={commentMutation.isPending}
           isSending={commentMutation.isPending}

@@ -1,4 +1,5 @@
 #![recursion_limit = "256"] // Deep Tauri command futures exceed the default layout query depth.
+mod ambient_voice;
 mod app_menu;
 mod app_state;
 mod archive;
@@ -333,18 +334,9 @@ pub fn run() {
                 *guard = Some(app_handle.clone());
             }
 
-            let (tts_settings, tts_settings_load_error) =
-                huddle::tts_settings::load_for_app(&app_handle);
-            if let Ok(mut guard) = state.huddle_audio.tts.lock() {
-                *guard = tts_settings.clone();
-            }
-            if let Ok(mut guard) = state.huddle_audio.tts_load_error.lock() {
-                *guard = tts_settings_load_error;
-            }
-            if let Ok(mut huddle) = state.huddle_state.lock() {
-                huddle.tts_enabled = tts_settings.agent_text_to_speech;
-            }
-
+            huddle::tts_settings::hydrate_for_app(&app_handle, &state);
+            // Load persisted ambient settings; the frontend starts the session once ready.
+            ambient_voice::hydrate_at_boot(&app_handle, &state);
             // Bring up the runtime-owned shared-compute coordinator before
             // saved agents are restored. Its lifetime is tied to the app, not
             // a UI mount; it publishes discovery and reconciles membership for
@@ -799,6 +791,20 @@ pub fn run() {
             huddle::agent_voice::ensure_huddle_agent_voice_settings,
             huddle::agent_voice::set_huddle_agent_tts_enabled,
             huddle::agent_voice::set_huddle_agent_voice,
+            ambient_voice::commands::get_ambient_voice_settings,
+            ambient_voice::commands::set_ambient_voice_settings,
+            ambient_voice::commands::set_ambient_voice_enabled,
+            ambient_voice::commands::set_ambient_voice_muted,
+            ambient_voice::commands::get_ambient_voice_status,
+            ambient_voice::commands::set_ambient_indicator_position,
+            ambient_voice::commands::get_ambient_model_status,
+            ambient_voice::commands::check_ambient_hotstart,
+            ambient_voice::commands::check_ambient_wake_word,
+            ambient_voice::commands::check_speech_endpoint,
+            ambient_voice::commands::push_ambient_audio_pcm,
+            ambient_voice::commands::report_ambient_audio_flow,
+            ambient_voice::commands::report_ambient_capture_error,
+            ambient_voice::commands::ambient_speak,
             speak_agent_message,
             interrupt_huddle_speech,
             add_agent_to_huddle,
