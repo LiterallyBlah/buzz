@@ -16,12 +16,14 @@ import {
   nextProjectIssueStatusCreatedAt,
   type ProjectIssue,
 } from "./projectIssues.mjs";
+import type { ProjectTaskCategory } from "./projectTaskCategories";
 
 type CreateProjectIssueInput = {
   title: string;
   body: string;
   /** Pubkeys to `p`-tag, from the dialog's mention picker. */
   recipients?: string[];
+  category?: ProjectTaskCategory;
 };
 
 /**
@@ -43,6 +45,7 @@ export function projectIssueEventInput(
       repoOwner: project.owner,
       title: input.title,
       recipients: input.recipients ?? [],
+      labels: [input.category ?? "issue"],
     }),
   };
 }
@@ -54,8 +57,8 @@ export async function publishProjectIssue(
   const event = await signRelayEvent(projectIssueEventInput(project, input));
   await relayClient.publishEvent(
     event,
-    "Timed out creating issue.",
-    "Failed to create issue.",
+    "Timed out creating task.",
+    "Failed to create task.",
   );
   return event.id;
 }

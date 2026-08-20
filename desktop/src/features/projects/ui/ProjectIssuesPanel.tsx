@@ -1,81 +1,121 @@
 import {
-  ArrowDown,
+  Circle,
   CircleCheck,
+  CircleDashed,
   CircleDot,
   CircleX,
   MessageSquare,
+  Tag,
+  type LucideIcon,
+  User,
 } from "lucide-react";
 import * as React from "react";
 import { toast } from "sonner";
 
 import { useIsManagedAgent } from "@/features/agent-memory/hooks";
 import { ForumComposer } from "@/features/forum/ui/ForumComposer";
-import { useCreateProjectIssueCommentMutation } from "@/features/projects/commentMutations";
 import {
   type ProjectIssue,
   type Repository as Project,
   useProjectIssuesQuery,
 } from "@/features/projects/hooks";
-import {
-  type ProjectIssueLifecycleStatus,
-  useUpdateProjectIssueStatusMutation,
-} from "@/features/projects/issueMutations";
-import { allowedActorsForProjectRoot } from "@/features/projects/projectIssues.mjs";
-import { useOpenProjectRoot } from "@/features/projects/useLiveProjectRoot";
-import { useIdentityQuery } from "@/shared/api/hooks";
-import { Button } from "@/shared/ui/button";
-import {
-  DropdownMenu,
-  DropdownMenuContent,
-  DropdownMenuItem,
-  DropdownMenuTrigger,
-} from "@/shared/ui/dropdown-menu";
+import { useCreateProjectIssueCommentMutation } from "@/features/projects/commentMutations";
 import {
   resolveUserLabel,
   type UserProfileLookup,
 } from "@/features/profile/lib/identity";
-import { workingAgentsKey } from "@/features/projects/lib/projectThreadPin";
 import { entityDiscussionQuery } from "@/features/projects/lib/discussionChannels";
 import { issueShareLink } from "@/features/projects/lib/projectShareLinks";
-import type { ProjectAgentActivity } from "@/features/projects/projectAgentActivity";
 import { relativeTime } from "@/features/projects/lib/projectsViewHelpers";
-import { useProjectAgentActivity } from "@/features/projects/useProjectAgentActivity";
+import {
+  projectTaskCategoryLabel,
+  projectTaskUserLabels,
+} from "@/features/projects/projectTaskCategories";
+import { useIdentityQuery } from "@/shared/api/hooks";
 import type { ChannelMember } from "@/shared/api/types";
-import { useElementWidthBreakpoint } from "@/shared/hooks/use-mobile";
-import { cn } from "@/shared/lib/cn";
+import { BuzzLoadingState } from "@/shared/ui/BuzzLoadingState";
 import { normalizePubkey } from "@/shared/lib/pubkey";
 import { IssueAssigneeFacepile, IssueAssigneesRow } from "./IssueAssigneesRow";
-import {
-  ProjectFeedRow,
-  ProjectFeedRowCluster,
-  ProjectFeedRowMonoCell,
-} from "./ProjectFeedRow";
-import { ProjectItemDeleteMenu } from "./ProjectItemDeleteMenu";
 import { DiscussedInChannels } from "./DiscussionChannels";
+import { ProjectItemDeleteMenu } from "./ProjectItemDeleteMenu";
+import { ProjectIssueCommentTimeline } from "./ProjectIssueCommentTimeline";
 import { ProjectOriginReference } from "./ProjectOriginReference";
-import { OverviewRailSection } from "./ProjectOverviewPanel";
+import {
+  ProjectDetailMetaList,
+  ProjectDetailMetaPills,
+  ProjectDetailMetaRow,
+} from "./ProjectDetailMeta";
+import { ProjectDetailSection } from "./ProjectDetailSection";
 import { ProfileIdentityButton } from "./ProjectProfileIdentity";
 import { ProjectRichContent } from "./ProjectRichContent";
-import { ProjectRootAgentsSection } from "./ProjectRootAgentsSection";
-import { ProjectWorkItemDescription } from "./ProjectWorkItemDescription";
-import { useProjectThreadPin } from "./useProjectThreadPin";
 import { ShareLinkButton } from "./ShareLinkButton";
+import { PROJECT_DETAIL_READING_COLUMN_CLASS } from "./projectPanelStyles";
+import {
+  ProjectStatusProgressIcon,
+  type ProjectStatusProgressState,
+} from "./ProjectStatusProgressIcon";
+import { ProjectWorkItemGroup } from "./ProjectWorkItemGroup";
+import { ProjectWorkItemRow } from "./ProjectWorkItemRow";
+import { ProjectRootAgentsSection } from "./ProjectRootAgentsSection";
+import { useOpenProjectRoot } from "@/features/projects/useLiveProjectRoot";
 
 export function issueStatusClassName(status: ProjectIssue["status"]) {
+  if (status === "Triage" || status === "In Progress") return "text-amber-500";
+  if (status === "Backlog") return "text-muted-foreground";
+  if (status === "In Review") return "text-green-500";
   if (status === "Done") return "text-purple-400";
   if (status === "Closed") return "text-destructive";
-  return "text-green-500";
+  return "text-muted-foreground";
 }
 
-function issueStatusVisual(status: ProjectIssue["status"]) {
+function issueStatusVisual(status: ProjectIssue["status"]): {
+  className: string;
+  icon: LucideIcon;
+  progress: ProjectStatusProgressState;
+} {
   if (status === "Done") {
-    return { className: "text-purple-400", icon: CircleCheck };
+    return {
+      className: "text-purple-400",
+      icon: CircleCheck,
+      progress: "completed",
+    };
   }
   if (status === "Closed") {
-    return { className: "text-destructive", icon: CircleX };
+    return {
+      className: "text-destructive",
+      icon: CircleX,
+      progress: "canceled",
+    };
   }
-  return { className: "text-green-500", icon: CircleDot };
+  if (status === "Backlog") {
+    return {
+      className: issueStatusClassName(status),
+      icon: Circle,
+      progress: "queued",
+    };
+  }
+  if (status === "Triage") {
+    return {
+      className: issueStatusClassName(status),
+      icon: CircleDashed,
+      progress: "queued",
+    };
+  }
+  return {
+    className: issueStatusClassName(status),
+    icon: CircleDot,
+    progress: status === "In Review" ? "review" : "started",
+  };
 }
+
+const ISSUE_STATUS_ORDER: readonly ProjectIssue["status"][] = [
+  "In Review",
+  "In Progress",
+  "Triage",
+  "Backlog",
+  "Done",
+  "Closed",
+];
 
 function issueMembers(
   project: Project,
@@ -102,29 +142,6 @@ function issueMembers(
   });
 }
 
-function AuthorIdentity({
-  profiles,
-  pubkey,
-  role,
-}: {
-  profiles?: UserProfileLookup;
-  pubkey: string;
-  role?: React.ReactNode;
-}) {
-  const profile = profiles?.[normalizePubkey(pubkey)];
-  return (
-    <ProfileIdentityButton
-      align="center"
-      avatarSize="xs"
-      avatarUrl={profile?.avatarUrl ?? null}
-      isAgent={profile?.isAgent === true}
-      label={resolveUserLabel({ profiles, pubkey })}
-      pubkey={pubkey}
-      role={role}
-    />
-  );
-}
-
 function IssueRow({
   issue,
   onOpen,
@@ -141,77 +158,100 @@ function IssueRow({
   const status = issueStatusVisual(issue.status);
 
   return (
-    <ProjectFeedRow
-      // Matches the pull-request row, which has carried its id since it was
-      // written. Without it an issue row is the one work item a test can see
-      // but cannot address.
+    <ProjectWorkItemRow
       eventId={issue.id}
-      meta={
-        <>
-          <ProfileIdentityButton
-            avatarClassName="shrink-0"
-            avatarSize="xs"
-            avatarUrl={authorProfile?.avatarUrl ?? null}
-            isAgent={authorProfile?.isAgent === true}
-            label={authorLabel}
-            pubkey={issue.author}
-            showLabel={false}
-          />
-          <span className="truncate text-foreground/80">
-            <span className="font-medium">{authorLabel}</span> created this
-            issue
-          </span>
-          <span>·</span>
-          <span>{issue.status}</span>
-          {issue.labels.map((label) => (
-            <span
-              className="rounded-full border border-border/60 px-1.5 py-0.5 text-2xs"
-              key={label}
-            >
-              {label}
-            </span>
-          ))}
-        </>
-      }
+      identifier={`#${issue.id.slice(0, 8)}`}
+      identifierTitle="View task"
       onOpen={onOpen}
       statusIcon={
-        <status.icon className={`h-3.5 w-3.5 shrink-0 ${status.className}`} />
+        <ProjectStatusProgressIcon
+          aria-label={issue.status}
+          className={`h-3.5 w-3.5 shrink-0 ${status.className}`}
+          state={status.progress}
+        />
       }
       testId="project-issue-row"
       title={issue.title}
       trailing={
         <>
-          <IssueAssigneeFacepile
-            assignees={issue.assignees}
-            profiles={profiles}
-          />
-          {issue.comments.length > 0 ? (
+          <span
+            className="hidden w-24 shrink-0 truncate text-right text-xs text-muted-foreground md:block"
+            data-testid="project-issue-row-category"
+          >
+            {projectTaskCategoryLabel(issue.category)}
+          </span>
+          <span className="flex w-20 shrink-0 items-center justify-end gap-1">
+            <span
+              className="flex h-5 w-5 shrink-0 items-center justify-center"
+              data-testid="project-issue-creator"
+              title={`Created by ${authorLabel}`}
+            >
+              <ProfileIdentityButton
+                avatarClassName="shrink-0"
+                avatarSize="xs"
+                avatarUrl={authorProfile?.avatarUrl ?? null}
+                isAgent={authorProfile?.isAgent === true}
+                label={authorLabel}
+                pubkey={issue.author}
+                showLabel={false}
+              />
+            </span>
+            <span
+              className="flex min-w-5 shrink-0 justify-end text-muted-foreground/45"
+              data-testid="project-issue-assignee-cell"
+            >
+              {issue.assignees.length > 0 ? (
+                <IssueAssigneeFacepile
+                  assignees={issue.assignees}
+                  profiles={profiles}
+                />
+              ) : (
+                <span
+                  className="flex h-5 w-5 items-center justify-center rounded-full border border-border/70 bg-muted/35"
+                  data-testid="project-issue-assignee-placeholder"
+                  title="Unassigned"
+                >
+                  <User aria-hidden="true" className="h-3 w-3" />
+                  <span className="sr-only">Unassigned</span>
+                </span>
+              )}
+            </span>
+          </span>
+          <span className="flex w-8 shrink-0 justify-end">
             <button
-              aria-label={`View ${issue.comments.length} comments`}
-              className="flex items-center gap-1 rounded-md text-xs text-muted-foreground hover:text-foreground focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring"
+              aria-label={
+                issue.comments.length > 0
+                  ? `View ${issue.comments.length} comments`
+                  : "View comments"
+              }
+              className={`flex items-center gap-1 rounded-md text-xs hover:text-foreground focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring ${
+                issue.comments.length > 0
+                  ? "text-muted-foreground"
+                  : "text-muted-foreground/45"
+              }`}
+              data-testid="project-issue-comments"
               onClick={onOpen}
               type="button"
             >
               <MessageSquare className="h-3.5 w-3.5" />
               {issue.comments.length}
             </button>
-          ) : null}
-          <ProjectFeedRowCluster>
-            <ProjectFeedRowMonoCell
-              label={`#${issue.id.slice(0, 8)}`}
-              onClick={onOpen}
-              title="View issue"
-            />
-          </ProjectFeedRowCluster>
+          </span>
+          <span
+            className="hidden w-20 shrink-0 text-right text-xs text-muted-foreground/70 sm:block"
+            data-testid="project-issue-row-date"
+            title={new Date(issue.createdAt * 1_000).toLocaleString()}
+          >
+            {relativeTime(issue.createdAt)}
+          </span>
           <ProjectItemDeleteMenu
             author={issue.author}
-            label={`More options for ${issue.title}`}
+            label="Delete task"
             project={project}
             rootId={issue.id}
             subject="issue"
             targetId={issue.id}
-            testId={`issue-${issue.id}`}
-            title={issue.title}
+            testId={`delete-task-${issue.id}`}
           />
         </>
       }
@@ -220,374 +260,20 @@ function IssueRow({
 }
 
 /** Full issue conversation and comment composer. */
-/**
- * The status changes offered for an issue in its current state.
- *
- * Only transitions that move somewhere: offering "Close" on a closed issue
- * publishes an event that changes nothing and leaves the panel looking
- * unresponsive.
- */
-function issueStatusActions(
-  status: ProjectIssue["status"],
-): { label: string; status: ProjectIssueLifecycleStatus }[] {
-  const actions: { label: string; status: ProjectIssueLifecycleStatus }[] = [];
-  if (status !== "Done")
-    actions.push({ label: "Mark done", status: "resolved" });
-  if (status !== "Closed")
-    actions.push({ label: "Close issue", status: "closed" });
-  if (status === "Done" || status === "Closed") {
-    actions.push({ label: "Reopen issue", status: "open" });
-  }
-  if (status !== "Triage")
-    actions.push({ label: "Move to triage", status: "draft" });
-  return actions;
-}
-
-/**
- * Issue status controls (V11: the desktop could change PR status and not issue
- * status, so closing an issue was CLI-only).
- *
- * Shown only to the two pubkeys `allowedActorsForProjectRoot` trusts — the issue
- * author and the repo owner. Anyone else's status event is discarded by the
- * reader, so offering them the control would produce a published event and a
- * panel that never changes.
- */
-function ProjectIssueStatusControls({
-  issue,
-  project,
-}: {
-  issue: ProjectIssue;
-  project: Project;
-}) {
-  const identityQuery = useIdentityQuery();
-  const statusMutation = useUpdateProjectIssueStatusMutation(project);
-  const self = identityQuery.data?.pubkey
-    ? normalizePubkey(identityQuery.data.pubkey)
-    : null;
-  const canChangeStatus = React.useMemo(
-    () => (self ? allowedActorsForProjectRoot(issue).has(self) : false),
-    [issue, self],
-  );
-
-  const handleStatusChange = React.useCallback(
-    async (status: ProjectIssueLifecycleStatus) => {
-      try {
-        await statusMutation.mutateAsync({ issue, status });
-        toast.success("Issue status updated.");
-      } catch (error) {
-        toast.error(
-          error instanceof Error
-            ? error.message
-            : "Failed to update issue status.",
-        );
-      }
-    },
-    [issue, statusMutation],
-  );
-
-  if (!canChangeStatus) return null;
-  const actions = issueStatusActions(issue.status);
-  if (actions.length === 0) return null;
-
-  return (
-    <DropdownMenu>
-      <DropdownMenuTrigger asChild>
-        <Button
-          data-testid="project-issue-status-trigger"
-          disabled={statusMutation.isPending}
-          size="sm"
-          variant="outline"
-        >
-          {statusMutation.isPending ? "Updating…" : "Change status"}
-        </Button>
-      </DropdownMenuTrigger>
-      <DropdownMenuContent align="end">
-        {actions.map((action) => (
-          <DropdownMenuItem
-            data-testid={`project-issue-status-${action.status}`}
-            key={action.status}
-            onSelect={() => void handleStatusChange(action.status)}
-          >
-            {action.label}
-          </DropdownMenuItem>
-        ))}
-      </DropdownMenuContent>
-    </DropdownMenu>
-  );
-}
-
-/**
- * Detail width below which the meta rail cannot sit beside the conversation.
- *
- * Measured on the detail element rather than the viewport because this
- * component renders in two shells of different widths at the same window
- * size — the project screen and the Home inbox pane — and a viewport media
- * query would put the rail beside a column too narrow to hold it in the
- * second one.
- */
-const ISSUE_RAIL_MIN_WIDTH_PX = 880;
-
-/** How much of a long issue description is shown before "Show more". */
-const ISSUE_BODY_CLAMP_CLASS = "line-clamp-[8]";
-
-function IssueStatusChip({ status }: { status: ProjectIssue["status"] }) {
-  const visual = issueStatusVisual(status);
-  return (
-    <span
-      className={`inline-flex shrink-0 items-center gap-1.5 rounded-md border border-border/60 px-2 py-0.5 text-xs font-medium ${visual.className}`}
-      data-testid="project-issue-status-chip"
-    >
-      <visual.icon className="h-3.5 w-3.5" />
-      {status}
-    </span>
-  );
-}
-
-/**
- * Whether an element is currently taller than the clamp showing it.
- *
- * Latches: once a body has been measured as overflowing, expanding it removes
- * the clamp and the same measurement reads "fits", so a non-latching version
- * would answer the toggle's own question by hiding the toggle that answered it.
- */
-function useClampOverflows<T extends HTMLElement>(
-  content: string,
-): [React.RefObject<T | null>, boolean] {
-  const ref = React.useRef<T>(null);
-  const [overflows, setOverflows] = React.useState(false);
-
-  React.useLayoutEffect(() => {
-    // Re-measured whenever the description changes: the latch is per-body, so
-    // a shorter one has to be able to retire the toggle a longer one earned.
-    setOverflows(false);
-    const element = ref.current;
-    if (!element || !content) return;
-    let latched = false;
-    const measure = () => {
-      if (latched) return;
-      if (element.scrollHeight - element.clientHeight > 1) {
-        latched = true;
-        setOverflows(true);
-      }
-    };
-    measure();
-    if (typeof ResizeObserver === "undefined") return;
-    // Fonts and images settle after the first layout pass, so a body that
-    // overflows by two lines can measure as fitting on mount.
-    const observer = new ResizeObserver(measure);
-    observer.observe(element);
-    return () => observer.disconnect();
-  }, [content]);
-
-  return [ref, overflows];
-}
-
-/**
- * The issue description, clamped by default.
- *
- * Clamped rather than collapsed-once-scrolled-past, which is what the design
- * discussion asked for: coupling the body's height to the scroll position
- * feeds the container's own scrollTop back into its content height, and the
- * standard result is an oscillation at the collapse boundary. Clamping
- * achieves the thing that was actually wanted — a long description never costs
- * a screen of scrolling — without any scroll-driven layout change at all, and
- * it does so on first paint instead of only after the reader has already paid
- * the scroll once.
- */
-function IssueBody({ issue }: { issue: ProjectIssue }) {
-  const [expanded, setExpanded] = React.useState(false);
-  const [bodyRef, overflows] = useClampOverflows<HTMLDivElement>(issue.content);
-
-  if (!issue.content) return null;
-
-  return (
-    <ProjectWorkItemDescription>
-      <div className={cn(!expanded && ISSUE_BODY_CLAMP_CLASS)} ref={bodyRef}>
-        <ProjectRichContent content={issue.content} tags={issue.tags} />
-      </div>
-      {overflows ? (
-        <button
-          className="rounded-sm text-xs font-medium text-muted-foreground hover:text-foreground focus-visible:outline-hidden focus-visible:ring-1 focus-visible:ring-ring"
-          data-testid="project-issue-body-toggle"
-          onClick={() => setExpanded((current) => !current)}
-          type="button"
-        >
-          {expanded ? "Show less" : "Show more"}
-        </button>
-      ) : null}
-    </ProjectWorkItemDescription>
-  );
-}
-
-/**
- * Title, id and status — the "where am I" line.
- *
- * Sticky in the pinned layout, so the one thing a reader loses by standing at
- * the bottom of a long thread is the one thing that never leaves the viewport.
- * The status chip is rendered only when the rail is not beside us: with the
- * rail visible it would be the same duplicated status this layout exists to
- * remove, and with the rail stacked below every comment it is the only copy
- * a reader can reach.
- */
-function IssueThreadHeader({
-  authorLabel,
-  issue,
-  project,
-  showStatusChip,
-  sticky,
-}: {
-  authorLabel: string;
-  issue: ProjectIssue;
-  project: Project;
-  showStatusChip: boolean;
-  sticky: boolean;
-}) {
-  return (
-    <header
-      className={cn(
-        "min-w-0 px-4 pb-3 pt-4",
-        sticky &&
-          "sticky top-0 z-20 border-b border-border/50 bg-background/95 backdrop-blur-sm supports-backdrop-filter:bg-background/80",
-      )}
-      data-testid="project-issue-thread-header"
-    >
-      <p className="flex flex-wrap items-center gap-1.5 text-xs font-medium text-muted-foreground">
-        <CircleDot className="h-3.5 w-3.5" />
-        Issue from {authorLabel}
-        <ProjectOriginReference
-          agentName={issue.originAgentName}
-          channelId={issue.channelId}
-        />
-      </p>
-      <div className="mt-1 flex items-start justify-between gap-3">
-        <h3
-          className={cn(
-            "min-w-0 text-base font-semibold text-foreground",
-            sticky ? "truncate" : "line-clamp-2",
-          )}
-          title={issue.title}
-        >
-          {issue.title}{" "}
-          <span className="font-normal text-muted-foreground">
-            #{issue.id.slice(0, 8)}
-          </span>
-          <ShareLinkButton
-            className="ml-1 inline-flex h-6 w-6 align-text-bottom"
-            label="Copy issue link"
-            link={issueShareLink(issue)}
-            testId="project-issue-copy-link"
-          />
-        </h3>
-        <div className="flex shrink-0 items-center gap-2">
-          {showStatusChip ? <IssueStatusChip status={issue.status} /> : null}
-          <ProjectIssueStatusControls issue={issue} project={project} />
-          <ProjectItemDeleteMenu
-            author={issue.author}
-            label={`More options for ${issue.title}`}
-            project={project}
-            rootId={issue.id}
-            subject="issue"
-            targetId={issue.id}
-            testId={`issue-detail-${issue.id}`}
-            title={issue.title}
-          />
-        </div>
-      </div>
-    </header>
-  );
-}
-
-function IssueComments({
-  issue,
-  padded = false,
-  profiles,
-  project,
-}: {
-  issue: ProjectIssue;
-  /**
-   * Carry the gutter. Set in the pinned layout, where the comments sit
-   * directly in the scroll region; the stacked layout nests them in a padded
-   * section beside a heading, and a second gutter there would indent the
-   * conversation away from everything it belongs to.
-   */
-  padded?: boolean;
-  profiles?: UserProfileLookup;
-  project: Project;
-}) {
-  if (issue.comments.length === 0) {
-    return (
-      <p className={cn("text-sm text-muted-foreground", padded && "px-4 py-3")}>
-        No comments yet.
-      </p>
-    );
-  }
-  return (
-    <div className={cn("space-y-3", padded && "px-4 py-3")}>
-      {issue.comments.map((item) => (
-        <article key={item.id}>
-          <div className="mb-2 flex min-w-0 items-center justify-between gap-2">
-            <AuthorIdentity
-              profiles={profiles}
-              pubkey={item.author}
-              role={relativeTime(item.createdAt)}
-            />
-            <ProjectItemDeleteMenu
-              author={item.author}
-              label="More options for this comment"
-              project={project}
-              rootId={issue.id}
-              subject="comment"
-              targetId={item.id}
-              testId={`comment-${item.id}`}
-            />
-          </div>
-          <ProjectRichContent content={item.content} tags={item.tags} />
-        </article>
-      ))}
-    </div>
-  );
-}
-
 export function ProjectIssueDetail({
   fillHeight = false,
   issue,
   profiles,
   project,
-  stackMetaRail = false,
 }: {
-  /**
-   * Own the height given by the parent: the thread scrolls inside this
-   * component instead of adding to a page that scrolls around it.
-   *
-   * Opt-in rather than the only behaviour, because the Home inbox renders this
-   * detail inside its own scroll container with its own padding; giving it a
-   * second nested scroll region is the trackpad hazard the design discussion
-   * flagged, and it is not what this phase was scoped to change.
-   */
   fillHeight?: boolean;
   issue: ProjectIssue;
   profiles?: UserProfileLookup;
   project: Project;
-  stackMetaRail?: boolean;
 }) {
   const commentMutation = useCreateProjectIssueCommentMutation(project);
-  // Mounted on the detail view rather than the panel: the Home inbox renders
-  // this component directly, and an issue open there is just as open.
   useOpenProjectRoot(project.id, issue.id);
   const authorLabel = resolveUserLabel({ profiles, pubkey: issue.author });
-  const [detailRef, isNarrow] = useElementWidthBreakpoint<HTMLDivElement>(
-    ISSUE_RAIL_MIN_WIDTH_PX,
-  );
-  // Subscribed only in the pinned layout, which is the only one with a pill to
-  // feed. `null` is the hook's own "do not open a REQ", so the Home inbox does
-  // not pay for a second activity subscription to answer a question its layout
-  // never asks.
-  const liveActivity = useProjectAgentActivity(fillHeight ? issue.id : null);
-  const pin = useProjectThreadPin({
-    commentCount: issue.comments.length,
-    rootId: issue.id,
-    workingAgents: workingAgentsKey(liveActivity),
-  });
   const members = React.useMemo(
     () => issueMembers(project, issue, profiles),
     [issue, profiles, project],
@@ -615,223 +301,10 @@ export function ProjectIssueDetail({
     },
     [commentMutation, issue],
   );
-
-  const composer = (
-    <ForumComposer
-      className="border border-border/60 bg-background/45"
-      compact={fillHeight}
-      disabled={commentMutation.isPending}
-      isSending={commentMutation.isPending}
-      members={members}
-      onSubmit={handleCommentSubmit}
-      placeholder="Add a comment…"
-      profiles={profiles}
-    />
-  );
-
-  if (!fillHeight) {
-    return (
-      <div
-        className={cn(
-          "grid",
-          !stackMetaRail && "xl:grid-cols-[minmax(0,1fr)_18rem]",
-        )}
-      >
-        <div className="min-w-0 divide-y divide-border/50">
-          <div>
-            <IssueThreadHeader
-              authorLabel={authorLabel}
-              issue={issue}
-              project={project}
-              showStatusChip={false}
-              sticky={false}
-            />
-            <IssueBody issue={issue} />
-          </div>
-          <section className="space-y-3 p-4">
-            <DiscussedInChannels
-              entityLabel="this issue"
-              query={entityDiscussionQuery(issue.id)}
-              testId="issue-discussed-in"
-            />
-            <h4 className="flex items-center gap-1.5 text-sm font-semibold text-foreground">
-              <MessageSquare className="h-3.5 w-3.5" />
-              Conversation
-            </h4>
-            <IssueComments
-              issue={issue}
-              profiles={profiles}
-              project={project}
-            />
-            {composer}
-          </section>
-        </div>
-
-        <IssueMetaRail
-          issue={issue}
-          profiles={profiles}
-          project={project}
-          stacked={stackMetaRail}
-        />
-      </div>
-    );
-  }
-
-  // One rule per boundary, and the sticky header already draws the first one.
-  //
-  // The header is `border-b`, so whichever block happens to come first inside
-  // the scroll region must not also draw a top rule — two 1px hairlines with
-  // nothing between them make a 2px line for a single boundary, heavier than
-  // every other divider on the surface. Which block comes first is not fixed:
-  // an issue with no description drops `IssueBody` entirely, so the first
-  // block is the rail below `xl` and the conversation heading above it.
-  //
-  // Hence one flag rather than a rule on each: the description is what stands
-  // between the header and everything after it, and when it is absent the
-  // header's own border is the boundary.
-  const hasDescription = Boolean(issue.content);
-
-  const rail = (
-    <IssueMetaRail
-      className={
-        isNarrow
-          ? cn("border-b border-border/60", hasDescription && "border-t")
-          : "min-h-0 overflow-y-auto border-l border-border/60"
-      }
-      issue={issue}
-      live={liveActivity}
-      profiles={profiles}
-      project={project}
-    />
-  );
-
-  return (
-    <div
-      className={cn(
-        "flex min-h-0 flex-1 flex-col",
-        !isNarrow && "grid grid-cols-[minmax(0,1fr)_18rem]",
-      )}
-      data-testid="project-issue-detail"
-      ref={detailRef}
-    >
-      <div className="flex min-h-0 min-w-0 flex-col">
-        <div
-          className="min-h-0 flex-1 overflow-y-auto overscroll-contain"
-          data-testid="project-issue-thread-scroll"
-          onScroll={pin.handleScroll}
-          ref={pin.scrollRef}
-        >
-          <div ref={pin.contentRef}>
-            <IssueThreadHeader
-              authorLabel={authorLabel}
-              issue={issue}
-              project={project}
-              showStatusChip={isNarrow}
-              sticky
-            />
-            <IssueBody issue={issue} />
-            {/* Too narrow for a column beside the conversation, so the rail
-                joins the scroll region — above the comments, not below them.
-                Below, it would be what the thread pins to: the reader would
-                be dropped at the bottom of the page and find reference
-                material where the newest comment should be. Status stays
-                reachable from the sticky header instead. */}
-            {isNarrow ? rail : null}
-            {/* Where the document ends and the conversation starts — but only
-                when something above us has not already closed. The rail brings
-                its own bottom border, and an issue with no description leaves
-                the sticky header directly above this heading with its border
-                already drawn. See `hasDescription`. */}
-            <div
-              className={cn(
-                "px-4 pt-3",
-                !isNarrow && hasDescription && "border-t border-border/50",
-              )}
-            >
-              <h4 className="flex items-center gap-1.5 text-sm font-semibold text-foreground">
-                <MessageSquare className="h-3.5 w-3.5" />
-                Conversation
-              </h4>
-              <DiscussedInChannels
-                entityLabel="this issue"
-                query={entityDiscussionQuery(issue.id)}
-                testId="issue-discussed-in"
-              />
-            </div>
-            <IssueComments
-              issue={issue}
-              padded
-              profiles={profiles}
-              project={project}
-            />
-          </div>
-        </div>
-
-        <div className="relative shrink-0 border-t border-border/50 p-3">
-          {pin.unreadBelow > 0 || pin.activitySettledBelow ? (
-            <button
-              className="-translate-x-1/2 absolute -top-4 left-1/2 z-10 flex items-center gap-1.5 rounded-full border border-border/60 bg-background px-3 py-1 text-xs font-medium text-foreground shadow-md hover:bg-muted focus-visible:outline-hidden focus-visible:ring-1 focus-visible:ring-ring"
-              data-testid="project-issue-jump-to-latest"
-              onClick={() => pin.scrollToBottom("smooth")}
-              type="button"
-            >
-              {/* A settled turn with nothing to count says so instead of
-                  claiming a comment. An agent that finished without posting one
-                  is still the thing the reader came back for, but "1 new" would
-                  send them to the bottom looking for a reply that is not
-                  there. */}
-              {pin.unreadBelow > 0 ? `${pin.unreadBelow} new` : "New activity"}
-              <ArrowDown className="h-3.5 w-3.5" />
-            </button>
-          ) : null}
-          {/* Focusing the composer from a scrolled-up position brings the
-              newest comment with it. Typing at the bottom of the viewport
-              while the comment being answered sits off-screen above is the
-              thing that makes a sent reply feel like it went nowhere. */}
-          <div onFocusCapture={() => pin.scrollToBottom("smooth")}>
-            {composer}
-          </div>
-        </div>
-      </div>
-
-      {isNarrow ? null : rail}
-    </div>
-  );
-}
-
-/**
- * Right-hand meta column for the issue detail view: status, author, agents,
- * labels and dates — keeps the conversation column focused.
- *
- * In the pinned layout this column no longer scrolls with the thread. It does
- * not get that by being `sticky`: the conversation beside it owns its own
- * scroll region, so the rail is simply a grid cell that never moves, which is
- * the same outcome without a stacking context or a top offset to keep in sync.
- */
-function IssueMetaRail({
-  className,
-  issue,
-  live,
-  profiles,
-  project,
-  stacked = false,
-}: {
-  /** Layout override for the pinned layout, which places the rail itself. */
-  className?: string;
-  issue: ProjectIssue;
-  /**
-   * Activity the detail already subscribes to, in the pinned layout. Absent in
-   * the stacked one, where nothing above the rail is listening and the agents
-   * section opens its own.
-   */
-  live?: readonly ProjectAgentActivity[];
-  profiles?: UserProfileLookup;
-  project: Project;
-  stacked?: boolean;
-}) {
   const identityQuery = useIdentityQuery();
   const authorProfile = profiles?.[normalizePubkey(issue.author)];
-  const authorLabel = resolveUserLabel({ profiles, pubkey: issue.author });
+  const status = issueStatusVisual(issue.status);
+  const labels = projectTaskUserLabels(issue.labels);
   const viewerPubkey = identityQuery.data?.pubkey;
   const viewer = viewerPubkey ? normalizePubkey(viewerPubkey) : null;
   const isAuthor = viewer === normalizePubkey(issue.author);
@@ -841,79 +314,127 @@ function IssueMetaRail({
     Boolean(viewer) && (isAuthor || isOwner || isManagedAgentOwner);
 
   return (
-    <aside
-      className={cn(
-        "space-y-6 border-border/60 p-4",
-        className ??
-          (stacked ? "border-t" : "border-t xl:border-l xl:border-t-0"),
-      )}
-      data-testid="project-issue-meta-rail"
+    <div
+      className={`${PROJECT_DETAIL_READING_COLUMN_CLASS} ${fillHeight ? "h-full overflow-y-auto overscroll-y-none" : ""}`}
+      data-project-detail-panel
+      data-testid="project-issue-detail"
     >
-      <OverviewRailSection title="Status">
-        <IssueStatusChip status={issue.status} />
-      </OverviewRailSection>
-      {issue.assignees.length > 0 || viewer ? (
-        <OverviewRailSection title="Assignees">
-          <IssueAssigneesRow
-            canAssignOthers={canAssignOthers}
-            issue={issue}
-            profiles={profiles}
-            project={project}
-            signAsManagedOwner={isManagedAgentOwner && !isOwner}
-            viewerPubkey={viewer}
+      <header className="space-y-2 px-6 pb-3 pt-5">
+        <h3 className="line-clamp-2 text-lg font-semibold leading-6 text-foreground">
+          {issue.title}{" "}
+          <span className="font-normal text-muted-foreground">
+            #{issue.id.slice(0, 8)}
+          </span>
+          <ShareLinkButton
+            className="ml-1 inline-flex h-7 w-7 align-text-bottom"
+            label="Copy task link"
+            link={issueShareLink(issue)}
+            testId="project-issue-copy-link"
           />
-        </OverviewRailSection>
-      ) : null}
-      <OverviewRailSection title="Author">
-        <ProfileIdentityButton
-          align="center"
-          avatarSize="xs"
-          avatarUrl={authorProfile?.avatarUrl ?? null}
-          isAgent={authorProfile?.isAgent === true}
-          label={authorLabel}
-          pubkey={issue.author}
-        />
-      </OverviewRailSection>
-      {/* Above Labels and Activity, below Author: the rail runs from "who owns
-          this" to "what has happened to it", and who has been working on it
-          belongs on the people side of that line. */}
+          <ProjectItemDeleteMenu
+            author={issue.author}
+            label="Delete task"
+            project={project}
+            rootId={issue.id}
+            subject="issue"
+            targetId={issue.id}
+            testId={`delete-issue-${issue.id}`}
+          />
+        </h3>
+        <p className="flex flex-wrap items-center gap-x-1 gap-y-1 text-xs text-muted-foreground">
+          <ProfileIdentityButton
+            avatarClassName="shrink-0"
+            avatarSize="xs"
+            avatarUrl={authorProfile?.avatarUrl ?? null}
+            isAgent={authorProfile?.isAgent === true}
+            label={authorLabel}
+            pubkey={issue.author}
+            showLabel={false}
+          />
+          <span className="font-medium text-foreground">{authorLabel}</span>
+          <span
+            className="shrink-0 whitespace-nowrap"
+            title={new Date(issue.createdAt * 1_000).toLocaleString()}
+          >
+            {relativeTime(issue.createdAt)}
+          </span>
+          <ProjectOriginReference
+            agentName={issue.originAgentName}
+            channelId={issue.channelId}
+          />
+        </p>
+      </header>
+      <ProjectDetailMetaList>
+        <ProjectDetailMetaRow icon={status.icon} label="Status">
+          <span className={`font-medium ${status.className}`}>
+            {issue.status}
+          </span>
+        </ProjectDetailMetaRow>
+        <ProjectDetailMetaRow icon={CircleDot} label="Category">
+          {projectTaskCategoryLabel(issue.category)}
+        </ProjectDetailMetaRow>
+        {issue.assignees.length > 0 || viewer ? (
+          <ProjectDetailMetaRow icon={User} label="Assignees">
+            <IssueAssigneesRow
+              canAssignOthers={canAssignOthers}
+              issue={issue}
+              profiles={profiles}
+              project={project}
+              signAsManagedOwner={isManagedAgentOwner && !isOwner}
+              viewerPubkey={viewer}
+            />
+          </ProjectDetailMetaRow>
+        ) : null}
+        {labels.length > 0 ? (
+          <ProjectDetailMetaRow icon={Tag} label="Labels">
+            <ProjectDetailMetaPills labels={labels} />
+          </ProjectDetailMetaRow>
+        ) : null}
+      </ProjectDetailMetaList>
       <ProjectRootAgentsSection
         commentAuthors={issue.comments}
-        live={live}
         profiles={profiles}
         rootEventId={issue.id}
       />
-      {issue.labels.length > 0 ? (
-        <OverviewRailSection title="Labels">
-          <div className="flex flex-wrap gap-1.5">
-            {issue.labels.map((label) => (
-              <span
-                className="rounded-full border border-border/60 px-1.5 py-0.5 text-2xs text-muted-foreground"
-                key={label}
-              >
-                {label}
-              </span>
-            ))}
-          </div>
-        </OverviewRailSection>
+      {issue.content ? (
+        <ProjectDetailSection defaultOpen title="Description">
+          <ProjectRichContent content={issue.content} tags={issue.tags} />
+        </ProjectDetailSection>
       ) : null}
-      <OverviewRailSection title="Activity">
-        <dl className="space-y-1.5 text-xs text-muted-foreground">
-          <div className="flex items-center justify-between gap-3">
-            <dt>Created</dt>
-            <dd className="font-medium text-foreground">
-              {relativeTime(issue.createdAt)}
-            </dd>
-          </div>
-          <div className="flex items-center justify-between gap-3">
-            <dt>Updated</dt>
-            <dd className="font-medium text-foreground">
-              {relativeTime(issue.updatedAt)}
-            </dd>
-          </div>
-        </dl>
-      </OverviewRailSection>
-    </aside>
+      <ProjectDetailSection defaultOpen title="Activity">
+        <div className="space-y-3">
+          <DiscussedInChannels
+            entityLabel="this task"
+            originChannelId={issue.channelId}
+            originCreatedAt={issue.createdAt}
+            originPubkey={issue.author}
+            query={entityDiscussionQuery(issue.id)}
+            testId="issue-discussed-in"
+          />
+          <ProjectIssueCommentTimeline
+            comments={issue.comments}
+            key={issue.id}
+            profiles={profiles}
+            project={project}
+            rootId={issue.id}
+          />
+        </div>
+      </ProjectDetailSection>
+      <div
+        className="border-border/50 border-t px-6 pb-6 pt-4"
+        data-testid="project-issue-comment-composer"
+      >
+        <ForumComposer
+          className="border border-border/60 bg-background/45"
+          disabled={commentMutation.isPending}
+          isSending={commentMutation.isPending}
+          members={members}
+          onSubmit={handleCommentSubmit}
+          placeholder="Add a comment…"
+          profiles={profiles}
+        />
+      </div>
+    </div>
   );
 }
 
@@ -924,7 +445,6 @@ export function ProjectIssuesPanel({
   project,
   selectedIssueId,
 }: {
-  /** Forwarded to the open issue: the thread owns the scroll region. */
   fillHeight?: boolean;
   onSelectedIssueIdChange: (id: string | null) => void;
   profiles?: UserProfileLookup;
@@ -936,27 +456,16 @@ export function ProjectIssuesPanel({
   const selectedIssue =
     issues.find((issue) => issue.id === selectedIssueId) ?? null;
 
-  // An issue that is gone — deleted here or by its author elsewhere — must not
-  // leave the surrounding view pointing at it, or the Issues tab stays selected
-  // on a detail nothing can render. Gated on loaded data so a refetch in flight
-  // does not drop a selection that is about to come back.
-  React.useEffect(() => {
-    if (!selectedIssueId || !issuesQuery.data) return;
-    if (!issuesQuery.data.some((issue) => issue.id === selectedIssueId)) {
-      onSelectedIssueIdChange(null);
-    }
-  }, [issuesQuery.data, onSelectedIssueIdChange, selectedIssueId]);
-
   if (issuesQuery.isLoading) {
-    return <p className="p-4 text-sm text-muted-foreground">Loading issues…</p>;
+    return <BuzzLoadingState label="Loading tasks" />;
   }
 
   if (issues.length === 0) {
     return (
       <p className="p-4 text-sm text-muted-foreground">
         {issuesQuery.error
-          ? "Could not load issues for this repository."
-          : "No issues yet."}
+          ? "Could not load tasks for this repository."
+          : "No tasks yet."}
       </p>
     );
   }
@@ -972,26 +481,39 @@ export function ProjectIssuesPanel({
     );
   }
 
+  const groups = ISSUE_STATUS_ORDER.map((status) => ({
+    items: issues.filter((issue) => issue.status === status),
+    status,
+  })).filter((group) => group.items.length > 0);
+
   return (
-    // The list keeps its own overflow under `fillHeight` so that the moment
-    // between an open issue disappearing and the selection clearing shows a
-    // scrollable list rather than one clipped by a container sized for a
-    // thread.
-    <div
-      className={cn(
-        "divide-y divide-border/50",
-        fillHeight && "min-h-0 flex-1 overflow-y-auto",
-      )}
-    >
-      {issues.map((issue) => (
-        <IssueRow
-          issue={issue}
-          key={issue.id}
-          onOpen={() => onSelectedIssueIdChange(issue.id)}
-          profiles={profiles}
-          project={project}
-        />
-      ))}
+    <div>
+      {groups.map(({ items, status }) => {
+        const visual = issueStatusVisual(status);
+        return (
+          <ProjectWorkItemGroup
+            count={items.length}
+            icon={
+              <ProjectStatusProgressIcon
+                className={`h-4 w-4 ${visual.className}`}
+                state={visual.progress}
+              />
+            }
+            key={status}
+            label={status}
+          >
+            {items.map((issue) => (
+              <IssueRow
+                issue={issue}
+                key={issue.id}
+                onOpen={() => onSelectedIssueIdChange(issue.id)}
+                profiles={profiles}
+                project={project}
+              />
+            ))}
+          </ProjectWorkItemGroup>
+        );
+      })}
     </div>
   );
 }

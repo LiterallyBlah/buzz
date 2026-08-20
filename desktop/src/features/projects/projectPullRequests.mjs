@@ -114,7 +114,7 @@ export function projectPullRequestReviewSummary(pullRequest) {
   const changeRequestCount = pullRequest.changeRequests.length;
   const isDraft = pullRequest.status === "Draft";
   const state = isDraft
-    ? "This pull request is still a work in progress."
+    ? "This review is still a work in progress."
     : changeRequestCount > 0
       ? `${changeRequestCount} reviewer${changeRequestCount === 1 ? "" : "s"} requested changes.`
       : pullRequest.reviewers.length > 0
@@ -125,7 +125,7 @@ export function projectPullRequestReviewSummary(pullRequest) {
     approvalCount,
     changeRequestCount,
     detail: isDraft
-      ? "Draft pull requests cannot be merged."
+      ? "Draft reviews cannot be merged."
       : approvalCount === 0 && changeRequestCount === 0
         ? "Approvals from reviewers will show up here."
         : null,
@@ -408,7 +408,7 @@ export function eventToProjectPullRequest(
   const title =
     getTag(pullRequest, "subject") ||
     pullRequest.content.split("\n")[0] ||
-    "Untitled pull request";
+    "Untitled review";
 
   return {
     id: pullRequest.id,

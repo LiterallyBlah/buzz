@@ -118,7 +118,7 @@ export function usePushProjectLocalRepositoryMutation(
             error:
               error instanceof Error
                 ? error.message
-                : "The pull request update could not be published.",
+                : "The review update could not be published.",
           };
         }
       }

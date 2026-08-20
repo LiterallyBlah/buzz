@@ -191,15 +191,15 @@ export function CreateIssueDialog({
   return (
     <CreateProjectWorkItemDialog
       bodyPlaceholder="Add context, expected behavior, or reproduction steps"
-      description={`Create an issue in ${projectName}`}
+      description={`Create a task in ${projectName}`}
       isCreating={isCreating}
       itemName="issue"
       onCreate={onCreate}
       onOpenChange={onOpenChange}
       open={open}
       recipients={recipients}
-      title="Create an issue"
-      titlePlaceholder="Describe the issue"
+      title="Create a task"
+      titlePlaceholder="Describe the task"
     >
       <IssueMentionPicker
         disabled={isCreating}

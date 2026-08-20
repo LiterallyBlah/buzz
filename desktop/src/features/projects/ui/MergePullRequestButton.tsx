@@ -121,9 +121,7 @@ export function MergePullRequestButton({
         setConfirmOpen(false);
       }
       toast.error(
-        error instanceof Error
-          ? error.message
-          : "Failed to merge pull request.",
+        error instanceof Error ? error.message : "Failed to merge review.",
       );
     }
   }, [mergeMutation, pullRequest]);
@@ -187,12 +185,12 @@ export function MergePullRequestButton({
         statusEvent: unpublishedStatusEvent,
       });
       setUnpublishedStatusState(null);
-      toast.success("Published merged pull request status.");
+      toast.success("Published merged review status.");
     } catch (error) {
       toast.error(
         error instanceof Error
           ? error.message
-          : "Failed to publish merged pull request status.",
+          : "Failed to publish merged review status.",
       );
     }
   }, [publishMergedMutation, unpublishedStatusEvent]);
@@ -222,7 +220,7 @@ export function MergePullRequestButton({
         </Button>
         <AlertDialogContent data-testid="merge-pull-request-confirm">
           <AlertDialogHeader>
-            <AlertDialogTitle>Merge pull request?</AlertDialogTitle>
+            <AlertDialogTitle>Merge review?</AlertDialogTitle>
             <AlertDialogDescription>
               Merge {pullRequest.branchName} into {targetBranch} and push the
               result to the repository. The remote will reject the operation if
@@ -243,7 +241,7 @@ export function MergePullRequestButton({
                 }}
                 type="button"
               >
-                {mergeMutation.isPending ? "Merging…" : "Merge pull request"}
+                {mergeMutation.isPending ? "Merging…" : "Merge review"}
               </Button>
             </AlertDialogAction>
           </AlertDialogFooter>
@@ -274,8 +272,8 @@ export function MergePullRequestButton({
             </pre>
           ) : (
             <p className="rounded-md bg-background/80 p-2 text-xs text-muted-foreground">
-              Resolve in Terminal securely fetches the target and pull request
-              commits before showing copyable commands.
+              Resolve in Terminal securely fetches the target and review commits
+              before showing copyable commands.
             </p>
           )}
           <div className="flex flex-wrap gap-2">

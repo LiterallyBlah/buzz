@@ -1,4 +1,5 @@
 import { sortEvents } from "../../shared/api/relayClientShared.ts";
+import { projectTaskCategoryFromLabels } from "./projectTaskCategories.ts";
 
 // Issue assignment mirrors PR review requests (projectPullRequests.mjs):
 // a kind:1 comment labeled with this `t` tag whose `p` tags are the
@@ -303,10 +304,9 @@ export function eventToProjectIssue(
   );
   const comments = commentsForIssue(issue.id, issueCommentEvents);
   const assignmentState = assignmentStateForIssue(issue, issueCommentEvents);
+  const labels = getAllTags(issue, "t");
   const title =
-    getTag(issue, "subject") ||
-    issue.content.split("\n")[0] ||
-    "Untitled issue";
+    getTag(issue, "subject") || issue.content.split("\n")[0] || "Untitled task";
 
   return {
     id: issue.id,
@@ -318,7 +318,8 @@ export function eventToProjectIssue(
     repoAddress: getTag(issue, "a") ?? null,
     channelId: getTag(issue, "h") ?? null,
     originAgentName: getTag(issue, "buzz-origin-agent") ?? null,
-    labels: getAllTags(issue, "t"),
+    labels,
+    category: projectTaskCategoryFromLabels(labels),
     recipients: getAllTags(issue, "p"),
     assignees: assignmentState.assignees,
     assigneeOperationHeads: assignmentState.heads,
@@ -472,17 +473,17 @@ export function buildGitIssueTags({
   recipients = [],
 }) {
   if (!repoAddress.startsWith("30617:")) {
-    throw new Error("Issue repo address must reference a kind:30617 repo.");
+    throw new Error("Task repo address must reference a kind:30617 repo.");
   }
   if (!/^[a-fA-F0-9]{64}$/.test(repoOwner)) {
     throw new Error("Repo owner must be 64 hex characters.");
   }
   const subject = title.trim();
   if (!subject) {
-    throw new Error("Issue title is required.");
+    throw new Error("Task title is required.");
   }
   if (subject.length > 256) {
-    throw new Error("Issue title must be 256 characters or fewer.");
+    throw new Error("Task title must be 256 characters or fewer.");
   }
 
   const tags = [
@@ -520,7 +521,7 @@ export function buildGitStatusTags({
   issueAuthor,
 }) {
   if (!/^[a-fA-F0-9]{64}$/.test(issueId)) {
-    throw new Error("Issue ID must be 64 hex characters.");
+    throw new Error("Task ID must be 64 hex characters.");
   }
   const tags = [["e", issueId, "", "root"]];
   if (repoAddress) tags.push(["a", repoAddress]);

@@ -116,9 +116,9 @@ async function publishProjectPullRequest(
   input: CreateProjectPullRequestInput,
 ) {
   const title = input.title.trim();
-  if (!title) throw new Error("Pull request title cannot be empty.");
+  if (!title) throw new Error("Review title cannot be empty.");
   if (title.length > 256) {
-    throw new Error("Pull request title must be 256 characters or fewer.");
+    throw new Error("Review title must be 256 characters or fewer.");
   }
   if (project.cloneUrls.length === 0) {
     throw new Error("This project has no clone URL.");
@@ -134,8 +134,8 @@ async function publishProjectPullRequest(
   });
   await relayClient.publishEvent(
     event,
-    "Timed out creating pull request.",
-    "Failed to create pull request.",
+    "Timed out creating review.",
+    "Failed to create review.",
   );
   return event.id;
 }
@@ -157,7 +157,7 @@ export async function publishProjectPullRequestUpdate({
     !canPublishProjectPullRequestUpdate(identity.pubkey, project, pullRequest)
   ) {
     throw new Error(
-      "Only the pull request author or repository owner can publish its update.",
+      "Only the review author or repository owner can publish its update.",
     );
   }
   const event = await signRelayEvent({
@@ -171,8 +171,8 @@ export async function publishProjectPullRequestUpdate({
   });
   await relayClient.publishEvent(
     event,
-    "Timed out updating pull request.",
-    "The branch was pushed, but the pull request update could not be published.",
+    "Timed out updating review.",
+    "The branch was pushed, but the review update could not be published.",
   );
   return true;
 }
@@ -211,8 +211,7 @@ export function useUpdateProjectPullRequestMutation(
       mergeBase: string | null;
     }) => {
       if (!project) throw new Error("No project selected.");
-      if (!pullRequest)
-        throw new Error("No open pull request for this branch.");
+      if (!pullRequest) throw new Error("No open review for this branch.");
       return publishProjectPullRequestUpdate({
         commit,
         mergeBase,
@@ -245,7 +244,7 @@ export function useMergeProjectPullRequestMutation(
       const target = pullRequestTargetCloneUrl(context);
       if (!target.ok) throw new Error(target.error);
       if (!pullRequest.branchName || !pullRequest.commit) {
-        throw new Error("Pull request branch information is incomplete.");
+        throw new Error("Review branch information is incomplete.");
       }
       const result = await mergeProjectPullRequest({
         targetCloneUrl: target.cloneUrl,

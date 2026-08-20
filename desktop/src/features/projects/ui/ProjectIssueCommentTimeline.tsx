@@ -1,7 +1,10 @@
 import { ChevronDown, ChevronUp, History } from "lucide-react";
 import * as React from "react";
 
-import type { ProjectIssue } from "@/features/projects/hooks";
+import type {
+  ProjectIssue,
+  Repository as Project,
+} from "@/features/projects/hooks";
 import {
   formatExactTimestamp,
   pluralize,
@@ -15,15 +18,20 @@ import { normalizePubkey } from "@/shared/lib/pubkey";
 import { UserAvatar } from "@/shared/ui/UserAvatar";
 import { ProfileAuthorName } from "./ProjectProfileIdentity";
 import { ProjectRichContent } from "./ProjectRichContent";
+import { ProjectItemDeleteMenu } from "./ProjectItemDeleteMenu";
 
 const COLLAPSED_COMMENT_COUNT = 3;
 
 export function ProjectIssueCommentTimeline({
   comments,
   profiles,
+  project,
+  rootId,
 }: {
   comments: ProjectIssue["comments"];
   profiles?: UserProfileLookup;
+  project: Project;
+  rootId: string;
 }) {
   const [isCollapsed, setIsCollapsed] = React.useState(false);
   const [isExpanded, setIsExpanded] = React.useState(false);
@@ -137,6 +145,15 @@ export function ProjectIssueCommentTimeline({
                 >
                   {relativeTime(comment.createdAt)}
                 </span>
+                <ProjectItemDeleteMenu
+                  author={comment.author}
+                  label="Delete comment"
+                  project={project}
+                  rootId={rootId}
+                  subject="comment"
+                  targetId={comment.id}
+                  testId={`delete-issue-comment-${comment.id}`}
+                />
               </div>
               <ProjectRichContent
                 className="mt-1 text-sm text-foreground/90"
