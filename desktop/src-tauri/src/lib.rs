@@ -294,13 +294,12 @@ pub fn run() {
             // present), all owner-keyed side effects (event sync, agent restore,
             // relay publish) are skipped. The frontend shows a recovery screen;
             // the user must relaunch after restoring the identity.
-            let identity_lost = state
+            let recovery_mode = state
                 .identity_lost
-                .load(std::sync::atomic::Ordering::Acquire);
-            let keyring_locked = state
-                .keyring_locked
-                .load(std::sync::atomic::Ordering::Acquire);
-            let recovery_mode = identity_lost || keyring_locked;
+                .load(std::sync::atomic::Ordering::Acquire)
+                || state
+                    .keyring_locked
+                    .load(std::sync::atomic::Ordering::Acquire);
 
             // Backfill the pinned persona snapshot for any pre-existing agent
             // that predates the record-authoritative-spawn cutover (persona_id
@@ -568,6 +567,7 @@ pub fn run() {
             get_project_local_repo_file_content,
             get_project_repo_sync_status,
             list_project_local_repositories,
+            open_project_repository_folder,
             clone_project_repository,
             create_project_remote_branch,
             delete_project_remote_branch,
@@ -610,6 +610,7 @@ pub fn run() {
             nip44_encrypt_to_self,
             nip44_decrypt_from_self,
             get_channels,
+            get_open_channel_directory,
             create_channel,
             ensure_starter_channels,
             open_dm,
@@ -637,6 +638,7 @@ pub fn run() {
             get_forum_posts,
             get_forum_thread,
             get_thread_replies,
+            get_channel_reconnect_repair,
             get_channel_window,
             get_channel_messages_before,
             edit_message,

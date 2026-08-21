@@ -24,6 +24,7 @@ import type {
 import { useCreateProjectPullRequestCommentMutation } from "@/features/projects/commentMutations";
 import { projectPullRequestCommentTimelineKind } from "@/features/projects/projectPullRequests.mjs";
 import { entityDiscussionQuery } from "@/features/projects/lib/discussionChannels";
+import { selectionItemFromReview } from "@/features/projects/lib/projectSelection";
 import { pullRequestShareLink } from "@/features/projects/lib/projectShareLinks";
 import {
   formatExactTimestamp,
@@ -255,16 +256,31 @@ function PullRequestCommitRow({
   );
 }
 
+function reviewSelectionItem(
+  project: Project,
+  pullRequest: ProjectPullRequest,
+) {
+  return selectionItemFromReview({
+    author: pullRequest.author,
+    channelId: pullRequest.channelId ?? project.channelId,
+    id: pullRequest.id,
+    shareLink: pullRequestShareLink(pullRequest),
+    title: pullRequest.title,
+  });
+}
+
 function PullRequestRow({
   onOpen,
   profiles,
   project,
   pullRequest,
+  rangeItems,
 }: {
   onOpen: () => void;
   profiles?: UserProfileLookup;
   project: Project;
   pullRequest: ProjectPullRequest;
+  rangeItems: ReturnType<typeof reviewSelectionItem>[];
 }) {
   const authorProfile = profileForPubkey(pullRequest.author, profiles);
   const authorLabel = labelForPubkey(pullRequest.author, profiles);
@@ -284,6 +300,10 @@ function PullRequestRow({
         ) : undefined
       }
       onOpen={onOpen}
+      selection={{
+        item: reviewSelectionItem(project, pullRequest),
+        rangeItems,
+      }}
       statusIcon={
         <ProjectStatusProgressIcon
           aria-label={pullRequest.status}
@@ -304,7 +324,7 @@ function PullRequestRow({
               }
               className={`flex items-center gap-1 rounded-md text-xs hover:text-foreground focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring ${
                 pullRequest.comments.length > 0
-                  ? "text-muted-foreground"
+                  ? "text-muted-foreground/60"
                   : "text-muted-foreground/45"
               }`}
               data-testid="project-pull-request-comments"
@@ -335,7 +355,7 @@ function PullRequestRow({
             title={pullRequest.title}
           />
           <span
-            className="hidden w-20 shrink-0 text-right text-xs text-muted-foreground/70 sm:block"
+            className="hidden w-20 shrink-0 text-right text-xs text-muted-foreground/55 sm:block"
             data-testid="project-pull-request-row-date"
             title={formatExactTimestamp(pullRequest.createdAt)}
           >
@@ -350,16 +370,12 @@ function PullRequestRow({
 /** GitHub-style PR title line, rendered as the top of the review detail
  * card. Status, branches, and dates sit in the meta header below. */
 export function PullRequestDetailHeader({
-  profiles,
   project,
   pullRequest,
 }: {
-  profiles?: UserProfileLookup;
   project?: Project;
   pullRequest: ProjectPullRequest;
 }) {
-  const authorLabel = labelForPubkey(pullRequest.author, profiles);
-
   return (
     <header className="min-w-0 space-y-2 px-6 pb-3 pt-5">
       <h3 className="line-clamp-2 min-w-0 text-lg font-semibold leading-6 text-foreground">
@@ -390,20 +406,7 @@ export function PullRequestDetailHeader({
         className="flex flex-wrap items-center gap-x-1 gap-y-1 text-xs text-muted-foreground"
         data-testid="project-pull-request-detail-metadata"
       >
-        <span
-          className="flex min-w-0 items-center gap-1"
-          data-project-metadata-phrase
-        >
-          <AuthorIdentity
-            avatarSize="xs"
-            profiles={profiles}
-            pubkey={pullRequest.author}
-            showLabel={false}
-          />
-          <ProfileAuthorName pubkey={pullRequest.author}>
-            {authorLabel}
-          </ProfileAuthorName>
-        </span>
+        <span data-project-metadata-phrase>Review opened</span>
         <span
           className="shrink-0 whitespace-nowrap"
           data-project-metadata-phrase
@@ -446,7 +449,6 @@ export function ProjectPullRequestDetail({
 }) {
   const identityQuery = useIdentityQuery();
   const commentMutation = useCreateProjectPullRequestCommentMutation(project);
-  // This detail also appears outside the project panel (for example, Home).
   useOpenProjectRoot(project.id, pullRequest.id);
   const [
     expandedReviewHistoryPullRequestIds,
@@ -546,11 +548,7 @@ export function ProjectPullRequestDetail({
       data-project-detail-panel
       data-testid="project-pull-request-detail"
     >
-      <PullRequestDetailHeader
-        profiles={profiles}
-        project={project}
-        pullRequest={pullRequest}
-      />
+      <PullRequestDetailHeader project={project} pullRequest={pullRequest} />
       <PullRequestMetaHeader
         diffStats={diffStats}
         profiles={profiles}
@@ -619,7 +617,7 @@ export function ProjectPullRequestDetail({
         defaultOpen={false}
         title="Commits"
       >
-        <div className="-mx-6 divide-y divide-border/50">
+        <div className="-mx-6">
           <PullRequestCommitRow
             author={pullRequest.author}
             branch={pullRequest.branchName}
@@ -859,7 +857,7 @@ export function ProjectPullRequestDetail({
         </div>
       </ProjectDetailSection>
       <div
-        className="border-border/50 border-t px-6 pb-6 pt-4"
+        className="px-6 pb-6 pt-4"
         data-testid="project-pull-request-comment-composer"
       >
         <ForumComposer
@@ -959,6 +957,9 @@ export function PullRequestsPanel({
     items: pullRequests.filter((pullRequest) => pullRequest.status === status),
     status,
   })).filter((group) => group.items.length > 0);
+  const rangeItems = pullRequests.map((pullRequest) =>
+    reviewSelectionItem(project, pullRequest),
+  );
 
   return (
     <div>
@@ -972,6 +973,9 @@ export function PullRequestsPanel({
                 state={pullRequestProgressState(status)}
               />
             }
+            items={items.map((pullRequest) =>
+              reviewSelectionItem(project, pullRequest),
+            )}
             key={status}
             label={status}
           >
@@ -982,6 +986,7 @@ export function PullRequestsPanel({
                 profiles={profiles}
                 project={project}
                 pullRequest={pullRequest}
+                rangeItems={rangeItems}
               />
             ))}
           </ProjectWorkItemGroup>
