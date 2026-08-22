@@ -141,6 +141,87 @@ export function toSearchHit(
   };
 }
 
+export function createDesktopNotificationActivationQueue(
+  activate: (
+    target: DesktopNotificationTarget,
+    signal: AbortSignal,
+  ) => Promise<void>,
+  onError?: (error: unknown) => void,
+): {
+  cancel: () => void;
+  enqueue: (target: DesktopNotificationTarget) => void;
+} {
+  const controller = new AbortController();
+  let pending = Promise.resolve();
+
+  return {
+    cancel: () => {
+      controller.abort();
+    },
+    enqueue: (target) => {
+      // Preserve native click order when macOS drains multiple queued targets.
+      // Contain failures so one rejected navigation cannot poison later clicks.
+      pending = pending
+        .then(() => {
+          if (!controller.signal.aborted) {
+            return activate(target, controller.signal);
+          }
+        })
+        .catch((error) => {
+          try {
+            onError?.(error);
+          } catch {
+            // Reporting must not poison the activation queue either.
+          }
+        });
+    },
+  };
+}
+
+export async function activateDesktopNotificationTarget(
+  target: DesktopNotificationTarget,
+  actions: {
+    goChannel: (
+      channelId: string,
+      options?: { force?: boolean },
+    ) => Promise<unknown>;
+    goHome: () => Promise<unknown>;
+    goProject: (
+      projectId: string,
+      options?: { force?: boolean },
+    ) => Promise<unknown>;
+    openSearchHit: (
+      hit: SearchHit,
+      behavior?: { force?: boolean; signal?: AbortSignal },
+    ) => Promise<unknown>;
+    revealWindow: () => Promise<void>;
+  },
+  signal?: AbortSignal,
+): Promise<void> {
+  if (signal?.aborted) {
+    return;
+  }
+
+  let navigation: Promise<unknown>;
+  // Project work-item alerts deliberately have no channel. Route them before
+  // the no-channel fallback or a click lands on Home instead of the project.
+  if (target.projectId) {
+    navigation = actions.goProject(target.projectId, { force: true });
+  } else if (!target.channelId) {
+    navigation = actions.goHome();
+  } else {
+    const anchor = toSearchHit(target);
+    navigation = anchor
+      ? actions.openSearchHit(anchor, { force: true, signal })
+      : actions.goChannel(target.channelId, { force: true });
+  }
+
+  // Native activation already foregrounds the app on macOS. Other platforms
+  // still get a best-effort reveal, but it must never gate click-through.
+  void actions.revealWindow().catch(() => undefined);
+  await navigation;
+}
+
 export function deriveShellRoute(pathname: string): {
   selectedChannelId: string | null;
   selectedView: AppView;

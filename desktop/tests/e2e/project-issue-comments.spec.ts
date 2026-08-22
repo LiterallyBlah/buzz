@@ -38,6 +38,22 @@ test("issue detail can open agent chat or seed a channel question", async ({
     "project-context-communication-actions",
   );
   await expect(communication).toBeVisible();
+  const contextPanel = page.getByTestId("project-repository-actions-panel");
+  await expect(
+    contextPanel.getByRole("heading", { name: "Actions", exact: true }),
+  ).toHaveCount(0);
+  await expect(
+    contextPanel.getByRole("heading", { name: "Details", exact: true }),
+  ).toBeVisible();
+  await expect(
+    contextPanel.getByRole("heading", { name: "Assignment", exact: true }),
+  ).toHaveCount(0);
+  await expect(
+    contextPanel.getByRole("heading", { name: "Discussion", exact: true }),
+  ).toHaveCount(0);
+  await expect(
+    contextPanel.getByTestId("project-repository-people"),
+  ).toHaveCount(0);
   await page.getByTestId("project-context-chat-agent").click();
   await expect(page.getByTestId("project-agent-chat-panel")).toBeVisible();
   await expect(page.getByTestId("projects-agent-selection-item")).toHaveCount(
@@ -103,9 +119,19 @@ test("issue discussion ignores an author-claimed origin channel", async ({
   await relatedChannel.click();
 
   await expect(page.getByTestId("chat-title")).toHaveText("general");
-  await expect(page.getByTestId("message-input")).toContainText("ffffffff");
+  const issueDraftChip = page
+    .getByTestId("message-input")
+    .locator('[data-composer-buzz-link=""]', {
+      hasText: "buzz",
+    });
+  await expect(issueDraftChip).toHaveAttribute(
+    "data-href",
+    new RegExp(`id=${forgedIssueId}`),
+  );
   await page.getByTestId("channel-random").click();
-  await expect(page.getByTestId("message-input")).not.toContainText("ffffffff");
+  await expect(
+    page.getByTestId("message-input").locator('[data-composer-buzz-link=""]'),
+  ).toHaveCount(0);
 });
 
 test("issue comments use the project activity timeline", async ({ page }) => {

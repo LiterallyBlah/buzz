@@ -39,9 +39,9 @@ const RELAY_PROJECT_QUERY_PARTS = new Set<string>([
   "activity-summaries",
   "issues",
   "pull-requests",
-  // The cross-project inbox reads issues and pull requests from the relay in
-  // one fan-out. Omitting it left the one view that shows every project's work
-  // stale after a reconnect, while the per-project lists beside it healed.
+  // Fresh for two minutes (PROJECT_WORK_ITEMS_STALE_TIME_MS) and tolerant of
+  // partial fan-out failure. Reconnect auto-heal must repair the cross-project
+  // inbox inside that window, just as it repairs the per-project lists.
   "work-items",
 ]);
 

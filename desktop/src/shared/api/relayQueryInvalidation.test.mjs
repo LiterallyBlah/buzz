@@ -63,7 +63,14 @@ test("relay invalidation separates relay project queries from local repo work", 
     ["project", "project-1", "pull-requests"],
     ["projects", "issues", ["project-1"]],
     ["projects", "activity-summaries", ["addr-1"]],
-    ["projects", "work-items", ["project-1", "project-2"]],
+    // Work items fan out over the relay and are fresh for two minutes;
+    // reconnect auto-heal must repair partial results across every project.
+    [
+      "projects",
+      "work-items",
+      ["project-1", "project-2"],
+      ["addr-1", "addr-2"],
+    ],
   ]) {
     assert.equal(isRelayDependentQueryKey(queryKey), true, queryKey.join("/"));
   }

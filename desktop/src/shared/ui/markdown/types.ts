@@ -29,6 +29,7 @@ export type MessageLinkPillProps = {
   href?: string;
   interactive: boolean;
   link: ParsedMessageLink;
+  onOpenChannel: (channelId: string) => void;
   onOpenMessageLink: (link: ParsedMessageLink) => void;
   threadExcerpt?: string | null;
   variant?: "default" | "sent-from-thread";
@@ -81,6 +82,13 @@ export type MarkdownProps = {
   hardLineBreaks?: boolean;
   imetaByUrl?: ImetaLookup;
   interactive?: boolean;
+  /**
+   * Render fenced code as scrollable code blocks even when `interactive` is
+   * false. Non-interactive surfaces default to inlining code (compact
+   * previews); document surfaces like repository READMEs pass true so long
+   * lines scroll inside the block instead of stretching the layout.
+   */
+  blockCode?: boolean;
   agentMentionPubkeysByName?: Record<string, string>;
   mentionNames?: string[];
   mentionPubkeysByName?: Record<string, string>;

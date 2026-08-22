@@ -762,8 +762,10 @@ export function ProjectPullRequestFilesChangedPanel({
 }
 
 export function ProjectDiffFilesPanel({
+  className,
   error,
   diff,
+  fileTreeClassName,
   isLoading,
   embedded = false,
   focusedAnchor,
@@ -771,6 +773,10 @@ export function ProjectDiffFilesPanel({
   inlineComments,
   subjectLabel,
 }: {
+  /** Extra classes for the file-tree/diff grid container. */
+  className?: string;
+  /** Overrides the file tree's default `max-h-96` cap, e.g. for full-height layouts. */
+  fileTreeClassName?: string;
   error: unknown;
   diff: ProjectRepoDiff | null | undefined;
   isLoading: boolean;
@@ -821,11 +827,11 @@ export function ProjectDiffFilesPanel({
     }
   }, [filteredFiles, selectedPath]);
 
-  if (isLoading) {
+  if (isLoading && !diff) {
     return <BuzzLoadingState label="Loading changed files" />;
   }
 
-  if (error) {
+  if (error && !diff) {
     const message = errorMessage(error);
     return (
       <div
@@ -864,6 +870,7 @@ export function ProjectDiffFilesPanel({
       className={cn(
         "grid min-h-0 overflow-hidden lg:grid-cols-[17rem_minmax(0,1fr)]",
         outerBorderClass,
+        className,
       )}
       data-project-detail-panel={embedded ? undefined : true}
     >
@@ -883,7 +890,12 @@ export function ProjectDiffFilesPanel({
             />
           </label>
         </div>
-        <nav className="max-h-96 overflow-auto border-border/50 border-t py-1">
+        <nav
+          className={cn(
+            "max-h-96 overflow-auto border-border/50 border-t py-1",
+            fileTreeClassName,
+          )}
+        >
           <FileTreeItems
             node={fileTree}
             onSelect={setSelectedPath}

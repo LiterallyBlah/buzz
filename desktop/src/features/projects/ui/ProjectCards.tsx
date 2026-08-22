@@ -20,10 +20,8 @@ import type {
   ProjectActivitySummary,
 } from "@/features/projects/hooks";
 import {
-  formatExactTimestamp,
   getProjectUpdatedAt,
   listRowDescription,
-  relativeTime,
 } from "@/features/projects/lib/projectsViewHelpers";
 import type { ProjectRepoUnavailableReason } from "@/features/projects/lib/projectRepoAvailability";
 import { projectShareLink } from "@/features/projects/lib/projectShareLinks";
@@ -54,39 +52,6 @@ import { CopyShareLinkMenuItem } from "./CopyShareLinkMenuItem";
 import { ProjectEntityListRow } from "./ProjectEntityListRow";
 import { PROJECT_GRID_CARD_BODY_CLASS } from "./projectGridCardStyles";
 import { ProjectListRowMenu } from "./ProjectListRowMenu";
-
-function ProjectUpdatedLabel({
-  profiles,
-  project,
-  summary,
-}: {
-  profiles?: UserProfileLookup;
-  project: Project;
-  summary: ProjectActivitySummary | undefined;
-}) {
-  const updatedAt = getProjectUpdatedAt(project, summary);
-  const latestCommit = summary?.latestCommit;
-  const authorLabel = latestCommit?.author
-    ? resolveUserLabel({ profiles, pubkey: latestCommit.author })
-    : null;
-
-  return (
-    <Tooltip>
-      <TooltipTrigger asChild>
-        <span className="whitespace-nowrap text-xs leading-4 text-muted-foreground/70">
-          {relativeTime(updatedAt)}
-        </span>
-      </TooltipTrigger>
-      <TooltipContent className="max-w-96 break-words">
-        {latestCommit
-          ? `${latestCommit.title || latestCommit.commit.slice(0, 7)}${
-              authorLabel ? ` · ${authorLabel}` : ""
-            } · ${formatExactTimestamp(latestCommit.createdAt)}`
-          : `Created ${formatExactTimestamp(project.createdAt)}`}
-      </TooltipContent>
-    </Tooltip>
-  );
-}
 
 export function ProjectPeopleStack({
   pubkeys,
@@ -333,7 +298,7 @@ function RepositoryUnavailableIndicator({
       </TooltipTrigger>
       <TooltipContent className="max-w-64">
         <p className="font-medium">{label}</p>
-        <p className="text-muted-foreground">{description}</p>
+        <p className="text-secondary-foreground">{description}</p>
       </TooltipContent>
     </Tooltip>
   );
@@ -540,12 +505,7 @@ export function ProjectGridCard({
               </div>
             </div>
           </div>
-          <div className="pointer-events-auto relative z-10 flex shrink-0 items-center gap-1">
-            <ProjectUpdatedLabel
-              profiles={profiles}
-              project={project}
-              summary={summary}
-            />
+          <div className="pointer-events-auto relative z-10 shrink-0">
             <ProjectActionsMenu
               canDelete={canDelete}
               disabled={deleteDisabled}
@@ -613,6 +573,7 @@ export function ProjectListRow({
           <span>{repositoryCount}</span>
         </span>
       }
+      affiliationClassName="w-auto"
       affiliationTestId="projects-row-context"
       affiliationTitle={`${repositoryCount} ${
         repositoryCount === 1 ? "repository" : "repositories"

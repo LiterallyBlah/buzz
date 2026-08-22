@@ -1,4 +1,5 @@
 import * as React from "react";
+import { useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 
 import {
@@ -15,6 +16,7 @@ import {
 } from "@/features/agents/hooks";
 import { useGlobalAgentConfig } from "@/features/agents/useGlobalAgentConfig";
 import { useChannelsQuery } from "@/features/channels/hooks";
+import { invalidateChannelMembersRosters } from "@/features/channels/rosterFreshness";
 import { usePresenceQuery } from "@/features/presence/hooks";
 import { useUsersBatchQuery } from "@/features/profile/hooks";
 import { useIdentityQuery } from "@/shared/api/hooks";
@@ -40,6 +42,7 @@ import {
 } from "../lib/ownedRelayAgents";
 
 export function useManagedAgentActions() {
+  const queryClient = useQueryClient();
   const { globalConfig } = useGlobalAgentConfig();
   const identityQuery = useIdentityQuery();
   const currentPubkey = identityQuery.data?.pubkey;
@@ -337,6 +340,9 @@ export function useManagedAgentActions() {
     await Promise.allSettled(
       channelIds.map((channelId) => removeChannelMember(channelId, pubkey)),
     );
+    // Direct writes bypass the member mutations' invalidation; without this,
+    // the deleted agent stays in cached rosters for the freshness window.
+    await invalidateChannelMembersRosters(queryClient, channelIds);
   }
 
   async function handleDelete(pubkey: string) {

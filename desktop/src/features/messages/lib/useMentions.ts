@@ -40,6 +40,7 @@ import type {
 import type { UserProfileLookup } from "@/features/profile/lib/identity";
 import { detectPrefixQuery } from "@/shared/lib/detectPrefixQuery";
 import { normalizePubkey } from "@/shared/lib/pubkey";
+import { channelMemberPubkeySet } from "@/shared/lib/rosterDerivations";
 import { trimMapToSize } from "@/shared/lib/trimMapToSize";
 import { flushMentionDebounce } from "./flushMentionDebounce";
 import { useAgentMentionRevalidation } from "./agentMentionRevalidation";
@@ -68,9 +69,8 @@ type UseMentionsOptions = {
   agentEligibilityScope?: AgentEligibilityScope;
   channelType?: ChannelType | null;
 };
-// One producer for "normalize a list of records into a pubkey Set", shared by
-// the managed-agent, relay-agent and channel-member memos below so they cannot
-// drift on normalization.
+// Keep managed-agent identity normalisation in one place. Channel-member sets
+// use the shared identity cache below so the timeline and composer reuse them.
 function toNormalizedPubkeySet(
   records: readonly { pubkey: string }[] | undefined,
 ) {
@@ -182,8 +182,10 @@ export function useMentions(
     () => getSharedChannelIds(channelsQuery.data),
     [channelsQuery.data],
   );
+  // Identity-cached (shared with the timeline's roster derivations) — the Set
+  // is built once per distinct roster instead of per consumer.
   const memberPubkeys = React.useMemo(
-    () => toNormalizedPubkeySet(members),
+    () => (members ? channelMemberPubkeySet(members) : new Set<string>()),
     [members],
   );
   const agentEligibilityScope = React.useMemo(() => {
@@ -544,6 +546,7 @@ export function useMentions(
       .slice(0, MENTION_SUGGESTION_LIMIT)
       .map(({ candidate, label }) =>
         mapMentionCandidateToSuggestion({
+          agentProvenanceReady: agentDirectoriesReady,
           candidate,
           label,
           channelType: options?.channelType,
@@ -554,6 +557,7 @@ export function useMentions(
       );
   }, [
     activePersonaIds,
+    agentDirectoriesReady,
     currentPubkey,
     mentionCandidatesWithTeams,
     mentionQuery,
@@ -934,6 +938,7 @@ export function useMentions(
             searchableNamesLowerRef,
             candidates: mentionCandidatesWithTeams,
             activePersonaIds,
+            agentProvenanceReady: agentDirectoriesReady,
             channelType: options?.channelType,
             currentPubkey,
             ownerProfiles: ownerProfilesQuery.data?.profiles,
@@ -963,6 +968,7 @@ export function useMentions(
     },
     [
       activePersonaIds,
+      agentDirectoriesReady,
       cancelMentionAutocomplete,
       currentPubkey,
       isMentionOpen,
