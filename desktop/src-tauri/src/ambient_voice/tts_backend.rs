@@ -135,6 +135,10 @@ async fn start_local_tts(
             model_dir,
             tts_active,
             tts_cancel,
+            // Ambient voice owns barge-in through `tts_cancel`; it is not part
+            // of a Huddle's shared human-floor arbitration. Keep an unbound
+            // floor so the common local TTS pipeline authorises its queue.
+            Default::default(),
             &voice,
             output_device,
             app,

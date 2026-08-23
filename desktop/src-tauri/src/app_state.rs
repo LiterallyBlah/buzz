@@ -298,6 +298,9 @@ pub fn resolve_persisted_identity(app: &AppHandle, state: &AppState) -> Result<(
 #[path = "app_state_accessors.rs"]
 mod accessors;
 
+#[path = "app_state_pending_channels.rs"]
+mod pending_channels;
+
 #[path = "app_state_keyring.rs"]
 mod keyring_config;
 pub(crate) use keyring_config::keyring_service;
