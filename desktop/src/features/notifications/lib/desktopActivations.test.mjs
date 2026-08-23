@@ -109,6 +109,7 @@ test("window focus re-drains activations stranded by a lost emit", async () => {
       kind: 9,
       pubkey: undefined,
       threadRootId: null,
+      projectId: null,
     },
   ]);
 
