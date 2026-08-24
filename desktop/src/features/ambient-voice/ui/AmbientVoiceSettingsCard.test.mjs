@@ -422,6 +422,58 @@ test("a stop phrase the model cannot encode is never written to disk", async () 
   );
 });
 
+test("a refused stop phrase does not hold the wake word hostage", async () => {
+  // The binding save carries no stop phrase, and the native save door
+  // re-validates everything it is given — so a stop-phrase error may explain
+  // its own field, but a wake-word edit committed while one is showing must
+  // still be written.
+  const refused = {
+    valid: false,
+    message: "Stop phrase: The wake-word model cannot hear: 7",
+    tokens: null,
+    checkedAgainstModel: true,
+  };
+  await mountSettings(
+    READY_MODELS,
+    async ({ act, calls, testing, view }) => {
+      const field = view.getByTestId("ambient-wake-word");
+      await act(() => {
+        testing.fireEvent.change(field, { target: { value: "okay hermes" } });
+      });
+      // Let both debounced checks land: the wake word's (valid) and the
+      // loaded stop phrase's (refused). Blur is the commit, and it must see
+      // the refusal on screen for this test to mean anything.
+      const before = Date.now();
+      await new Promise((resolve) => setTimeout(resolve, 500));
+      await act(() => {});
+      assert.ok(
+        Date.now() - before >= 450,
+        `the debounce wait was skipped (${Date.now() - before}ms)`,
+      );
+      assert.match(
+        view.getByTestId("ambient-stop-phrase-error").textContent,
+        /cannot hear/,
+      );
+      await act(() => {
+        testing.fireEvent.blur(field);
+      });
+
+      const saved = calls.filter(
+        (call) => call.command === "set_ambient_voice_settings",
+      );
+      assert.equal(saved.length, 1, "the wake word was never persisted");
+      assert.equal(
+        saved[0].args.settings.wakeBindings[0].wakeWord,
+        "okay hermes",
+      );
+    },
+    {
+      settings: { ...SETTINGS, stopPhrase: "buzz 7" },
+      stopPhraseCheck: refused,
+    },
+  );
+});
+
 test("clearing a stop phrase works even once it would be refused", async () => {
   // The way out. A phrase on disk that has stopped being valid — because the
   // wake word was edited to match it, or because it predates the check — must

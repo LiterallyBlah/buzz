@@ -300,7 +300,14 @@ export function AmbientVoiceSettingsCard() {
   }, []);
 
   const saveBinding = React.useCallback(() => {
-    if (!settings || block || !agentPubkey) return;
+    // A stop-phrase refusal is about the other field: the binding this
+    // function writes does not carry the phrase, and the native save door
+    // re-validates whatever it is given. Holding the wake word hostage to a
+    // stop phrase the user is still typing turned one field's error into the
+    // whole card refusing to save, with a message about a field the user
+    // was not editing.
+    if (!settings || (block && block.reason !== "stop_phrase") || !agentPubkey)
+      return;
     void persist(
       withPrimaryBinding(settings, {
         wakeWord: wakeWord.trim(),
