@@ -18,6 +18,7 @@ use std::{
 
 use super::*;
 use crate::ambient_voice::http_tts::{HttpTtsPipeline, SpeechPlayer};
+use crate::ambient_voice::speech_health::RoleHealth;
 use crate::ambient_voice::speech_http::SpeechEndpoint;
 use crate::ambient_voice::speech_stub_server::{StubReply, StubRequest, StubSpeechServer};
 use crate::ambient_voice::speech_wav::{self, DecodedAudio};
@@ -59,6 +60,7 @@ fn tts_through(server: &StubSpeechServer) -> AmbientTts {
         Box::new(move || Ok(Box::new(player))),
         Arc::new(AtomicBool::new(false)),
         Arc::new(AtomicBool::new(false)),
+        Arc::new(RoleHealth::default()),
     )
     .expect("pipeline");
     AmbientTts::Http(Arc::new(pipeline))

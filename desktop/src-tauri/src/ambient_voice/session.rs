@@ -312,6 +312,10 @@ pub struct AmbientSessionConfig {
     pub stop_phrase: Option<String>,
     /// How long a pause closes an utterance, in milliseconds.
     pub silence_hold_ms: u32,
+    /// Where the speech server's answers are recorded when this session runs
+    /// speech-to-text on one, so a server that is failing softly is visible
+    /// rather than only on stderr.
+    pub stt_health: Arc<super::speech_health::RoleHealth>,
     /// Shared with the ambient TTS pipeline: true while it is playing.
     pub tts_active: Arc<AtomicBool>,
     /// Shared with the ambient TTS pipeline: set to cancel playback.
@@ -534,6 +538,7 @@ fn ambient_worker(
         stop_keyword,
         stop_phrase,
         silence_hold_ms,
+        stt_health,
         tts_active,
         tts_cancel,
         muted,
@@ -555,7 +560,8 @@ fn ambient_worker(
             return;
         }
     };
-    let transcriber = match Transcriber::build(&stt_model_dir, stt_endpoint.as_deref()) {
+    let transcriber = match Transcriber::build(&stt_model_dir, stt_endpoint.as_deref(), stt_health)
+    {
         Ok(transcriber) => transcriber,
         Err(error) => {
             eprintln!("buzz-desktop: ambient speech recognizer unavailable: {error}");

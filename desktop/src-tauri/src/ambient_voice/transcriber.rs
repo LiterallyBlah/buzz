@@ -11,8 +11,9 @@
 //! thread-bound: the sherpa recogniser is not `Send`-safe across await points
 //! and the HTTP client is a blocking one.
 
-use std::path::Path;
+use std::{path::Path, sync::Arc};
 
+use super::speech_health::RoleHealth;
 use super::speech_http::{self, SpeechEndpoint};
 
 /// Rate of the worker's utterance buffer, after resampling.
@@ -28,6 +29,10 @@ pub(crate) enum Transcriber {
         client: reqwest::blocking::Client,
         endpoint: SpeechEndpoint,
         local: Option<sherpa_onnx::OfflineRecognizer>,
+        /// Where each attempt against the server is recorded, so a server that
+        /// is failing softly is visible on the indicator instead of only on
+        /// stderr. It records; it decides nothing.
+        health: Arc<RoleHealth>,
     },
 }
 
@@ -43,7 +48,11 @@ impl Transcriber {
     /// local recogniser rather than killing the session: the wake word, the
     /// microphone and the transcript path all still work, and the alternative
     /// is a feature that goes silent because of a typo in a URL.
-    pub(crate) fn build(stt_model_dir: &Path, endpoint_url: Option<&str>) -> Result<Self, String> {
+    pub(crate) fn build(
+        stt_model_dir: &Path,
+        endpoint_url: Option<&str>,
+        health: Arc<RoleHealth>,
+    ) -> Result<Self, String> {
         let local = create_recognizer(stt_model_dir);
         let Some(raw) = endpoint_url else {
             return local.map(Transcriber::Local);
@@ -63,6 +72,7 @@ impl Transcriber {
                     client,
                     endpoint,
                     local,
+                    health,
                 })
             }
             Err(error) => match local {
@@ -91,20 +101,30 @@ impl Transcriber {
                 client,
                 endpoint,
                 local,
-            } => match speech_http::transcribe(client, endpoint, samples, UTTERANCE_SAMPLE_RATE) {
-                Ok(text) => Ok(text),
-                Err(error) => {
-                    eprintln!("buzz-desktop: ambient speech server failed: {error}");
-                    // Per utterance, and deliberately without switching the
-                    // session's backend: the user chose a server, and a
-                    // client that quietly stopped using it would leave them
-                    // unable to tell a working server from a broken one.
-                    Ok(decode_locally(
-                        fallback_after(local.as_ref(), error)?,
-                        samples,
-                    ))
+                health,
+            } => {
+                let answered =
+                    speech_http::transcribe(client, endpoint, samples, UTTERANCE_SAMPLE_RATE);
+                // Recorded before the fallback runs, so what is reported is
+                // what the *server* did rather than what the session managed
+                // to do in spite of it.
+                health.record(&answered);
+                match answered {
+                    Ok(text) => Ok(text),
+                    Err(error) => {
+                        eprintln!("buzz-desktop: ambient speech server failed: {error}");
+                        // Per utterance, and deliberately without switching
+                        // the session's backend: the user chose a server, and
+                        // a client that quietly stopped using it would leave
+                        // them unable to tell a working server from a broken
+                        // one. The health line is what makes that tellable.
+                        Ok(decode_locally(
+                            fallback_after(local.as_ref(), error)?,
+                            samples,
+                        ))
+                    }
                 }
-            },
+            }
         }
     }
 }

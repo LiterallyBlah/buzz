@@ -109,6 +109,7 @@ fn start_http_tts(
             settings.output_device.clone(),
             Arc::clone(&ambient.tts_active),
             Arc::clone(&ambient.tts_cancel),
+            Arc::clone(&ambient.speech_health.tts),
         )
     });
     match built {

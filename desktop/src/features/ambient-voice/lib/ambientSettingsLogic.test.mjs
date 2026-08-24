@@ -4,6 +4,7 @@ import test from "node:test";
 import {
   ambientModelRows,
   ambientSaveBlock,
+  ambientSpeechHealthLines,
   clampSilenceHoldMs,
   mergeAgentOptions,
   modelStatusLabel,
@@ -14,6 +15,14 @@ import {
   SILENCE_HOLD_MIN_MS,
   SILENCE_HOLD_STEP_MS,
 } from "./ambientSettingsLogic.ts";
+import {
+  ambientReportLabel,
+  speechBackendFailureLabel,
+} from "./ambientVoiceApi.ts";
+import {
+  ambientReport,
+  failingSpeechServerReport,
+} from "./ambientVoiceTestDom.mjs";
 
 const AGENT = "a".repeat(64);
 const valid = {
@@ -197,4 +206,106 @@ test("nothing is listed before the model manager has answered", () => {
   // A blank list is honest; inventing "Not downloaded" for three models the
   // app has not asked about yet would be a fabricated alarm on every launch.
   assert.deepEqual(ambientModelRows(null), []);
+});
+
+// ── A speech server that has stopped answering ───────────────────────────────
+
+test("a role that runs on this computer is never reported as a failing server", () => {
+  // The default, and the shape of every settings file that has never named a
+  // server. An alarm about a server that does not exist would be the same
+  // class of harm as the silence this replaces.
+  assert.equal(speechBackendFailureLabel(ambientReport().speechBackends), null);
+  assert.deepEqual(ambientSpeechHealthLines(ambientReport()), []);
+  assert.equal(
+    ambientReportLabel(ambientReport()),
+    "Listening for the wake word",
+  );
+});
+
+test("a failing speech server replaces the pill's claim to be listening", () => {
+  // The shipped fault: speech-to-text on a server that has been refused for
+  // an hour, the utterance quietly falling back to this computer, and the
+  // pill still saying "Listening for the wake word".
+  const report = failingSpeechServerReport();
+  assert.equal(
+    ambientReportLabel(report),
+    "Speech-to-text server is not answering",
+  );
+});
+
+test("both servers failing is named as both", () => {
+  const report = failingSpeechServerReport({
+    speechBackends: {
+      stt: {
+        configured: true,
+        failing: true,
+        consecutiveFailures: 1,
+        lastError: "connection refused",
+      },
+      tts: {
+        configured: true,
+        failing: true,
+        consecutiveFailures: 1,
+        lastError: "connection refused",
+      },
+    },
+  });
+  assert.equal(ambientReportLabel(report), "Speech servers are not answering");
+});
+
+test("a more specific status keeps the pill, a failing server does not bury it", () => {
+  // "Transcribing…" and an error already on screen are facts about right now;
+  // replacing either with the server's health would be the same trade this
+  // exists to undo. Only the state that claims all is well is replaced.
+  for (const status of [
+    { state: "transcribing" },
+    { state: "speaking" },
+    { state: "error", detail: "the wake-word model is incomplete" },
+    { state: "muted" },
+  ]) {
+    const report = failingSpeechServerReport({ status });
+    assert.notEqual(
+      ambientReportLabel(report),
+      "Speech-to-text server is not answering",
+      `${status.state} was buried under the server health`,
+    );
+  }
+  // And a deaf microphone still outranks it: it is the more urgent of the two,
+  // and the one the user can act on.
+  const deaf = failingSpeechServerReport({ audioStale: true });
+  assert.equal(
+    ambientReportLabel(deaf),
+    "No audio arriving from the microphone",
+  );
+});
+
+test("the settings section says which server, how long, and what it said", () => {
+  // The pill has room for the headline only. This is where someone who read it
+  // finds out which server and why.
+  assert.deepEqual(ambientSpeechHealthLines(failingSpeechServerReport()), [
+    "Speech-to-text server is not answering (3 attempts): speech server did not answer: connection refused",
+  ]);
+});
+
+test("a server that came back stops being complained about", () => {
+  // This answers "is it failing now". A line that stayed after recovery would
+  // become furniture the user learns to ignore.
+  const recovered = failingSpeechServerReport({
+    speechBackends: {
+      stt: {
+        configured: true,
+        failing: false,
+        consecutiveFailures: 0,
+        lastError: null,
+      },
+      tts: {
+        configured: false,
+        failing: false,
+        consecutiveFailures: 0,
+        lastError: null,
+      },
+    },
+  });
+  assert.deepEqual(ambientSpeechHealthLines(recovered), []);
+  assert.equal(ambientReportLabel(recovered), "Listening for the wake word");
 });

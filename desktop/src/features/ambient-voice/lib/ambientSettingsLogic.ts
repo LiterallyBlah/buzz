@@ -1,10 +1,11 @@
-import type {
-  AmbientModelStatus,
-  AmbientVoiceSettings,
-  AmbientVoiceStatusReport,
-  ModelStatus,
-  WakeBinding,
-  WakeWordCheck,
+import {
+  SPEECH_ROLE_NAMES,
+  type AmbientModelStatus,
+  type AmbientVoiceSettings,
+  type AmbientVoiceStatusReport,
+  type ModelStatus,
+  type WakeBinding,
+  type WakeWordCheck,
 } from "./ambientVoiceApi";
 import { truncatePubkey } from "@/shared/lib/pubkey";
 
@@ -214,6 +215,32 @@ export function ambientAudioFlowLine(
       ? "; this window has no microphone open"
       : "";
   return `Audio: none received${quietFor} (${received}, ${pushed})${pipeline}`;
+}
+
+/**
+ * One line per speech server that is failing, with what it said.
+ *
+ * The pill has room for the headline only; this is where someone who has read
+ * it comes to find out which server and why. Empty when both roles are fine or
+ * run on this computer — a permanently present "servers: OK" row would be
+ * furniture, and this section already lists the addresses.
+ */
+export function ambientSpeechHealthLines(
+  report: AmbientVoiceStatusReport | null,
+): string[] {
+  const health = report?.speechBackends;
+  if (!health) return [];
+  return (["stt", "tts"] as const)
+    .filter((role) => health[role].failing)
+    .map((role) => {
+      const detail = health[role].lastError;
+      const attempts = health[role].consecutiveFailures;
+      const tried =
+        attempts > 1 ? ` (${attempts} attempts)` : attempts === 1 ? "" : "";
+      return `${SPEECH_ROLE_NAMES[role]} server is not answering${tried}${
+        detail ? `: ${detail}` : ""
+      }`;
+    });
 }
 
 /**

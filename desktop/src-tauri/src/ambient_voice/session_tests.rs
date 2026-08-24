@@ -274,6 +274,7 @@ fn the_worker_announces_the_transitions_it_makes() {
         stop_keyword: None,
         stop_phrase: None,
         silence_hold_ms: super::super::utterance::DEFAULT_SILENCE_HOLD_MS,
+        stt_health: Arc::new(crate::ambient_voice::speech_health::RoleHealth::default()),
         tts_active: Arc::new(AtomicBool::new(false)),
         tts_cancel: Arc::new(AtomicBool::new(false)),
         muted: Arc::new(AtomicBool::new(false)),
@@ -318,6 +319,7 @@ fn the_worker_stamps_the_audio_it_takes_off_the_queue() {
         stop_keyword: None,
         stop_phrase: None,
         silence_hold_ms: super::super::utterance::DEFAULT_SILENCE_HOLD_MS,
+        stt_health: Arc::new(crate::ambient_voice::speech_health::RoleHealth::default()),
         tts_active: Arc::new(AtomicBool::new(false)),
         tts_cancel: Arc::new(AtomicBool::new(false)),
         muted: Arc::new(AtomicBool::new(false)),
@@ -404,7 +406,12 @@ fn a_slow_speech_server_does_not_make_a_fed_session_look_deaf() {
         StubReply::json(r#"{"text": "book me a room"}"#)
     });
     let dir = tempfile::tempdir().expect("temp dir");
-    let transcriber = Transcriber::build(dir.path(), Some(server.base_url())).expect("transcriber");
+    let transcriber = Transcriber::build(
+        dir.path(),
+        Some(server.base_url()),
+        Arc::new(crate::ambient_voice::speech_health::RoleHealth::default()),
+    )
+    .expect("transcriber");
 
     let flow = AudioFlow::new();
     flow.record(1);

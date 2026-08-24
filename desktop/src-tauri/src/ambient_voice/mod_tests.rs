@@ -661,6 +661,7 @@ fn the_status_report_serialises_with_the_keys_the_frontend_reads() {
         "msSinceLastAudio",
         "webviewCapture",
         "launch",
+        "speechBackends",
     ] {
         assert!(value.get(key).is_some(), "missing {key} in {value}");
     }
@@ -671,6 +672,55 @@ fn the_status_report_serialises_with_the_keys_the_frontend_reads() {
         Some(&serde_json::Value::Null)
     );
     assert_eq!(value.get("audioStale"), Some(&serde_json::json!(false)));
+}
+
+#[test]
+fn the_speech_backend_health_serialises_in_the_shape_the_frontend_parses() {
+    // The labels bug in its other form: a frontend written against an invented
+    // shape renders nothing and nothing fails, which for this field means the
+    // app goes back to hiding a server that is down. Pinned from the producing
+    // side; `AmbientSpeechHealth` in `ambientVoiceApi.ts` and the fixtures in
+    // `ambientVoiceTestDom.mjs` change with it.
+    let state = crate::app_state::build_app_state();
+    let health = &state.ambient_voice.speech_health;
+    health.configure(true, true);
+    health
+        .stt
+        .failed("speech server answered HTTP 502: gateway");
+
+    let value = serde_json::to_value(build_report(&state).expect("report")).expect("json");
+    assert_eq!(
+        value.get("speechBackends"),
+        Some(&serde_json::json!({
+            "stt": {
+                "configured": true,
+                "failing": true,
+                "consecutiveFailures": 1,
+                "lastError": "speech server answered HTTP 502: gateway",
+            },
+            "tts": {
+                "configured": true,
+                "failing": false,
+                "consecutiveFailures": 0,
+                "lastError": null,
+            },
+        }))
+    );
+}
+
+#[test]
+fn nothing_configured_reports_no_speech_server_trouble() {
+    // The default, and the shape of every settings file that has never named a
+    // server: two roles on this computer, nothing that can be down.
+    let state = crate::app_state::build_app_state();
+    let value = serde_json::to_value(build_report(&state).expect("report")).expect("json");
+    assert_eq!(
+        value.get("speechBackends"),
+        Some(&serde_json::json!({
+            "stt": { "configured": false, "failing": false, "consecutiveFailures": 0, "lastError": null },
+            "tts": { "configured": false, "failing": false, "consecutiveFailures": 0, "lastError": null },
+        }))
+    );
 }
 
 #[test]

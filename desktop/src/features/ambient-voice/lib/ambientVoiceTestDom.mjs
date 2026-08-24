@@ -181,6 +181,20 @@ export function ambientReport(overrides = {}) {
     audioBatchesReceived: 640,
     msSinceLastAudio: 96,
     webviewCapture: { batchesPushed: 642, captureReady: true },
+    speechBackends: {
+      stt: {
+        configured: false,
+        failing: false,
+        consecutiveFailures: 0,
+        lastError: null,
+      },
+      tts: {
+        configured: false,
+        failing: false,
+        consecutiveFailures: 0,
+        lastError: null,
+      },
+    },
     launch: {
       version: "0.5.8-unified.11",
       previousVersion: "0.5.8-unified.11",
@@ -189,6 +203,31 @@ export function ambientReport(overrides = {}) {
     },
     ...overrides,
   };
+}
+
+/**
+ * The report a session whose speech-to-text server has stopped answering
+ * produces. Its shape is pinned from the producing side by
+ * `the_speech_backend_health_serialises_in_the_shape_the_frontend_parses`.
+ */
+export function failingSpeechServerReport(overrides = {}) {
+  return ambientReport({
+    speechBackends: {
+      stt: {
+        configured: true,
+        failing: true,
+        consecutiveFailures: 3,
+        lastError: "speech server did not answer: connection refused",
+      },
+      tts: {
+        configured: false,
+        failing: false,
+        consecutiveFailures: 0,
+        lastError: null,
+      },
+    },
+    ...overrides,
+  });
 }
 
 /** The report a session that is running but receiving nothing produces. */

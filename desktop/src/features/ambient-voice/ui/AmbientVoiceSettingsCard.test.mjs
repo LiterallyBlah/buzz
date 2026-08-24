@@ -19,6 +19,7 @@ import { AMBIENT_STATE_CHANGED_EVENT } from "../lib/ambientVoiceApi.ts";
 import {
   ambientReport,
   deafAmbientReport,
+  failingSpeechServerReport,
   withAmbientDom,
 } from "../lib/ambientVoiceTestDom.mjs";
 
@@ -608,4 +609,30 @@ test("an address typed into the field is saved in the shape the native side read
       },
     },
   );
+});
+
+test("a speech server that has stopped answering is named under the status", async () => {
+  // The feature keeps working when a server fails — the utterance falls back
+  // to this computer, the reply is still on screen — and until now that was
+  // the whole of it: the address sat in this section looking like it was in
+  // use, and nothing anywhere said otherwise.
+  await mountSettings(
+    READY_MODELS,
+    async ({ view }) => {
+      const line = view.getByTestId("ambient-speech-health");
+      assert.match(line.textContent, /Speech-to-text server is not answering/);
+      assert.match(line.textContent, /connection refused/);
+      // Said as a problem, not as another grey diagnostic line.
+      assert.match(line.className, /destructive/);
+    },
+    { report: failingSpeechServerReport() },
+  );
+});
+
+test("nothing is said about speech servers when none is failing", async () => {
+  // The control: a standing "servers OK" row would be furniture, and this
+  // section already lists the addresses.
+  await mountSettings(READY_MODELS, async ({ view }) => {
+    assert.equal(view.queryByTestId("ambient-speech-health"), null);
+  });
 });

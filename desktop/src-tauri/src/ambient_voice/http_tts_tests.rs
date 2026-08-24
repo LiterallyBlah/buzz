@@ -12,6 +12,7 @@ use std::sync::{
 };
 
 use super::*;
+use crate::ambient_voice::speech_health::RoleHealth;
 use crate::ambient_voice::speech_stub_server::{StubReply, StubRequest, StubSpeechServer};
 
 const WAIT: Duration = Duration::from_secs(5);
@@ -74,18 +75,24 @@ struct Harness {
     player: Arc<TestPlayer>,
     tts_active: Arc<AtomicBool>,
     tts_cancel: Arc<AtomicBool>,
+    /// The same handle the status report reads, so what the pill would say
+    /// about this server is assertable here.
+    health: Arc<RoleHealth>,
 }
 
 fn harness(base_url: &str) -> Harness {
     let player = Arc::new(TestPlayer::default());
     let tts_active = Arc::new(AtomicBool::new(false));
     let tts_cancel = Arc::new(AtomicBool::new(false));
+    let health = Arc::new(RoleHealth::default());
+    health.configure(true);
     let for_worker = Arc::clone(&player);
     let pipeline = HttpTtsPipeline::with_player(
         SpeechEndpoint::parse(base_url).expect("endpoint"),
         Box::new(move || Ok(Box::new(for_worker))),
         Arc::clone(&tts_active),
         Arc::clone(&tts_cancel),
+        Arc::clone(&health),
     )
     .expect("pipeline");
     Harness {
@@ -93,6 +100,7 @@ fn harness(base_url: &str) -> Harness {
         player,
         tts_active,
         tts_cancel,
+        health,
     }
 }
 
@@ -233,6 +241,22 @@ fn a_server_that_will_not_speak_costs_a_reply_and_not_the_session() {
         "a failed reply gated the microphone with nothing playing"
     );
 
+    // And it is *visible*: falling back quietly is the right behaviour, doing
+    // it invisibly is not. The pill and the settings section read exactly this
+    // handle, so what they would say is asserted here.
+    assert!(
+        wait_until(|| harness.health.snapshot_for_test().failing),
+        "a server that refused a reply was not reported as failing"
+    );
+    assert!(
+        harness
+            .health
+            .snapshot_for_test()
+            .last_error
+            .is_some_and(|error| error.contains("voice pack missing")),
+        "the server's own words were not kept"
+    );
+
     harness
         .pipeline
         .speak("The next one, on the same server.".to_string())
@@ -240,6 +264,29 @@ fn a_server_that_will_not_speak_costs_a_reply_and_not_the_session() {
     assert!(
         wait_until(|| !harness.player.played().is_empty()),
         "the pipeline gave up after one failure"
+    );
+    // A server that comes back stops being complained about, or the line
+    // becomes furniture the user learns to ignore.
+    assert!(
+        wait_until(|| !harness.health.snapshot_for_test().failing),
+        "a server that recovered was still reported as failing"
+    );
+}
+
+#[test]
+fn audio_the_server_sent_that_cannot_be_played_is_reported_as_its_failure() {
+    // A 200 carrying something this build cannot decode is the server failing
+    // as much as a 500 is: it answered, and nothing was spoken.
+    let server = StubSpeechServer::always(StubReply::wav(b"RIFFnot really a wav".to_vec()));
+    let harness = harness(server.base_url());
+    harness
+        .pipeline
+        .speak("Anything.".to_string())
+        .expect("speak");
+
+    assert!(
+        wait_until(|| harness.health.snapshot_for_test().failing),
+        "undecodable audio left the server looking healthy"
     );
 }
 
@@ -270,6 +317,7 @@ fn an_audio_device_that_will_not_open_is_reported_rather_than_silently_mute() {
         Box::new(|| Err("no audio device".to_string())),
         Arc::new(AtomicBool::new(false)),
         Arc::new(AtomicBool::new(false)),
+        Arc::new(RoleHealth::default()),
     )
     .expect_err("a device that will not open");
     assert!(error.contains("no audio device"), "{error}");

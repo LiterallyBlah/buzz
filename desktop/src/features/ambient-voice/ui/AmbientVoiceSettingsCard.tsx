@@ -37,6 +37,7 @@ import {
   ambientLaunchLine,
   ambientModelRows,
   ambientSaveBlock,
+  ambientSpeechHealthLines,
   clampSilenceHoldMs,
   mergeAgentOptions,
   modelStatusLabel,
@@ -289,6 +290,7 @@ export function AmbientVoiceSettingsCard() {
   const selectedAgent = agents.find((agent) => agent.pubkey === agentPubkey);
   const audioFlowLine = ambientAudioFlowLine(report);
   const launchLine = ambientLaunchLine(report);
+  const speechHealthLines = ambientSpeechHealthLines(report);
 
   return (
     <section className="min-w-0" data-testid="settings-ambient-voice">
@@ -547,6 +549,20 @@ export function AmbientVoiceSettingsCard() {
                 {audioFlowLine}
               </p>
             ) : null}
+            {/* A configured server that is failing. The feature keeps
+                working — speech to text falls back to this computer, and a
+                reply that cannot be spoken is still on screen — which is
+                exactly why it had to be said out loud somewhere. */}
+            {speechHealthLines.map((line) => (
+              <p
+                className="text-2xs text-destructive"
+                data-testid="ambient-speech-health"
+                key={line}
+                role="alert"
+              >
+                {line}
+              </p>
+            ))}
             {launchLine ? (
               <p
                 className="text-2xs text-muted-foreground"

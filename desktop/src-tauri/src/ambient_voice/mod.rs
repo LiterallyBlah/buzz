@@ -21,6 +21,7 @@
 //! | [`session`] | the audio worker: spotter → barge-in → VAD → recogniser |
 //! | [`publish`] | egress boundary 9: kind:9 transcripts and kind:48106 |
 //! | [`models`] | wake-word model access over the shared download manager |
+//! | [`speech_health`] | whether a configured speech server is answering |
 //! | [`speech_http`] | the wire contract for a role that runs on a server |
 //! | [`speech_text`] | Markdown flattened to what a voice should read |
 //! | [`speech_wav`] | PCM16 WAV coding for that wire |
@@ -53,6 +54,7 @@ pub mod models;
 pub mod publish;
 pub mod session;
 pub mod settings;
+pub mod speech_health;
 pub mod speech_http;
 pub mod speech_text;
 pub mod speech_wav;
@@ -86,6 +88,7 @@ use launch::LaunchDiagnostics;
 use publish::{AmbientDestination, AmbientPublisher};
 use session::{AmbientSession, AmbientSessionConfig, AudioFlowSnapshot};
 use settings::AmbientVoiceSettings;
+use speech_health::{SpeechBackendHealthReport, SpeechHealth};
 use status::AmbientStatus;
 use tts_backend::{start_ambient_tts, AmbientTts};
 use wake_word::WakeWordTokenizer;
@@ -247,6 +250,9 @@ pub struct AmbientVoiceState {
     stale_announced: AtomicBool,
     /// What kind of launch this is. Recorded once, by [`hydrate_at_boot`].
     launch: Mutex<Option<LaunchDiagnostics>>,
+    /// Whether the speech servers a running session was pointed at are
+    /// answering. Written by the worker threads, read by every status report.
+    speech_health: Arc<SpeechHealth>,
 }
 
 impl Default for AmbientVoiceState {
@@ -263,6 +269,7 @@ impl Default for AmbientVoiceState {
             generation: Arc::new(AtomicU64::new(0)),
             stale_announced: AtomicBool::new(false),
             launch: Mutex::new(None),
+            speech_health: Arc::new(SpeechHealth::default()),
         }
     }
 }
@@ -350,6 +357,13 @@ pub struct AmbientVoiceStatusReport {
     pub webview_capture: Option<WebviewCaptureFlow>,
     /// What kind of launch this is. `None` before boot hydration has run.
     pub launch: Option<LaunchDiagnostics>,
+    /// Whether the speech servers this session was pointed at are answering.
+    /// Both roles report `configured: false` when they run on this computer,
+    /// which is the default and the shape of every settings file that has
+    /// never named a server. The fallback is not affected by any of this — the
+    /// field exists so a server that is failing softly stops doing it
+    /// invisibly.
+    pub speech_backends: SpeechBackendHealthReport,
 }
 
 /// Whether a session is running and being fed nothing.
@@ -440,6 +454,7 @@ fn build_report(state: &AppState) -> Result<AmbientVoiceStatusReport, String> {
             .lock()
             .map(|launch| launch.clone())
             .unwrap_or(None),
+        speech_backends: ambient.speech_health.report(),
     })
 }
 
@@ -541,6 +556,10 @@ fn stop_session(state: &AppState, next: AmbientStatus) -> Result<(), String> {
     drop(tts);
     ambient.tts_cancel.store(false, Ordering::Release);
     ambient.tts_active.store(false, Ordering::Release);
+    // Nothing is left to fail, so nothing may still be reported as failing: a
+    // red line about a server the session that is ending was pointed at would
+    // outlive the thing it described.
+    ambient.speech_health.configure(false, false);
     ambient.set_status(next);
     Ok(())
 }
@@ -659,6 +678,12 @@ async fn start_session(state: &AppState, settings: &AmbientVoiceSettings) -> Res
         .map_err(|_| "ambient destination is not a channel".to_string())?;
 
     let ambient = &state.ambient_voice;
+    // Before either backend is built, so the first attempt each makes is
+    // recorded against a clean slate rather than against the last session's.
+    ambient.speech_health.configure(
+        settings.stt.http_base_url().is_some(),
+        settings.tts.http_base_url().is_some(),
+    );
     let tts = start_ambient_tts(state, settings).await?;
 
     let (session, transcript_rx) = AmbientSession::new(AmbientSessionConfig {
@@ -669,6 +694,7 @@ async fn start_session(state: &AppState, settings: &AmbientVoiceSettings) -> Res
         stop_keyword: stop_phrase.as_deref().map(wake_word::engine_keyword),
         stop_phrase,
         silence_hold_ms: settings.silence_hold_ms,
+        stt_health: Arc::clone(&ambient.speech_health.stt),
         tts_active: Arc::clone(&ambient.tts_active),
         tts_cancel: Arc::clone(&ambient.tts_cancel),
         muted: Arc::clone(&ambient.muted),

@@ -33,6 +33,32 @@ export type AmbientWebviewCapture = {
   captureReady: boolean;
 };
 
+/**
+ * Mirrors `ambient_voice::speech_health::SpeechRoleHealth` — whether one
+ * server-backed speech role is answering.
+ *
+ * `configured` is false whenever the role runs on this computer, which is the
+ * default and the shape of every settings file that has never named a server;
+ * nothing about a local role can be "failing". The shape is pinned from the
+ * producing side by
+ * `the_speech_backend_health_serialises_in_the_shape_the_frontend_parses`.
+ */
+export type AmbientSpeechRoleHealth = {
+  configured: boolean;
+  /** Its last attempt failed and it has not answered since. */
+  failing: boolean;
+  /** Attempts since the last success. */
+  consecutiveFailures: number;
+  /** The server's own words. `null` when there is nothing to explain. */
+  lastError: string | null;
+};
+
+/** Mirrors `ambient_voice::speech_health::SpeechBackendHealthReport`. */
+export type AmbientSpeechHealth = {
+  stt: AmbientSpeechRoleHealth;
+  tts: AmbientSpeechRoleHealth;
+};
+
 /** Mirrors `ambient_voice::launch::LaunchDiagnostics`. */
 export type AmbientLaunchDiagnostics = {
   version: string;
@@ -83,6 +109,15 @@ export type AmbientVoiceStatusReport = {
   webviewCapture: AmbientWebviewCapture | null;
   /** `null` before native boot hydration has run. */
   launch: AmbientLaunchDiagnostics | null;
+  /**
+   * Whether the speech servers this session was pointed at are answering.
+   *
+   * Both roles fall back on their own — an utterance to the on-device
+   * recogniser, a reply to silence — and that is deliberate. What is not is
+   * doing it invisibly, which left the pill saying "Listening for the wake
+   * word" while the server behind it had been down for an hour.
+   */
+  speechBackends: AmbientSpeechHealth;
 };
 
 /** Mirrors `ambient_voice::settings::WakeBinding`. */
@@ -272,11 +307,48 @@ export function ambientReportLabel(
 ): string {
   if (!report) return "Not started";
   if (report.audioStale) return AMBIENT_NO_AUDIO_MESSAGE;
+  // Only in place of "listening". Every other status is a specific fact about
+  // what is happening right now — transcribing, speaking, an error already on
+  // screen — and burying it under a server's health would be the same trade
+  // this exists to undo. "Listening for the wake word" is the one that claims
+  // all is well, so it is the one a failing server replaces.
+  if (report.status.state === "listening") {
+    const failing = speechBackendFailureLabel(report.speechBackends);
+    if (failing) return failing;
+  }
   return ambientStatusLabel(report.status);
 }
 
 /** Shown in place of "Listening for the wake word" when nothing arrives. */
 export const AMBIENT_NO_AUDIO_MESSAGE = "No audio arriving from the microphone";
+
+/** What each server-backed role is called, in the user's terms. */
+export const SPEECH_ROLE_NAMES = {
+  stt: "Speech-to-text",
+  tts: "Voice",
+} as const;
+
+/**
+ * One line naming the failing server, or `null` when both are fine.
+ *
+ * Deliberately short and deliberately not alarming: the feature still works —
+ * speech-to-text falls back to this computer, and a reply that cannot be
+ * synthesised is still on screen — so this says what is broken, not that
+ * everything is. Both roles failing is named as both rather than as the first
+ * one found, because "the server is down" and "both servers are down" are
+ * different things to go and look at.
+ */
+export function speechBackendFailureLabel(
+  health: AmbientSpeechHealth | undefined,
+): string | null {
+  if (!health) return null;
+  const failing = (["stt", "tts"] as const).filter(
+    (role) => health[role].failing,
+  );
+  if (failing.length === 0) return null;
+  if (failing.length === 2) return "Speech servers are not answering";
+  return `${SPEECH_ROLE_NAMES[failing[0]]} server is not answering`;
+}
 
 /** Human-readable label for the listening indicator. */
 export function ambientStatusLabel(status: AmbientStatus): string {
