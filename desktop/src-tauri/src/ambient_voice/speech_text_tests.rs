@@ -298,6 +298,34 @@ fn a_reply_nested_thousands_deep_is_spoken_rather_than_taken_as_an_attack() {
 }
 
 #[test]
+fn a_line_of_marks_that_pair_with_nothing_is_read_once_and_not_once_per_mark() {
+    // Every `~` here can only open — whitespace before it, a letter after —
+    // and every `*` can only close, so nothing on the line pairs with anything.
+    // While one stack held every marker's openers, each `*` searched all of
+    // them and found none: a hundred kilobytes on one line, which is one reply,
+    // took about a second inside the flattener before a word reached the voice,
+    // and it is the reply that chooses how long that line is.
+    const RUNS: usize = 16_666; // ≈ 100 kB on a single line
+    let line = " ~a".repeat(RUNS) + &"b* ".repeat(RUNS);
+
+    let started = std::time::Instant::now();
+    let spoken = flatten_markdown_for_speech(&line);
+    let took = started.elapsed();
+
+    // Nothing paired, so nothing was a mark and every character is still said.
+    assert_eq!(spoken.matches("~a").count(), RUNS, "openers were lost");
+    assert_eq!(spoken.matches("b*").count(), RUNS, "closers were lost");
+    // Two orders of magnitude above the single pass and a fifth of the search
+    // it replaced: scheduler noise cannot reach this, and a per-mark search
+    // cannot hide under it.
+    assert!(
+        took < std::time::Duration::from_millis(200),
+        "pairing {} kB of marks that close nothing took {took:?}",
+        line.len() / 1000
+    );
+}
+
+#[test]
 fn brackets_that_open_nothing_are_spoken_rather_than_swallowed() {
     // The other half: a `[` with no `]` after it is not a label, so it is a
     // character the author typed and the listener hears. Degrading a runaway

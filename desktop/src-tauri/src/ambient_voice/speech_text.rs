@@ -261,7 +261,9 @@ fn ends_with_sentence_punctuation(said: &str) -> bool {
 /// runs on and aborted the whole app, with quadratic time and memory on the way
 /// there. A reply is remote text, so that was reachable from anything the bound
 /// agent said. The labels are resolved once by [`link_spans`] and walked
-/// through with an explicit stack, which is linear in both.
+/// through with an explicit stack, which is linear in both. So is
+/// [`emphasis_pairs`] beside it: the line is read once and each run it opens is
+/// looked at a fixed number of times, however many the reply opens.
 fn flatten_inline(line: &str) -> String {
     let chars: Vec<char> = line.chars().collect();
     let links = link_spans(&chars);
@@ -497,12 +499,34 @@ fn autolink(chars: &[char], start: usize) -> Option<(String, usize)> {
 
 /// The emphasis runs on a line that actually pair up, by the index each starts
 /// at and how many characters long it is.
-struct EmphasisPairs(Vec<Option<usize>>);
+///
+/// One byte a character, not an `Option<usize>`'s sixteen: a paired run is at
+/// most [`MAX_EMPHASIS_RUN`] characters long and the line it is indexing may be
+/// a whole reply, so zero stands for "no pair here".
+struct EmphasisPairs(Vec<u8>);
 
 impl EmphasisPairs {
     fn at(&self, index: usize) -> Option<usize> {
-        self.0.get(index).copied().flatten()
+        self.0
+            .get(index)
+            .copied()
+            .filter(|run| *run > 0)
+            .map(usize::from)
     }
+}
+
+/// The three characters CommonMark can read as emphasis. A run of one of them
+/// never closes a run of another, so each keeps its own stack in
+/// [`emphasis_pairs`] and this array's order is what indexes them.
+const EMPHASIS_MARKERS: [char; 3] = ['*', '~', '_'];
+
+/// An emphasis run that could open a pair and has not been closed yet.
+#[derive(Debug, Clone, Copy)]
+struct OpenRun {
+    /// Index of the first marker character of the run.
+    at: usize,
+    /// How many marker characters it is — at most [`MAX_EMPHASIS_RUN`].
+    run: u8,
 }
 
 /// Match every emphasis run on the line against a closing one.
@@ -519,13 +543,29 @@ impl EmphasisPairs {
 /// characters belongs to the word (`snake_case`). Pairing is then the ordinary
 /// stack: a run that can close takes the nearest unclosed opener of its own
 /// marker, and anything still unclosed at the end of the line is text.
+///
+/// ## One stack per marker, because the openers are remote text
+///
+/// The openers used to share one stack, which a closing run searched from the
+/// top for its own marker. A line of `~` that can only open, followed by a line
+/// of `*` that can only close, therefore searched every one of those openers
+/// per `*` and matched none: a hundred kilobytes on one line — a single reply —
+/// spent about a second inside this function before the first word reached the
+/// voice, and a megabyte spent minutes. A reply is remote text, so the depth of
+/// that stack is not this side's to choose.
+///
+/// Each marker now keeps its own stack, so a closing run looks at exactly one
+/// entry: the top of its own. Pairing still cancels every opener left inside
+/// the pair — `*a ~b* c~` closes the star and drops the tilde with it, the same
+/// answer the single stack gave — but those entries are dropped from the top of
+/// each stack, at most once each over the whole line. Both are therefore linear
+/// in the length of the line, whatever the reply puts on it.
 fn emphasis_pairs(chars: &[char]) -> EmphasisPairs {
-    if !chars.iter().any(|c| matches!(c, '*' | '~' | '_')) {
+    if !chars.iter().any(|c| EMPHASIS_MARKERS.contains(c)) {
         return EmphasisPairs(Vec::new());
     }
-    let mut pairs: Vec<Option<usize>> = vec![None; chars.len()];
-    // One stack per marker: `*` never closes a `~`.
-    let mut open: Vec<(char, usize, usize)> = Vec::new();
+    let mut pairs: Vec<u8> = vec![0; chars.len()];
+    let mut open: [Vec<OpenRun>; EMPHASIS_MARKERS.len()] = [Vec::new(), Vec::new(), Vec::new()];
     let mut i = 0;
     while i < chars.len() {
         let marker = chars[i];
@@ -534,13 +574,17 @@ fn emphasis_pairs(chars: &[char]) -> EmphasisPairs {
             i += 2;
             continue;
         }
-        if !matches!(marker, '*' | '~' | '_') {
+        let Some(slot) = EMPHASIS_MARKERS.iter().position(|known| *known == marker) else {
             i += 1;
             continue;
-        }
+        };
         let run = chars[i..].iter().take_while(|c| **c == marker).count();
         // Longer than any emphasis CommonMark gives meaning to: it is drawing.
-        if run > MAX_EMPHASIS_RUN {
+        // The saturating conversion is the same rejection by another road — a
+        // run of more than 255 characters is drawing several times over — and
+        // is what keeps a recorded run inside the byte `pairs` holds.
+        let length = u8::try_from(run).unwrap_or(u8::MAX);
+        if usize::from(length) > MAX_EMPHASIS_RUN {
             i += run;
             continue;
         }
@@ -552,20 +596,20 @@ fn emphasis_pairs(chars: &[char]) -> EmphasisPairs {
             && before.is_some_and(char::is_alphanumeric)
             && after.is_some_and(char::is_alphanumeric);
         if !intraword_underscore {
-            if let Some(position) = closes
-                .then(|| {
-                    open.iter()
-                        .rposition(|(open_marker, _, _)| *open_marker == marker)
-                })
-                .flatten()
-            {
-                let (_, start, open_run) = open.remove(position);
-                pairs[start] = Some(open_run);
-                pairs[i] = Some(run);
-                // Anything left open inside the pair was never closed.
-                open.truncate(position);
+            let opener = if closes { open[slot].pop() } else { None };
+            if let Some(opener) = opener {
+                pairs[opener.at] = opener.run;
+                pairs[i] = length;
+                // Anything left open inside the pair was never closed. Openers
+                // are pushed in the order they are read, so "inside the pair"
+                // is "above this one" on every stack.
+                for stack in &mut open {
+                    while stack.last().is_some_and(|entry| entry.at > opener.at) {
+                        stack.pop();
+                    }
+                }
             } else if opens {
-                open.push((marker, i, run));
+                open[slot].push(OpenRun { at: i, run: length });
             }
         }
         i += run;
