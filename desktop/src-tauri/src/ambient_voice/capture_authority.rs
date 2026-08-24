@@ -269,6 +269,14 @@ fn publish(text: Option<String>, mute_epoch: u64, transcript_tx: &tokio_mpsc::Se
 /// for two stores and released — a mute never waits on the network, which is
 /// the whole reason the *send* is started under it rather than awaited under
 /// it. An unmute takes nothing: it revives no capture and invalidates nothing.
+///
+/// A mute is not the only thing this lock orders. Ending the session itself —
+/// the toggle, a huddle claiming the microphone, a settings change that
+/// replaces the session — revokes every transcript still in the pipeline, and
+/// `super::stop_session` bumps the session generation under this same lock for
+/// exactly the same reason and with exactly the same guarantee. The gate
+/// checks both counters in one closure, so whichever revocation happened, the
+/// answer it gets under the lock cannot be stale.
 pub(crate) fn apply_mute(
     muted: &AtomicBool,
     mute_epochs: &AtomicU64,

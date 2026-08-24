@@ -234,9 +234,10 @@ impl AmbientPublisher {
         let dispatch = {
             let _authority = gate.take_authority();
             if !(gate.still_wanted)() {
-                // A mute got here first. Its epoch was bumped under this same
-                // lock, so this answer cannot be stale, and the prepared
-                // request is dropped unsent.
+                // A mute, or the teardown of the session these words were
+                // spoken into, got here first. Both counters are bumped under
+                // this same lock, so this answer cannot be stale, and the
+                // prepared request is dropped unsent.
                 return Ok(());
             }
             // Started, not awaited: by the time the gate is released the send
@@ -272,17 +273,21 @@ async fn relay_outcome(
 
 /// The authority a prepared transcript needs before its bytes may leave.
 ///
-/// Two things, because either alone leaves a race. `still_wanted` is the
-/// transcript's mute-epoch check ([`super::session::transcript_still_wanted`]
-/// bound to the epoch its capture was armed under) — it answers *whether* the
-/// capture is still allowed to speak. `authority` answers *in which order* a
-/// mute and a dispatch happened when they happened at the same moment:
-/// [`super::session::apply_mute`] bumps the epoch while holding this same lock,
-/// so one of the two wins outright. Either the mute's stores land first and the
-/// check under the lock sees them, or the send is already under way and the
-/// mute governs the next transcript instead. An unsynchronised second look at
-/// the epoch would only make the window narrower, and a narrower window is
-/// still a window: the words a user muted would still, sometimes, be sent.
+/// Two things, because either alone leaves a race. `still_wanted` answers
+/// *whether* these words are still allowed out, and it is two questions in one
+/// closure: the capture's mute epoch is unmoved
+/// ([`super::session::transcript_still_wanted`]) **and** the session that
+/// captured them is still the live one (the generation
+/// `super::spawn_publisher_task` was spawned under). `authority` answers *in
+/// which order* a revocation and a dispatch happened when they happened at the
+/// same moment: [`super::session::apply_mute`] bumps the epoch and
+/// `super::stop_session` bumps the generation, each while holding this same
+/// lock, so one side wins outright. Either the revoking stores land first and
+/// the check under the lock sees them, or the send is already under way and the
+/// revocation governs the next transcript instead. An unsynchronised second
+/// look at either counter would only make the window narrower, and a narrower
+/// window is still a window: the words a user muted — or spoke into a session
+/// they have since switched off — would still, sometimes, be sent.
 ///
 /// Only transcripts pass through here. The kind:48106 guidelines are not
 /// fenced — they carry no speech, only the etiquette an agent needs to answer

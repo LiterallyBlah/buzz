@@ -408,6 +408,157 @@ async fn a_mute_while_the_transcript_waits_behind_publisher_work_stops_the_post(
 }
 
 #[tokio::test]
+async fn a_teardown_while_the_transcript_waits_behind_publisher_work_stops_the_post() {
+    // The session-generation half of the same fence, and the race it was
+    // losing. The publisher used to look at the generation exactly once, at
+    // dequeue, and the closure the gate re-evaluates at the wire asked only
+    // about the mute epoch. So: a transcript is dequeued while its session is
+    // live, the publisher blocks on the network — here, inside the guidelines
+    // POST — and the session is torn down while it waits. When the publisher
+    // resumed, the gate had nothing left to refuse it with, and words spoken
+    // into a session the user had switched off went out as an ordinary kind:9
+    // message. Switching ambient voice off, a huddle claiming the microphone
+    // and a settings change that rebuilds the session are all this ordering.
+    //
+    // The teardown below is `stop_session` itself rather than a hand-rolled
+    // bump of the counter: it is the generation's only writer and every path
+    // that ends or replaces a session funnels through it, so what this test
+    // drives is what production runs.
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    use crate::ambient_voice::session::Transcript;
+    use crate::ambient_voice::status::AmbientStatus;
+    use crate::ambient_voice::{spawn_publisher_task, stop_session};
+
+    const STOPPED: &str = "the words of the session the user switched off";
+    const REPLACEMENT: &str = "said by the session that came after it";
+
+    let state = crate::app_state::build_app_state();
+    let ambient = &state.ambient_voice;
+    let (base, bodies, first_seen, release_first) = stub_holding_the_first_response();
+    let publisher = AmbientPublisher {
+        http_client: reqwest::Client::new(),
+        keys: keys(),
+        relay_base_url: base,
+    };
+    let channel = Uuid::new_v4();
+    let agent = "b".repeat(64);
+    // One per session, as `start_session` builds it — including the unsent
+    // guidelines, which is what gives each pipeline something to block on.
+    let new_destination = || {
+        Arc::new(AmbientDestination {
+            channel_id: channel,
+            agent_pubkey: agent.clone(),
+            wake_word: "hey hermes".to_string(),
+            guidelines_sent: Arc::new(AtomicBool::new(false)),
+        })
+    };
+
+    // The live session's publisher pipeline, spawned exactly as `start_session`
+    // spawns it and against this `AppState`'s own authorities — so the
+    // generation it binds itself to is the one the teardown will move.
+    let (transcripts, transcript_rx) = tokio::sync::mpsc::channel::<Transcript>(4);
+    spawn_publisher_task(
+        transcript_rx,
+        new_destination(),
+        publisher.clone(),
+        Arc::clone(&ambient.generation),
+        Arc::clone(&ambient.mute_epochs),
+        Arc::clone(&ambient.mute_authority),
+    );
+    let captured_under = ambient.mute_epochs.load(Ordering::Acquire);
+    transcripts
+        .send(Transcript {
+            text: STOPPED.to_string(),
+            mute_epoch: captured_under,
+        })
+        .await
+        .expect("the publisher pipeline is not draining");
+
+    // Held inside the guidelines POST, the transcript is now past every check
+    // the loop top makes with the network still in front of it. That is where
+    // the session ends.
+    tokio::task::spawn_blocking(move || first_seen.recv())
+        .await
+        .expect("join")
+        .expect("the guidelines POST was never made");
+    stop_session(&state, AmbientStatus::Off).expect("the session is torn down");
+    release_first.send(()).expect("release the held response");
+
+    // A worker can be mid-close when its session is stopped, so one more
+    // transcript can still arrive on this pipeline. It is refused at the loop
+    // top — the cheap check that was always there — and the pipeline then ends,
+    // dropping its receiver. That is how this test knows the publisher above has
+    // *finished*: everything asserted below is a statement about a task that ran
+    // to completion, not about who won a race to the stub.
+    transcripts
+        .send(Transcript {
+            text: STOPPED.to_string(),
+            mute_epoch: captured_under,
+        })
+        .await
+        .expect("queued behind the stopped publisher");
+    tokio::time::timeout(Duration::from_secs(10), transcripts.closed())
+        .await
+        .expect("the stopped session's publisher never finished");
+
+    let wait = Duration::from_secs(5);
+    let held: serde_json::Value =
+        serde_json::from_slice(&bodies.recv_timeout(wait).expect("guidelines body"))
+            .expect("guidelines json");
+    assert_eq!(
+        held["kind"], 48106,
+        "the held request was not the guidelines"
+    );
+    assert!(
+        bodies.try_recv().is_err(),
+        "the stopped session's words reached the wire from inside the publisher"
+    );
+
+    // And the invalidation is not a wedge. The session that replaces this one
+    // gets its own pipeline, bound to the generation the teardown moved to, and
+    // what it captures publishes normally.
+    let (fresh, fresh_rx) = tokio::sync::mpsc::channel::<Transcript>(4);
+    spawn_publisher_task(
+        fresh_rx,
+        new_destination(),
+        publisher,
+        Arc::clone(&ambient.generation),
+        Arc::clone(&ambient.mute_epochs),
+        Arc::clone(&ambient.mute_authority),
+    );
+    fresh
+        .send(Transcript {
+            text: REPLACEMENT.to_string(),
+            mute_epoch: ambient.mute_epochs.load(Ordering::Acquire),
+        })
+        .await
+        .expect("the fresh pipeline is not draining");
+
+    let fresh_guidelines: serde_json::Value = serde_json::from_slice(
+        &bodies
+            .recv_timeout(wait)
+            .expect("the replacement session's guidelines"),
+    )
+    .expect("guidelines json");
+    assert_eq!(fresh_guidelines["kind"], 48106);
+    let published = bodies
+        .recv_timeout(wait)
+        .expect("the replacement session's transcript");
+    assert!(
+        !String::from_utf8_lossy(&published).contains(STOPPED),
+        "the stopped session's words went out under the session that replaced it"
+    );
+    let published: serde_json::Value = serde_json::from_slice(&published).expect("transcript json");
+    assert_eq!(published["kind"], 9);
+    assert_eq!(
+        published["content"], REPLACEMENT,
+        "the replacement session's transcript did not reach the wire"
+    );
+}
+
+#[tokio::test]
 async fn a_transcript_longer_than_the_old_flat_cap_reaches_the_wire_unclipped() {
     // End to end through the real publisher — sign, guard, authenticate, POST —
     // because the truncation this guards against lived exactly one step past

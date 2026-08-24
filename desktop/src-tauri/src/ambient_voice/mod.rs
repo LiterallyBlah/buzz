@@ -250,16 +250,21 @@ pub struct AmbientVoiceState {
     /// disagree — a mute is a death sentence for the capture in progress, and an
     /// unmute must not commute it.
     mute_epochs: Arc<AtomicU64>,
-    /// Serialises a mute against the dispatch of a transcript, so the two
-    /// cannot overlap: mute-on bumps the counter above while holding this, and
-    /// a prepared transcript decides and starts its send while holding it.
-    /// Held for two stores on one side and one decision on the other — never
-    /// across a network round trip, so the mute button stays as immediate as
-    /// the flag it sets. See [`session::apply_mute`] and
-    /// [`publish::DispatchGate`].
+    /// Serialises the two ways a transcript can lose its authority against the
+    /// dispatch of that transcript, so neither can overlap it: mute-on bumps
+    /// the counter above while holding this ([`session::apply_mute`]), a
+    /// teardown bumps the generation below while holding it ([`stop_session`]),
+    /// and a prepared transcript decides and starts its send while holding it
+    /// ([`publish::DispatchGate`]). Held for two stores on one side, one store
+    /// on the other and one decision at the gate — never across a network round
+    /// trip, so the mute button and the off switch stay as immediate as the
+    /// flags they set. Named for the mute it was built for; it is the authority
+    /// over the whole egress boundary now.
     mute_authority: Arc<Mutex<()>>,
     reported: Arc<Mutex<AmbientStatus>>,
-    /// Invalidates in-flight publisher tasks from a previous session.
+    /// Invalidates in-flight publisher tasks from a previous session. Moved
+    /// only by [`stop_session`], under `mute_authority`, so a publisher that is
+    /// mid-dispatch cannot slip a stopped session's words past the bump.
     generation: Arc<AtomicU64>,
     /// Whether the last report announced to the frontend said the audio was
     /// stale. The staleness of a running session changes with the clock, not
@@ -556,7 +561,30 @@ fn capture_failure_is_pacing(
 /// threads, and ONNX teardown is not instant.
 fn stop_session(state: &AppState, next: AmbientStatus) -> Result<(), String> {
     let ambient = &state.ambient_voice;
-    ambient.generation.fetch_add(1, Ordering::Release);
+    {
+        // Under the mute authority, for exactly the reason the mute epoch is
+        // ([`session::apply_mute`]): a transcript already inside the publisher
+        // decides whether it may be dispatched — and starts its send — while
+        // holding this same lock ([`publish::DispatchGate`]). Bumped outside
+        // it, the teardown was a race the words could win: the publisher had
+        // passed its last look at the generation and was blocked on the
+        // network, and the session it belonged to was gone by the time the gate
+        // let it through. Under it there is one winner — either this store
+        // lands first and the stale transcript is refused, or its send is
+        // already irrevocably under way and this teardown governs the next one.
+        //
+        // Held for the one store and released here: before the runtime lock,
+        // before the joins, and across nothing that can wait, so a teardown
+        // never makes a dispatch — or a mute — queue behind a round trip.
+        // Poisoning is recovered rather than propagated exactly as `apply_mute`
+        // does; the lock guards `()`, and a panic elsewhere under it must not
+        // be able to keep a stopped session's words alive.
+        let _authority = ambient
+            .mute_authority
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        ambient.generation.fetch_add(1, Ordering::Release);
+    }
     let (session, tts) = {
         let mut runtime = ambient.runtime()?;
         runtime.destination = None;
@@ -793,15 +821,24 @@ fn worker_status_notifier(state: &AppState) -> Option<session::AmbientStatusNoti
 
 /// Drain transcripts and publish them, until the session generation moves.
 ///
-/// Two authorities are checked for every transcript, and they answer different
+/// Two authorities govern every transcript, and they answer different
 /// questions: the session generation says whether this *pipeline* is still the
 /// live one, and the transcript's own mute epoch says whether the *capture* it
-/// came from is still allowed to speak. The epoch is checked here on arrival
-/// because a mute can land while the transcript sits in this queue, and again
-/// inside the publisher — there under the mute authority
-/// ([`publish::DispatchGate`]), which is where the question is finally settled
-/// rather than merely asked. A transcript whose epoch has moved is a capture
-/// the user muted, however long ago the audio was spoken.
+/// came from is still allowed to speak. Both are checked here on arrival,
+/// cheaply, because either can have moved while the transcript sat in this
+/// queue — and both are checked again at the egress boundary, under the mute
+/// authority ([`publish::DispatchGate`]), which is where each question is
+/// finally settled rather than merely asked.
+///
+/// The second look is the load-bearing one: the publisher awaits the guidelines
+/// POST and the relay admission gate in between, and either authority can move
+/// during that wait — a mute, or the `stop_session` behind the toggle, a huddle
+/// claiming the microphone and a settings change that rebuilds the session.
+/// Checking the generation at dequeue alone left that half unguarded, and a
+/// transcript already past it published words from a session the user had
+/// stopped. Both terms therefore live in the closure the gate re-evaluates
+/// under the authority — an extra unsynchronised load out here would only
+/// narrow the window, and a narrower window is still a window.
 fn spawn_publisher_task(
     mut transcript_rx: tokio::sync::mpsc::Receiver<session::Transcript>,
     destination: Arc<AmbientDestination>,
@@ -822,8 +859,10 @@ fn spawn_publisher_task(
                 // A mute landed while this transcript waited in the queue.
                 continue;
             }
-            let still_wanted =
-                || session::transcript_still_wanted(&mute_epochs, transcript.mute_epoch);
+            let still_wanted = || {
+                generation.load(Ordering::Acquire) == spawned_generation
+                    && session::transcript_still_wanted(&mute_epochs, transcript.mute_epoch)
+            };
             let gate = publish::DispatchGate::new(&mute_authority, &still_wanted);
             destination
                 .publish(&publisher, &transcript.text, &gate)
