@@ -215,6 +215,43 @@ fn a_settings_save_cannot_flip_mute_or_enablement() {
 }
 
 #[test]
+fn a_stop_phrase_is_checked_against_the_wake_word_the_save_door_will_see() {
+    // The settings card checks a stop phrase against the wake-word field as it
+    // is typed, and then posts the phrase over the settings object it loaded —
+    // so an edited but unsaved wake word is not what `save_to_path` validates
+    // against. Asking about the field alone called this phrase valid and let
+    // the save refuse it, with an error naming a wake word that was no longer
+    // anywhere on the screen.
+    let saved = Some("hey hermes");
+    let refused = stop_phrase_check("hey hermes", "hey buzz", saved, None);
+    assert!(!refused.valid, "{refused:?}");
+    let message = refused.message.unwrap_or_default();
+    assert!(
+        message.contains("hey hermes"),
+        "the clash names no wake word the user can act on: {message}"
+    );
+
+    // The field is still asked, and a phrase that clashes with neither wake
+    // word is still valid.
+    assert!(!stop_phrase_check("hey buzz", "hey buzz", saved, None).valid);
+    assert!(stop_phrase_check("that is all", "hey buzz", saved, None).valid);
+
+    // Nothing saved yet — a wake word being entered for the first time — and
+    // the field is the only wake word there is.
+    assert!(!stop_phrase_check("hey buzz", "hey buzz", None, None).valid);
+    assert!(stop_phrase_check("that is all", "hey buzz", None, None).valid);
+
+    // A saved wake word the user has not touched must not be reported twice
+    // over, and an empty phrase is how the feature is switched off.
+    let same = stop_phrase_check("hey hermes", "hey hermes", saved, None);
+    assert_eq!(
+        same.message.unwrap_or_default(),
+        "The stop phrase must be different from the wake word"
+    );
+    assert!(stop_phrase_check("", "hey buzz", saved, None).valid);
+}
+
+#[test]
 fn a_configuration_change_restarts_the_running_session() {
     // `reconcile` used to leave any healthy session alone, so a wake word,
     // agent, destination, microphone or speaker changed while ambient voice

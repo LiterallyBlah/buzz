@@ -322,34 +322,92 @@ pub fn check_ambient_wake_word(wake_word: String) -> WakeWordCheck {
 /// voice down.
 ///
 /// Two rules the wake word does not have: an empty phrase is *valid* (it is how
-/// the feature is switched off), and the phrase must differ from `wake_word` —
+/// the feature is switched off), and the phrase must differ from the wake word —
 /// one keyword armed twice leaves no answer to which job a detection is doing.
 /// Both live in `settings::validate_stop_phrase_against`, so the rule the UI
 /// reports is the rule the save door enforces.
+///
+/// `wake_word` is the settings card's field as it currently reads, which is not
+/// always the wake word the save door will see — hence the stored binding as
+/// well; [`stop_phrase_check`] carries the reason.
 #[tauri::command]
-pub fn check_ambient_stop_phrase(stop_phrase: String, wake_word: String) -> WakeWordCheck {
-    let tokenizer = settings::installed_tokenizer();
+pub fn check_ambient_stop_phrase(
+    stop_phrase: String,
+    wake_word: String,
+    state: State<'_, AppState>,
+) -> WakeWordCheck {
+    let saved = state
+        .ambient_voice
+        .settings_snapshot()
+        .ok()
+        .and_then(|settings| {
+            settings
+                .primary_binding()
+                .map(|binding| binding.wake_word.clone())
+        });
+    stop_phrase_check(
+        &stop_phrase,
+        &wake_word,
+        saved.as_deref(),
+        settings::installed_tokenizer().as_ref(),
+    )
+}
+
+/// Whether `stop_phrase` can be saved, against both wake words in play.
+///
+/// `typed` is what the wake-word field reads right now; `saved` is the wake word
+/// the stored binding still carries. They agree until the field is edited, and
+/// the field is not what the save door validates against: the settings card
+/// posts a stop phrase over the settings object it loaded, so the binding in
+/// that payload — and therefore in `save_to_path` — is the stored one until the
+/// wake word is saved in its own right.
+///
+/// Checking the typed one alone therefore answered "valid" for a phrase the very
+/// next save refused, with an error about a wake word that was no longer on the
+/// screen. Both are asked now, and a clash with the stored one says which wake
+/// word it clashed with and what to do about it, because that one cannot be read
+/// off the field the user is looking at.
+pub(super) fn stop_phrase_check(
+    stop_phrase: &str,
+    typed: &str,
+    saved: Option<&str>,
+    tokenizer: Option<&WakeWordTokenizer>,
+) -> WakeWordCheck {
+    let refused = |message: String| WakeWordCheck {
+        valid: false,
+        message: Some(message),
+        tokens: None,
+        checked_against_model: tokenizer.is_some(),
+    };
     let probe = AmbientVoiceSettings {
-        wake_bindings: wake_binding_for_check(&wake_word),
-        stop_phrase: Some(stop_phrase.clone()),
+        wake_bindings: wake_binding_for_check(typed),
+        stop_phrase: Some(stop_phrase.to_string()),
         ..AmbientVoiceSettings::default()
     };
-    match settings::validate_stop_phrase_against(&probe, tokenizer.as_ref()) {
-        Ok(()) => WakeWordCheck {
-            valid: true,
-            message: None,
-            tokens: tokenizer
-                .as_ref()
-                .zip(probe.armed_stop_phrase())
-                .and_then(|(tokenizer, phrase)| tokenizer.tokenize(phrase).ok()),
-            checked_against_model: tokenizer.is_some(),
-        },
-        Err(message) => WakeWordCheck {
-            valid: false,
-            message: Some(message),
-            tokens: None,
-            checked_against_model: tokenizer.is_some(),
-        },
+    if let Err(message) = settings::validate_stop_phrase_against(&probe, tokenizer) {
+        return refused(message);
+    }
+    // The same question again, of the wake word the save door will see. Only
+    // the clash rule reads the binding, so this is the only rule that can
+    // answer differently from the pass above.
+    if let Some(saved) = saved.filter(|saved| !saved.trim().is_empty() && *saved != typed) {
+        let stored = AmbientVoiceSettings {
+            wake_bindings: wake_binding_for_check(saved),
+            ..probe.clone()
+        };
+        if let Err(message) = settings::validate_stop_phrase_against(&stored, tokenizer) {
+            return refused(format!(
+                "{message} — \"{saved}\" is still the saved wake word, so save the wake word first."
+            ));
+        }
+    }
+    WakeWordCheck {
+        valid: true,
+        message: None,
+        tokens: tokenizer
+            .zip(probe.armed_stop_phrase())
+            .and_then(|(tokenizer, phrase)| tokenizer.tokenize(phrase).ok()),
+        checked_against_model: tokenizer.is_some(),
     }
 }
 
