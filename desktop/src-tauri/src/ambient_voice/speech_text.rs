@@ -65,9 +65,6 @@ const MAX_EMPHASIS_RUN: usize = 3;
 pub(crate) fn flatten_markdown_for_speech(markdown: &str) -> String {
     let mut spoken: Vec<String> = Vec::new();
     let mut fence: Option<String> = None;
-    // Where the open fence's own line landed, so it can be renamed if the
-    // reply ends before the fence does.
-    let mut fence_line: Option<usize> = None;
 
     for raw_line in markdown.lines() {
         let line = raw_line.trim_end();
@@ -77,12 +74,13 @@ pub(crate) fn flatten_markdown_for_speech(markdown: &str) -> String {
         if let Some(open) = fence.as_deref() {
             if closes_fence(trimmed, open) {
                 fence = None;
+                drop_repeated_code_block(&mut spoken);
             }
             continue;
         }
         if let Some(open) = opening_fence(trimmed) {
             fence = Some(open);
-            fence_line = Some(push_line(&mut spoken, CODE_BLOCK_SPOKEN_AS.to_string()));
+            spoken.push(CODE_BLOCK_SPOKEN_AS.to_string());
             continue;
         }
 
@@ -107,13 +105,15 @@ pub(crate) fn flatten_markdown_for_speech(markdown: &str) -> String {
         if ends_a_sentence && !ends_with_sentence_punctuation(&said) {
             said.push('.');
         }
-        push_line(&mut spoken, said);
+        spoken.push(said);
     }
 
     // A fence still open here never closed, and everything after it went
     // unspoken. Say which kind of block it was, so the silence has a reason.
+    // Nothing is spoken between an opening fence and its close, so the line
+    // that fence opened is the last one there is.
     if fence.is_some() {
-        if let Some(line) = fence_line.and_then(|index| spoken.get_mut(index)) {
+        if let Some(line) = spoken.last_mut() {
             *line = UNFINISHED_CODE_BLOCK_SPOKEN_AS.to_string();
         }
     }
@@ -121,19 +121,27 @@ pub(crate) fn flatten_markdown_for_speech(markdown: &str) -> String {
     spoken.join("\n")
 }
 
-/// Append `line`, unless it repeats the "code block" line already there, and
-/// answer where the line that now stands for it is.
+/// Drop the line a closing fence just finished, when the block before it said
+/// the same thing.
 ///
-/// A reply that alternates prose and fences is common; two adjacent fences
-/// with nothing between them are not two pieces of news.
-fn push_line(spoken: &mut Vec<String>, line: String) -> usize {
-    if line == CODE_BLOCK_SPOKEN_AS
+/// A reply that alternates prose and fences is common; two finished blocks with
+/// nothing between them are not two pieces of news. It happens when the block
+/// closes rather than when it opens because until then there is nothing to
+/// compare: a fence that never closes is named differently, and while the
+/// collapsing was done at the opening fence it collapsed onto the finished
+/// block above it and then took that block's name — a reply carrying a complete
+/// block and then an unfinished one was spoken as "unfinished code block."
+/// alone, with the finished block gone from the count.
+fn drop_repeated_code_block(spoken: &mut Vec<String>) {
+    let before = spoken
+        .len()
+        .checked_sub(2)
+        .and_then(|index| spoken.get(index));
+    if before.map(String::as_str) == Some(CODE_BLOCK_SPOKEN_AS)
         && spoken.last().map(String::as_str) == Some(CODE_BLOCK_SPOKEN_AS)
     {
-        return spoken.len().saturating_sub(1);
+        spoken.pop();
     }
-    spoken.push(line);
-    spoken.len().saturating_sub(1)
 }
 
 /// The fence a line opens, if it opens one: three or more backticks or tildes.

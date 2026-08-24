@@ -277,6 +277,27 @@ fn an_unfinished_code_block_is_said_to_be_unfinished() {
 }
 
 #[test]
+fn a_finished_block_keeps_its_name_when_an_unfinished_fence_follows_it() {
+    // Two finished blocks in a row are one piece of news, and still are.
+    assert_eq!(
+        flatten_markdown_for_speech("```\nx\n```\n```\ny\n```"),
+        "code block."
+    );
+    // A finished block and then a fence that never closes are two, and the
+    // second was being folded onto the first and then renaming it: the whole
+    // reply said "unfinished code block." as though the block that did finish
+    // had never been there.
+    assert_eq!(
+        flatten_markdown_for_speech("```\nx\n```\n```"),
+        "code block.\nunfinished code block."
+    );
+    assert_eq!(
+        flatten_markdown_for_speech("Here:\n```\nlet x = 1;\n```\nAnd then:\n```\nlet y ="),
+        "Here:\ncode block.\nAnd then:\nunfinished code block."
+    );
+}
+
+#[test]
 fn a_task_list_speaks_its_items_and_not_its_boxes() {
     // `[x]` is a drawing of a ticked box. Spoken, it was the letter x at the
     // head of every finished item. Neither state is announced: a voice that
