@@ -149,3 +149,55 @@ fn the_pipeline_still_speaks_after_an_empty_reply_was_skipped() {
         "Now for the real one."
     );
 }
+
+#[test]
+fn a_voice_server_that_cannot_be_addressed_says_so_instead_of_going_quiet() {
+    // The TTS half of the same gap. A pipeline that was never built asks the
+    // server nothing, so the per-reply recording never runs — the role stayed
+    // "configured, not failing" while every reply went unspoken and the only
+    // evidence was a line on stderr no packaged build keeps.
+    //
+    // An address that does not parse never reaches the audio device, which is
+    // what makes this runnable without a sound card.
+    for unusable in ["not a url at all", "speech.example:30120", "ftp://host"] {
+        let health = Arc::new(RoleHealth::default());
+        health.configure(true);
+
+        let built = build_http_tts(
+            unusable,
+            None,
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::clone(&health),
+        );
+
+        assert!(built.is_none(), "{unusable:?} built a pipeline");
+        let snapshot = health.snapshot_for_test();
+        assert!(
+            snapshot.failing,
+            "{unusable:?} left the voice role looking healthy"
+        );
+        assert!(
+            snapshot.last_error.is_some(),
+            "{unusable:?} was recorded with nothing to explain it"
+        );
+    }
+}
+
+#[test]
+fn a_voice_role_on_this_computer_never_reports_a_server_problem() {
+    // The control. `configured` is false for a local role, so `failing` cannot
+    // be true however the pipeline went — a user who never named a server must
+    // never be told one is down.
+    let health = Arc::new(RoleHealth::default());
+    health.configure(false);
+    let built = build_http_tts(
+        "not a url at all",
+        None,
+        Arc::new(AtomicBool::new(false)),
+        Arc::new(AtomicBool::new(false)),
+        Arc::clone(&health),
+    );
+    assert!(built.is_none());
+    assert!(!health.snapshot_for_test().failing);
+}

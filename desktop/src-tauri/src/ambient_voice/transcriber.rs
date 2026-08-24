@@ -75,17 +75,26 @@ impl Transcriber {
                     health,
                 })
             }
-            Err(error) => match local {
-                Ok(recognizer) => {
-                    eprintln!(
-                        "buzz-desktop: ambient speech server unusable ({error}); using the on-device recogniser"
-                    );
-                    Ok(Transcriber::Local(recognizer))
+            Err(error) => {
+                // The one chance to record this. A server that cannot be
+                // addressed at all is never asked anything, so the per-request
+                // recording below never runs and the report would say
+                // "configured, not failing" for the whole session — the pill
+                // claiming all is well while every utterance is quietly decoded
+                // on this computer, which is the state this was built to end.
+                health.failed(&error);
+                match local {
+                    Ok(recognizer) => {
+                        eprintln!(
+                            "buzz-desktop: ambient speech server unusable ({error}); using the on-device recogniser"
+                        );
+                        Ok(Transcriber::Local(recognizer))
+                    }
+                    Err(local_error) => Err(format!(
+                        "{error} — and the on-device speech model is unavailable: {local_error}"
+                    )),
                 }
-                Err(local_error) => Err(format!(
-                    "{error} — and the on-device speech model is unavailable: {local_error}"
-                )),
-            },
+            }
         }
     }
 

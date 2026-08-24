@@ -18,6 +18,7 @@ use crate::huddle::{tts::TtsPipeline, tts_settings};
 use super::http_tts::HttpTtsPipeline;
 use super::models;
 use super::settings::AmbientVoiceSettings;
+use super::speech_health::RoleHealth;
 use super::speech_http::SpeechEndpoint;
 use super::speech_text::flatten_markdown_for_speech;
 
@@ -103,19 +104,45 @@ fn start_http_tts(
 ) -> Option<AmbientTts> {
     let ambient = &state.ambient_voice;
     ambient.tts_cancel.store(false, Ordering::Release);
+    build_http_tts(
+        url,
+        settings.output_device.clone(),
+        Arc::clone(&ambient.tts_active),
+        Arc::clone(&ambient.tts_cancel),
+        Arc::clone(&ambient.speech_health.tts),
+    )
+}
+
+/// The pipeline itself, without the runtime it is being built for.
+///
+/// Split out so the failure below can be exercised: an address that does not
+/// parse never reaches the audio device, so this whole path runs in a test
+/// without a sound card.
+pub(super) fn build_http_tts(
+    url: &str,
+    output_device: Option<String>,
+    tts_active: Arc<std::sync::atomic::AtomicBool>,
+    tts_cancel: Arc<std::sync::atomic::AtomicBool>,
+    health: Arc<RoleHealth>,
+) -> Option<AmbientTts> {
     let built = SpeechEndpoint::parse(url).and_then(|endpoint| {
         HttpTtsPipeline::new(
             endpoint,
-            settings.output_device.clone(),
-            Arc::clone(&ambient.tts_active),
-            Arc::clone(&ambient.tts_cancel),
-            Arc::clone(&ambient.speech_health.tts),
+            output_device,
+            tts_active,
+            tts_cancel,
+            Arc::clone(&health),
         )
     });
     match built {
         Ok(pipeline) => Some(AmbientTts::Http(Arc::new(pipeline))),
         Err(error) => {
             eprintln!("buzz-desktop: ambient speech server unavailable: {error}");
+            // A pipeline that was never built asks the server nothing, so
+            // `fetch_speech` never records anything and the role would report
+            // itself healthy for the whole session — while every reply went
+            // unspoken with only a line on stderr to say why.
+            health.failed(&error);
             None
         }
     }

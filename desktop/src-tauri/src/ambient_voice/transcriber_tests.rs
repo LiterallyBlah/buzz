@@ -115,6 +115,36 @@ fn what_the_server_did_is_recorded_whether_or_not_anything_fell_back() {
 }
 
 #[test]
+fn an_address_that_cannot_be_used_at_all_is_reported_like_any_other_failure() {
+    // A URL the client cannot even be pointed at is the *permanent* version of
+    // a failing server, and it was the one version nothing recorded: the
+    // request path is where failures are counted, and this never reaches it.
+    // The role sat at "configured, not failing" for the whole session while
+    // every utterance was quietly decoded on this computer.
+    for unusable in [
+        "not a url at all",
+        "speech.example:30120", // no scheme — the most common thing to type
+        "ftp://speech.example",
+    ] {
+        let health = health();
+        let dir = tempfile::tempdir().expect("temp dir");
+        // No speech model here either, so the session cannot start — what
+        // matters is that the answer was recorded before that was decided.
+        let _ = Transcriber::build(dir.path(), Some(unusable), Arc::clone(&health));
+
+        let snapshot = health.snapshot_for_test();
+        assert!(
+            snapshot.failing,
+            "{unusable:?} left the role looking healthy"
+        );
+        assert!(
+            snapshot.last_error.is_some(),
+            "{unusable:?} was recorded with nothing to explain it"
+        );
+    }
+}
+
+#[test]
 fn a_server_failure_falls_back_per_utterance_when_a_recogniser_exists() {
     // The rule the fallback rests on, pinned without the model: an installed
     // recogniser answers this utterance, and its absence is what turns the
