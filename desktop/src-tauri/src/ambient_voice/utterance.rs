@@ -27,11 +27,22 @@
 //! The two requirements coexist because they apply to two different consumers
 //! of the same PCM stream.
 //!
-//! Constants deliberately match `huddle::stt`, which is tuned against real
-//! huddle audio; diverging would mean re-tuning from scratch. The one
-//! exception is how long a pause is allowed to last, which is the user's to
-//! choose ([`UtteranceTiming`]) because it is the difference between "finish
-//! my sentence for me" and "let me think mid-sentence".
+//! ## Where these constants came from, and where they no longer agree
+//!
+//! The frame size and the minimum voiced length were taken from `huddle::stt`,
+//! which is tuned against real huddle audio, and they still match it. The
+//! endpointing no longer does, in both directions and on purpose:
+//!
+//! * how long a pause may last is the user's to choose here
+//!   ([`UtteranceTiming`]), because it is the difference between "finish my
+//!   sentence for me" and "let me think mid-sentence";
+//! * `huddle::stt` has since re-tuned its own endpointing for a live
+//!   conference turn (#6397): a 31-frame silence flush, a 0.55/0.35 hysteresis
+//!   band, pre-roll and hangover.
+//!
+//! Nothing in this file reads a `huddle::stt` constant, so neither side moves
+//! the other; the two are recorded as separate tunings rather than asserted to
+//! be one.
 
 use std::time::{Duration, Instant};
 
@@ -46,8 +57,11 @@ const SAMPLES_PER_MS: usize = 16;
 
 /// Shortest silence hold the settings slider offers.
 ///
-/// The value this feature shipped with, and `huddle::stt`'s own tuning: quick
-/// enough to feel immediate, short enough to cut someone off mid-thought.
+/// The value this feature shipped with: quick enough to feel immediate, short
+/// enough to cut someone off mid-thought. It was also `huddle::stt`'s flush
+/// window until #6397 lengthened that one to 31 frames; the floor stays here
+/// because it is the fastest end-of-turn a user may ask for, not a mirror of
+/// the huddle pipeline's own tuning.
 pub const MIN_SILENCE_HOLD_MS: u32 = 300;
 
 /// Longest silence hold the settings slider offers.

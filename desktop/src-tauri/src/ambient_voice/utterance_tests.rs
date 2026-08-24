@@ -439,11 +439,14 @@ fn reset_abandons_everything_in_flight() {
 }
 
 #[test]
-fn the_capture_constants_match_the_huddle_pipeline() {
-    // These are tuned against real huddle audio in `huddle::stt`. Divergence
-    // would mean re-tuning the ambient path from scratch, so it is asserted
-    // rather than left to comments. The silence hold is the one value that is
-    // now the user's, and its floor is still exactly what huddle uses.
+fn the_capture_constants_are_the_ones_this_path_is_tuned_to() {
+    // The frame size and the minimum voiced length came from `huddle::stt`,
+    // tuned against real huddle audio, and still match it. The endpointing
+    // does not: the hold is the user's setting here, and huddle re-tuned its
+    // own flush window to 31 frames with a 0.55/0.35 hysteresis band in #6397.
+    // These are therefore this path's own values, pinned so a change to them
+    // is a decision rather than a drift — the previous name claimed a parity
+    // with huddle that a literal in this file could never have detected losing.
     assert_eq!(VAD_FRAME_SAMPLES, 256);
     assert_eq!(MIN_VOICED_FRAMES, 12);
     assert_eq!(TTS_COOLDOWN, Duration::from_millis(150));
