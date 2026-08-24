@@ -252,6 +252,15 @@ impl RollingCapture {
             Some(phrase) => strip_trailing_phrase(&text, phrase),
             None => text,
         };
+        if text.len() > MAX_UTTERANCE_TEXT_BYTES {
+            // The final gate, on the exact bytes that would be published. The
+            // per-chunk accounting in `absorb` cannot see the spaces `stitch`
+            // puts between chunks, so a capture landing within a few bytes of
+            // the bound can stitch to just over it — and over the bound must
+            // fail here, on the indicator, not one step later in the publisher
+            // where the refusal is a log line the user never sees.
+            return Err(PAST_ONE_MESSAGE.to_string());
+        }
         Ok(if text.is_empty() { None } else { Some(text) })
     }
 

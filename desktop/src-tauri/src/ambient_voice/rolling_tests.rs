@@ -347,6 +347,28 @@ fn a_capture_whose_text_outgrows_one_message_fails_loudly_with_bounded_memory() 
 }
 
 #[test]
+fn the_spaces_that_stitch_chunks_together_count_against_the_bound() {
+    // Four chunks of exactly a quarter of the bound pass the per-chunk
+    // accounting at exactly the ceiling — and the three spaces that stitch
+    // them together are bytes the message carries too. The close is the last
+    // place the exact published length exists, so the bound is final there:
+    // over by even a separator is the loud failure, never a transcript the
+    // publisher then refuses off-screen.
+    let quarter_of_the_bound = "y".repeat(MAX_UTTERANCE_TEXT_BYTES / 4);
+    let reply = quarter_of_the_bound.clone();
+    let mut capture = RollingCapture::spawn(move |_| Ok(reply.clone())).expect("spawn");
+
+    for _ in 0..3 {
+        capture.hand_off(chunk(CHUNK_SAMPLES[0]));
+        wait_until_the_transcriber_catches_up(&capture);
+    }
+    let Err(error) = capture.finish(chunk(CHUNK_SAMPLES[1]), None) else {
+        panic!("a stitched transcript over the bound was left for the publisher to refuse");
+    };
+    assert_eq!(error, PAST_ONE_MESSAGE);
+}
+
+#[test]
 fn the_transcription_thread_ends_with_the_capture_that_started_it() {
     // A session torn down mid-roll must not leave a thread holding a
     // microphone's worth of PCM and a recogniser.
