@@ -339,8 +339,11 @@ pub struct AmbientVoiceStatusReport {
     pub audio_stale: bool,
     /// Batches the worker has taken off the queue since the session started.
     pub audio_batches_received: u64,
-    /// Milliseconds since the last batch reached the worker, or since the
-    /// session started when none has. `None` when no session is running.
+    /// Milliseconds the worker has been free to receive audio and received
+    /// none — since the last batch, or since the session started when none has.
+    /// `None` when no session is running. Time the worker spent transcribing is
+    /// excluded, because during it the worker was not reading its queue; see
+    /// [`session::AudioFlow`].
     pub ms_since_last_audio: Option<u64>,
     /// The webview's own view of the same audio path, as of its last report.
     /// `None` until it sends one.

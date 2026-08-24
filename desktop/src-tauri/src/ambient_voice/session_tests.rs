@@ -18,6 +18,7 @@
 //!   unobservable from Rust: bad input kills the process rather than erroring.
 
 use super::*;
+use crate::ambient_voice::speech_stub_server::{StubReply, StubSpeechServer};
 use crate::ambient_voice::wake_word::WakeWordTokenizer;
 
 const MODEL_DIR_ENV: &str = "BUZZ_AMBIENT_KWS_MODEL_DIR";
@@ -351,6 +352,103 @@ fn the_worker_stamps_the_audio_it_takes_off_the_queue() {
         "audio reached the worker and was never stamped: {flow:?}"
     );
     assert!(flow.since_last_batch < Duration::from_secs(1), "{flow:?}");
+}
+
+// ── A busy worker is not a starved one ───────────────────────────────────────
+
+#[test]
+fn time_spent_transcribing_is_not_counted_as_time_without_audio() {
+    // Every edge of the measurement, with the clock passed in. `now`, the last
+    // batch, the finished transcriptions and the one in flight are four reads
+    // of four atomics, and the answer has to stay a sane duration for all of
+    // them — including the orderings only a torn read could produce.
+    //
+    // The `+ 1` on the in-flight stamp is why a transcription that started at
+    // millisecond zero still counts: 1 means "started at 0", 0 means "none".
+    assert_eq!(starved_ms(10_000, 4_000, 0, 0), 6_000);
+    // The same six seconds, all of it spent transcribing: nothing was starved.
+    assert_eq!(starved_ms(10_000, 4_000, 6_000, 0), 0);
+    // Half of it finished, half still in flight.
+    assert_eq!(starved_ms(10_000, 4_000, 3_000, 7_000 + 1), 0);
+    // Quiet, then a transcription that is still running: only the quiet counts.
+    assert_eq!(starved_ms(10_000, 1_000, 0, 9_000 + 1), 8_000);
+    // A transcription that began in the session's first millisecond.
+    assert_eq!(starved_ms(5_000, 0, 0, 1), 0);
+    // Impossible orderings saturate instead of wrapping.
+    assert_eq!(starved_ms(1_000, 4_000, 0, 0), 0);
+    assert_eq!(starved_ms(10_000, 4_000, 99_000, 0), 0);
+    // A stamp later than `now` is the one torn read that can actually happen:
+    // `snapshot` reads the clock before the atomics, so a transcription that
+    // starts in between is stamped after the `now` it will be compared with.
+    // Nothing is subtracted for it, which errs towards reporting a starved
+    // worker rather than towards hiding a genuinely deaf one — and the time
+    // being ignored is the microsecond that race is wide.
+    assert_eq!(starved_ms(10_000, 4_000, 0, 99_000 + 1), 6_000);
+}
+
+#[test]
+fn a_slow_speech_server_does_not_make_a_fed_session_look_deaf() {
+    // The shipped fault this fixes, driven through the production
+    // `finish_capture` against a real loopback server that takes its time.
+    //
+    // The worker is one loop: while it waits for a transcript it is not
+    // draining its audio queue, so an utterance sent to a slow server used to
+    // read as that many seconds of "no audio arriving from the microphone" —
+    // which put the wrong words on the pill and had the webview's watchdog
+    // rebuild the whole capture pipeline, once per utterance, against a
+    // microphone that was working.
+    const SERVER_TAKES: Duration = Duration::from_millis(400);
+
+    let server = StubSpeechServer::start(|_| {
+        thread::sleep(SERVER_TAKES);
+        StubReply::json(r#"{"text": "book me a room"}"#)
+    });
+    let dir = tempfile::tempdir().expect("temp dir");
+    let transcriber = Transcriber::build(dir.path(), Some(server.base_url())).expect("transcriber");
+
+    let flow = AudioFlow::new();
+    flow.record(1);
+    let (transcript_tx, mut transcripts) = tokio_mpsc::channel::<String>(4);
+    let status = StatusSink::new(Arc::new(Mutex::new(AmbientStatus::Capturing)), None);
+    let mut speech_buf = vec![0.05_f32; 16_000];
+
+    finish_capture(
+        &transcriber,
+        &mut speech_buf,
+        &transcript_tx,
+        &status,
+        None,
+        &flow,
+    );
+
+    // The utterance really did go to the server and come back — otherwise this
+    // would be measuring a call that never blocked.
+    assert_eq!(
+        transcripts.try_recv().ok().as_deref(),
+        Some("book me a room")
+    );
+    assert_eq!(server.requests().len(), 1);
+
+    let flow = flow.snapshot();
+    assert!(
+        flow.since_last_batch < SERVER_TAKES / 2,
+        "a worker busy with the server's own latency was reported starved of audio: {flow:?}"
+    );
+}
+
+#[test]
+fn a_worker_that_is_transcribing_nothing_is_still_measured_as_before() {
+    // The other half: subtracting the worker's own work must not make a
+    // genuinely deaf session look fed. Nothing is transcribing here, so time
+    // passing is exactly what it was before this existed.
+    let flow = AudioFlow::new();
+    flow.record(1);
+    thread::sleep(Duration::from_millis(120));
+    let quiet = flow.snapshot().since_last_batch;
+    assert!(
+        quiet >= Duration::from_millis(100),
+        "silence stopped being measured at all: {quiet:?}"
+    );
 }
 
 // ── Fixture-driven tests through the real engine ─────────────────────────────

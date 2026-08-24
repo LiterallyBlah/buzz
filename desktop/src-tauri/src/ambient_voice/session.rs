@@ -143,8 +143,25 @@ impl StatusSink {
 ///
 /// Written from the audio thread and read from command threads, so it is
 /// atomics rather than a mutex: a status report must never be able to block the
-/// worker, and a millisecond of skew between the two fields cannot matter to a
-/// five-second staleness window.
+/// worker, and a millisecond of skew between the fields cannot matter to a
+/// five-second staleness window. Every write is made by the worker thread
+/// alone, so the fields cannot interleave with each other.
+///
+/// ## Why transcription time is subtracted
+///
+/// The worker is a single loop: while it is decoding an utterance it is not
+/// draining its audio queue, and with speech-to-text pointed at a server that
+/// decode is a network round trip which may take up to `TRANSCRIBE_TIMEOUT`
+/// (ten seconds) before the local fallback even starts. Measured naively, an
+/// ordinary utterance through a slow server therefore reads as five seconds of
+/// nothing arriving — so the pill claimed "No audio arriving from the
+/// microphone" and the webview's watchdog rebuilt the whole capture pipeline,
+/// once per utterance, against a microphone that was working perfectly.
+///
+/// What the watchdog needs to know is whether the worker is *starved*, not
+/// whether time has passed, so the time the worker spent doing its own work is
+/// excluded. The audio the webview pushed meanwhile is not lost: it waits in
+/// the bounded queue and is stamped when the worker takes it.
 #[derive(Debug)]
 pub struct AudioFlow {
     started_at: Instant,
@@ -153,6 +170,16 @@ pub struct AudioFlow {
     /// arrives, which is why `batches` is what distinguishes "none yet" from
     /// "one arrived in the first millisecond".
     last_batch_ms: AtomicU64,
+    /// Milliseconds the worker has spent inside finished transcriptions since
+    /// the last batch arrived. Reset by [`AudioFlow::record`]: a batch that has
+    /// arrived settles the starvation question on its own.
+    busy_since_last_batch_ms: AtomicU64,
+    /// When the transcription now in flight started, as milliseconds from
+    /// `started_at` **plus one**; `0` means none is. The offset is what keeps a
+    /// transcription that began in the session's first millisecond from reading
+    /// as "not transcribing", in one atomic rather than two that could be read
+    /// out of step.
+    transcribing_since_ms: AtomicU64,
 }
 
 /// One read of [`AudioFlow`], for one status report.
@@ -160,9 +187,13 @@ pub struct AudioFlow {
 pub struct AudioFlowSnapshot {
     /// Batches the worker has taken off the queue since the session started.
     pub batches: u64,
-    /// Since the last batch reached the worker — or since the session started,
-    /// when none ever has. The session start is the right zero point: a session
-    /// that has never been fed is precisely the state being watched for.
+    /// How long the worker has been free to receive audio and received none —
+    /// since the last batch, or since the session started when none ever
+    /// arrived. The session start is the right zero point: a session that has
+    /// never been fed is precisely the state being watched for.
+    ///
+    /// Time the worker spent transcribing is not counted, because during it the
+    /// worker was not listening to the queue at all. See [`AudioFlow`].
     pub since_last_batch: Duration,
 }
 
@@ -172,26 +203,74 @@ impl AudioFlow {
             started_at: Instant::now(),
             batches: AtomicU64::new(0),
             last_batch_ms: AtomicU64::new(0),
+            busy_since_last_batch_ms: AtomicU64::new(0),
+            transcribing_since_ms: AtomicU64::new(0),
         }
+    }
+
+    fn elapsed_ms(&self) -> u64 {
+        self.started_at.elapsed().as_millis() as u64
     }
 
     /// Record that `batches` arrived from the webview, now.
     fn record(&self, batches: u64) {
         self.batches.fetch_add(batches, Ordering::Release);
-        self.last_batch_ms.store(
-            self.started_at.elapsed().as_millis() as u64,
-            Ordering::Release,
-        );
+        self.busy_since_last_batch_ms.store(0, Ordering::Release);
+        self.last_batch_ms
+            .store(self.elapsed_ms(), Ordering::Release);
+    }
+
+    /// The worker is about to block on turning an utterance into text.
+    fn begin_transcription(&self) {
+        self.transcribing_since_ms
+            .store(self.elapsed_ms() + 1, Ordering::Release);
+    }
+
+    /// It has finished, however it went.
+    fn end_transcription(&self) {
+        let started = self.transcribing_since_ms.swap(0, Ordering::AcqRel);
+        if started == 0 {
+            return;
+        }
+        let spent = self.elapsed_ms().saturating_sub(started - 1);
+        self.busy_since_last_batch_ms
+            .fetch_add(spent, Ordering::Release);
     }
 
     pub fn snapshot(&self) -> AudioFlowSnapshot {
-        let elapsed = self.started_at.elapsed().as_millis() as u64;
-        let last_batch_ms = self.last_batch_ms.load(Ordering::Acquire);
         AudioFlowSnapshot {
             batches: self.batches.load(Ordering::Acquire),
-            since_last_batch: Duration::from_millis(elapsed.saturating_sub(last_batch_ms)),
+            since_last_batch: Duration::from_millis(starved_ms(
+                self.elapsed_ms(),
+                self.last_batch_ms.load(Ordering::Acquire),
+                self.busy_since_last_batch_ms.load(Ordering::Acquire),
+                self.transcribing_since_ms.load(Ordering::Acquire),
+            )),
         }
     }
+}
+
+/// How long the worker has gone without audio while it was free to receive it.
+///
+/// Pure, with the clock passed in, so every edge is testable without sleeping:
+/// nothing transcribed, a transcription still in flight, one that has finished,
+/// and the impossible orderings a torn read could produce. Saturating
+/// throughout — the answer is a duration, and no combination of reads may
+/// produce a longer one than the session has existed for.
+fn starved_ms(
+    now_ms: u64,
+    last_batch_ms: u64,
+    busy_since_last_batch_ms: u64,
+    transcribing_since_ms: u64,
+) -> u64 {
+    let in_flight = match transcribing_since_ms {
+        0 => 0,
+        started => now_ms.saturating_sub(started - 1),
+    };
+    now_ms
+        .saturating_sub(last_batch_ms)
+        .saturating_sub(busy_since_last_batch_ms)
+        .saturating_sub(in_flight)
 }
 
 /// A running ambient session.
@@ -565,6 +644,7 @@ fn ambient_worker(
                                 &transcript_tx,
                                 &status,
                                 stop_phrase.as_deref(),
+                                &flow,
                             ),
                             FrameOutcome::Drop => {
                                 speech_buf.clear();
@@ -617,6 +697,7 @@ fn ambient_worker(
                                 &transcript_tx,
                                 &status,
                                 None,
+                                &flow,
                             );
                         }
                     }
@@ -671,9 +752,17 @@ fn finish_capture(
     transcript_tx: &tokio_mpsc::Sender<String>,
     status: &StatusSink,
     trim: Option<&str>,
+    flow: &AudioFlow,
 ) {
     status.set(AmbientStatus::Transcribing);
+    // The worker cannot drain its audio queue while this blocks, and against a
+    // speech server it blocks for a network round trip. Marked at both ends so
+    // the staleness window measures a starved worker rather than a busy one —
+    // see [`AudioFlow`]. Marked around the whole call, not just the HTTP one,
+    // because the local recogniser blocks the same loop for the same reason.
+    flow.begin_transcription();
     let outcome = transcribe(transcriber, speech_buf, transcript_tx, trim);
+    flow.end_transcription();
     speech_buf.clear();
     status.set(status_after_decode(outcome));
 }
