@@ -7,13 +7,23 @@
 //!
 //! ```text
 //!            wake word fires
-//!   Idle ──────────────────────► Armed ──── speech starts ───► Capturing
+//!   Idle ──────────────────────► Armed ──── speech starts ───► Capturing ⟲ Chunk
 //!    ▲                             │                               │
 //!    │                             │ nothing said in ARM_TIMEOUT   │ the silence
-//!    │                             ▼                               │ hold, the cap,
-//!    └───────────── Drop ──────────┴───────────── Decode ──────────┘ or the stop
-//!                                                                     phrase
+//!    │                             ▼                               │ hold or the
+//!    └───────────── Drop ──────────┴───────────── Decode ──────────┘ stop phrase
 //! ```
+//!
+//! ## The ceiling closes a chunk, not the utterance
+//!
+//! `Capturing ⟲ Chunk` is the loop the ceiling takes. The buffer has a maximum
+//! size so a stuck voice-activity detector cannot grow it without bound, and
+//! that limit used to end the capture: whoever was talking lost everything they
+//! said afterwards, silently, and the stop phrase they eventually said closed
+//! nothing. The limit is still exactly as far as one buffer may grow — it just
+//! ends a *chunk* of the utterance now. The caller hands that chunk off to be
+//! transcribed and goes on capturing into an empty buffer, and the chunks are
+//! stitched back into one utterance when the capture genuinely ends.
 //!
 //! ## Barge-in and echo gating are both honoured here
 //!
@@ -74,15 +84,15 @@ pub const MAX_SILENCE_HOLD_MS: u32 = 10_000;
 /// sentence still reaches the agent without a wait anyone would notice.
 pub const DEFAULT_SILENCE_HOLD_MS: u32 = 800;
 
-/// Base ceiling on one utterance, before the hold is accounted for.
+/// Base ceiling on one buffered chunk, before the hold is accounted for.
 const BASE_CAP_MS: u32 = 30_000;
 
-/// How many silence holds of headroom the cap carries on top of that base.
+/// How many silence holds of headroom the ceiling carries on top of that base.
 ///
-/// The cap exists so a stuck VAD cannot grow the buffer without bound, but a
+/// The ceiling exists so a stuck VAD cannot grow the buffer without bound, but a
 /// long hold spends real time *inside* an utterance waiting for pauses to end.
-/// Leaving the ceiling fixed would mean the pauses the user asked for became
-/// the thing that truncated them.
+/// Leaving it fixed would mean the pauses the user asked for became the thing
+/// that chopped their sentence into more pieces than it needed.
 const CAP_HOLDS: u32 = 20;
 
 /// Minimum voiced frames before an utterance may be transcribed (~192 ms).
@@ -135,8 +145,8 @@ impl UtteranceTiming {
         self.silence_flush_frames
     }
 
-    /// Hard ceiling on one utterance, in 16 kHz samples. Test-facing for the
-    /// same reason.
+    /// Hard ceiling on one buffered chunk, in 16 kHz samples. Test-facing for
+    /// the same reason.
     #[cfg(test)]
     pub fn max_speech_samples(&self) -> usize {
         self.max_speech_samples
@@ -161,9 +171,15 @@ pub enum FrameOutcome {
     Idle,
     /// Append the frame to the speech buffer.
     Buffer,
-    /// Append the frame, then transcribe and clear the buffer.
+    /// Append the frame, hand the buffer off to be transcribed, and go on
+    /// capturing into an empty one. The utterance is not over: this chunk is
+    /// one piece of it, and the pieces are stitched at the close.
+    Chunk,
+    /// Append the frame, then transcribe and clear the buffer. The utterance
+    /// ends here, and everything it was chunked into is submitted as one.
     Decode,
-    /// Clear the buffer without transcribing.
+    /// Clear the buffer, and abandon any chunks already handed off, without
+    /// transcribing.
     Drop,
 }
 
@@ -178,8 +194,15 @@ pub struct UtteranceMachine {
     /// TTS playback does not consume the user's speaking window.
     armed_at: Option<Instant>,
     silence_frames: usize,
+    /// Voiced frames in the chunk being buffered now, not in the utterance.
+    /// Both this and `buffered_samples` describe the caller's current buffer,
+    /// and the ceiling empties that buffer without ending the utterance.
     voiced_frames: usize,
     buffered_samples: usize,
+    /// Chunks of this utterance already handed off to be transcribed. Zero for
+    /// an ordinary utterance, which is why "is there anything to abandon" is
+    /// this **or** a non-empty buffer rather than the buffer alone.
+    chunks: usize,
     tts_was_active: bool,
     tts_stopped_at: Option<Instant>,
 }
@@ -199,6 +222,7 @@ impl UtteranceMachine {
             silence_frames: 0,
             voiced_frames: 0,
             buffered_samples: 0,
+            chunks: 0,
             tts_was_active: false,
             tts_stopped_at: None,
         }
@@ -215,8 +239,8 @@ impl UtteranceMachine {
         self.timing
     }
 
-    /// Voiced frames accumulated in the current utterance. Test-facing: the
-    /// worker reads the [`FrameOutcome`], not the counter.
+    /// Voiced frames accumulated in the chunk being buffered now. Test-facing:
+    /// the worker reads the [`FrameOutcome`], not the counter.
     #[cfg(test)]
     pub fn voiced_frames(&self) -> usize {
         self.voiced_frames
@@ -225,16 +249,41 @@ impl UtteranceMachine {
     /// A wake word fired. Arms the capture stage and abandons any partial
     /// utterance — a second wake word is a restart, not a continuation.
     ///
-    /// Returns `true` when a buffered partial utterance was abandoned, so the
-    /// caller can clear its buffer.
+    /// Returns `true` when a partial utterance was abandoned, so the caller can
+    /// clear its buffer and drop whatever it has handed off. That includes an
+    /// utterance whose buffer is empty because the ceiling just took it: the
+    /// audio still exists, it is simply somewhere else.
     pub fn on_wake(&mut self, now: Instant) -> bool {
-        let had_buffer = self.buffered_samples > 0;
+        let had_audio = self.has_captured_audio();
         self.phase = UtterancePhase::Armed;
         self.armed_at = Some(now);
+        self.start_utterance();
+        had_audio
+    }
+
+    /// Whether anything of the current utterance exists yet — in the caller's
+    /// buffer, or in a chunk it has already handed off.
+    fn has_captured_audio(&self) -> bool {
+        self.buffered_samples > 0 || self.chunks > 0
+    }
+
+    /// Begin a fresh utterance: nothing buffered, nothing handed off.
+    fn start_utterance(&mut self) {
         self.silence_frames = 0;
         self.voiced_frames = 0;
         self.buffered_samples = 0;
-        had_buffer
+        self.chunks = 0;
+    }
+
+    /// Whether a close of this utterance is worth transcribing.
+    ///
+    /// The voiced-frame floor is what keeps room noise out of the recogniser,
+    /// and it is measured against the buffer it applies to. Once a chunk has
+    /// been handed off that question is already settled — reaching the ceiling
+    /// takes far more voice than the floor asks for — so a long capture is not
+    /// thrown away because the user happened to say one short word after it.
+    fn worth_transcribing(&self) -> bool {
+        self.voiced_frames >= MIN_VOICED_FRAMES || self.chunks > 0
     }
 
     /// The stop phrase fired. Close whatever is being captured, right now.
@@ -252,9 +301,9 @@ impl UtteranceMachine {
         if self.phase != UtterancePhase::Capturing {
             return FrameOutcome::Idle;
         }
-        let enough_voice = self.voiced_frames >= MIN_VOICED_FRAMES;
+        let worth_transcribing = self.worth_transcribing();
         self.reset();
-        if enough_voice {
+        if worth_transcribing {
             FrameOutcome::Decode
         } else {
             FrameOutcome::Drop
@@ -268,9 +317,7 @@ impl UtteranceMachine {
     pub fn reset(&mut self) {
         self.phase = UtterancePhase::Idle;
         self.armed_at = None;
-        self.silence_frames = 0;
-        self.voiced_frames = 0;
-        self.buffered_samples = 0;
+        self.start_utterance();
     }
 
     /// Feed one VAD-classified frame.
@@ -295,13 +342,11 @@ impl UtteranceMachine {
             .tts_stopped_at
             .is_some_and(|stopped| now.duration_since(stopped) < TTS_COOLDOWN);
         if tts_active || in_cooldown {
-            let had_buffer = self.buffered_samples > 0;
+            let had_audio = self.has_captured_audio();
             self.phase = UtterancePhase::Armed;
             self.armed_at = Some(now);
-            self.silence_frames = 0;
-            self.voiced_frames = 0;
-            self.buffered_samples = 0;
-            return if had_buffer {
+            self.start_utterance();
+            return if had_audio {
                 FrameOutcome::Drop
             } else {
                 FrameOutcome::Idle
@@ -344,10 +389,20 @@ impl UtteranceMachine {
                 if !ended && !capped {
                     return FrameOutcome::Buffer;
                 }
+                if capped && !ended {
+                    // The buffer is full, the user is not finished. Close the
+                    // chunk and keep the phase: `silence_frames` deliberately
+                    // survives, so a pause running across the boundary still
+                    // ends the utterance on the hold the user asked for.
+                    self.chunks += 1;
+                    self.voiced_frames = 0;
+                    self.buffered_samples = 0;
+                    return FrameOutcome::Chunk;
+                }
 
-                let enough_voice = self.voiced_frames >= MIN_VOICED_FRAMES;
+                let worth_transcribing = self.worth_transcribing();
                 self.reset();
-                if enough_voice {
+                if worth_transcribing {
                     FrameOutcome::Decode
                 } else {
                     FrameOutcome::Drop

@@ -27,6 +27,28 @@ fn feed(
         .collect()
 }
 
+/// Frames of speech it takes to fill one buffer to the ceiling.
+fn frames_to_ceiling(machine: &UtteranceMachine) -> usize {
+    machine
+        .timing()
+        .max_speech_samples()
+        .div_ceil(VAD_FRAME_SAMPLES)
+}
+
+/// Speak until the buffer hits the ceiling, and return every outcome on the way.
+fn fill_to_ceiling(machine: &mut UtteranceMachine, now: Instant) -> Vec<FrameOutcome> {
+    let frames = frames_to_ceiling(machine);
+    feed(machine, frames, true, false, now)
+}
+
+/// How many of these outcomes were a chunk handed off.
+fn chunks_in(outcomes: &[FrameOutcome]) -> usize {
+    outcomes
+        .iter()
+        .filter(|outcome| **outcome == FrameOutcome::Chunk)
+        .count()
+}
+
 /// Wake, then say enough to be worth transcribing.
 fn start_speaking(machine: &mut UtteranceMachine, now: Instant) {
     machine.on_wake(now);
@@ -211,15 +233,162 @@ fn the_cap_leaves_room_for_the_pauses_the_hold_allows() {
     machine.on_wake(now);
     let frames_to_cap = 46_000 * 16 / VAD_FRAME_SAMPLES;
     let outcomes = feed(&mut machine, frames_to_cap, true, false, now);
-    assert_eq!(outcomes.last().copied(), Some(FrameOutcome::Decode));
+    assert_eq!(outcomes.last().copied(), Some(FrameOutcome::Chunk));
     assert_eq!(
         outcomes
             .iter()
-            .filter(|o| **o == FrameOutcome::Decode)
+            .filter(|o| **o == FrameOutcome::Chunk)
             .count(),
         1
     );
+}
+
+// ── The ceiling closes a chunk, not the capture ──────────────────────────────
+
+#[test]
+fn the_ceiling_hands_a_chunk_off_and_goes_on_capturing() {
+    // The shipped fault: at the ceiling the capture ended, silently, and
+    // everything said afterwards was lost until the next wake word. What the
+    // ceiling ends now is the buffer.
+    let mut machine = UtteranceMachine::default();
+    let now = t0();
+    machine.on_wake(now);
+    let outcomes = fill_to_ceiling(&mut machine, now);
+
+    assert_eq!(outcomes.last().copied(), Some(FrameOutcome::Chunk));
+    assert_eq!(machine.phase(), UtterancePhase::Capturing);
+    // And the very next word is captured, into a buffer that started again
+    // empty rather than into nothing at all.
+    assert_eq!(machine.on_frame(true, false, now), FrameOutcome::Buffer);
+    assert_eq!(machine.phase(), UtterancePhase::Capturing);
+}
+
+#[test]
+fn every_chunk_is_bounded_by_the_same_ceiling() {
+    // The ceiling's engineering purpose is unchanged: no buffer may grow
+    // without bound. A conversation three ceilings long is three chunks, each
+    // one closed at the same size.
+    let mut machine = UtteranceMachine::default();
+    let now = t0();
+    machine.on_wake(now);
+    let to_ceiling = frames_to_ceiling(&machine);
+
+    let mut chunk_frames = Vec::new();
+    let mut since_chunk = 0;
+    for _ in 0..to_ceiling * 3 {
+        since_chunk += 1;
+        if machine.on_frame(true, false, now) == FrameOutcome::Chunk {
+            chunk_frames.push(since_chunk);
+            since_chunk = 0;
+        }
+    }
+    assert_eq!(chunk_frames, vec![to_ceiling, to_ceiling, to_ceiling]);
+    assert_eq!(machine.phase(), UtterancePhase::Capturing);
+}
+
+#[test]
+fn a_capture_that_rolled_once_and_was_stopped_is_two_chunks() {
+    // The whole shape of the feature, end to end through the machine: the
+    // ceiling takes the first chunk, the user carries on talking, and the stop
+    // phrase closes the second and last one.
+    let mut machine = machine_holding(MAX_SILENCE_HOLD_MS);
+    let now = t0();
+    machine.on_wake(now);
+    let outcomes = fill_to_ceiling(&mut machine, now);
+    assert_eq!(chunks_in(&outcomes), 1);
+
+    let more = feed(&mut machine, MIN_VOICED_FRAMES, true, false, now);
+    assert_eq!(chunks_in(&more), 0, "a second ceiling arrived early");
+    assert_eq!(machine.on_stop_phrase(), FrameOutcome::Decode);
     assert_eq!(machine.phase(), UtterancePhase::Idle);
+}
+
+#[test]
+fn a_capture_that_rolled_once_still_closes_on_the_silence_hold() {
+    // The other close, unchanged by any of this: the pause the user chose ends
+    // the utterance whether or not the ceiling took a chunk out of it first.
+    let mut machine = UtteranceMachine::default();
+    let hold = machine.timing().silence_flush_frames();
+    let now = t0();
+    machine.on_wake(now);
+    fill_to_ceiling(&mut machine, now);
+    feed(&mut machine, MIN_VOICED_FRAMES, true, false, now);
+
+    let outcomes = feed(&mut machine, hold, false, false, now);
+    assert_eq!(outcomes.last().copied(), Some(FrameOutcome::Decode));
+    assert_eq!(machine.phase(), UtterancePhase::Idle);
+}
+
+#[test]
+fn a_pause_running_across_a_chunk_boundary_still_ends_the_utterance_on_time() {
+    // The silence run belongs to the utterance, not to the buffer the ceiling
+    // happened to close in the middle of it. Resetting it there would hand the
+    // user a hold longer than the one they asked for, exactly once per chunk.
+    let mut machine = machine_holding(MIN_SILENCE_HOLD_MS);
+    let now = t0();
+    machine.on_wake(now);
+    let hold = machine.timing().silence_flush_frames();
+    // Speak up to one hold short of the ceiling, then fall silent through it.
+    let speaking = frames_to_ceiling(&machine) - hold + 1;
+    feed(&mut machine, speaking, true, false, now);
+    let outcomes = feed(&mut machine, hold, false, false, now);
+
+    assert_eq!(
+        chunks_in(&outcomes),
+        1,
+        "the ceiling was not crossed: {outcomes:?}"
+    );
+    assert_eq!(outcomes.last().copied(), Some(FrameOutcome::Decode));
+    assert_eq!(machine.phase(), UtterancePhase::Idle);
+}
+
+#[test]
+fn a_short_word_after_a_chunk_does_not_throw_the_whole_capture_away() {
+    // The voiced-frame floor keeps room noise out of the recogniser, and it is
+    // measured against the buffer. Applied to the last chunk alone it would
+    // discard minutes of already-captured speech because the user said one
+    // short word before stopping.
+    let mut machine = machine_holding(MAX_SILENCE_HOLD_MS);
+    let now = t0();
+    machine.on_wake(now);
+    fill_to_ceiling(&mut machine, now);
+    feed(&mut machine, MIN_VOICED_FRAMES - 1, true, false, now);
+
+    assert!(machine.voiced_frames() < MIN_VOICED_FRAMES);
+    assert_eq!(machine.on_stop_phrase(), FrameOutcome::Decode);
+}
+
+#[test]
+fn a_wake_word_mid_roll_abandons_the_chunks_already_handed_off() {
+    // A second wake word is a restart, and the caller learns to throw away what
+    // it is holding from this answer. After a chunk handoff its buffer is empty
+    // and the audio is elsewhere — answering "nothing to abandon" would stitch
+    // the abandoned sentence into the next one.
+    let mut machine = UtteranceMachine::default();
+    let now = t0();
+    machine.on_wake(now);
+    let outcomes = fill_to_ceiling(&mut machine, now);
+    assert_eq!(outcomes.last().copied(), Some(FrameOutcome::Chunk));
+
+    assert!(
+        machine.on_wake(now),
+        "a rolled capture was restarted without being abandoned"
+    );
+    assert_eq!(machine.phase(), UtterancePhase::Armed);
+}
+
+#[test]
+fn playback_starting_mid_roll_abandons_the_chunks_already_handed_off() {
+    // Same rule, reached the other way: the app started speaking, so the
+    // half-captured sentence is dropped — including the part of it that is
+    // already on its way to the recogniser.
+    let mut machine = UtteranceMachine::default();
+    let now = t0();
+    machine.on_wake(now);
+    fill_to_ceiling(&mut machine, now);
+
+    assert_eq!(machine.on_frame(true, true, now), FrameOutcome::Drop);
+    assert_eq!(machine.phase(), UtterancePhase::Armed);
 }
 
 // ── The stop phrase ──────────────────────────────────────────────────────────

@@ -9,8 +9,10 @@
 //!       ├─ sherpa-onnx KeywordSpotter   (ALWAYS fed, including during TTS)
 //!       │     on fire → cancel TTS (barge-in) → arm the utterance machine
 //!       └─ earshot VAD → UtteranceMachine (gated while TTS plays)
-//!             on decode → Transcriber → transcript
-//!                         (sherpa-onnx Parakeet here, or a speech server)
+//!             on chunk  → RollingCapture — hand off, keep capturing
+//!             on decode → RollingCapture — hand off the last chunk, wait,
+//!                         stitch  [ambient-voice-transcriber thread:
+//!                         sherpa-onnx Parakeet here, or a speech server]
 //!   → transcript_tx  [tokio mpsc]
 //!   → publisher task → kind:9 to the bound agent's destination
 //! ```
@@ -40,6 +42,7 @@ use std::{
 
 use tokio::sync::mpsc as tokio_mpsc;
 
+use super::rolling::RollingCapture;
 use super::status::AmbientStatus;
 use super::transcriber::Transcriber;
 use super::utterance::{FrameOutcome, UtteranceMachine, UtteranceTiming, VAD_FRAME_SAMPLES};
@@ -149,9 +152,9 @@ impl StatusSink {
 ///
 /// ## Why transcription time is subtracted
 ///
-/// The worker is a single loop: while it is decoding an utterance it is not
-/// draining its audio queue, and with speech-to-text pointed at a server that
-/// decode is a network round trip which runs to the budget
+/// The worker is a single loop: while it *waits* for an utterance to come back
+/// as text it is not draining its audio queue, and with speech-to-text pointed
+/// at a server that wait is a network round trip which runs to the budget
 /// `super::speech_http` gives it — ten seconds for a short utterance and longer
 /// for a long one — before the local fallback even starts. Measured naively, an
 /// ordinary utterance through a slow server therefore reads as five seconds of
@@ -163,6 +166,18 @@ impl StatusSink {
 /// whether time has passed, so the time the worker spent doing its own work is
 /// excluded. The audio the webview pushed meanwhile is not lost: it waits in
 /// the bounded queue and is stamped when the worker takes it.
+///
+/// ## What the mark must not cover
+///
+/// Decoding happens on its own thread now ([`super::rolling`]), and the mark
+/// follows the *worker*, not the decoder. A chunk handed off mid-capture is
+/// transcribed while the worker goes on draining its queue, so nothing is
+/// marked for it and nothing needs to be: every batch the worker takes calls
+/// [`AudioFlow::record`], which restamps the clock this measures from. Marking
+/// a rolling capture busy would be the opposite mistake to the one above — it
+/// would subtract minutes of a genuinely fed session's time, and a microphone
+/// that died mid-conversation would never be reported at all. Only
+/// [`finish_capture`]'s wait, where the worker really is blocked, is marked.
 #[derive(Debug)]
 pub struct AudioFlow {
     started_at: Instant,
@@ -598,6 +613,18 @@ fn ambient_worker(
             return;
         }
     };
+    // The recogniser moves onto its own thread: a chunk closed by the ceiling
+    // is decoded there while this loop keeps draining the audio queue, which is
+    // what makes a capture longer than the ceiling possible at all.
+    let mut rolling = match RollingCapture::spawn(move |samples| transcriber.transcribe(samples)) {
+        Ok(rolling) => rolling,
+        Err(error) => {
+            eprintln!("buzz-desktop: ambient transcription thread unavailable: {error}");
+            status.set(AmbientStatus::Error(error));
+            drain_until_shutdown(audio_rx, &shutdown, &flow);
+            return;
+        }
+    };
 
     let mut resampler = match Resampler::new(input_sample_rate) {
         Ok(resampler) => resampler,
@@ -647,6 +674,9 @@ fn ambient_worker(
             if machine.phase() != super::utterance::UtterancePhase::Idle {
                 machine.reset();
                 speech_buf.clear();
+                // Chunks already handed off are part of the same half-captured
+                // sentence, and are abandoned with it.
+                rolling.abort();
             }
             leftover_16k.clear();
             continue;
@@ -673,7 +703,7 @@ fn ambient_worker(
                         eprintln!("buzz-desktop: ambient stop phrase fired ({keyword})");
                         match machine.on_stop_phrase() {
                             FrameOutcome::Decode => finish_capture(
-                                &transcriber,
+                                &mut rolling,
                                 &mut speech_buf,
                                 &transcript_tx,
                                 &status,
@@ -682,12 +712,13 @@ fn ambient_worker(
                             ),
                             FrameOutcome::Drop => {
                                 speech_buf.clear();
+                                rolling.abort();
                                 status.set(current_idle_status(
                                     &machine,
                                     tts_active.load(Ordering::Acquire),
                                 ));
                             }
-                            FrameOutcome::Idle | FrameOutcome::Buffer => {}
+                            FrameOutcome::Idle | FrameOutcome::Buffer | FrameOutcome::Chunk => {}
                         }
                         continue;
                     }
@@ -698,6 +729,7 @@ fn ambient_worker(
                     tts_cancel.store(true, Ordering::Release);
                     if machine.on_wake(now) {
                         speech_buf.clear();
+                        rolling.abort();
                     }
                     status.set(AmbientStatus::Heard);
                 }
@@ -719,14 +751,25 @@ fn ambient_worker(
                             }
                             speech_buf.extend_from_slice(&frame);
                         }
+                        FrameOutcome::Chunk => {
+                            // The ceiling, mid-sentence. The chunk leaves for
+                            // the transcription thread and the buffer starts
+                            // again empty; the status deliberately does not
+                            // move, because from the user's side nothing has
+                            // happened — they are still talking and the app is
+                            // still listening.
+                            speech_buf.extend_from_slice(&frame);
+                            rolling.hand_off(std::mem::take(&mut speech_buf));
+                        }
                         FrameOutcome::Drop => {
                             speech_buf.clear();
+                            rolling.abort();
                             status.set(current_idle_status(&machine, playing));
                         }
                         FrameOutcome::Decode => {
                             speech_buf.extend_from_slice(&frame);
                             finish_capture(
-                                &transcriber,
+                                &mut rolling,
                                 &mut speech_buf,
                                 &transcript_tx,
                                 &status,
@@ -776,12 +819,19 @@ fn is_stop_keyword(stop_keyword: Option<&str>, fired: &str) -> bool {
     stop_keyword.is_some_and(|stop| fired.trim().eq_ignore_ascii_case(stop))
 }
 
-/// Transcribe, publish, and clear — the tail every close shares.
+/// Close the capture, publish what it said, and leave the buffer empty — the
+/// tail every close shares.
+///
+/// The buffer is the utterance's **last** chunk, and it is usually the only
+/// one. Anything the ceiling closed earlier is already being transcribed;
+/// [`RollingCapture::finish`] waits for all of it and hands back one transcript.
+/// The samples are moved out rather than copied: the chunk belongs to the
+/// transcription thread from here on.
 ///
 /// `trim` is the stop phrase when one ended this capture, so the phrase the
 /// user said to stop talking is not itself sent to the agent.
 fn finish_capture(
-    transcriber: &Transcriber,
+    rolling: &mut RollingCapture,
     speech_buf: &mut Vec<f32>,
     transcript_tx: &tokio_mpsc::Sender<String>,
     status: &StatusSink,
@@ -791,91 +841,31 @@ fn finish_capture(
     status.set(AmbientStatus::Transcribing);
     // The worker cannot drain its audio queue while this blocks, and against a
     // speech server it blocks for a network round trip. Marked for the length
-    // of the call so the staleness window measures a starved worker rather
-    // than a busy one — see [`AudioFlow`]. Marked around the whole call, not
-    // just the HTTP one, because the local recogniser blocks the same loop for
-    // the same reason.
+    // of the wait so the staleness window measures a starved worker rather than
+    // a busy one — see [`AudioFlow`]. This is the only wait that is marked: a
+    // chunk handed off mid-capture is decoded on the transcription thread while
+    // the worker goes on taking audio off its queue.
     let outcome = {
         let _busy = flow.transcribing();
-        transcribe(transcriber, speech_buf, transcript_tx, trim)
+        rolling
+            .finish(std::mem::take(speech_buf), trim)
+            .map(|text| publish(text, transcript_tx))
     };
-    speech_buf.clear();
     status.set(status_after_decode(outcome));
 }
 
-/// Turn the captured utterance into a published transcript.
+/// Send one finished utterance on to the publisher task.
 ///
-/// The error is the transcriber's own — already logged there, and returned
-/// here so the caller can leave it on the indicator. Audio that carried no
-/// words is `Ok`: an utterance the recogniser found nothing in is an ordinary
-/// outcome, not a fault to report. That includes an utterance which was only
-/// the stop phrase, and is therefore empty once trimmed.
-fn transcribe(
-    transcriber: &Transcriber,
-    speech_buf: &[f32],
-    transcript_tx: &tokio_mpsc::Sender<String>,
-    trim: Option<&str>,
-) -> Result<(), String> {
-    if speech_buf.is_empty() {
-        return Ok(());
-    }
-    let text = transcriber.transcribe(speech_buf)?;
-    let text = match trim {
-        Some(stop_phrase) => strip_trailing_phrase(&text, stop_phrase),
-        None => text,
+/// `None` is an utterance that carried no words, which is an ordinary outcome
+/// and not a fault to report — including one which was only the stop phrase,
+/// and is therefore empty once trimmed.
+fn publish(text: Option<String>, transcript_tx: &tokio_mpsc::Sender<String>) {
+    let Some(text) = text else {
+        return;
     };
-    if text.is_empty() {
-        return Ok(());
-    }
     if let Err(error) = transcript_tx.blocking_send(text) {
         eprintln!("buzz-desktop: ambient transcript channel closed: {error}");
     }
-    Ok(())
-}
-
-/// Drop `phrase` from the end of `text`, if that is where it is.
-///
-/// The stop phrase is what *ended* the capture, so its audio is already in the
-/// buffer the recogniser was handed — the spotter only emits a keyword a couple
-/// of trailing blank frames after the phrase finishes. Trimming the audio
-/// instead would need the keyword's position in the buffer, and the engine does
-/// not give one that can be used: `KeywordResult::start_time` is always 0.00,
-/// and `timestamps` are measured from the spotter's last internal reset, which
-/// is a clock this crate would have to shadow and which was measured 0.1–0.2 s
-/// away from the true phrase boundary. Cutting audio on that estimate would
-/// take the user's last word about as often as it took the stop phrase.
-///
-/// Words are compared on their letters and digits alone, so "Buzz, stop." ends
-/// on the same match as "buzz stop", and only a whole-word run at the very end
-/// is removed — a sentence that merely mentions the phrase keeps it.
-fn strip_trailing_phrase(text: &str, phrase: &str) -> String {
-    let phrase_keys: Vec<String> = phrase.split_whitespace().map(word_key).collect();
-    let phrase_keys: Vec<&String> = phrase_keys.iter().filter(|key| !key.is_empty()).collect();
-    if phrase_keys.is_empty() {
-        return text.trim().to_string();
-    }
-    let words: Vec<&str> = text.split_whitespace().collect();
-    if words.len() < phrase_keys.len() {
-        return text.trim().to_string();
-    }
-    let tail = &words[words.len() - phrase_keys.len()..];
-    if !tail
-        .iter()
-        .zip(&phrase_keys)
-        .all(|(word, key)| word_key(word) == **key)
-    {
-        return text.trim().to_string();
-    }
-    words[..words.len() - phrase_keys.len()].join(" ")
-}
-
-/// One spoken word reduced to what two transcriptions of it must share:
-/// uppercase letters and digits, with punctuation dropped.
-fn word_key(word: &str) -> String {
-    word.chars()
-        .filter(|c| c.is_alphanumeric())
-        .flat_map(char::to_uppercase)
-        .collect()
 }
 
 /// Keep draining until shutdown so a dead worker cannot back-pressure the

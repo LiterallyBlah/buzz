@@ -142,58 +142,6 @@ fn only_the_configured_stop_phrase_reads_as_a_stop() {
     assert!(!is_stop_keyword(None, "BUZZ STOP"));
 }
 
-// ── Trimming the stop phrase back out of the transcript ──────────────────────
-
-#[test]
-fn the_stop_phrase_is_trimmed_off_the_end_of_the_transcript() {
-    // It is what ended the capture, so it is in the audio the recogniser was
-    // given. Sending it to the agent would mean every hands-free message
-    // finished with the words the user said to stop talking.
-    assert_eq!(
-        strip_trailing_phrase("remind me to buy milk buzz stop", "buzz stop"),
-        "remind me to buy milk"
-    );
-    // Casing and punctuation are the recogniser's to choose, not the user's.
-    assert_eq!(
-        strip_trailing_phrase("Remind me to buy milk. Buzz, stop.", "buzz stop"),
-        "Remind me to buy milk."
-    );
-    assert_eq!(
-        strip_trailing_phrase("  remind me   BUZZ STOP  ", "  Buzz   Stop "),
-        "remind me"
-    );
-}
-
-#[test]
-fn an_utterance_that_was_only_the_stop_phrase_leaves_nothing_to_send() {
-    assert_eq!(strip_trailing_phrase("buzz stop", "buzz stop"), "");
-}
-
-#[test]
-fn a_transcript_that_merely_mentions_the_phrase_keeps_it() {
-    // Only a whole-word run at the very end is removed. Anything else would
-    // quietly edit the user's message.
-    assert_eq!(
-        strip_trailing_phrase("buzz stop asking me that", "buzz stop"),
-        "buzz stop asking me that"
-    );
-    assert_eq!(
-        strip_trailing_phrase("tell me when to stop", "buzz stop"),
-        "tell me when to stop"
-    );
-    // A partial match at the end is not a match.
-    assert_eq!(strip_trailing_phrase("stop", "buzz stop"), "stop");
-}
-
-#[test]
-fn a_transcript_closed_by_silence_is_never_trimmed() {
-    // The trim only applies to the close that put the phrase in the buffer.
-    // `None` here is the silence-close and the cap, which have no phrase to
-    // remove and must not lose the user's last words to one.
-    assert_eq!(strip_trailing_phrase("buzz stop", ""), "buzz stop");
-    assert_eq!(strip_trailing_phrase("buzz stop", "   "), "buzz stop");
-}
-
 // ── Status announcements ─────────────────────────────────────────────────────
 
 /// A shared, thread-safe list of the statuses a notifier was handed.
@@ -418,9 +366,11 @@ fn a_slow_speech_server_does_not_make_a_fed_session_look_deaf() {
     let (transcript_tx, mut transcripts) = tokio_mpsc::channel::<String>(4);
     let status = StatusSink::new(Arc::new(Mutex::new(AmbientStatus::Capturing)), None);
     let mut speech_buf = vec![0.05_f32; 16_000];
+    let mut rolling =
+        RollingCapture::spawn(move |samples| transcriber.transcribe(samples)).expect("rolling");
 
     finish_capture(
-        &transcriber,
+        &mut rolling,
         &mut speech_buf,
         &transcript_tx,
         &status,
@@ -483,6 +433,188 @@ fn a_transcription_that_unwinds_gives_the_watchdog_back() {
     assert!(
         quiet >= Duration::from_millis(100),
         "the watchdog stayed marked busy after an unwind: {quiet:?}"
+    );
+}
+
+// ── Closing a capture, with and without a chunk behind it ────────────────────
+
+/// A capture about to be closed: the status recorder, the transcript channel
+/// and a buffer with something in it.
+struct ClosingCapture {
+    announced: Announced,
+    status: StatusSink,
+    transcript_tx: tokio_mpsc::Sender<String>,
+    transcripts: tokio_mpsc::Receiver<String>,
+    speech_buf: Vec<f32>,
+    flow: AudioFlow,
+}
+
+impl ClosingCapture {
+    fn new() -> Self {
+        let announced: Announced = Arc::new(Mutex::new(Vec::new()));
+        let status = StatusSink::new(
+            Arc::new(Mutex::new(AmbientStatus::Capturing)),
+            Some(recorder(&announced)),
+        );
+        let (transcript_tx, transcripts) = tokio_mpsc::channel::<String>(4);
+        Self {
+            announced,
+            status,
+            transcript_tx,
+            transcripts,
+            speech_buf: vec![0.05_f32; 16_000],
+            flow: AudioFlow::new(),
+        }
+    }
+
+    fn close(&mut self, rolling: &mut RollingCapture, trim: Option<&str>) {
+        finish_capture(
+            rolling,
+            &mut self.speech_buf,
+            &self.transcript_tx,
+            &self.status,
+            trim,
+            &self.flow,
+        );
+    }
+
+    fn announced(&self) -> Vec<AmbientStatus> {
+        self.announced.lock().expect("announced").clone()
+    }
+
+    /// Every transcript submitted so far. One entry is one message to the
+    /// agent, which is what "submitted once" is counted in.
+    fn submitted(&mut self) -> Vec<String> {
+        let mut sent = Vec::new();
+        while let Ok(text) = self.transcripts.try_recv() {
+            sent.push(text);
+        }
+        sent
+    }
+}
+
+/// A transcriber that answers each chunk with the next line of `script`.
+fn scripted_capture(script: &'static [&'static str]) -> RollingCapture {
+    let next = AtomicU64::new(0);
+    RollingCapture::spawn(move |_| {
+        let index = next.fetch_add(1, Ordering::AcqRel) as usize;
+        Ok(script.get(index).copied().unwrap_or_default().to_string())
+    })
+    .expect("rolling")
+}
+
+#[test]
+fn an_ordinary_utterance_announces_transcribing_once_and_sends_one_message() {
+    // The parity regression. Almost every utterance is one chunk, and for those
+    // the rolling machinery must be invisible: the pill goes Transcribing while
+    // the recogniser has it and back to Listening when it is done, and the
+    // agent is sent exactly one message.
+    let mut capture = ClosingCapture::new();
+    let mut rolling = scripted_capture(&["book me a room"]);
+
+    capture.close(&mut rolling, None);
+
+    assert_eq!(
+        capture.announced(),
+        vec![AmbientStatus::Transcribing, AmbientStatus::Listening]
+    );
+    assert_eq!(capture.submitted(), vec!["book me a room".to_string()]);
+    assert!(
+        capture.speech_buf.is_empty(),
+        "the buffer was left holding audio"
+    );
+}
+
+#[test]
+fn a_chunk_handed_off_mid_capture_announces_nothing_until_the_close() {
+    // Status honesty: from the user's side the ceiling is not an event. They
+    // are still talking, so the pill still says so — and the two chunks arrive
+    // as one message, in the order they were spoken.
+    //
+    // The handoff has no way to announce anything (it is not given the sink);
+    // what is asserted here is the sequence a whole rolled capture produces,
+    // which is the one an extra `Transcribing` per chunk would show up in.
+    let mut capture = ClosingCapture::new();
+    let mut rolling = scripted_capture(&["the first half", "and the second"]);
+
+    rolling.hand_off(vec![0.05_f32; 16_000]);
+    capture.close(&mut rolling, None);
+
+    assert_eq!(
+        capture.announced(),
+        vec![AmbientStatus::Transcribing, AmbientStatus::Listening],
+        "a rolled capture moved the indicator more than an ordinary one"
+    );
+    assert_eq!(
+        capture.submitted(),
+        vec!["the first half and the second".to_string()],
+        "a rolled capture must reach the agent as one message"
+    );
+}
+
+#[test]
+fn a_stop_phrase_that_closed_a_rolled_capture_is_still_trimmed_off() {
+    // The stop phrase closes the last chunk exactly as it closes a capture
+    // today, and what it must not do is end up in the message.
+    let mut capture = ClosingCapture::new();
+    let mut rolling = scripted_capture(&["remind me to buy milk", "buzz stop"]);
+
+    rolling.hand_off(vec![0.05_f32; 16_000]);
+    capture.close(&mut rolling, Some("buzz stop"));
+
+    assert_eq!(
+        capture.submitted(),
+        vec!["remind me to buy milk".to_string()]
+    );
+}
+
+#[test]
+fn a_chunk_that_failed_leaves_the_failure_on_the_indicator_and_sends_nothing() {
+    // A hole in the middle of a message, silently sent, would be worse than no
+    // message: the user would read their own words back with a sentence missing
+    // and nothing to say one had been lost.
+    let mut capture = ClosingCapture::new();
+    let mut rolling = RollingCapture::spawn(|_| Err("Speech server failed: HTTP 502".to_string()))
+        .expect("rolling");
+
+    rolling.hand_off(vec![0.05_f32; 16_000]);
+    capture.close(&mut rolling, None);
+
+    assert_eq!(
+        capture.announced(),
+        vec![
+            AmbientStatus::Transcribing,
+            AmbientStatus::Error("Speech server failed: HTTP 502".to_string()),
+        ]
+    );
+    assert!(capture.submitted().is_empty());
+}
+
+#[test]
+fn a_chunk_decoding_off_the_worker_thread_leaves_the_audio_watchdog_on() {
+    // The other half of `a_slow_speech_server_does_not_make_a_fed_session_look
+    // _deaf`, and the edge that arrives with rolling capture: the busy mark
+    // measures the *worker* being blocked, and a chunk being decoded elsewhere
+    // does not block it. Marking one would switch the staleness watchdog off
+    // for as long as a capture runs — minutes — and a microphone that died
+    // mid-conversation would never be reported at all.
+    const DECODE_TAKES: Duration = Duration::from_millis(400);
+
+    let flow = AudioFlow::new();
+    flow.record(1);
+    let mut rolling = RollingCapture::spawn(move |_| {
+        thread::sleep(DECODE_TAKES);
+        Ok("the first half".to_string())
+    })
+    .expect("rolling");
+
+    rolling.hand_off(vec![0.05_f32; 16_000]);
+    thread::sleep(Duration::from_millis(120));
+
+    let quiet = flow.snapshot().since_last_batch;
+    assert!(
+        quiet >= Duration::from_millis(100),
+        "a chunk decoding off the worker thread switched the audio watchdog off: {quiet:?}"
     );
 }
 

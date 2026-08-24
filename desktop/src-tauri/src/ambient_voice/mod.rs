@@ -19,6 +19,7 @@
 //! | [`wake_word`] | tokenisation + the strict validation the engine needs |
 //! | [`utterance`] | the capture state machine (pure, clock-injected) |
 //! | [`session`] | the audio worker: spotter → barge-in → VAD → recogniser |
+//! | [`rolling`] | one utterance's chunks, transcribed off the worker thread |
 //! | [`publish`] | egress boundary 9: kind:9 transcripts and kind:48106 |
 //! | [`models`] | wake-word model access over the shared download manager |
 //! | [`speech_health`] | whether a configured speech server is answering |
@@ -52,6 +53,7 @@ pub mod http_tts;
 pub mod launch;
 pub mod models;
 pub mod publish;
+pub mod rolling;
 pub mod session;
 pub mod settings;
 pub mod speech_health;
