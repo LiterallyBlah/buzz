@@ -712,6 +712,33 @@ fn the_status_report_serialises_with_the_keys_the_frontend_reads() {
 }
 
 #[test]
+fn a_wake_binding_save_answers_in_the_shape_the_settings_card_reads() {
+    // The card takes two things off this answer: the settings it now shows
+    // (the stop phrase among them, which this write may have dropped) and the
+    // status report every other write returns. A frontend written against an
+    // invented shape renders nothing and nothing fails — which here would mean
+    // the card going on displaying a stop phrase that is no longer on disk.
+    // `AmbientWakeBindingSaved` in `ambientVoiceApi.ts` changes with this test.
+    let state = crate::app_state::build_app_state();
+    let saved = AmbientWakeBindingSaved {
+        settings: bound(true),
+        status: build_report(&state).expect("report"),
+    };
+    let value = serde_json::to_value(&saved).expect("json");
+    assert_eq!(
+        value["settings"]["wakeBindings"][0]["wakeWord"],
+        "hey hermes"
+    );
+    assert_eq!(value["settings"]["wakeBindings"][0]["agentPubkey"], AGENT);
+    assert!(
+        value["settings"]["stopPhrase"].is_null(),
+        "the card reads the phrase off this answer: {value}"
+    );
+    assert_eq!(value["status"]["muted"], serde_json::json!(false));
+    assert!(value["status"]["status"].is_object() || value["status"]["status"].is_string());
+}
+
+#[test]
 fn the_speech_backend_health_serialises_in_the_shape_the_frontend_parses() {
     // The labels bug in its other form: a frontend written against an invented
     // shape renders nothing and nothing fails, which for this field means the

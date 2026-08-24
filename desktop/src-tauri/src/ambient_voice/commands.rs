@@ -61,6 +61,20 @@ async fn persist_and_reconcile(
         state.ambient_voice.settings_snapshot()?.indicator_position,
     );
     settings::save_to_path(&settings::settings_path(app)?, &next)?;
+    adopt_and_reconcile(state, next).await
+}
+
+/// Take settings that are already on disk as the runtime's own, and reconcile.
+///
+/// The half of a settings write that happens *after* the file is written, in
+/// one place because there is now more than one door writing the file and they
+/// must not drift: a binding change that skipped [`reconcile`] would apply only
+/// after the user switched the feature off and on again, which is the shipped
+/// dogfood fix `a_configuration_change_restarts_the_running_session` pins.
+async fn adopt_and_reconcile(
+    state: &AppState,
+    next: AmbientVoiceSettings,
+) -> Result<AmbientVoiceStatusReport, String> {
     state
         .ambient_voice
         .muted
@@ -120,6 +134,56 @@ pub async fn set_ambient_voice_settings(
 ) -> Result<AmbientVoiceStatusReport, String> {
     let next = merge_client_settings(&state.ambient_voice.settings_snapshot()?, settings);
     persist_and_reconcile(&app, &state, next).await
+}
+
+/// What a wake-binding save answers with.
+///
+/// Both halves, because the write can change a field the card is showing:
+/// [`settings::patch_primary_binding`] drops a stored stop phrase that cannot
+/// stand beside the new wake word rather than refusing the write, and a card
+/// still displaying that phrase would be describing a file that no longer
+/// carries it. `settings` is therefore the file as re-read from disk, and
+/// `status` is the same report every other write returns.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AmbientWakeBindingSaved {
+    pub settings: AmbientVoiceSettings,
+    pub status: AmbientVoiceStatusReport,
+}
+
+/// Persist the wake word and its agent, without touching anything else.
+///
+/// Its own command rather than a [`set_ambient_voice_settings`] round trip, for
+/// the reason [`settings::patch_primary_binding`] documents at length: posting
+/// the whole settings object made every other field's validity a condition of
+/// the wake word being saved, and a stop phrase the new wake word clashed with
+/// took the whole write down — leaving the user unable to save the one field
+/// that would have resolved the clash.
+///
+/// Everything after the file is written is what a settings write does, through
+/// the same [`adopt_and_reconcile`]: a binding is bound once, when the session
+/// starts, so a new wake word or agent only reaches the engines through a
+/// restart of the live session.
+#[tauri::command]
+pub async fn set_ambient_wake_binding(
+    wake_word: String,
+    agent_pubkey: String,
+    destination: Option<String>,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<AmbientWakeBindingSaved, String> {
+    ensure_writable(&state)?;
+    let settings = settings::patch_primary_binding(
+        &settings::settings_path(&app)?,
+        settings::WakeBinding {
+            wake_word,
+            agent_pubkey,
+            destination,
+        },
+        settings::installed_tokenizer().as_ref(),
+    )?;
+    let status = adopt_and_reconcile(&state, settings.clone()).await?;
+    Ok(AmbientWakeBindingSaved { settings, status })
 }
 
 /// The Experiments toggle's native side effect.

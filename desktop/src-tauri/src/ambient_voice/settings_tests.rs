@@ -662,3 +662,207 @@ fn invalid_json_is_an_error_so_the_file_is_preserved() {
         .expect_err("invalid json")
         .contains("not valid JSON"));
 }
+
+// ── The wake binding's own save door ─────────────────────────────────────────
+//
+// `patch_primary_binding` exists because saving a wake word by posting the
+// whole settings object made every other field in that object a condition of
+// the wake word being written. Every test below reads the FILE back after the
+// call: the return value is a claim about what was written, and the thing that
+// actually failed in dogfood was the file not changing at all.
+
+/// A populated settings file, written through the same door the app writes it.
+///
+/// The tokenizer is the fixture rather than whatever this machine downloaded,
+/// so the save door these tests cross is the one the shipped model produces.
+fn stored_settings(stop_phrase: Option<&str>) -> AmbientVoiceSettings {
+    AmbientVoiceSettings {
+        enabled: true,
+        muted: true,
+        wake_bindings: vec![binding()],
+        stt: SpeechBackendSettings {
+            backend: SpeechBackend::Http,
+            endpoint_url: Some("http://speech.example:30120".to_string()),
+        },
+        silence_hold_ms: 2_500,
+        stop_phrase: stop_phrase.map(str::to_string),
+        input_device_id: Some("mic-abc".to_string()),
+        output_device: Some("Speakers (Realtek)".to_string()),
+        indicator_position: Some(IndicatorPosition {
+            x: 1180.0,
+            y: 690.5,
+        }),
+        ..AmbientVoiceSettings::default()
+    }
+}
+
+/// Write `settings` to a fresh temp file and hand back the directory and path.
+fn stored_file(settings: &AmbientVoiceSettings) -> (tempfile::TempDir, PathBuf) {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join(SETTINGS_FILE);
+    save_to_path_with(&path, settings, Some(&fixture_tokenizer())).expect("fixture write");
+    (dir, path)
+}
+
+/// The binding a user typing a new wake word produces: same agent, new phrase.
+fn rebound(wake_word: &str) -> WakeBinding {
+    WakeBinding {
+        wake_word: wake_word.to_string(),
+        ..binding()
+    }
+}
+
+#[test]
+fn a_wake_word_saved_on_its_own_leaves_every_other_stored_field_alone() {
+    // The isolation property, from the other side: what a binding write must
+    // NOT do. The card used to post its whole loaded copy back, so every field
+    // in the file was rewritten from a snapshot taken at mount — and mute, the
+    // indicator position and the speech backends have all moved underneath it
+    // since.
+    let tokenizer = fixture_tokenizer();
+    let stored = stored_settings(Some("that's all"));
+    let (_dir, path) = stored_file(&stored);
+
+    let returned =
+        patch_primary_binding(&path, rebound("okay hermes"), Some(&tokenizer)).expect("patch");
+
+    let on_disk = load_from_path_with(&path, Some(&tokenizer)).expect("reload");
+    assert_eq!(
+        on_disk.primary_binding().map(|b| b.wake_word.as_str()),
+        Some("okay hermes"),
+        "the wake word never reached the file"
+    );
+    assert_eq!(
+        on_disk, returned,
+        "the answer must be the file as it now reads, not the candidate"
+    );
+    assert_eq!(
+        on_disk,
+        AmbientVoiceSettings {
+            wake_bindings: vec![rebound("okay hermes")],
+            ..stored
+        },
+        "a binding write moved a field that was not the binding"
+    );
+}
+
+#[test]
+fn a_wake_word_that_clashes_with_the_stored_stop_phrase_still_saves() {
+    // The reviewer's reproducer. Stored: "hey hermes" bound, "buzz stop" as the
+    // stop phrase. The user types "buzz stop" as their wake word. The two
+    // cannot both be armed — one keyword twice, and no answer to which job a
+    // detection is doing — and the whole write used to be refused for it, so
+    // the wake word did not persist and the field that would have resolved the
+    // clash was the one the user could not save.
+    //
+    // The wake word wins: without it nothing arms at all. The stop phrase is
+    // dropped, exactly as `start_session` already declines to arm one that
+    // clashes and as the load door already drops one the model refuses.
+    let tokenizer = fixture_tokenizer();
+    let (_dir, path) = stored_file(&stored_settings(Some("buzz stop")));
+
+    let returned = patch_primary_binding(&path, rebound("buzz stop"), Some(&tokenizer))
+        .expect("the clash took the whole write down with it");
+
+    let on_disk = load_from_path_with(&path, Some(&tokenizer)).expect("reload");
+    assert_eq!(
+        on_disk.primary_binding().map(|b| b.wake_word.as_str()),
+        Some("buzz stop")
+    );
+    assert!(
+        on_disk.stop_phrase.is_none(),
+        "a clashing stop phrase survived on disk: {on_disk:?}"
+    );
+    // And in the answer, which is what takes it off the settings screen.
+    assert!(returned.stop_phrase.is_none(), "{returned:?}");
+
+    // In the bytes the next launch reads, since that is the process that arms
+    // the spotter and it has only the file.
+    let value: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).expect("read")).expect("json");
+    assert_eq!(value["wakeBindings"][0]["wakeWord"], "buzz stop");
+    assert!(value["stopPhrase"].is_null());
+}
+
+#[test]
+fn a_stop_phrase_that_can_still_stand_beside_the_new_wake_word_is_kept() {
+    // The control for the test above: dropping is the answer to a clash, not
+    // the price of every binding write. A phrase that is still perfectly
+    // armable must be exactly where the user left it.
+    let tokenizer = fixture_tokenizer();
+    let (_dir, path) = stored_file(&stored_settings(Some("buzz stop")));
+
+    patch_primary_binding(&path, rebound("okay hermes"), Some(&tokenizer)).expect("patch");
+
+    let on_disk = load_from_path_with(&path, Some(&tokenizer)).expect("reload");
+    assert_eq!(on_disk.armed_stop_phrase(), Some("buzz stop"));
+    assert_eq!(
+        on_disk.primary_binding().map(|b| b.wake_word.as_str()),
+        Some("okay hermes")
+    );
+}
+
+#[test]
+fn a_wake_word_the_spotter_could_not_arm_is_refused_and_costs_the_file_nothing() {
+    // The wake word is not the field that yields. It is handed to a C library
+    // that terminates the process on input it cannot tokenise, so a phrase the
+    // model refuses is refused here — with the file left byte-for-byte as it
+    // was, because a failed save that half-wrote the file would cost the user
+    // everything else in it.
+    //
+    // "hey hermes 7" passes every shape check and the model cannot hear the
+    // digit; "the" fails the shape checks alone. Both belts, one door.
+    let tokenizer = fixture_tokenizer();
+    let (_dir, path) = stored_file(&stored_settings(Some("buzz stop")));
+    let before = std::fs::read(&path).expect("read");
+
+    for (wake_word, expected) in [("hey hermes 7", "7"), ("the", "at least")] {
+        let error = patch_primary_binding(&path, rebound(wake_word), Some(&tokenizer))
+            .expect_err(wake_word);
+        assert!(error.contains(expected), "{wake_word}: {error}");
+        assert_eq!(
+            std::fs::read(&path).expect("read"),
+            before,
+            "{wake_word}: a refused binding still wrote to the file"
+        );
+    }
+}
+
+#[test]
+fn bindings_a_later_milestone_stored_survive_an_m1_wake_word_edit() {
+    // `wakeBindings` is a list so per-agent wake words need no migration. The
+    // M1 card edits the first row; anything after it belongs to a milestone
+    // this build does not render, and silently deleting configuration the user
+    // cannot see is the worst kind of loss.
+    let tokenizer = fixture_tokenizer();
+    let second = WakeBinding {
+        wake_word: "good morning buzz".to_string(),
+        ..binding()
+    };
+    let (_dir, path) = stored_file(&AmbientVoiceSettings {
+        wake_bindings: vec![binding(), second.clone()],
+        ..stored_settings(None)
+    });
+
+    patch_primary_binding(&path, rebound("okay hermes"), Some(&tokenizer)).expect("patch");
+
+    assert_eq!(
+        load_from_path_with(&path, Some(&tokenizer))
+            .expect("reload")
+            .wake_bindings,
+        vec![rebound("okay hermes"), second]
+    );
+}
+
+#[test]
+fn the_first_binding_an_install_ever_saves_is_written_rather_than_dropped() {
+    // The shipping default is an empty binding list, and this door is how the
+    // very first wake word reaches the file: there is no first row to replace.
+    let tokenizer = fixture_tokenizer();
+    let (_dir, path) = stored_file(&AmbientVoiceSettings::default());
+
+    patch_primary_binding(&path, rebound("okay hermes"), Some(&tokenizer)).expect("patch");
+
+    let on_disk = load_from_path_with(&path, Some(&tokenizer)).expect("reload");
+    assert_eq!(on_disk.wake_bindings, vec![rebound("okay hermes")]);
+}

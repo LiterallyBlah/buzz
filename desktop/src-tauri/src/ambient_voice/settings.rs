@@ -268,7 +268,10 @@ pub(crate) fn settings_path(app: &AppHandle) -> Result<PathBuf, String> {
 /// The wake word must pass the same strict tokenizer-independent checks the
 /// settings UI applies, minus the model-vocabulary check — the model may not
 /// be downloaded yet when settings are saved, and an un-tokenizable phrase is
-/// caught again (fatally, before the engine) at arm time.
+/// caught again (fatally, before the engine) at arm time. A binding arriving
+/// through [`patch_primary_binding`] gets that check too, when the model is
+/// there: it is the phrase the user just typed, so the answer is worth having
+/// before it is written rather than at the next session start.
 pub(crate) fn validate_binding_shape(binding: &WakeBinding) -> Result<(), String> {
     if binding.wake_word.chars().count() > MAX_WAKE_WORD_CHARS {
         return Err(format!(
@@ -288,7 +291,7 @@ pub(crate) fn validate_binding_shape(binding: &WakeBinding) -> Result<(), String
     Ok(())
 }
 
-/// Validate the stop phrase for persistence, against the installed model.
+/// Validate the stop phrase for persistence, against a model when there is one.
 ///
 /// It reaches the keyword spotter beside the wake word, so it passes the same
 /// checks — and one more: a stop phrase identical to the wake word would arm
@@ -296,22 +299,18 @@ pub(crate) fn validate_binding_shape(binding: &WakeBinding) -> Result<(), String
 /// jobs a detection was doing.
 ///
 /// Unlike [`validate_binding_shape`], this **does** run the model-vocabulary
-/// check when the model is installed. The wake word can skip it here because
+/// check when the model is installed. The wake word can skip it there because
 /// the settings UI runs it on every keystroke and refuses to save without it;
 /// the stop phrase had no such gate, so a phrase the tokenizer cannot encode
 /// used to save cleanly and then fail the whole session at arm time. When the
 /// model is not downloaded yet the check is simply unavailable, exactly as it
 /// is for the wake word, and the shape checks still run.
-pub(crate) fn validate_stop_phrase(settings: &AmbientVoiceSettings) -> Result<(), String> {
-    validate_stop_phrase_against(settings, installed_tokenizer().as_ref())
-}
-
-/// The same validation with the tokenizer supplied.
 ///
-/// The seam exists so the tests can pin the vocabulary rule against the
-/// in-repo fixture rather than against whatever this machine has downloaded —
-/// a check that silently degrades to "no model, so valid" is a check that
-/// proves nothing about the phrases it is supposed to refuse.
+/// The tokenizer is supplied rather than looked up so the tests can pin the
+/// vocabulary rule against the in-repo fixture rather than against whatever
+/// this machine has downloaded — a check that silently degrades to "no model,
+/// so valid" is a check that proves nothing about the phrases it is supposed
+/// to refuse.
 pub(crate) fn validate_stop_phrase_against(
     settings: &AmbientVoiceSettings,
     tokenizer: Option<&WakeWordTokenizer>,
@@ -356,6 +355,17 @@ pub(crate) fn installed_tokenizer() -> Option<WakeWordTokenizer> {
 /// future-version file is an error, not a silent reset, so the user's
 /// configuration is preserved for the newer build that wrote it).
 pub(crate) fn load_from_path(path: &Path) -> Result<AmbientVoiceSettings, String> {
+    load_from_path_with(path, installed_tokenizer().as_ref())
+}
+
+/// The same load with the tokenizer supplied, for the same reason
+/// [`validate_stop_phrase_against`] takes one: a caller that already holds the
+/// tokenizer must not have it loaded again underneath it, and a test must be
+/// able to pin the vocabulary rule to the in-repo fixture.
+pub(crate) fn load_from_path_with(
+    path: &Path,
+    tokenizer: Option<&WakeWordTokenizer>,
+) -> Result<AmbientVoiceSettings, String> {
     if !path.exists() {
         return Ok(AmbientVoiceSettings::default());
     }
@@ -381,7 +391,7 @@ pub(crate) fn load_from_path(path: &Path) -> Result<AmbientVoiceSettings, String
 
     let settings: AmbientVoiceSettings = serde_json::from_value(sanitize_backends(value))
         .map_err(|error| format!("ambient voice settings are invalid: {error}"))?;
-    Ok(sanitize_loaded(settings, installed_tokenizer().as_ref()))
+    Ok(sanitize_loaded(settings, tokenizer))
 }
 
 /// Bring a freshly-deserialised file back inside the ranges the runtime honours.
@@ -455,6 +465,22 @@ fn sanitize_backends(mut value: serde_json::Value) -> serde_json::Value {
 }
 
 pub(crate) fn save_to_path(path: &Path, settings: &AmbientVoiceSettings) -> Result<(), String> {
+    save_to_path_with(path, settings, installed_tokenizer().as_ref())
+}
+
+/// The same write with the tokenizer supplied.
+///
+/// Every rule the save door applies is applied here; the seam exists so the
+/// one rule that needs a model is asked of a known vocabulary. A caller that
+/// has already decided something against a tokenizer — [`patch_primary_binding`]
+/// decides whether the stored stop phrase can stand beside a new wake word —
+/// must be able to hand this door the *same* one, or the door can still refuse
+/// a write the caller believed it had made acceptable.
+pub(crate) fn save_to_path_with(
+    path: &Path,
+    settings: &AmbientVoiceSettings,
+    tokenizer: Option<&WakeWordTokenizer>,
+) -> Result<(), String> {
     if settings.version != CURRENT_VERSION {
         return Err(format!(
             "Unsupported ambient voice settings version: {}",
@@ -469,7 +495,7 @@ pub(crate) fn save_to_path(path: &Path, settings: &AmbientVoiceSettings) -> Resu
     for binding in &settings.wake_bindings {
         validate_binding_shape(binding)?;
     }
-    validate_stop_phrase(settings)?;
+    validate_stop_phrase_against(settings, tokenizer)?;
     if !(MIN_SILENCE_HOLD_MS..=MAX_SILENCE_HOLD_MS).contains(&settings.silence_hold_ms) {
         return Err(format!(
             "The pause before Buzz stops listening must be between \
@@ -487,6 +513,66 @@ pub(crate) fn save_to_path(path: &Path, settings: &AmbientVoiceSettings) -> Resu
         .map_err(|error| format!("could not encode ambient voice settings: {error}"))?;
     atomic_write_json_restricted(path, &payload)
         .map_err(|error| format!("could not save ambient voice settings: {error}"))
+}
+
+/// Write one wake binding into the stored file, and nothing else.
+///
+/// The settings card used to save a wake word by posting the whole settings
+/// object it had loaded, which made every other field in that object a
+/// condition of the wake word being written: a stored stop phrase the new wake
+/// word clashes with, or one an older build saved that the model cannot encode,
+/// had the save door refuse the write entire — so the wake word did not
+/// persist, and the field that would have resolved the clash was the one the
+/// user could not save. Nothing on the card's side could fix that, because the
+/// refusal is the save door's and the door is right to refuse what it was
+/// handed. So the binding gets a door of its own that is handed the binding
+/// alone.
+///
+/// Three rules, in this order:
+///
+/// 1. The stored file is the base — never a copy the client sent. The card
+///    holds one from whenever it mounted, and mute, enablement and the
+///    indicator have all moved underneath it since.
+/// 2. The binding is validated as strictly as the check command validates it:
+///    [`validate_binding_shape`] plus the model vocabulary when `tokenizer` is
+///    `Some`, which is the belt `commands::check_ambient_wake_word` applies on
+///    every keystroke. A wake word that fails is refused and nothing is
+///    written.
+/// 3. A stored stop phrase that cannot stand beside the new binding is
+///    **dropped**, and the write goes through. The wake word is the primary
+///    control — without it nothing arms at all — and a stop phrase is already
+///    the field that yields elsewhere: [`sanitize_loaded`] drops one the model
+///    refuses, and `super::start_session` filters out one that clashes rather
+///    than arming one keyword twice. The caller sees it gone in the returned
+///    settings, which is what lets the card take it off the screen.
+///
+/// Returns the file as re-read from disk, so what the caller adopts is what
+/// the next launch will load rather than the candidate that was written.
+pub(crate) fn patch_primary_binding(
+    path: &Path,
+    binding: WakeBinding,
+    tokenizer: Option<&WakeWordTokenizer>,
+) -> Result<AmbientVoiceSettings, String> {
+    validate_binding_shape(&binding)?;
+    if let Some(tokenizer) = tokenizer {
+        tokenizer
+            .tokenize(&binding.wake_word)
+            .map_err(|error: WakeWordError| error.to_string())?;
+    }
+    let mut next = load_from_path_with(path, tokenizer)?;
+    // Replace the first binding and keep any extras a later milestone stored:
+    // editing the M1 row must never silently delete M2 configuration. An empty
+    // list is the first save an install ever makes.
+    if next.wake_bindings.is_empty() {
+        next.wake_bindings.push(binding);
+    } else {
+        next.wake_bindings[0] = binding;
+    }
+    if validate_stop_phrase_against(&next, tokenizer).is_err() {
+        next.stop_phrase = None;
+    }
+    save_to_path_with(path, &next, tokenizer)?;
+    load_from_path_with(path, tokenizer)
 }
 
 /// Boot hydration entry point. Never fails the app: a broken file yields

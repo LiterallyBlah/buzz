@@ -791,6 +791,7 @@ pub fn run() {
             huddle::agent_voice::set_huddle_agent_voice,
             ambient_voice::commands::get_ambient_voice_settings,
             ambient_voice::commands::set_ambient_voice_settings,
+            ambient_voice::commands::set_ambient_wake_binding,
             ambient_voice::commands::set_ambient_voice_enabled,
             ambient_voice::commands::set_ambient_voice_muted,
             ambient_voice::commands::get_ambient_voice_status,
