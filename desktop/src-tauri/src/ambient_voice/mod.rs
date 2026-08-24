@@ -48,6 +48,10 @@
 //! microphone continuously would be a different feature. Only a finished
 //! utterance, and only a reply already published to the relay, ever leave.
 
+/// The mute fence the audio worker and the publisher both answer to. Reached
+/// through [`session`], which re-exports it: this is where the fence is written,
+/// not a second door onto it.
+mod capture_authority;
 pub mod commands;
 pub mod http_tts;
 pub mod launch;
