@@ -173,6 +173,66 @@ fn nothing_a_reply_can_contain_makes_this_lose_a_word() {
     }
 }
 
+/// Run `body` on a thread with a stack far smaller than any the app gives this
+/// code, so that recursion over a reply's own structure fails the test rather
+/// than passing on whatever headroom the harness happened to have.
+fn on_a_small_stack<T: Send + 'static>(body: impl FnOnce() -> T + Send + 'static) -> T {
+    const SMALL_STACK_BYTES: usize = 256 * 1024;
+    std::thread::Builder::new()
+        .stack_size(SMALL_STACK_BYTES)
+        .spawn(body)
+        .expect("spawn")
+        .join()
+        .expect("the flattener died on a reply it was given")
+}
+
+#[test]
+fn a_reply_nested_thousands_deep_is_spoken_rather_than_taken_as_an_attack() {
+    // Twenty kilobytes of `[`, which is nothing for a message, used to be an
+    // abort: each label was walked into by calling the flattener again, so a
+    // reply's bracket depth became the process's stack depth and ten thousand
+    // levels overflowed the 2 MiB stack a Tauri command runs on. Replies are
+    // remote text — this was anything the bound agent said.
+    //
+    // The word in the middle is the point. Depth is not a reason to lose it.
+    const DEEP: usize = 10_000;
+    let reply = format!("{}buried{}", "[".repeat(DEEP), "]".repeat(DEEP));
+
+    let started = std::time::Instant::now();
+    let spoken = on_a_small_stack(move || flatten_markdown_for_speech(&reply));
+    let took = started.elapsed();
+
+    assert_eq!(spoken, "buried");
+    // Generous, because it is diagnosing a shape and not a machine: the linear
+    // walk is microseconds, and anything quadratic in the nesting is minutes.
+    assert!(
+        took < std::time::Duration::from_secs(5),
+        "flattening {DEEP} nested labels took {took:?}"
+    );
+}
+
+#[test]
+fn brackets_that_open_nothing_are_spoken_rather_than_swallowed() {
+    // The other half: a `[` with no `]` after it is not a label, so it is a
+    // character the author typed and the listener hears. Degrading a runaway
+    // nesting into silence would trade a crash for a reply that lies.
+    const MANY: usize = 10_000;
+    let reply = format!("{}stranded", "[".repeat(MANY));
+    let spoken = on_a_small_stack(move || flatten_markdown_for_speech(&reply));
+    assert_eq!(spoken.matches('[').count(), MANY);
+    assert!(spoken.ends_with("stranded"), "the word was lost");
+
+    // And the everyday version of the same rule.
+    assert_eq!(
+        flatten_markdown_for_speech("The bracket [ is not a link."),
+        "The bracket [ is not a link."
+    );
+    assert_eq!(
+        flatten_markdown_for_speech("See [the docs](https://example.test"),
+        "See [the docs](https://example.test"
+    );
+}
+
 #[test]
 fn an_empty_or_marks_only_reply_flattens_to_nothing_rather_than_to_noise() {
     for nothing in ["", "   ", "\n\n", "---", "**", "> "] {

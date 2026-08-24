@@ -200,12 +200,40 @@ fn ends_with_sentence_punctuation(said: &str) -> bool {
 }
 
 /// Remove the inline marks from one line, keeping every word.
+///
+/// Iterative, and deliberately so. Link labels nest, and walking into one by
+/// calling this function again meant a reply's bracket depth became the
+/// process's stack depth: about ten thousand nested `[` — twenty kilobytes of
+/// text, well inside one message — overflowed the 2 MiB stack a Tauri command
+/// runs on and aborted the whole app, with quadratic time and memory on the way
+/// there. A reply is remote text, so that was reachable from anything the bound
+/// agent said. The labels are resolved once by [`link_spans`] and walked
+/// through with an explicit stack, which is linear in both.
 fn flatten_inline(line: &str) -> String {
     let chars: Vec<char> = line.chars().collect();
+    let links = link_spans(&chars);
     let mut out = String::with_capacity(line.len());
+    // Labels being walked through, innermost last: where each one ends, and
+    // where to carry on once it has.
+    let mut open_labels: Vec<LabelSpan> = Vec::new();
     let mut i = 0;
 
     while i < chars.len() {
+        // Only the innermost label can end here. Anything a code span or an
+        // autolink jumped clean over is stale and is dropped without a jump.
+        while let Some(&label) = open_labels.last() {
+            if label.close > i {
+                break;
+            }
+            open_labels.pop();
+            if label.close == i {
+                i = label.resume;
+            }
+        }
+        if i >= chars.len() {
+            break;
+        }
+
         match chars[i] {
             // A backslash escape is the author saying "this one is literal".
             '\\' if i + 1 < chars.len() && chars[i + 1].is_ascii_punctuation() => {
@@ -226,15 +254,18 @@ fn flatten_inline(line: &str) -> String {
                 // An image speaks its alt text — written for someone who
                 // cannot see it, which is exactly this listener. The `[` that
                 // follows is handled by the arm below on the next pass.
-                if link_label(&chars, i + 1).is_none() {
+                if links.at(i + 1).is_none() {
                     out.push('!');
                 }
                 i += 1;
             }
-            '[' => match link_label(&chars, i) {
-                Some((label, next)) => {
-                    out.push_str(&flatten_inline(&label));
-                    i = next;
+            '[' => match links.at(i) {
+                // Step into the label and keep going: its text is inline
+                // content like any other, and the address is skipped when the
+                // closing bracket is reached.
+                Some(label) => {
+                    open_labels.push(label);
+                    i += 1;
                 }
                 None => {
                     out.push('[');
@@ -293,46 +324,88 @@ fn code_span(chars: &[char], start: usize) -> Option<(String, usize)> {
     None
 }
 
-/// The label of a link or image starting at `[`, and where the whole link ends.
+/// One link or image label: where it ends, and where its whole link does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LabelSpan {
+    /// Index of the `]` that closes the label.
+    close: usize,
+    /// Index to carry on from — past the address, when there is one.
+    resume: usize,
+}
+
+/// Every link label on the line, indexed by the `[` that opens it.
+///
+/// Empty when the line has no `[` at all, which is almost every line: the
+/// lookup answers `None` for any index, and nothing is allocated.
+struct LinkSpans(Vec<Option<LabelSpan>>);
+
+impl LinkSpans {
+    fn at(&self, index: usize) -> Option<LabelSpan> {
+        self.0.get(index).copied().flatten()
+    }
+}
+
+/// The longest address that is still read as one.
+///
+/// A link's address is a URL, and one longer than this is not a link anyone
+/// wrote — it is an unclosed bracket with the rest of the reply behind it.
+/// Bounding the scan keeps [`link_spans`] linear over the line; past the bound
+/// the `[` is simply spoken, which is the safe direction to fail in.
+const MAX_LINK_ADDRESS_CHARS: usize = 2048;
+
+/// Resolve every label on the line in one left-to-right pass.
 ///
 /// Covers the three shapes a reply actually uses — `[text](url)`,
 /// `[text][ref]` and the shortcut `[text]` — because all three speak the same:
-/// the label, never the address.
-fn link_label(chars: &[char], start: usize) -> Option<(String, usize)> {
-    if chars.get(start) != Some(&'[') {
-        return None;
+/// the label, never the address. A `[` with no `]` after it gets no span and is
+/// therefore spoken as itself; so is one whose address never closes.
+fn link_spans(chars: &[char]) -> LinkSpans {
+    if !chars.contains(&'[') {
+        return LinkSpans(Vec::new());
     }
-    let mut depth = 0usize;
-    let mut i = start;
-    let close = loop {
-        match chars.get(i)? {
+    let mut spans: Vec<Option<LabelSpan>> = vec![None; chars.len()];
+    let mut open: Vec<usize> = Vec::new();
+    let mut i = 0;
+    while i < chars.len() {
+        match chars[i] {
+            // A backslash escape is the author saying "this one is literal",
+            // so the bracket behind it opens and closes nothing.
             '\\' => i += 1,
-            '[' => depth += 1,
+            '[' => open.push(i),
             ']' => {
-                depth -= 1;
-                if depth == 0 {
-                    break i;
+                if let Some(start) = open.pop() {
+                    if let Some(resume) = address_end(chars, i + 1) {
+                        spans[start] = Some(LabelSpan { close: i, resume });
+                    }
                 }
             }
             _ => {}
         }
         i += 1;
-    };
-    let label: String = chars[start + 1..close].iter().collect();
-    let after = close + 1;
-    let end = match chars.get(after) {
-        Some('(') => skip_balanced(chars, after, '(', ')')?,
-        Some('[') => skip_balanced(chars, after, '[', ']')?,
-        _ => after,
-    };
-    Some((label, end))
+    }
+    LinkSpans(spans)
+}
+
+/// Where the address following a label ends, or `None` when it never closes.
+fn address_end(chars: &[char], after: usize) -> Option<usize> {
+    match chars.get(after) {
+        Some('(') => skip_balanced(chars, after, '(', ')'),
+        Some('[') => skip_balanced(chars, after, '[', ']'),
+        // A shortcut label — `[text]` with nothing after it — is its own link.
+        _ => Some(after),
+    }
 }
 
 /// Index just past the balanced `open`/`close` pair beginning at `start`.
+///
+/// Gives up after [`MAX_LINK_ADDRESS_CHARS`] rather than running to the end of
+/// the line: an address that long is a bracket someone forgot to close, and
+/// scanning for its end once per label is how a line of them becomes quadratic.
 fn skip_balanced(chars: &[char], start: usize, open: char, close: char) -> Option<usize> {
     let mut depth = 0usize;
     let mut i = start;
-    loop {
+    let limit = start.saturating_add(MAX_LINK_ADDRESS_CHARS);
+    while i <= limit {
         let c = *chars.get(i)?;
         if c == '\\' {
             i += 2;
@@ -348,6 +421,7 @@ fn skip_balanced(chars: &[char], start: usize, open: char, close: char) -> Optio
         }
         i += 1;
     }
+    None
 }
 
 /// A `<https://…>` autolink: the address without its brackets, and where it
