@@ -1,5 +1,4 @@
 import assert from "node:assert/strict";
-import { registerHooks } from "node:module";
 import { after, before, test } from "node:test";
 
 import { JSDOM } from "jsdom";
@@ -10,28 +9,11 @@ import { reviewDiffWorkspaceBranch } from "../lib/projectReviewDisplay.ts";
 import { pullRequestsPanelKind } from "./PullRequestsPanelSurface.tsx";
 import { buildProjectDetailCrumbs } from "./useProjectDetailCrumbs.ts";
 
-// The real composer mounts TipTap and never releases jsdom handles. Stub it so
-// the production panel can prove selectedPullRequest wiring without hanging
-// the node:test process.
-registerHooks({
-  resolve(specifier, context, nextResolve) {
-    if (specifier === "@/features/forum/ui/ForumComposer") {
-      return { shortCircuit: true, url: "buzz-pr-panel-stub:ForumComposer" };
-    }
-    return nextResolve(specifier, context);
-  },
-  load(url, context, nextLoad) {
-    if (url === "buzz-pr-panel-stub:ForumComposer") {
-      return {
-        format: "module",
-        shortCircuit: true,
-        source:
-          "globalThis.__FORUM_COMPOSER_STUBBED__ = true;\nexport function ForumComposer() { return null; }\n",
-      };
-    }
-    return nextLoad(url, context);
-  },
-});
+// The real composer mounts TipTap and never releases jsdom handles; the test
+// loader serves a stub for projects-feature importers (see the ForumComposer
+// block in test-loader-hooks.mjs — a sync registerHooks stub here crashes
+// Node 22). The `__FORUM_COMPOSER_STUBBED__` assertion below proves the stub,
+// not the real composer, is what the panel rendered.
 
 const OWNER = "a".repeat(64);
 const REVIEW_A_ID = "b".repeat(64);
