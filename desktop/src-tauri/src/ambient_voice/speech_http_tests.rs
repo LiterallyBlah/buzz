@@ -13,6 +13,10 @@ use crate::ambient_voice::speech_stub_server::{StubReply, StubSpeechServer};
 const UTTERANCE_RATE: u32 = 16_000;
 const WAIT: Duration = Duration::from_secs(5);
 
+/// A reply of the size the shipped failure was made of: an agent answering four
+/// minutes of transcript, some 900 characters — about a minute of speech.
+const REPLY_TO_FOUR_MINUTES: usize = 900;
+
 fn endpoint(base: &str) -> SpeechEndpoint {
     SpeechEndpoint::parse(base).expect("endpoint")
 }
@@ -344,13 +348,16 @@ fn an_oversized_transcription_answer_is_a_server_failure_and_not_an_allocation()
 
 #[test]
 fn an_oversized_speech_answer_is_a_server_failure_and_not_an_allocation() {
-    let server = StubSpeechServer::always(StubReply::wav(vec![0u8; MAX_SPEECH_BYTES as usize + 1]));
+    // A one-word reply's cap is the floor, which is the eight megabytes this
+    // shipped with — a short reply is bounded exactly as it always was.
+    let server =
+        StubSpeechServer::always(StubReply::wav(vec![0u8; SPEECH_BASE_BYTES as usize + 1]));
     let client = blocking_client().expect("client");
 
     let error =
         synthesize(&client, &endpoint(server.base_url()), "hello").expect_err("an over-cap reply");
     assert!(error.contains("audio"), "{error}");
-    assert!(error.contains(&MAX_SPEECH_BYTES.to_string()), "{error}");
+    assert!(error.contains(&SPEECH_BASE_BYTES.to_string()), "{error}");
 }
 
 #[test]
@@ -358,7 +365,7 @@ fn an_answer_that_fits_is_still_delivered_whole() {
     // The control for both caps: a body one byte under the limit is not
     // truncated, clipped or refused. A guard that quietly shortened a long but
     // legitimate reply would be a worse bug than the one it prevents.
-    let audio = vec![7u8; MAX_SPEECH_BYTES as usize - 1];
+    let audio = vec![7u8; SPEECH_BASE_BYTES as usize - 1];
     let server = StubSpeechServer::always(StubReply::wav(audio.clone()));
     let client = blocking_client().expect("client");
 
@@ -366,6 +373,103 @@ fn an_answer_that_fits_is_still_delivered_whole() {
         synthesize(&client, &endpoint(server.base_url()), "hello"),
         Ok(audio)
     );
+}
+
+#[test]
+fn how_much_audio_a_reply_may_answer_with_follows_the_length_of_its_text() {
+    // The rule from the arithmetic it is drawn from rather than off the
+    // implementation: a second of the audio these servers return is 48,000
+    // bytes (24 kHz, 16-bit, mono), a second of speech is fifteen characters of
+    // text, and the cap is drawn six times wider than that expectation so that
+    // a different format or a slower voice is not a refusal.
+
+    // A short reply keeps exactly the eight megabytes this shipped with.
+    assert_eq!(speech_bytes_cap(0), 8 * 1024 * 1024);
+    assert_eq!(speech_bytes_cap(200), 8 * 1024 * 1024);
+
+    // A reply worth more than that gets what its own length asks for: 900
+    // characters is a minute of speech, and a minute of speech is 48,000 bytes
+    // a second before the margin.
+    assert_eq!(speech_bytes_cap(900), 60 * 48_000 * 6);
+    assert_eq!(speech_bytes_cap(3_000), 200 * 48_000 * 6);
+
+    // The failure this scaling exists for: the flat cap was about 175 seconds
+    // of speech, so a reply to four minutes of talking could be discarded after
+    // arriving whole and inside its budget.
+    let cap = speech_bytes_cap(REPLY_TO_FOUR_MINUTES);
+    assert!(
+        cap > 8 * 1024 * 1024,
+        "a reply to four minutes of speech is still held to the flat cap: {cap}"
+    );
+
+    // Never unbounded, however long the text — and monotonic on the way there,
+    // so a longer reply is never allowed less audio than a shorter one.
+    assert_eq!(speech_bytes_cap(usize::MAX), MAX_SPEECH_BYTES);
+    assert_eq!(speech_bytes_cap(20_000), MAX_SPEECH_BYTES);
+    let mut previous = 0;
+    for text_len in [0usize, 200, 900, 3_000, 20_000, usize::MAX] {
+        let cap = speech_bytes_cap(text_len);
+        assert!(
+            cap >= previous,
+            "{text_len} characters was allowed less audio than the length below it"
+        );
+        previous = cap;
+    }
+    // And the largest cap any text can produce is a body this app can hold:
+    // `decode_pcm16` turns it into f32 samples twice as large, and both live at
+    // once.
+    let largest = speech_bytes_cap(usize::MAX);
+    assert!(
+        largest <= 128 * 1024 * 1024,
+        "{largest} bytes of WAV decodes to twice that in memory"
+    );
+}
+
+#[test]
+fn a_reply_long_enough_to_ask_for_it_may_answer_with_more_than_the_flat_cap() {
+    // The other half of the shipped failure, at the seam rather than in the
+    // arithmetic: a reply that arrived whole and in time was thrown away for
+    // being over eight megabytes — about 175 seconds of speech, which an agent
+    // answering four minutes of talking can exceed. This body is over that old
+    // flat cap and well inside what its own text asks for.
+    let long_reply = "a sentence about the calendar. ".repeat(65);
+    assert!(long_reply.len() > 2_000, "{}", long_reply.len());
+    let audio = vec![7u8; 9_500 * 1024];
+    assert!(
+        audio.len() as u64 > SPEECH_BASE_BYTES,
+        "the body has to be over the old flat cap to prove anything: {}",
+        audio.len()
+    );
+    let server = StubSpeechServer::always(StubReply::wav(audio.clone()));
+    let client = blocking_client().expect("client");
+
+    match synthesize(&client, &endpoint(server.base_url()), &long_reply) {
+        // Compared without printing either side: an unequal body would
+        // otherwise print nine megabytes of sevens twice over.
+        Ok(spoken) => assert!(
+            spoken == audio,
+            "the reply came back changed: {} bytes, expected {}",
+            spoken.len(),
+            audio.len()
+        ),
+        Err(error) => panic!(
+            "a reply of {} characters may answer with {} bytes of audio: {error}",
+            long_reply.len(),
+            audio.len()
+        ),
+    }
+
+    // And the cap is still a cap: the identical body for a one-line reply is
+    // refused, so what changed is what the bound is drawn from, not the bound
+    // being lifted.
+    let error = synthesize(
+        &client,
+        &endpoint(server.base_url()),
+        "Your calendar is clear.",
+    )
+    .expect_err("a one-line reply may not answer with nine megabytes of audio");
+    assert!(error.contains("audio"), "{error}");
+    assert!(error.contains(&SPEECH_BASE_BYTES.to_string()), "{error}");
 }
 
 #[test]
@@ -524,6 +628,116 @@ fn the_budget_for_one_utterance_follows_how_much_of_it_there_is() {
     // A rate of zero is unreachable through the callers and must still not
     // divide by zero on the audio thread.
     assert!(transcribe_timeout(seconds(1), 0) >= Duration::from_secs(10));
+}
+
+#[test]
+fn the_budget_for_one_reply_follows_how_much_speech_it_is() {
+    // The rule, stated from the sizes it has to serve: twenty seconds for the
+    // round trip and the voice model's warm-up, plus two seconds for every
+    // second of speech the reply comes to (fifteen characters of text a
+    // second), with a ceiling.
+
+    // A reply with nothing in it is the flat budget this shipped with, and no
+    // reply of any length is ever given less than that.
+    assert_eq!(speak_timeout(0), Duration::from_secs(20));
+    for text_len in [0usize, 1, 40, 900, 100_000, usize::MAX] {
+        assert!(
+            speak_timeout(text_len) >= Duration::from_secs(20),
+            "{text_len} characters was given less than the flat budget"
+        );
+    }
+
+    // 150 characters is ten seconds of speech, so twenty seconds on top…
+    assert_eq!(speak_timeout(150), Duration::from_secs(20 + 20));
+    // …and 900 characters is a minute of it, so two minutes on top.
+    assert_eq!(speak_timeout(900), Duration::from_secs(20 + 120));
+
+    // The failure this scaling exists for: a server synthesised a reply to a
+    // four-minute transcript in about 24 seconds and answered 200, four
+    // seconds after the flat budget had hung up on it — the audio was finished
+    // and nobody was listening. The same reply now has room for that answer
+    // several times over.
+    let observed_server_took = Duration::from_secs(24);
+    let budget = speak_timeout(REPLY_TO_FOUR_MINUTES);
+    assert!(
+        budget > Duration::from_secs(30),
+        "a reply to four minutes of speech is still on a sentence's budget: {budget:?}"
+    );
+    assert!(
+        budget >= observed_server_took * 4,
+        "no real margin over what the server that failed actually needed: {budget:?}"
+    );
+
+    // And nothing exceeds the ceiling, however long the text is…
+    let longest = speak_timeout(usize::MAX);
+    assert_eq!(speak_timeout(10_000), SPEAK_MAX_TIMEOUT);
+    assert_eq!(longest, SPEAK_MAX_TIMEOUT);
+    // …which is finite, and short enough that an address that answers nothing
+    // cannot hold the speaking worker for the length of a meeting.
+    assert!(longest <= Duration::from_secs(300), "{longest:?}");
+}
+
+#[test]
+fn a_longer_reply_is_given_longer_than_a_shorter_one() {
+    // Monotonic, for the same reason the transcription budget is: a reply twice
+    // as long must not be given less room to be spoken in than the one below
+    // it.
+    let mut previous = Duration::ZERO;
+    for text_len in [0usize, 20, 200, 900, 1_600, 5_000, 50_000] {
+        let budget = speak_timeout(text_len);
+        assert!(
+            budget >= previous,
+            "{text_len} characters was given less than the length below it"
+        );
+        previous = budget;
+    }
+}
+
+#[test]
+fn a_server_still_working_when_the_flat_budget_expired_is_waited_for() {
+    // The shipped failure itself, driven through `synthesize` against a real
+    // server that takes its time — because the budget being asserted is a wall
+    // clock at a socket, and the arithmetic above proves nothing about which
+    // number reaches the request. Twenty-one seconds is what this test costs,
+    // and it is the whole point of it: the only honest way to show that a reply
+    // is no longer cut off at twenty seconds is to let one run past twenty
+    // seconds.
+    const SERVER_TAKES: Duration = Duration::from_secs(21);
+
+    let spoken = crate::ambient_voice::speech_wav::encode_pcm16_mono(&[0.25; 240], 24_000);
+    let reply = spoken.clone();
+    let server = StubSpeechServer::start(move |_| {
+        std::thread::sleep(SERVER_TAKES);
+        StubReply::wav(reply.clone())
+    });
+    let client = blocking_client().expect("client");
+    // A minute of speech, the size of the reply that failed.
+    let text = "a sentence about the calendar. ".repeat(30);
+    assert!(text.len() >= REPLY_TO_FOUR_MINUTES, "{}", text.len());
+
+    let started = std::time::Instant::now();
+    match synthesize(&client, &endpoint(server.base_url()), &text) {
+        // Compared without printing either side: a mismatch is a wrong body,
+        // and the failure worth reading is the one below it.
+        Ok(audio) => assert!(
+            audio == spoken,
+            "the reply came back changed: {} bytes, expected {}",
+            audio.len(),
+            spoken.len()
+        ),
+        Err(error) => panic!(
+            "a reply of {} characters was hung up on after {:?}, and its finished audio went to a closed socket: {error}",
+            text.len(),
+            started.elapsed()
+        ),
+    }
+    // The server really did take longer than the flat budget, so this measured
+    // a request that was at risk rather than one that was never near it.
+    assert!(
+        started.elapsed() >= SERVER_TAKES,
+        "the server answered inside the old flat budget: {:?}",
+        started.elapsed()
+    );
 }
 
 #[test]
