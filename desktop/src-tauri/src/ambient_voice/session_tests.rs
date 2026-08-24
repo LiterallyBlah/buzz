@@ -458,6 +458,34 @@ fn a_worker_that_is_transcribing_nothing_is_still_measured_as_before() {
     );
 }
 
+#[test]
+fn a_transcription_that_unwinds_gives_the_watchdog_back() {
+    // The mark is what switches the staleness watchdog off, so an exit that
+    // skipped its removal would leave the watchdog off for the life of the
+    // session — silently, since a session with the watchdog disabled looks
+    // exactly like a session that is being fed. That is a worse failure than
+    // the one the marking was added to fix, so it must not depend on control
+    // reaching a second call.
+    let flow = AudioFlow::new();
+    flow.record(1);
+
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let died = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _busy = flow.transcribing();
+        panic!("the recogniser gave up mid-utterance");
+    }));
+    std::panic::set_hook(previous);
+    assert!(died.is_err(), "the panic did not happen");
+
+    thread::sleep(Duration::from_millis(120));
+    let quiet = flow.snapshot().since_last_batch;
+    assert!(
+        quiet >= Duration::from_millis(100),
+        "the watchdog stayed marked busy after an unwind: {quiet:?}"
+    );
+}
+
 // ── Fixture-driven tests through the real engine ─────────────────────────────
 
 fn model_dir_from_env() -> PathBuf {

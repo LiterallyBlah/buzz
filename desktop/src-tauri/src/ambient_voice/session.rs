@@ -220,6 +220,19 @@ impl AudioFlow {
             .store(self.elapsed_ms(), Ordering::Release);
     }
 
+    /// Mark the worker busy until the returned guard is dropped.
+    ///
+    /// A guard rather than a matching call because the mark is what switches
+    /// the staleness watchdog off: an exit that skipped the closing call —
+    /// an unwind out of the recogniser, a `?` added to the block later —
+    /// would leave `transcribing_since_ms` set for the life of the session,
+    /// and `starved_ms` would answer "not starved" forever. The watchdog
+    /// would be off with nothing to show that it was.
+    fn transcribing(&self) -> Transcribing<'_> {
+        self.begin_transcription();
+        Transcribing { flow: self }
+    }
+
     /// The worker is about to block on turning an utterance into text.
     fn begin_transcription(&self) {
         self.transcribing_since_ms
@@ -247,6 +260,20 @@ impl AudioFlow {
                 self.transcribing_since_ms.load(Ordering::Acquire),
             )),
         }
+    }
+}
+
+/// Held for as long as the worker is inside a transcription.
+///
+/// Its whole job is the `Drop`: however the transcription ends, the mark comes
+/// off with it.
+struct Transcribing<'a> {
+    flow: &'a AudioFlow,
+}
+
+impl Drop for Transcribing<'_> {
+    fn drop(&mut self) {
+        self.flow.end_transcription();
     }
 }
 
@@ -762,13 +789,15 @@ fn finish_capture(
 ) {
     status.set(AmbientStatus::Transcribing);
     // The worker cannot drain its audio queue while this blocks, and against a
-    // speech server it blocks for a network round trip. Marked at both ends so
-    // the staleness window measures a starved worker rather than a busy one —
-    // see [`AudioFlow`]. Marked around the whole call, not just the HTTP one,
-    // because the local recogniser blocks the same loop for the same reason.
-    flow.begin_transcription();
-    let outcome = transcribe(transcriber, speech_buf, transcript_tx, trim);
-    flow.end_transcription();
+    // speech server it blocks for a network round trip. Marked for the length
+    // of the call so the staleness window measures a starved worker rather
+    // than a busy one — see [`AudioFlow`]. Marked around the whole call, not
+    // just the HTTP one, because the local recogniser blocks the same loop for
+    // the same reason.
+    let outcome = {
+        let _busy = flow.transcribing();
+        transcribe(transcriber, speech_buf, transcript_tx, trim)
+    };
     speech_buf.clear();
     status.set(status_after_decode(outcome));
 }
