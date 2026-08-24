@@ -10,11 +10,32 @@ use super::*;
 
 const AGENT: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
+/// The KWS model's own vocabulary pair — the same fixture `wake_word_tests`
+/// segments against. Used here so the stop phrase's vocabulary rule is pinned
+/// to the model this app ships rather than to whatever the machine running the
+/// tests happens to have downloaded.
+const BPE_MODEL: &[u8] = include_bytes!("../../resources/ambient-voice-test-vocab/bpe.model");
+const TOKENS_TXT: &str = include_str!("../../resources/ambient-voice-test-vocab/tokens.txt");
+
+fn fixture_tokenizer() -> WakeWordTokenizer {
+    WakeWordTokenizer::from_parts(BPE_MODEL, TOKENS_TXT).expect("load fixture tokenizer")
+}
+
 fn binding() -> WakeBinding {
     WakeBinding {
         wake_word: "hey hermes".to_string(),
         agent_pubkey: AGENT.to_string(),
         destination: None,
+    }
+}
+
+/// Settings carrying `phrase` as the stop phrase, bound to the usual wake word.
+fn with_stop_phrase(phrase: &str) -> AmbientVoiceSettings {
+    AmbientVoiceSettings {
+        enabled: true,
+        wake_bindings: vec![binding()],
+        stop_phrase: Some(phrase.to_string()),
+        ..AmbientVoiceSettings::default()
     }
 }
 
@@ -287,6 +308,82 @@ fn saving_refuses_a_stop_phrase_the_spotter_could_not_arm() {
     assert!(save_to_path(&path, &too_long)
         .expect_err("over-long stop phrase")
         .contains("too long"));
+}
+
+#[test]
+fn a_stop_phrase_the_model_cannot_encode_is_refused() {
+    // The whole of F1: these three pass every shape check — long enough, more
+    // than one word, under the length cap — and the tokenizer refuses all of
+    // them. Before the vocabulary check reached this door they saved cleanly
+    // and then failed `keywords_buf` at arm time, which takes the session down
+    // and with it the wake word, the microphone and the transcript path.
+    //
+    // The expectations come from what the model can represent (500 uppercase
+    // ASCII pieces: no digits, no accents, no sentence punctuation), not from
+    // running the code and writing down its answer.
+    let tokenizer = fixture_tokenizer();
+    for (phrase, cannot_hear) in [("buzz stop.", "."), ("stop now 2", "2"), ("café stop", "É")] {
+        let error = validate_stop_phrase_against(&with_stop_phrase(phrase), Some(&tokenizer))
+            .expect_err(phrase);
+        assert!(
+            error.starts_with("Stop phrase: "),
+            "{phrase}: the message must name the field it came from: {error}"
+        );
+        assert!(
+            error.contains(cannot_hear),
+            "{phrase}: the message must name what the model cannot hear: {error}"
+        );
+    }
+
+    // And the phrase the settings field offers as its example must work, or
+    // the first thing anyone types is the thing that breaks it.
+    assert!(
+        validate_stop_phrase_against(&with_stop_phrase("that's all"), Some(&tokenizer)).is_ok(),
+        "the placeholder the stop-phrase field suggests must be usable"
+    );
+    assert!(validate_stop_phrase_against(&with_stop_phrase("buzz stop"), Some(&tokenizer)).is_ok());
+}
+
+#[test]
+fn a_stop_phrase_an_older_build_saved_is_dropped_the_first_time_it_is_read() {
+    // The upgrade path. A build without the vocabulary check at the save door
+    // could persist "buzz stop.", and that file is still on disk after the
+    // update. Reading it must cost the user the stop phrase and nothing else —
+    // in particular not the wake word, which is what arm-time refusal used to
+    // take with it.
+    let stored = with_stop_phrase("buzz stop.");
+    let loaded = sanitize_loaded(stored, Some(&fixture_tokenizer()));
+    assert!(loaded.stop_phrase.is_none());
+    assert!(loaded.armed_stop_phrase().is_none());
+    assert_eq!(
+        loaded.primary_binding().map(|b| b.wake_word.as_str()),
+        Some("hey hermes"),
+        "dropping the stop phrase must not disturb the binding beside it"
+    );
+
+    // A usable one survives the same pass untouched.
+    let kept = sanitize_loaded(with_stop_phrase("that's all"), Some(&fixture_tokenizer()));
+    assert_eq!(kept.armed_stop_phrase(), Some("that's all"));
+}
+
+#[test]
+fn without_the_model_the_stop_phrase_keeps_its_shape_checks() {
+    // Settings are saved long before the wake-word model is downloaded, so the
+    // vocabulary check is not always available. What must not happen is the
+    // other rules going with it: the field is still refused when it is too
+    // short to discriminate or identical to the wake word, exactly as the wake
+    // word's own check degrades.
+    assert!(validate_stop_phrase_against(&with_stop_phrase("buzz stop."), None).is_ok());
+    assert!(validate_stop_phrase_against(&with_stop_phrase("the"), None)
+        .expect_err("too short")
+        .contains("fire constantly"));
+    assert!(
+        validate_stop_phrase_against(&with_stop_phrase("hey hermes"), None)
+            .expect_err("clashes")
+            .contains("different from the wake word")
+    );
+    // No phrase at all is the default and needs no model to be valid.
+    assert!(validate_stop_phrase_against(&AmbientVoiceSettings::default(), None).is_ok());
 }
 
 #[test]

@@ -59,45 +59,100 @@ test("a channel bot with no name falls back to a readable pubkey stub", () => {
   assert.equal(option.name, "ffffffff…ffff");
 });
 
+/** A saveable form, which each case below breaks in exactly one way. */
+function form(overrides = {}) {
+  return {
+    wakeWord: "hey hermes",
+    wakeWordCheck: valid,
+    stopPhrase: "",
+    stopPhraseCheck: null,
+    agentPubkey: AGENT,
+    loadError: null,
+    ...overrides,
+  };
+}
+
 test("an unchecked wake word is never saveable", () => {
   // Fail closed: no answer from the validator is not a pass. Persisting an
   // un-encodable phrase would hand the C library input that kills the process.
-  const block = ambientSaveBlock("hey hermes", AGENT, null, null);
+  const block = ambientSaveBlock(form({ wakeWordCheck: null }));
   assert.equal(block.reason, "wake_word");
 });
 
 test("an invalid wake word blocks saving and shows the validator's own words", () => {
   const block = ambientSaveBlock(
-    "the",
-    AGENT,
-    {
-      valid: false,
-      message: "A one-word wake phrase needs at least 8 letters",
-      tokens: null,
-      checkedAgainstModel: false,
-    },
-    null,
+    form({
+      wakeWord: "the",
+      wakeWordCheck: {
+        valid: false,
+        message: "A one-word wake phrase needs at least 8 letters",
+        tokens: null,
+        checkedAgainstModel: false,
+      },
+    }),
   );
   assert.equal(block.reason, "wake_word");
   assert.match(block.message, /at least 8 letters/);
 });
 
 test("an empty wake word and a missing agent are each reported", () => {
-  assert.equal(ambientSaveBlock("  ", AGENT, valid, null).reason, "wake_word");
-  assert.equal(
-    ambientSaveBlock("hey hermes", null, valid, null).reason,
-    "agent",
-  );
+  assert.equal(ambientSaveBlock(form({ wakeWord: "  " })).reason, "wake_word");
+  assert.equal(ambientSaveBlock(form({ agentPubkey: null })).reason, "agent");
 });
 
 test("a valid form with an agent is saveable", () => {
-  assert.equal(ambientSaveBlock("hey hermes", AGENT, valid, null), null);
+  assert.equal(ambientSaveBlock(form()), null);
 });
 
 test("a settings file that failed to load blocks every write", () => {
-  const block = ambientSaveBlock("hey hermes", AGENT, valid, "not valid JSON");
+  const block = ambientSaveBlock(form({ loadError: "not valid JSON" }));
   assert.equal(block.reason, "load_error");
   assert.match(block.message, /not valid JSON/);
+});
+
+test("no stop phrase is a complete form, not an unfinished one", () => {
+  // Empty is how the second keyword is switched off, and it is what every
+  // install has until someone types one. It must never be waited on, or the
+  // default configuration would be permanently unsaveable.
+  assert.equal(ambientSaveBlock(form({ stopPhrase: "" })), null);
+  assert.equal(ambientSaveBlock(form({ stopPhrase: "   " })), null);
+});
+
+test("an unchecked stop phrase is never saveable", () => {
+  // The same fail-closed rule as the wake word, because it is armed on the
+  // same spotter: a phrase saved without an answer is a phrase that can stop
+  // the session from starting at all.
+  const block = ambientSaveBlock(form({ stopPhrase: "buzz stop" }));
+  assert.equal(block.reason, "stop_phrase");
+  assert.match(block.message, /Checking/);
+});
+
+test("a stop phrase the model cannot encode blocks saving", () => {
+  // The message is the native validator's, so what the user reads is the
+  // reason the save door would give — not a second wording of it.
+  const block = ambientSaveBlock(
+    form({
+      stopPhrase: "buzz stop.",
+      stopPhraseCheck: {
+        valid: false,
+        message:
+          "Stop phrase: The wake-word model only understands unaccented English letters. It cannot hear: .",
+        tokens: null,
+        checkedAgainstModel: true,
+      },
+    }),
+  );
+  assert.equal(block.reason, "stop_phrase");
+  assert.match(block.message, /cannot hear/);
+});
+
+test("a checked stop phrase saves alongside everything else", () => {
+  assert.equal(
+    ambientSaveBlock(
+      form({ stopPhrase: "that's all", stopPhraseCheck: valid }),
+    ),
+    null,
+  );
 });
 
 test("editing the first binding preserves later ones", () => {

@@ -312,6 +312,65 @@ pub fn check_ambient_wake_word(wake_word: String) -> WakeWordCheck {
     }
 }
 
+/// Validate a candidate stop phrase.
+///
+/// The stop-phrase field's counterpart to [`check_ambient_wake_word`], and it
+/// exists for the same reason: the phrase is armed on the same keyword spotter,
+/// so a phrase the model cannot encode fails the whole session at arm time. It
+/// went unchecked while the wake word beside it was checked on every keystroke,
+/// which made a full stop or a digit in this one field enough to take ambient
+/// voice down.
+///
+/// Two rules the wake word does not have: an empty phrase is *valid* (it is how
+/// the feature is switched off), and the phrase must differ from `wake_word` —
+/// one keyword armed twice leaves no answer to which job a detection is doing.
+/// Both live in `settings::validate_stop_phrase_against`, so the rule the UI
+/// reports is the rule the save door enforces.
+#[tauri::command]
+pub fn check_ambient_stop_phrase(stop_phrase: String, wake_word: String) -> WakeWordCheck {
+    let tokenizer = settings::installed_tokenizer();
+    let probe = AmbientVoiceSettings {
+        wake_bindings: wake_binding_for_check(&wake_word),
+        stop_phrase: Some(stop_phrase.clone()),
+        ..AmbientVoiceSettings::default()
+    };
+    match settings::validate_stop_phrase_against(&probe, tokenizer.as_ref()) {
+        Ok(()) => WakeWordCheck {
+            valid: true,
+            message: None,
+            tokens: tokenizer
+                .as_ref()
+                .zip(probe.armed_stop_phrase())
+                .and_then(|(tokenizer, phrase)| tokenizer.tokenize(phrase).ok()),
+            checked_against_model: tokenizer.is_some(),
+        },
+        Err(message) => WakeWordCheck {
+            valid: false,
+            message: Some(message),
+            tokens: None,
+            checked_against_model: tokenizer.is_some(),
+        },
+    }
+}
+
+/// A stand-in binding carrying `wake_word`, for the clash rule alone.
+///
+/// The clash check reads `primary_binding()`, and the settings UI can be asked
+/// about a stop phrase before an agent has been chosen. The agent key is
+/// therefore a placeholder that is never validated, never persisted and never
+/// leaves this function — an empty wake word yields no binding at all, which is
+/// the honest answer to "does this clash with nothing".
+fn wake_binding_for_check(wake_word: &str) -> Vec<settings::WakeBinding> {
+    if wake_word.trim().is_empty() {
+        return Vec::new();
+    }
+    vec![settings::WakeBinding {
+        wake_word: wake_word.to_string(),
+        agent_pubkey: String::new(),
+        destination: None,
+    }]
+}
+
 /// Ask a speech server whether it is there, for the settings "Check" button.
 ///
 /// Its own command rather than a side effect of saving, because the answer is

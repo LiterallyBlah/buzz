@@ -50,6 +50,14 @@ const READY_ENDPOINT = {
   probedUrl: "http://speech.example:30120/v1/health/ready",
 };
 
+/** A `check_ambient_stop_phrase` answer: usable, as most phrases are. */
+const USABLE_STOP_PHRASE = {
+  valid: true,
+  message: null,
+  tokens: null,
+  checkedAgainstModel: true,
+};
+
 async function mountSettings(
   models,
   body,
@@ -57,6 +65,7 @@ async function mountSettings(
     report = ambientReport(),
     settings = SETTINGS,
     endpointCheck = READY_ENDPOINT,
+    stopPhraseCheck = USABLE_STOP_PHRASE,
   } = {},
 ) {
   await withAmbientDom(
@@ -80,6 +89,8 @@ async function mountSettings(
               tokens: null,
               checkedAgainstModel: false,
             };
+          case "check_ambient_stop_phrase":
+            return stopPhraseCheck;
           case "check_speech_endpoint":
             return endpointCheck;
           case "set_ambient_voice_settings":
@@ -370,6 +381,75 @@ test("the stop phrase field renders bound to the stored phrase", async () => {
       assert.equal(view.getByTestId("ambient-stop-phrase").value, "buzz stop");
     },
     { settings: { ...SETTINGS, stopPhrase: "buzz stop" } },
+  );
+});
+
+test("a stop phrase the model cannot encode is never written to disk", async () => {
+  // The whole of F1 seen from the settings screen. "buzz stop." passes every
+  // shape check and the tokenizer refuses it, so before this the field saved
+  // it happily and the next session start failed with the wake word, the
+  // microphone and the transcript path going down with it.
+  const refused = {
+    valid: false,
+    message:
+      "Stop phrase: The wake-word model only understands unaccented English letters. It cannot hear: .",
+    tokens: null,
+    checkedAgainstModel: true,
+  };
+  await mountSettings(
+    READY_MODELS,
+    async ({ act, calls, testing, view }) => {
+      const field = view.getByTestId("ambient-stop-phrase");
+      await act(() => {
+        testing.fireEvent.change(field, { target: { value: "buzz stop." } });
+        testing.fireEvent.blur(field);
+      });
+
+      assert.equal(
+        calls.filter((call) => call.command === "set_ambient_voice_settings")
+          .length,
+        0,
+        "a phrase the model cannot encode reached the settings file",
+      );
+      // And the user is told why, in the validator's own words rather than a
+      // second wording of them.
+      assert.match(
+        view.getByTestId("ambient-stop-phrase-error").textContent,
+        /cannot hear/,
+      );
+    },
+    { stopPhraseCheck: refused },
+  );
+});
+
+test("clearing a stop phrase works even once it would be refused", async () => {
+  // The way out. A phrase on disk that has stopped being valid — because the
+  // wake word was edited to match it, or because it predates the check — must
+  // still be removable, or the field becomes a trap.
+  await mountSettings(
+    READY_MODELS,
+    async ({ act, calls, testing, view }) => {
+      const field = view.getByTestId("ambient-stop-phrase");
+      await act(() => {
+        testing.fireEvent.change(field, { target: { value: "" } });
+        testing.fireEvent.blur(field);
+      });
+
+      const saved = calls.filter(
+        (call) => call.command === "set_ambient_voice_settings",
+      );
+      assert.equal(saved.length, 1, "the stop phrase could not be cleared");
+      assert.equal(saved[0].args.settings.stopPhrase, null);
+    },
+    {
+      settings: { ...SETTINGS, stopPhrase: "buzz stop." },
+      stopPhraseCheck: {
+        valid: false,
+        message: "Stop phrase: It cannot hear: .",
+        tokens: null,
+        checkedAgainstModel: true,
+      },
+    },
   );
 });
 

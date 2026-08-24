@@ -798,6 +798,7 @@ pub fn run() {
             ambient_voice::commands::get_ambient_model_status,
             ambient_voice::commands::check_ambient_hotstart,
             ambient_voice::commands::check_ambient_wake_word,
+            ambient_voice::commands::check_ambient_stop_phrase,
             ambient_voice::commands::check_speech_endpoint,
             ambient_voice::commands::push_ambient_audio_pcm,
             ambient_voice::commands::report_ambient_audio_flow,

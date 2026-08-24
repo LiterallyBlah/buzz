@@ -664,6 +664,22 @@ async fn start_session(state: &AppState, settings: &AmbientVoiceSettings) -> Res
         .filter(|phrase| {
             wake_word::engine_keyword(phrase) != wake_word::engine_keyword(&binding.wake_word)
         })
+        // Dropped rather than fatal, unlike the wake word below. Saving a
+        // phrase the model cannot encode is refused now, and loading one drops
+        // it — but both of those need the model on disk, and it downloads after
+        // the settings file exists. A phrase that slipped through that window
+        // costs the user their second keyword; taking the wake word down with
+        // it would cost them the whole feature.
+        .filter(|phrase| match tokenizer.tokenize(phrase) {
+            Ok(_) => true,
+            Err(error) => {
+                eprintln!(
+                    "buzz-desktop: ambient stop phrase \"{phrase}\" cannot be armed ({error}); \
+                     starting with the wake word alone"
+                );
+                false
+            }
+        })
         .map(str::to_string);
     let mut phrases = vec![binding.wake_word.clone()];
     phrases.extend(stop_phrase.clone());

@@ -49,7 +49,9 @@ use tauri::{AppHandle, Manager};
 use crate::managed_agents::storage::atomic_write_json_restricted;
 
 use super::utterance::{DEFAULT_SILENCE_HOLD_MS, MAX_SILENCE_HOLD_MS, MIN_SILENCE_HOLD_MS};
-use super::wake_word::{engine_keyword, validate_wake_word, WakeWordError, MAX_WAKE_WORD_CHARS};
+use super::wake_word::{
+    engine_keyword, validate_wake_word, WakeWordError, WakeWordTokenizer, MAX_WAKE_WORD_CHARS,
+};
 
 pub(crate) const SETTINGS_FILE: &str = "ambient-voice-settings.json";
 pub(crate) const CURRENT_VERSION: u32 = 1;
@@ -286,13 +288,34 @@ pub(crate) fn validate_binding_shape(binding: &WakeBinding) -> Result<(), String
     Ok(())
 }
 
-/// Validate the stop phrase for persistence.
+/// Validate the stop phrase for persistence, against the installed model.
 ///
 /// It reaches the keyword spotter beside the wake word, so it passes the same
 /// checks — and one more: a stop phrase identical to the wake word would arm
 /// the same keyword twice, and there would be no answer to which of the two
 /// jobs a detection was doing.
+///
+/// Unlike [`validate_binding_shape`], this **does** run the model-vocabulary
+/// check when the model is installed. The wake word can skip it here because
+/// the settings UI runs it on every keystroke and refuses to save without it;
+/// the stop phrase had no such gate, so a phrase the tokenizer cannot encode
+/// used to save cleanly and then fail the whole session at arm time. When the
+/// model is not downloaded yet the check is simply unavailable, exactly as it
+/// is for the wake word, and the shape checks still run.
 pub(crate) fn validate_stop_phrase(settings: &AmbientVoiceSettings) -> Result<(), String> {
+    validate_stop_phrase_against(settings, installed_tokenizer().as_ref())
+}
+
+/// The same validation with the tokenizer supplied.
+///
+/// The seam exists so the tests can pin the vocabulary rule against the
+/// in-repo fixture rather than against whatever this machine has downloaded —
+/// a check that silently degrades to "no model, so valid" is a check that
+/// proves nothing about the phrases it is supposed to refuse.
+pub(crate) fn validate_stop_phrase_against(
+    settings: &AmbientVoiceSettings,
+    tokenizer: Option<&WakeWordTokenizer>,
+) -> Result<(), String> {
     let Some(phrase) = settings.armed_stop_phrase() else {
         return Ok(());
     };
@@ -304,6 +327,11 @@ pub(crate) fn validate_stop_phrase(settings: &AmbientVoiceSettings) -> Result<()
     // Named, because the shared validator's words are about the phrase and not
     // about which field it came from, and this file has two phrase fields.
     validate_wake_word(phrase).map_err(|error: WakeWordError| format!("Stop phrase: {error}"))?;
+    if let Some(tokenizer) = tokenizer {
+        tokenizer
+            .tokenize(phrase)
+            .map_err(|error: WakeWordError| format!("Stop phrase: {error}"))?;
+    }
     let clashes = settings
         .primary_binding()
         .is_some_and(|binding| engine_keyword(&binding.wake_word) == engine_keyword(phrase));
@@ -311,6 +339,14 @@ pub(crate) fn validate_stop_phrase(settings: &AmbientVoiceSettings) -> Result<()
         return Err("The stop phrase must be different from the wake word".to_string());
     }
     Ok(())
+}
+
+/// The tokenizer for the downloaded wake-word model, when there is one.
+///
+/// `None` before the model has been downloaded, which is an ordinary state:
+/// settings are saved long before a session ever runs.
+pub(crate) fn installed_tokenizer() -> Option<WakeWordTokenizer> {
+    super::models::kws_model_dir().and_then(|dir| WakeWordTokenizer::load(&dir).ok())
 }
 
 /// Load settings from `path`, applying migration rules.
@@ -343,8 +379,22 @@ pub(crate) fn load_from_path(path: &Path) -> Result<AmbientVoiceSettings, String
         ));
     }
 
-    let mut settings: AmbientVoiceSettings = serde_json::from_value(sanitize_backends(value))
+    let settings: AmbientVoiceSettings = serde_json::from_value(sanitize_backends(value))
         .map_err(|error| format!("ambient voice settings are invalid: {error}"))?;
+    Ok(sanitize_loaded(settings, installed_tokenizer().as_ref()))
+}
+
+/// Bring a freshly-deserialised file back inside the ranges the runtime honours.
+///
+/// Every rule here is forgiving on purpose: the alternative to dropping one bad
+/// field is a file that will not open at all, which costs the user everything
+/// else in it. Separated from [`load_from_path`] and given the tokenizer
+/// explicitly so the vocabulary rule can be tested against the in-repo fixture
+/// rather than against whatever this machine has downloaded.
+fn sanitize_loaded(
+    mut settings: AmbientVoiceSettings,
+    tokenizer: Option<&WakeWordTokenizer>,
+) -> AmbientVoiceSettings {
     settings.version = CURRENT_VERSION;
 
     // Drop bindings that could never arm. A malformed binding is a defect in
@@ -357,8 +407,10 @@ pub(crate) fn load_from_path(path: &Path) -> Result<AmbientVoiceSettings, String
 
     // Same forgiveness, for the same reason: a stop phrase the spotter could
     // not be given must never reach it, and dropping it costs the user one
-    // setting rather than the whole file.
-    if validate_stop_phrase(&settings).is_err() {
+    // setting rather than the whole file. This is also the upgrade path for a
+    // phrase an older build saved before the vocabulary check reached the save
+    // door — it is dropped the first time the fixed build reads the file.
+    if validate_stop_phrase_against(&settings, tokenizer).is_err() {
         settings.stop_phrase = None;
     }
     settings.silence_hold_ms = settings
@@ -371,7 +423,7 @@ pub(crate) fn load_from_path(path: &Path) -> Result<AmbientVoiceSettings, String
     settings.indicator_position = settings
         .indicator_position
         .filter(IndicatorPosition::is_storable);
-    Ok(settings)
+    settings
 }
 
 /// Replace unknown `stt`/`tts` backend names with the local default.

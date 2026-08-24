@@ -66,44 +66,72 @@ export function mergeAgentOptions(
 /** Why the Save button is disabled, or `null` when it is not. */
 export type AmbientSaveBlock =
   | { reason: "wake_word"; message: string }
+  | { reason: "stop_phrase"; message: string }
   | { reason: "agent"; message: string }
   | { reason: "load_error"; message: string }
   | null;
 
+/** The form state the save block is decided from. */
+export type AmbientFormState = {
+  wakeWord: string;
+  /** The native answer for `wakeWord`. `null` while a check is in flight. */
+  wakeWordCheck: WakeWordCheck | null;
+  /** Empty means no stop phrase, which is how the feature is switched off. */
+  stopPhrase: string;
+  /** The native answer for `stopPhrase`. `null` while a check is in flight. */
+  stopPhraseCheck: WakeWordCheck | null;
+  agentPubkey: string | null;
+  loadError: string | null;
+};
+
 /**
  * Whether the current form can be saved, and if not, what to tell the user.
  *
- * A wake word that the model cannot encode must never be persisted: the
- * settings file is read at boot and handed to a C library that terminates the
- * process on input it cannot tokenise. The check is the same one the native
- * side runs, so a phrase accepted here cannot kill the app later.
+ * Neither phrase the model cannot encode may be persisted: the settings file
+ * is read at boot and both phrases are handed to a C library that terminates
+ * the process on input it cannot tokenise. The app's own tokenizer runs first,
+ * so what actually happens is that the session refuses to start — which is why
+ * the stop phrase needs this gate as much as the wake word does. Both checks
+ * are the native side's, so a phrase accepted here cannot fail later.
+ *
+ * Named fields rather than positional arguments: there are now two phrases and
+ * two answers about them, and a call site that transposed them would compile.
  */
-export function ambientSaveBlock(
-  wakeWord: string,
-  agentPubkey: string | null,
-  check: WakeWordCheck | null,
-  loadError: string | null,
-): AmbientSaveBlock {
-  if (loadError) {
+export function ambientSaveBlock(form: AmbientFormState): AmbientSaveBlock {
+  if (form.loadError) {
     return {
       reason: "load_error",
-      message: `Settings cannot be saved until the existing file is fixed: ${loadError}`,
+      message: `Settings cannot be saved until the existing file is fixed: ${form.loadError}`,
     };
   }
-  if (wakeWord.trim().length === 0) {
+  if (form.wakeWord.trim().length === 0) {
     return { reason: "wake_word", message: "Choose a wake word." };
   }
   // Fail closed while a check is in flight: no answer is not a pass.
-  if (!check) {
+  if (!form.wakeWordCheck) {
     return { reason: "wake_word", message: "Checking the wake word…" };
   }
-  if (!check.valid) {
+  if (!form.wakeWordCheck.valid) {
     return {
       reason: "wake_word",
-      message: check.message ?? "That wake word cannot be used.",
+      message: form.wakeWordCheck.message ?? "That wake word cannot be used.",
     };
   }
-  if (!agentPubkey) {
+  // An empty stop phrase is the default and is never checked — "no second
+  // keyword" is a valid configuration, not an unfinished one.
+  if (form.stopPhrase.trim().length > 0) {
+    if (!form.stopPhraseCheck) {
+      return { reason: "stop_phrase", message: "Checking the stop phrase…" };
+    }
+    if (!form.stopPhraseCheck.valid) {
+      return {
+        reason: "stop_phrase",
+        message:
+          form.stopPhraseCheck.message ?? "That stop phrase cannot be used.",
+      };
+    }
+  }
+  if (!form.agentPubkey) {
     return { reason: "agent", message: "Choose an agent to talk to." };
   }
   return null;

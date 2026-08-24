@@ -251,6 +251,19 @@ export const getAmbientModelStatus = () =>
 export const checkAmbientWakeWord = (wakeWord: string) =>
   invoke<WakeWordCheck>("check_ambient_wake_word", { wakeWord });
 
+/**
+ * Ask whether a stop phrase can be armed, before it is saved.
+ *
+ * The wake word's check with the stop phrase's two extra rules: an empty
+ * phrase is valid (it is how the feature is switched off), and the phrase must
+ * differ from `wakeWord`. Both are the native side's, so what this reports is
+ * what the save door enforces — the field used to be unchecked, and a phrase
+ * the model could not encode saved cleanly and then took the whole session
+ * down at arm time.
+ */
+export const checkAmbientStopPhrase = (stopPhrase: string, wakeWord: string) =>
+  invoke<WakeWordCheck>("check_ambient_stop_phrase", { stopPhrase, wakeWord });
+
 export const checkAmbientHotstart = () =>
   invoke<AmbientVoiceStatusReport>("check_ambient_hotstart");
 

@@ -21,6 +21,7 @@ import { Switch } from "@/shared/ui/switch";
 import {
   AMBIENT_STATE_CHANGED_EVENT,
   ambientReportLabel,
+  checkAmbientStopPhrase,
   checkAmbientWakeWord,
   getAmbientModelStatus,
   getAmbientVoiceSettings,
@@ -59,6 +60,9 @@ import { AmbientSpeechBackendRow } from "./AmbientSpeechBackendRow";
 
 const WAKE_WORD_CHECK_DEBOUNCE_MS = 250;
 
+/** The stop phrase is checked on the same cadence, and for the same reason. */
+const STOP_PHRASE_CHECK_DEBOUNCE_MS = 250;
+
 /**
  * Settings section for the `ambientVoice` preview feature.
  *
@@ -85,6 +89,8 @@ export function AmbientVoiceSettingsCard() {
   );
   const [agentPubkey, setAgentPubkey] = React.useState<string | null>(null);
   const [check, setCheck] = React.useState<WakeWordCheck | null>(null);
+  const [stopPhraseCheck, setStopPhraseCheck] =
+    React.useState<WakeWordCheck | null>(null);
   const [error, setError] = React.useState<string | null>(null);
   const [saving, setSaving] = React.useState(false);
   const { inputDevices, outputDevices } = useAmbientAudioDevices();
@@ -234,12 +240,46 @@ export function AmbientVoiceSettingsCard() {
     };
   }, [wakeWord]);
 
-  const block = ambientSaveBlock(
+  // ── Stop-phrase validation, debounced ────────────────────────────────────
+  //
+  // The same gate as the wake word, because it is armed on the same spotter: a
+  // phrase the model cannot encode used to save cleanly and then take the whole
+  // session down when it next started. It depends on the wake word too — the
+  // two must differ — so a wake-word edit re-runs it.
+  React.useEffect(() => {
+    setStopPhraseCheck(null);
+    if (stopPhrase.trim().length === 0) return;
+    let disposed = false;
+    const id = window.setTimeout(() => {
+      void checkAmbientStopPhrase(stopPhrase, wakeWord)
+        .then((next) => {
+          if (!disposed) setStopPhraseCheck(next);
+        })
+        .catch(() => {
+          if (!disposed) {
+            setStopPhraseCheck({
+              valid: false,
+              message: "The stop phrase could not be checked.",
+              tokens: null,
+              checkedAgainstModel: false,
+            });
+          }
+        });
+    }, STOP_PHRASE_CHECK_DEBOUNCE_MS);
+    return () => {
+      disposed = true;
+      window.clearTimeout(id);
+    };
+  }, [stopPhrase, wakeWord]);
+
+  const block = ambientSaveBlock({
     wakeWord,
+    wakeWordCheck: check,
+    stopPhrase,
+    stopPhraseCheck,
     agentPubkey,
-    check,
-    report?.loadError ?? null,
-  );
+    loadError: report?.loadError ?? null,
+  });
 
   const persist = React.useCallback(async (next: AmbientVoiceSettings) => {
     setSaving(true);
@@ -277,15 +317,40 @@ export function AmbientVoiceSettingsCard() {
     void persist({ ...settings, silenceHoldMs: next });
   }, [persist, settings, silenceHoldMs]);
 
-  const saveStopPhrase = React.useCallback(() => {
+  const saveStopPhrase = React.useCallback(async () => {
     // Blank means "no stop phrase", which the native side reads from `null`
     // as readily as from an empty string — but `null` is what an untouched
     // install has, so writing it back keeps the file identical either way.
     const trimmed = stopPhrase.trim();
     const next = trimmed.length === 0 ? null : trimmed;
     if (!settings || (settings.stopPhrase ?? null) === next) return;
+    // Clearing the field is always allowed: emptying it is how the second
+    // keyword is switched off, and a phrase already on disk must stay
+    // removable even after it stopped being valid — a wake word edited to
+    // match it, say.
+    if (next === null) {
+      void persist({ ...settings, stopPhrase: null });
+      return;
+    }
+    // A phrase is checked before it is written. Asked here and not only in the
+    // debounced effect because leaving the field is the commit, and someone
+    // who types and tabs away inside the debounce window would otherwise have
+    // a perfectly good phrase silently dropped.
+    let verdict = stopPhraseCheck;
+    if (!verdict) {
+      verdict = await checkAmbientStopPhrase(stopPhrase, wakeWord).catch(
+        (): WakeWordCheck => ({
+          valid: false,
+          message: "The stop phrase could not be checked.",
+          tokens: null,
+          checkedAgainstModel: false,
+        }),
+      );
+      setStopPhraseCheck(verdict);
+    }
+    if (!verdict.valid) return;
     void persist({ ...settings, stopPhrase: next });
-  }, [persist, settings, stopPhrase]);
+  }, [persist, settings, stopPhrase, stopPhraseCheck, wakeWord]);
 
   const selectedAgent = agents.find((agent) => agent.pubkey === agentPubkey);
   const audioFlowLine = ambientAudioFlowLine(report);
@@ -450,12 +515,24 @@ export function AmbientVoiceSettingsCard() {
             aria-label="Stop phrase"
             className="max-w-56"
             data-testid="ambient-stop-phrase"
-            onBlur={saveStopPhrase}
+            onBlur={() => void saveStopPhrase()}
             onChange={(event) => setStopPhrase(event.target.value)}
             placeholder="that's all"
             value={stopPhrase}
           />
         </SettingsOptionRow>
+
+        {stopPhraseCheck &&
+        !stopPhraseCheck.valid &&
+        stopPhraseCheck.message ? (
+          <p
+            className="px-4 pb-3 text-sm text-destructive"
+            data-testid="ambient-stop-phrase-error"
+            role="alert"
+          >
+            {stopPhraseCheck.message}
+          </p>
+        ) : null}
 
         <DevicePickerRow
           devices={inputDevices.map((device) => ({
