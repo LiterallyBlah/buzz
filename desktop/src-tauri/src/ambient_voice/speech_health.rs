@@ -132,6 +132,11 @@ impl SpeechHealth {
         self.tts.configure(tts_on_a_server);
     }
 
+    /// Both roles as of right now, for one status report.
+    ///
+    /// A snapshot rather than a handle: the report is serialised to the
+    /// frontend, and a reader that could see one role move while it read the
+    /// other would put two different moments on the same pill.
     pub fn report(&self) -> SpeechBackendHealthReport {
         SpeechBackendHealthReport {
             stt: self.stt.snapshot(),

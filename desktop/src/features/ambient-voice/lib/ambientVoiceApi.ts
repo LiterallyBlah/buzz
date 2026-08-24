@@ -103,7 +103,17 @@ export type AmbientVoiceStatusReport = {
   audioStale: boolean;
   /** Batches the native worker has taken off its queue this session. */
   audioBatchesReceived: number;
-  /** Since the last batch reached the worker, or since the session started. */
+  /**
+   * How long the native worker has been free to receive audio and received
+   * none — since the last batch, or since the session started when none ever
+   * arrived.
+   *
+   * Not wall-clock time since the last batch. The worker is one loop, and time
+   * it spends inside a transcription is excluded, because during it the worker
+   * is not reading its queue at all: measured naively, one utterance through a
+   * speech server read as five seconds of silence and the watchdog rebuilt the
+   * capture pipeline against a microphone that was working perfectly.
+   */
   msSinceLastAudio: number | null;
   /** What this webview last reported pushing. `null` until it reports. */
   webviewCapture: AmbientWebviewCapture | null;

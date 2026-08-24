@@ -151,8 +151,9 @@ impl StatusSink {
 ///
 /// The worker is a single loop: while it is decoding an utterance it is not
 /// draining its audio queue, and with speech-to-text pointed at a server that
-/// decode is a network round trip which may take up to `TRANSCRIBE_TIMEOUT`
-/// (ten seconds) before the local fallback even starts. Measured naively, an
+/// decode is a network round trip which runs to the budget
+/// `super::speech_http` gives it — ten seconds for a short utterance and longer
+/// for a long one — before the local fallback even starts. Measured naively, an
 /// ordinary utterance through a slow server therefore reads as five seconds of
 /// nothing arriving — so the pill claimed "No audio arriving from the
 /// microphone" and the webview's watchdog rebuilt the whole capture pipeline,
