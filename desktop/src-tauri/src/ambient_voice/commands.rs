@@ -364,9 +364,14 @@ pub fn check_ambient_stop_phrase(
 ///
 /// Checking the typed one alone therefore answered "valid" for a phrase the very
 /// next save refused, with an error about a wake word that was no longer on the
-/// screen. Both are asked now, and a clash with the stored one says which wake
-/// word it clashed with and what to do about it, because that one cannot be read
-/// off the field the user is looking at.
+/// screen. Both are asked now, and a clash with the stored one names it, because
+/// it is the one thing here that cannot be read off the screen.
+///
+/// Naming it is as far as this goes. The settings card gates every field's save
+/// on one verdict, so this message is also the line telling the user why nothing
+/// else is saving — including the wake word, which is what would resolve the
+/// clash. A message from here that told them to go and save it would be the
+/// reason they could not.
 pub(super) fn stop_phrase_check(
     stop_phrase: &str,
     typed: &str,
@@ -397,7 +402,7 @@ pub(super) fn stop_phrase_check(
         };
         if let Err(message) = settings::validate_stop_phrase_against(&stored, tokenizer) {
             return refused(format!(
-                "{message} — \"{saved}\" is still the saved wake word, so save the wake word first."
+                "{message}, and \"{saved}\" is still the saved wake word"
             ));
         }
     }
