@@ -212,6 +212,7 @@ fn ends_with_sentence_punctuation(said: &str) -> bool {
 fn flatten_inline(line: &str) -> String {
     let chars: Vec<char> = line.chars().collect();
     let links = link_spans(&chars);
+    let emphasis = emphasis_pairs(&chars);
     let mut out = String::with_capacity(line.len());
     // Labels being walked through, innermost last: where each one ends, and
     // where to carry on once it has.
@@ -285,8 +286,9 @@ fn flatten_inline(line: &str) -> String {
                     i += 1;
                 }
             },
-            '*' | '~' | '_' => match emphasis_run(&chars, i) {
-                Some(next) => i = next,
+            '*' | '~' | '_' => match emphasis.at(i) {
+                // Both ends of a pair go together, or neither does.
+                Some(run) => i += run,
                 None => {
                     out.push(chars[i]);
                     i += 1;
@@ -440,32 +442,82 @@ fn autolink(chars: &[char], start: usize) -> Option<(String, usize)> {
     is_url.then(|| (inner, start + close + 2))
 }
 
-/// Where an emphasis run at `start` ends, or `None` when it is not emphasis.
+/// The emphasis runs on a line that actually pair up, by the index each starts
+/// at and how many characters long it is.
+struct EmphasisPairs(Vec<Option<usize>>);
+
+impl EmphasisPairs {
+    fn at(&self, index: usize) -> Option<usize> {
+        self.0.get(index).copied().flatten()
+    }
+}
+
+/// Match every emphasis run on the line against a closing one.
 ///
-/// The test is flanking, not a full CommonMark pass: a run with whitespace on
-/// both sides is arithmetic or a drawing ("2 * 3"), and an underscore between
-/// two word characters belongs to the word (`snake_case`). Everything else at
-/// a word edge is a mark someone put there for an eye.
-fn emphasis_run(chars: &[char], start: usize) -> Option<usize> {
-    let marker = chars[start];
-    let run = chars[start..].iter().take_while(|c| **c == marker).count();
-    if run > MAX_EMPHASIS_RUN {
-        return None;
+/// A mark is only a mark if something closes it. `*` before a word is emphasis
+/// when a later `*` after a word ends it, and otherwise it is a glob or a
+/// multiplication sign the author typed — `rm *.rs` and `5*5` were being spoken
+/// as "rm .rs" and "55", which is the flattener's own "keeps every word" rule
+/// broken by the flattener.
+///
+/// The flanking test decides which end a run *could* be, and is deliberately
+/// not a full CommonMark pass: a run with whitespace on both sides is
+/// arithmetic or a drawing ("2 * 3"), and an underscore between two word
+/// characters belongs to the word (`snake_case`). Pairing is then the ordinary
+/// stack: a run that can close takes the nearest unclosed opener of its own
+/// marker, and anything still unclosed at the end of the line is text.
+fn emphasis_pairs(chars: &[char]) -> EmphasisPairs {
+    if !chars.iter().any(|c| matches!(c, '*' | '~' | '_')) {
+        return EmphasisPairs(Vec::new());
     }
-    let before = start.checked_sub(1).and_then(|i| chars.get(i)).copied();
-    let after = chars.get(start + run).copied();
-    let opens = after.is_some_and(|c| !c.is_whitespace());
-    let closes = before.is_some_and(|c| !c.is_whitespace());
-    if !opens && !closes {
-        return None;
+    let mut pairs: Vec<Option<usize>> = vec![None; chars.len()];
+    // One stack per marker: `*` never closes a `~`.
+    let mut open: Vec<(char, usize, usize)> = Vec::new();
+    let mut i = 0;
+    while i < chars.len() {
+        let marker = chars[i];
+        // An escaped mark is a character, not a mark, and closes nothing.
+        if marker == '\\' {
+            i += 2;
+            continue;
+        }
+        if !matches!(marker, '*' | '~' | '_') {
+            i += 1;
+            continue;
+        }
+        let run = chars[i..].iter().take_while(|c| **c == marker).count();
+        // Longer than any emphasis CommonMark gives meaning to: it is drawing.
+        if run > MAX_EMPHASIS_RUN {
+            i += run;
+            continue;
+        }
+        let before = i.checked_sub(1).and_then(|at| chars.get(at)).copied();
+        let after = chars.get(i + run).copied();
+        let opens = after.is_some_and(|c| !c.is_whitespace());
+        let closes = before.is_some_and(|c| !c.is_whitespace());
+        let intraword_underscore = marker == '_'
+            && before.is_some_and(char::is_alphanumeric)
+            && after.is_some_and(char::is_alphanumeric);
+        if !intraword_underscore {
+            if let Some(position) = closes
+                .then(|| {
+                    open.iter()
+                        .rposition(|(open_marker, _, _)| *open_marker == marker)
+                })
+                .flatten()
+            {
+                let (_, start, open_run) = open.remove(position);
+                pairs[start] = Some(open_run);
+                pairs[i] = Some(run);
+                // Anything left open inside the pair was never closed.
+                open.truncate(position);
+            } else if opens {
+                open.push((marker, i, run));
+            }
+        }
+        i += run;
     }
-    if marker == '_'
-        && before.is_some_and(char::is_alphanumeric)
-        && after.is_some_and(char::is_alphanumeric)
-    {
-        return None;
-    }
-    Some(start + run)
+    EmphasisPairs(pairs)
 }
 
 /// One space between words, none at the ends. Removing a mark leaves a gap.

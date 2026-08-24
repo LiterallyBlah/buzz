@@ -173,6 +173,50 @@ fn nothing_a_reply_can_contain_makes_this_lose_a_word() {
     }
 }
 
+#[test]
+fn a_star_that_closes_nothing_is_a_character_and_not_a_mark() {
+    // A mark is only a mark if something closes it. These four are what an
+    // agent writes about files and arithmetic, and every one of them was being
+    // spoken as less than it said: "rm .rs", "src/.rs", "55", "23".
+    for verbatim in [
+        "run rm *.rs and ls *.md now",
+        "src/*.rs matches",
+        "5*5 = 25",
+        "2*3 is 6",
+    ] {
+        assert_eq!(flatten_markdown_for_speech(verbatim), verbatim);
+    }
+
+    // Unpaired underscores and tildes go the same way, and so does a run too
+    // long to be emphasis at all.
+    for verbatim in [
+        "the flag is _dry_run and the other is _x",
+        "roughly ~50 people",
+        "a ** b and c ~~~~ d",
+    ] {
+        assert_eq!(flatten_markdown_for_speech(verbatim), verbatim);
+    }
+}
+
+#[test]
+fn emphasis_that_does_close_is_still_stripped() {
+    // The control for the rule above: the marks a writer actually paired must
+    // still come off, or the fix would have traded one wrong reading for
+    // another.
+    assert_eq!(
+        flatten_markdown_for_speech("The file *matters* and so does **this**."),
+        "The file matters and so does this."
+    );
+    assert_eq!(
+        flatten_markdown_for_speech("Delete *.rs but keep *this* one."),
+        "Delete *.rs but keep this one."
+    );
+    assert_eq!(
+        flatten_markdown_for_speech("~~gone~~, _here_, and 2 * 3."),
+        "gone, here, and 2 * 3."
+    );
+}
+
 /// Run `body` on a thread with a stack far smaller than any the app gives this
 /// code, so that recursion over a reply's own structure fails the test rather
 /// than passing on whatever headroom the harness happened to have.
