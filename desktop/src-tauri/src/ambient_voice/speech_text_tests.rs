@@ -450,6 +450,25 @@ fn brackets_that_open_nothing_are_spoken_rather_than_swallowed() {
 }
 
 #[test]
+fn an_address_as_long_as_the_bound_names_is_still_an_address() {
+    // The bound is on the address; the brackets around it are not part of it.
+    // One character short of what the constant is called was where the line
+    // between "a link" and "a bracket someone forgot to close" actually fell.
+    let longest = "a".repeat(MAX_LINK_ADDRESS_CHARS);
+    assert_eq!(
+        flatten_markdown_for_speech(&format!("See [the docs]({longest}).")),
+        "See the docs."
+    );
+    let one_over = "a".repeat(MAX_LINK_ADDRESS_CHARS + 1);
+    let past_the_bound = format!("See [the docs]({one_over}).");
+    assert_eq!(
+        flatten_markdown_for_speech(&past_the_bound),
+        past_the_bound,
+        "past the bound the bracket is spoken rather than swallowed"
+    );
+}
+
+#[test]
 fn an_empty_or_marks_only_reply_flattens_to_nothing_rather_than_to_noise() {
     for nothing in ["", "   ", "\n\n", "---", "**", "> "] {
         assert_eq!(flatten_markdown_for_speech(nothing), "", "{nothing:?}");

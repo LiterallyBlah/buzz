@@ -488,7 +488,10 @@ fn address_end(chars: &[char], after: usize) -> Option<usize> {
 fn skip_balanced(chars: &[char], start: usize, open: char, close: char) -> Option<usize> {
     let mut depth = 0usize;
     let mut i = start;
-    let limit = start.saturating_add(MAX_LINK_ADDRESS_CHARS);
+    // `start` is the opening bracket and the closing one may sit on the limit
+    // itself, so what the bound allows between them is exactly the
+    // [`MAX_LINK_ADDRESS_CHARS`] the name promises rather than one less.
+    let limit = start.saturating_add(MAX_LINK_ADDRESS_CHARS + 1);
     while i <= limit {
         let c = *chars.get(i)?;
         if c == '\\' {
