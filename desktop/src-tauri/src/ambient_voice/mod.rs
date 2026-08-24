@@ -22,6 +22,7 @@
 //! | [`publish`] | egress boundary 9: kind:9 transcripts and kind:48106 |
 //! | [`models`] | wake-word model access over the shared download manager |
 //! | [`speech_http`] | the wire contract for a role that runs on a server |
+//! | [`speech_text`] | Markdown flattened to what a voice should read |
 //! | [`speech_wav`] | PCM16 WAV coding for that wire |
 //! | [`status`] | what the listening indicator shows |
 //! | [`transcriber`] | which recogniser an utterance goes to |
@@ -53,6 +54,7 @@ pub mod publish;
 pub mod session;
 pub mod settings;
 pub mod speech_http;
+pub mod speech_text;
 pub mod speech_wav;
 pub mod status;
 pub mod transcriber;

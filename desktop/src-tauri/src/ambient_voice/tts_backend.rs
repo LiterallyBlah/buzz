@@ -19,6 +19,7 @@ use super::http_tts::HttpTtsPipeline;
 use super::models;
 use super::settings::AmbientVoiceSettings;
 use super::speech_http::SpeechEndpoint;
+use super::speech_text::flatten_markdown_for_speech;
 
 /// The speech pipeline a running session holds.
 ///
@@ -36,7 +37,23 @@ pub enum AmbientTts {
 
 impl AmbientTts {
     /// Queue a reply to be spoken.
+    ///
+    /// This is where the reply stops being Markdown. Agent replies are written
+    /// as Markdown and the message pane renders them as Markdown, but a voice
+    /// reads `**ready**` as "star star ready star star" and a fenced block as
+    /// its backticks — so the text is flattened here, at the one door both
+    /// pipelines go through, and nowhere on the path that publishes or shows
+    /// it. Doing it in each pipeline instead would leave the next backend to
+    /// remember; doing it in the caller would leave the flattening one refactor
+    /// away from the thing it protects.
     pub fn speak(&self, text: String) -> Result<(), String> {
+        let text = flatten_markdown_for_speech(&text);
+        if text.is_empty() {
+            // A reply that was nothing but marks — a bare rule, an empty code
+            // fence. There is nothing to say, and queueing an empty string
+            // would make a server synthesise silence for it.
+            return Ok(());
+        }
         match self {
             Self::Local(pipeline) => pipeline.speak(text),
             Self::Http(pipeline) => pipeline.speak(text),
@@ -155,3 +172,7 @@ async fn start_local_tts(
         }
     }
 }
+
+#[cfg(test)]
+#[path = "tts_backend_tests.rs"]
+mod tts_backend_tests;

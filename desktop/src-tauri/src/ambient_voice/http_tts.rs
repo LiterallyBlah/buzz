@@ -143,7 +143,13 @@ impl HttpTtsPipeline {
         )
     }
 
-    fn with_player(
+    /// The same pipeline with the audio device replaced.
+    ///
+    /// Visible to the rest of the feature, not just to this file's tests, so
+    /// `tts_backend`'s tests can drive a real `AmbientTts::Http` against a
+    /// loopback server without a sound card — the alternative is asserting
+    /// that the door flattens by reading the door.
+    pub(super) fn with_player(
         endpoint: SpeechEndpoint,
         player_factory: PlayerFactory,
         tts_active: Arc<AtomicBool>,
