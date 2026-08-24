@@ -175,6 +175,87 @@ fn nothing_a_reply_can_contain_makes_this_lose_a_word() {
 }
 
 #[test]
+fn brackets_that_cross_rather_than_nest_keep_the_words_they_run_through() {
+    // `[a [b](c] d)` is a reply whose brackets cross: the inner link's address
+    // `(c] d)` contains the `]` that closes the outer label. Stepping into the
+    // inner label and carrying on past its address jumped over the outer
+    // label's close and everything behind it, so " d)" was never spoken —
+    // three words in and the flattener is losing words, which is the one thing
+    // it must not do.
+    //
+    // Spans that cross are not a link anyone wrote, so the inner `[` is spoken
+    // as itself: the same answer a bracket that never closes already gets.
+    assert_eq!(flatten_markdown_for_speech("[a [b](c] d)"), "a [b](c d)");
+    assert_eq!(
+        flatten_markdown_for_speech("[why [see](there] and the rest of it)"),
+        "why [see](there and the rest of it)"
+    );
+
+    // The control: labels that nest are still labels, and the address of a
+    // nested one is still never spoken.
+    assert_eq!(
+        flatten_markdown_for_speech(
+            "[the [inner](https://example.test/in) label](https://example.test/out)"
+        ),
+        "the inner label"
+    );
+}
+
+#[test]
+fn no_arrangement_of_brackets_a_reply_can_contain_loses_a_word() {
+    // The case above is one shape of a class — brackets and parentheses a
+    // reply can arrange any way at all — so the class is walked rather than
+    // sampled: every string up to six characters over both brackets, both
+    // parentheses, a space and a word.
+    //
+    // A word inside `(…)` may be a link's address, and an address is the one
+    // thing this flattener drops on purpose, so the expectation is about the
+    // words outside them. `][` is left out for the same reason: it is the
+    // other way an address begins, and its contents are not parenthesised.
+    const ALPHABET: [char; 6] = ['[', ']', '(', ')', ' ', 'w'];
+    const LONGEST: u32 = 6;
+
+    /// Words no arrangement of these characters could read as an address.
+    fn words_outside_parentheses(input: &str) -> usize {
+        let mut depth = 0usize;
+        let mut outside = 0usize;
+        for c in input.chars() {
+            match c {
+                '(' => depth += 1,
+                ')' => depth = depth.saturating_sub(1),
+                'w' if depth == 0 => outside += 1,
+                _ => {}
+            }
+        }
+        outside
+    }
+
+    let mut checked = 0usize;
+    for length in 1..=LONGEST {
+        for combination in 0..ALPHABET.len().pow(length) {
+            let mut rest = combination;
+            let input: String = (0..length)
+                .map(|_| {
+                    let c = ALPHABET[rest % ALPHABET.len()];
+                    rest /= ALPHABET.len();
+                    c
+                })
+                .collect();
+            if input.contains("][") {
+                continue;
+            }
+            let spoken = flatten_markdown_for_speech(&input);
+            assert!(
+                spoken.matches('w').count() >= words_outside_parentheses(&input),
+                "{input:?} was spoken as {spoken:?}"
+            );
+            checked += 1;
+        }
+    }
+    assert!(checked > 40_000, "only {checked} arrangements were walked");
+}
+
+#[test]
 fn an_unfinished_code_block_is_said_to_be_unfinished() {
     // A fence that never closes holds back everything after it, which is
     // CommonMark's own reading and stays. What must not happen is it sounding

@@ -310,12 +310,12 @@ fn flatten_inline(line: &str) -> String {
                 // An image speaks its alt text — written for someone who
                 // cannot see it, which is exactly this listener. The `[` that
                 // follows is handled by the arm below on the next pass.
-                if links.at(i + 1).is_none() {
+                if nested_label_at(&links, &open_labels, i + 1).is_none() {
                     out.push('!');
                 }
                 i += 1;
             }
-            '[' => match links.at(i) {
+            '[' => match nested_label_at(&links, &open_labels, i) {
                 // Step into the label and keep going: its text is inline
                 // content like any other, and the address is skipped when the
                 // closing bracket is reached.
@@ -357,6 +357,25 @@ fn flatten_inline(line: &str) -> String {
     }
 
     collapse_spaces(&out)
+}
+
+/// The label opening at `at`, when stepping into it would stay inside the
+/// label already open around it.
+///
+/// Labels nest or they are not labels. `[a [b](c] d)` crosses them: the inner
+/// link's address is read as `(c] d)`, which contains the `]` that closes the
+/// outer label, so walking into the inner label and carrying on past its
+/// address stepped over that close and over every word behind it — "a b", and
+/// " d)" was not spoken at all. A reply that crosses its brackets is not a link
+/// anyone wrote, so the inner `[` is left to be spoken as itself, which is the
+/// same answer this gives a bracket that never closes and the safe direction to
+/// fail in: the marks are heard, the words are not lost.
+fn nested_label_at(links: &LinkSpans, open_labels: &[LabelSpan], at: usize) -> Option<LabelSpan> {
+    let label = links.at(at)?;
+    match open_labels.last() {
+        Some(enclosing) if label.resume > enclosing.close => None,
+        _ => Some(label),
+    }
 }
 
 /// The contents of a backtick code span starting at `start`, and where it ends.
