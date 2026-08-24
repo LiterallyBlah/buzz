@@ -866,3 +866,102 @@ fn the_first_binding_an_install_ever_saves_is_written_rather_than_dropped() {
     let on_disk = load_from_path_with(&path, Some(&tokenizer)).expect("reload");
     assert_eq!(on_disk.wake_bindings, vec![rebound("okay hermes")]);
 }
+
+/// The whole-object write, driven the way `set_ambient_voice_settings` drives it.
+///
+/// That command merges the client payload over what the runtime holds, applies
+/// the indicator guard and saves; adoption and reconciliation follow, need a
+/// running Tauri app, and touch no file. The three steps a file can be asked
+/// about are *called* here rather than restated — a test that re-implemented
+/// the merge would go on passing with the merge itself broken, which is the
+/// one thing it exists to catch.
+fn full_settings_save(
+    path: &Path,
+    current: &AmbientVoiceSettings,
+    client: AmbientVoiceSettings,
+    tokenizer: &WakeWordTokenizer,
+) -> Result<(), String> {
+    use crate::ambient_voice::commands::{keep_stored_indicator_position, merge_client_settings};
+
+    let next = keep_stored_indicator_position(
+        merge_client_settings(current, client),
+        current.indicator_position,
+    );
+    save_to_path_with(path, &next, Some(tokenizer))
+}
+
+#[test]
+fn a_stale_full_settings_save_cannot_undo_a_wake_word_saved_beside_it() {
+    // Two doors write this file, and the reviewer's reproducer runs them in the
+    // order a user produces without trying: stored is "hey hermes" bound with
+    // "buzz stop" as the stop phrase; the user makes "buzz stop" the wake word,
+    // which the binding door writes (dropping the phrase it now clashes with);
+    // and before the card has adopted what came back, they clear the stop
+    // phrase — which posts the WHOLE settings object the card loaded at mount,
+    // stale binding and all.
+    //
+    // The binding in that payload is never an edit: `set_ambient_wake_binding`
+    // is the only door the wake word and the agent are ever changed through.
+    // Passing it through therefore put "hey hermes" back over the wake word the
+    // user had just saved, in the file the next launch arms from, with the card
+    // showing neither the write nor the loss.
+    let tokenizer = fixture_tokenizer();
+    // An M2 binding this build never renders, to prove the merge holds the
+    // stored list rather than a first row it reconstructed.
+    let second = WakeBinding {
+        wake_word: "good morning buzz".to_string(),
+        ..binding()
+    };
+    let seeded = AmbientVoiceSettings {
+        wake_bindings: vec![binding(), second.clone()],
+        ..stored_settings(Some("buzz stop"))
+    };
+    let (_dir, path) = stored_file(&seeded);
+
+    // Door one: the wake word, on its own. It drops the clashing stop phrase.
+    let after_binding = patch_primary_binding(&path, rebound("buzz stop"), Some(&tokenizer))
+        .expect("the binding door refused the wake word");
+
+    // Door two: the stop-phrase clear, carrying the card's mount-time copy —
+    // the old binding, the old mute, the old everything.
+    full_settings_save(
+        &path,
+        &after_binding,
+        AmbientVoiceSettings {
+            stop_phrase: None,
+            ..seeded.clone()
+        },
+        &tokenizer,
+    )
+    .expect("the full-settings write was refused");
+
+    let on_disk = load_from_path_with(&path, Some(&tokenizer)).expect("reload");
+    assert_eq!(
+        on_disk.primary_binding().map(|b| b.wake_word.as_str()),
+        Some("buzz stop"),
+        "a stale full-settings save rolled the wake word back: {on_disk:?}"
+    );
+    // In the bytes, because it is the file and not this process that the next
+    // launch arms the spotter from.
+    let value: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).expect("read")).expect("json");
+    assert_eq!(value["wakeBindings"][0]["wakeWord"], "buzz stop");
+
+    // The client's own edit still landed — holding the binding back must not
+    // cost the user the field they were actually changing.
+    assert!(
+        on_disk.stop_phrase.is_none(),
+        "the stop-phrase clear did not reach the file: {on_disk:?}"
+    );
+    // And nothing else moved: the M2 binding is still there, and every field
+    // the payload merely carried reads as it was seeded.
+    assert_eq!(
+        on_disk,
+        AmbientVoiceSettings {
+            wake_bindings: vec![rebound("buzz stop"), second],
+            stop_phrase: None,
+            ..seeded
+        },
+        "a full-settings write moved a field that was not the client's edit"
+    );
+}

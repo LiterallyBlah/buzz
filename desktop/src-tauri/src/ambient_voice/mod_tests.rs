@@ -164,12 +164,21 @@ fn a_settings_save_cannot_flip_mute_or_enablement() {
     // unmuting from the indicator never stuck, and a save from an open
     // settings page could silently re-open the microphone after the user had
     // switched the feature off.
-    let current = AmbientVoiceSettings {
+    //
+    // The wake binding is held back for the same reason and was not, which is
+    // the rollback `a_stale_full_settings_save_cannot_undo_a_wake_word_saved_beside_it`
+    // pins against the file. The two wake words below differ on purpose: with
+    // the same phrase on both sides this assertion passes whichever object the
+    // merge took it from, and proves nothing.
+    let mut current = AmbientVoiceSettings {
         enabled: true,
         muted: false,
         ..bound(true)
     };
-    // What a card mounted before the user unmuted would send back.
+    // What the user just saved through the binding's own save door.
+    current.wake_bindings[0].wake_word = "okay hermes".to_string();
+    // What a card mounted before the user unmuted — and before that binding
+    // write — would send back.
     let stale = AmbientVoiceSettings {
         enabled: false,
         muted: true,
@@ -188,9 +197,12 @@ fn a_settings_save_cannot_flip_mute_or_enablement() {
         merged.enabled,
         "a stale save re-asserted enablement: {merged:?} (current {current:?})"
     );
-    // Everything else in the payload is still the client's to set.
+    assert_eq!(
+        merged.wake_bindings, current.wake_bindings,
+        "a stale save carried a wake binding back: {merged:?} (current {current:?})"
+    );
+    // Everything that has no door of its own is still the client's to set.
     assert_eq!(merged.input_device_id.as_deref(), Some("mic-abc"));
-    assert_eq!(merged.wake_bindings, stale.wake_bindings);
     assert_eq!(merged.version, settings::CURRENT_VERSION);
 
     // And the mirror case: a card that mounted while unmuted and enabled must

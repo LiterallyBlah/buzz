@@ -113,6 +113,17 @@ pub fn get_ambient_voice_settings(
 /// (`set_ambient_voice_muted`, `set_ambient_voice_enabled`); the settings card
 /// holds a copy from whenever it mounted, so a later save from it must not be
 /// able to re-assert those two fields.
+///
+/// The wake bindings are held back for exactly that reason, and letting them
+/// through was a silent data rollback. [`set_ambient_wake_binding`] is the
+/// binding's own save door and every mutation of it goes through there — the
+/// wake-word field's blur and the agent picker are the only two edits that
+/// exist, the first binding an install ever saves included — so a binding
+/// arriving on a whole-object write is never an edit. It is the snapshot the
+/// card loaded, and by the time a save of some *other* field carries it back
+/// (clearing the stop phrase, letting go of the silence slider) the binding
+/// door may already have written a newer one underneath it. Passing it through
+/// put the replaced wake word back, with nothing on screen to say so.
 pub(super) fn merge_client_settings(
     current: &AmbientVoiceSettings,
     incoming: AmbientVoiceSettings,
@@ -121,6 +132,7 @@ pub(super) fn merge_client_settings(
         version: settings::CURRENT_VERSION,
         muted: current.muted,
         enabled: current.enabled,
+        wake_bindings: current.wake_bindings.clone(),
         ..incoming
     }
 }
