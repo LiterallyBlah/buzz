@@ -9,7 +9,6 @@ import {
   mergeAgentOptions,
   modelStatusLabel,
   silenceHoldLabel,
-  withPrimaryBinding,
   SILENCE_HOLD_DEFAULT_MS,
   SILENCE_HOLD_MAX_MS,
   SILENCE_HOLD_MIN_MS,
@@ -155,35 +154,12 @@ test("a checked stop phrase saves alongside everything else", () => {
   );
 });
 
-test("editing the first binding preserves later ones", () => {
-  const settings = {
-    version: 1,
-    enabled: true,
-    muted: false,
-    wakeBindings: [
-      { wakeWord: "hey hermes", agentPubkey: AGENT, destination: null },
-      {
-        wakeWord: "hey archivist",
-        agentPubkey: "b".repeat(64),
-        destination: null,
-      },
-    ],
-    stt: { backend: "local", endpointUrl: null },
-    tts: { backend: "local", endpointUrl: null },
-    inputDeviceId: null,
-    outputDevice: null,
-  };
-  const next = withPrimaryBinding(settings, {
-    wakeWord: "good morning buzz",
-    agentPubkey: AGENT,
-    destination: null,
-  });
-  assert.equal(next.wakeBindings.length, 2);
-  assert.equal(next.wakeBindings[0].wakeWord, "good morning buzz");
-  assert.equal(next.wakeBindings[1].wakeWord, "hey archivist");
-  // Unrelated fields are carried through untouched.
-  assert.equal(next.enabled, true);
-});
+// "editing the first binding preserves later ones" lived here, over
+// `withPrimaryBinding`. The binding is no longer merged in the frontend at all
+// — `set_ambient_wake_binding` carries the binding alone and merges it into the
+// stored file natively — and the property it asserted is now pinned where the
+// merge happens, by `bindings_a_later_milestone_stored_survive_an_m1_wake_word_edit`
+// in `ambient_voice/settings_tests.rs`.
 
 test("the slider offers the range the native side accepts, and no more", () => {
   // These bounds are duplicated from `ambient_voice::utterance`, which clamps

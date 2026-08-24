@@ -1,10 +1,8 @@
 import {
   SPEECH_ROLE_NAMES,
   type AmbientModelStatus,
-  type AmbientVoiceSettings,
   type AmbientVoiceStatusReport,
   type ModelStatus,
-  type WakeBinding,
   type WakeWordCheck,
 } from "./ambientVoiceApi";
 import { truncatePubkey } from "@/shared/lib/pubkey";
@@ -137,16 +135,14 @@ export function ambientSaveBlock(form: AmbientFormState): AmbientSaveBlock {
   return null;
 }
 
-/** Build the settings payload from the form, preserving unrelated fields. */
-export function withPrimaryBinding(
-  settings: AmbientVoiceSettings,
-  binding: WakeBinding,
-): AmbientVoiceSettings {
-  // Replace the first binding and keep any extras a later milestone stored, so
-  // editing the M1 row never silently deletes M2 configuration.
-  const rest = settings.wakeBindings.slice(1);
-  return { ...settings, wakeBindings: [binding, ...rest] };
-}
+// The binding payload used to be built here, by splicing a wake binding into
+// the whole settings object the card had loaded and posting that back. That is
+// what made every other field's validity a condition of the wake word being
+// saved — the native save door re-validates what it is handed, so a stored stop
+// phrase clashing with the new wake word refused the write entire. The binding
+// now goes through `setAmbientWakeBinding`, which carries the binding alone and
+// leaves the merge (extras included) to the native side, where the stored file
+// is.
 
 // ── The pause that ends what you are saying ──────────────────────────────────
 //

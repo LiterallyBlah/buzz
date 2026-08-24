@@ -66,11 +66,17 @@ async function mountSettings(
     settings = SETTINGS,
     endpointCheck = READY_ENDPOINT,
     stopPhraseCheck = USABLE_STOP_PHRASE,
+    // The settings `set_ambient_wake_binding` answers with. The native side
+    // reads the stored file itself, so its answer is the file as it now reads —
+    // by default the stored settings carrying the binding it was handed. A test
+    // about the native side changing something else in that file (a stop phrase
+    // dropped for clashing with the new wake word) supplies its own.
+    bindingSaveSettings = null,
   } = {},
 ) {
   await withAmbientDom(
     {
-      invoke: (command) => {
+      invoke: (command, args) => {
         switch (command) {
           case "get_ambient_voice_settings":
             return settings;
@@ -95,6 +101,21 @@ async function mountSettings(
             return endpointCheck;
           case "set_ambient_voice_settings":
             return report;
+          case "set_ambient_wake_binding":
+            return {
+              settings: bindingSaveSettings ?? {
+                ...settings,
+                wakeBindings: [
+                  {
+                    wakeWord: args.wakeWord,
+                    agentPubkey: args.agentPubkey,
+                    destination: args.destination,
+                  },
+                  ...settings.wakeBindings.slice(1),
+                ],
+              },
+              status: report,
+            };
           default:
             throw new Error(`unexpected command: ${command}`);
         }
@@ -423,10 +444,11 @@ test("a stop phrase the model cannot encode is never written to disk", async () 
 });
 
 test("a refused stop phrase does not hold the wake word hostage", async () => {
-  // The binding save carries no stop phrase, and the native save door
-  // re-validates everything it is given — so a stop-phrase error may explain
-  // its own field, but a wake-word edit committed while one is showing must
-  // still be written.
+  // A stop-phrase error is about the other field. The wake word goes to its
+  // own native command carrying the binding and nothing else, so a phrase
+  // sitting in its refused state has nothing to refuse — where a whole-settings
+  // write would have handed the save door the stored phrase along with the new
+  // wake word and had the lot rejected.
   const refused = {
     valid: false,
     message: "Stop phrase: The wake-word model cannot hear: 7",
@@ -442,7 +464,9 @@ test("a refused stop phrase does not hold the wake word hostage", async () => {
       });
       // Let both debounced checks land: the wake word's (valid) and the
       // loaded stop phrase's (refused). Blur is the commit, and it must see
-      // the refusal on screen for this test to mean anything.
+      // the refusal on screen for this test to mean anything. The wait is a
+      // plain awaited timeout OUTSIDE `act`: wrapping it in `act(async …)`
+      // returns instantly and the debounce never elapses.
       const before = Date.now();
       await new Promise((resolve) => setTimeout(resolve, 500));
       await act(() => {});
@@ -459,17 +483,103 @@ test("a refused stop phrase does not hold the wake word hostage", async () => {
       });
 
       const saved = calls.filter(
-        (call) => call.command === "set_ambient_voice_settings",
+        (call) => call.command === "set_ambient_wake_binding",
       );
       assert.equal(saved.length, 1, "the wake word was never persisted");
+      // The binding fields, and only them: no settings object goes over this
+      // wire, so nothing else in the file is re-validated or re-written.
+      assert.deepEqual(saved[0].args, {
+        wakeWord: "okay hermes",
+        agentPubkey: "a".repeat(64),
+        destination: null,
+      });
       assert.equal(
-        saved[0].args.settings.wakeBindings[0].wakeWord,
-        "okay hermes",
+        calls.filter((call) => call.command === "set_ambient_voice_settings")
+          .length,
+        0,
+        "the wake word was still saved by re-posting the whole settings file",
       );
     },
     {
       settings: { ...SETTINGS, stopPhrase: "buzz 7" },
       stopPhraseCheck: refused,
+    },
+  );
+});
+
+test("a wake word equal to the stored stop phrase saves, and the phrase goes", async () => {
+  // The reviewer's reproducer, end to end. Stored: "hey hermes" bound, "buzz
+  // stop" as the stop phrase; the user types "buzz stop" as their wake word.
+  // Both fields cannot arm the same keyword, and the whole write used to be
+  // refused for it — so the wake word never persisted, and the field that
+  // would have resolved the clash was the one that could not be saved.
+  //
+  // The wake word is the primary control, so the phrase yields natively
+  // (`a_wake_word_that_clashes_with_the_stored_stop_phrase_still_saves` pins
+  // the file side). What this covers is the half only the card can: the answer
+  // is a readback, and the field showing a phrase that is no longer on disk
+  // must empty.
+  const clash = {
+    valid: false,
+    message: "The stop phrase must be different from the wake word",
+    tokens: null,
+    checkedAgainstModel: true,
+  };
+  await mountSettings(
+    READY_MODELS,
+    async ({ act, calls, testing, view }) => {
+      assert.equal(view.getByTestId("ambient-stop-phrase").value, "buzz stop");
+
+      const field = view.getByTestId("ambient-wake-word");
+      await act(() => {
+        testing.fireEvent.change(field, { target: { value: "buzz stop" } });
+      });
+      const before = Date.now();
+      await new Promise((resolve) => setTimeout(resolve, 500));
+      await act(() => {});
+      assert.ok(
+        Date.now() - before >= 450,
+        `the debounce wait was skipped (${Date.now() - before}ms)`,
+      );
+      assert.match(
+        view.getByTestId("ambient-stop-phrase-error").textContent,
+        /different from the wake word/,
+      );
+
+      await act(() => {
+        testing.fireEvent.blur(field);
+      });
+
+      const saved = calls.filter(
+        (call) => call.command === "set_ambient_wake_binding",
+      );
+      assert.equal(saved.length, 1, "the clash blocked the wake word again");
+      assert.deepEqual(saved[0].args, {
+        wakeWord: "buzz stop",
+        agentPubkey: "a".repeat(64),
+        destination: null,
+      });
+      // The readback, on screen: the stop phrase the native side dropped is
+      // gone from the field, and with it the error explaining the clash.
+      assert.equal(view.getByTestId("ambient-stop-phrase").value, "");
+      assert.equal(view.queryByTestId("ambient-stop-phrase-error"), null);
+    },
+    {
+      settings: { ...SETTINGS, stopPhrase: "buzz stop" },
+      stopPhraseCheck: clash,
+      // What the native side answers with: the binding written, the clashing
+      // phrase dropped.
+      bindingSaveSettings: {
+        ...SETTINGS,
+        wakeBindings: [
+          {
+            wakeWord: "buzz stop",
+            agentPubkey: "a".repeat(64),
+            destination: null,
+          },
+        ],
+        stopPhrase: null,
+      },
     },
   );
 });

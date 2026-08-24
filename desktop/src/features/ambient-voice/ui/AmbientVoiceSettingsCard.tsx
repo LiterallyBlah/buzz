@@ -28,6 +28,7 @@ import {
   getAmbientVoiceStatus,
   setAmbientVoiceMuted,
   setAmbientVoiceSettings,
+  setAmbientWakeBinding,
   type AmbientModelStatus,
   type AmbientVoiceSettings,
   type AmbientVoiceStatusReport,
@@ -43,7 +44,6 @@ import {
   mergeAgentOptions,
   modelStatusLabel,
   silenceHoldLabel,
-  withPrimaryBinding,
   SILENCE_HOLD_DEFAULT_MS,
   SILENCE_HOLD_MAX_MS,
   SILENCE_HOLD_MIN_MS,
@@ -299,23 +299,62 @@ export function AmbientVoiceSettingsCard() {
     }
   }, []);
 
+  /**
+   * Write the wake binding on its own, through its own native command.
+   *
+   * Not a settings write. This card holds a whole settings object it loaded at
+   * mount, and posting that back made every other field in it a condition of
+   * the wake word being saved: the native save door re-validates what it is
+   * handed, so a stored stop phrase clashing with the NEW wake word refused
+   * the write entire — and the field that would have resolved the clash was
+   * the one that could not be saved. The native side now reads the file
+   * itself, replaces the binding, and drops a stop phrase that can no longer
+   * stand beside it, so what comes back is the file as it now reads.
+   */
+  const persistBinding = React.useCallback(
+    async (agent: string) => {
+      setSaving(true);
+      setError(null);
+      // What the stop-phrase field is showing on the file's behalf. A phrase
+      // this write drops has to leave the screen; one the user is in the
+      // middle of typing must not, so only an untouched field follows the
+      // file.
+      const shownPhrase = settings?.stopPhrase ?? "";
+      try {
+        const saved = await setAmbientWakeBinding({
+          wakeWord: wakeWord.trim(),
+          agentPubkey: agent,
+          destination: null,
+        });
+        setSettings(saved.settings);
+        setStopPhrase((typed) =>
+          typed === shownPhrase ? (saved.settings.stopPhrase ?? "") : typed,
+        );
+        setReport(saved.status);
+      } catch (saveError) {
+        setError(
+          saveError instanceof Error
+            ? saveError.message
+            : "The wake word could not be saved.",
+        );
+      } finally {
+        setSaving(false);
+      }
+    },
+    [settings, wakeWord],
+  );
+
   const saveBinding = React.useCallback(() => {
-    // A stop-phrase refusal is about the other field: the binding this
-    // function writes does not carry the phrase, and the native save door
-    // re-validates whatever it is given. Holding the wake word hostage to a
-    // stop phrase the user is still typing turned one field's error into the
-    // whole card refusing to save, with a message about a field the user
-    // was not editing.
+    // A stop-phrase refusal is about the other field: this write carries the
+    // binding alone, and the native side keeps the two fields apart rather
+    // than refusing one for the other. Holding the wake word hostage to a stop
+    // phrase the user is still typing turned one field's error into the whole
+    // card refusing to save, with a message about a field the user was not
+    // editing.
     if (!settings || (block && block.reason !== "stop_phrase") || !agentPubkey)
       return;
-    void persist(
-      withPrimaryBinding(settings, {
-        wakeWord: wakeWord.trim(),
-        agentPubkey,
-        destination: null,
-      }),
-    );
-  }, [settings, block, agentPubkey, wakeWord, persist]);
+    void persistBinding(agentPubkey);
+  }, [settings, block, agentPubkey, persistBinding]);
 
   /** Write the slider's committed position, if it moved. */
   const saveSilenceHold = React.useCallback(() => {
@@ -438,14 +477,13 @@ export function AmbientVoiceSettingsCard() {
               <DropdownMenuRadioGroup
                 onValueChange={(next) => {
                   setAgentPubkey(next);
+                  // The same binding write as the wake-word field's blur, and
+                  // for the same reason it is field-isolated: choosing an
+                  // agent is not consent to re-post every other setting, and
+                  // a stop phrase that clashes with the wake word on screen
+                  // must not be able to swallow the choice.
                   if (settings && wakeWord.trim() && check?.valid) {
-                    void persist(
-                      withPrimaryBinding(settings, {
-                        wakeWord: wakeWord.trim(),
-                        agentPubkey: next,
-                        destination: null,
-                      }),
-                    );
+                    void persistBinding(next);
                   }
                 }}
                 value={agentPubkey ?? ""}

@@ -238,6 +238,44 @@ export const getAmbientVoiceSettings = () =>
 export const setAmbientVoiceSettings = (settings: AmbientVoiceSettings) =>
   invoke<AmbientVoiceStatusReport>("set_ambient_voice_settings", { settings });
 
+/**
+ * Mirrors `ambient_voice::commands::AmbientWakeBindingSaved`.
+ *
+ * Both halves, because a binding write can change a field the card is showing:
+ * a stored stop phrase the new wake word clashes with is dropped rather than
+ * refusing the write, so `settings` is the file as the native side re-read it
+ * and is what the card must render from. Pinned from the producing side by
+ * `a_wake_binding_save_answers_in_the_shape_the_settings_card_reads` in
+ * `ambient_voice/mod_tests.rs`; that test and this type change together.
+ */
+export type AmbientWakeBindingSaved = {
+  settings: AmbientVoiceSettings;
+  status: AmbientVoiceStatusReport;
+};
+
+/**
+ * Persist the wake word and its agent, and nothing else.
+ *
+ * Deliberately not a `setAmbientVoiceSettings` round trip with the binding
+ * spliced in. The card holds a whole settings object it loaded at mount, and
+ * posting that back made every other field in it a condition of the wake word
+ * being saved: the native save door re-validates what it is handed, so a
+ * stored stop phrase that clashes with the NEW wake word — or one an older
+ * build wrote that the model cannot encode — refused the write entire, and the
+ * wake word did not persist. The field that would have resolved the clash was
+ * the one the user could not save.
+ *
+ * The native side reads the stored file itself (the card's copy may be stale),
+ * replaces the primary binding, drops a stop phrase that can no longer stand
+ * beside it, and answers with the file as re-read from disk.
+ */
+export const setAmbientWakeBinding = (binding: WakeBinding) =>
+  invoke<AmbientWakeBindingSaved>("set_ambient_wake_binding", {
+    wakeWord: binding.wakeWord,
+    agentPubkey: binding.agentPubkey,
+    destination: binding.destination,
+  });
+
 export const setAmbientVoiceEnabled = (enabled: boolean) =>
   invoke<AmbientVoiceStatusReport>("set_ambient_voice_enabled", { enabled });
 
