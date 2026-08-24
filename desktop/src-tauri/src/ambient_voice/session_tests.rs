@@ -376,6 +376,7 @@ fn a_slow_speech_server_does_not_make_a_fed_session_look_deaf() {
         &status,
         None,
         &flow,
+        &AtomicBool::new(false),
     );
 
     // The utterance really did go to the server and come back — otherwise this
@@ -475,6 +476,7 @@ impl ClosingCapture {
             &self.status,
             trim,
             &self.flow,
+            &AtomicBool::new(false),
         );
     }
 
@@ -615,6 +617,74 @@ fn a_chunk_decoding_off_the_worker_thread_leaves_the_audio_watchdog_on() {
     assert!(
         quiet >= Duration::from_millis(100),
         "a chunk decoding off the worker thread switched the audio watchdog off: {quiet:?}"
+    );
+}
+
+#[test]
+fn a_mute_landing_during_the_final_close_is_not_talked_over() {
+    // The close blocks the worker for as long as transcription takes — against
+    // a slow server, minutes — and the mute button works the whole time:
+    // `set_muted` stores the flag and writes `Muted` to the pill from the
+    // command thread. The worker only reads the flag between audio batches, so
+    // without a fence the close queued the muted words for publication anyway
+    // and then wrote `Listening` straight over the `Muted` the user was shown.
+    let (release_tx, release_rx) = mpsc::channel::<()>();
+    let mut rolling = RollingCapture::spawn(move |_| {
+        let _ = release_rx.recv();
+        Ok("said just before the mute".to_string())
+    })
+    .expect("rolling");
+
+    let muted = Arc::new(AtomicBool::new(false));
+    let status_cell = Arc::new(Mutex::new(AmbientStatus::Capturing));
+    let announced: Announced = Arc::new(Mutex::new(Vec::new()));
+    let status = StatusSink::new(Arc::clone(&status_cell), Some(recorder(&announced)));
+    let (transcript_tx, mut transcripts) = tokio_mpsc::channel::<String>(4);
+
+    let worker = {
+        let muted = Arc::clone(&muted);
+        thread::spawn(move || {
+            let flow = AudioFlow::new();
+            finish_capture(
+                &mut rolling,
+                &mut vec![0.05_f32; 16_000],
+                &transcript_tx,
+                &status,
+                None,
+                &flow,
+                &muted,
+            );
+        })
+    };
+
+    // Wait until the close is genuinely inside its blocking wait…
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !matches!(
+        *status_cell.lock().expect("status"),
+        AmbientStatus::Transcribing
+    ) {
+        assert!(Instant::now() < deadline, "the close never started");
+        thread::sleep(Duration::from_millis(1));
+    }
+    // …then mute through the exact writes the `set_muted` command performs…
+    apply_mute(&muted, &status_cell, true);
+    // …and only then let the transcription finish.
+    drop(release_tx);
+    worker.join().expect("the close panicked");
+
+    assert!(
+        transcripts.try_recv().is_err(),
+        "words muted mid-close were queued for publication anyway"
+    );
+    assert_eq!(
+        *status_cell.lock().expect("status"),
+        AmbientStatus::Muted,
+        "the close talked over the mute the user was shown"
+    );
+    assert_eq!(
+        announced.lock().expect("announced").clone(),
+        vec![AmbientStatus::Transcribing],
+        "nothing after the mute may announce a status"
     );
 }
 

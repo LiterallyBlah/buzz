@@ -450,13 +450,7 @@ impl AmbientSession {
     /// announcing from inside would re-enter that lock for an event the
     /// command is about to send anyway.
     pub fn set_muted(&self, muted: bool) {
-        self.muted.store(muted, Ordering::Release);
-        let mut status = self.status.lock().unwrap_or_else(|e| e.into_inner());
-        *status = if muted {
-            AmbientStatus::Muted
-        } else {
-            AmbientStatus::Listening
-        };
+        apply_mute(&self.muted, &self.status, muted);
     }
 
     pub fn status(&self) -> AmbientStatus {
@@ -709,6 +703,7 @@ fn ambient_worker(
                                 &status,
                                 stop_phrase.as_deref(),
                                 &flow,
+                                &muted,
                             ),
                             FrameOutcome::Drop => {
                                 speech_buf.clear();
@@ -775,6 +770,7 @@ fn ambient_worker(
                                 &status,
                                 None,
                                 &flow,
+                                &muted,
                             );
                         }
                     }
@@ -837,6 +833,7 @@ fn finish_capture(
     status: &StatusSink,
     trim: Option<&str>,
     flow: &AudioFlow,
+    muted: &AtomicBool,
 ) {
     status.set(AmbientStatus::Transcribing);
     // The worker cannot drain its audio queue while this blocks, and against a
@@ -847,10 +844,19 @@ fn finish_capture(
     // the worker goes on taking audio off its queue.
     let outcome = {
         let _busy = flow.transcribing();
-        rolling
-            .finish(std::mem::take(speech_buf), trim)
-            .map(|text| publish(text, transcript_tx))
+        rolling.finish(std::mem::take(speech_buf), trim)
     };
+    // The wait is long — against a slow server, minutes — and the mute button
+    // works during it. The worker only reads the flag between batches, so this
+    // is where a mute that landed mid-close is honoured: the words were muted
+    // before they were sent, so they are not sent, and the pill `set_muted`
+    // wrote stays exactly as it wrote it. Without this check the transcript
+    // would be queued anyway and the close would overwrite `Muted` with
+    // `Listening` — a mute the app took and then talked over.
+    if muted.load(Ordering::Acquire) {
+        return;
+    }
+    let outcome = outcome.map(|text| publish(text, transcript_tx));
     status.set(status_after_decode(outcome));
 }
 
@@ -866,6 +872,21 @@ fn publish(text: Option<String>, transcript_tx: &tokio_mpsc::Sender<String>) {
     if let Err(error) = transcript_tx.blocking_send(text) {
         eprintln!("buzz-desktop: ambient transcript channel closed: {error}");
     }
+}
+
+/// What a mute is, mechanically: the flag the worker honours plus the pill.
+///
+/// One function rather than two lines in [`AmbientSession::set_muted`] so the
+/// mute-fence regression drives the exact writes the command path performs —
+/// a test that hand-rolled its own version would bless nothing.
+pub(crate) fn apply_mute(muted: &AtomicBool, status: &Mutex<AmbientStatus>, on: bool) {
+    muted.store(on, Ordering::Release);
+    let mut status = status.lock().unwrap_or_else(|e| e.into_inner());
+    *status = if on {
+        AmbientStatus::Muted
+    } else {
+        AmbientStatus::Listening
+    };
 }
 
 /// Keep draining until shutdown so a dead worker cannot back-pressure the
