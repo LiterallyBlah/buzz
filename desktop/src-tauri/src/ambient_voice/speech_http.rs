@@ -28,6 +28,7 @@
 //! is the same reason `huddle::stt` is a thread rather than a task. The health
 //! probe is async because its caller is a Tauri command on the runtime.
 
+use std::io::Read;
 use std::time::Duration;
 
 use serde::Serialize;
@@ -57,6 +58,33 @@ const HEALTH_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// How much of a failing server's body is quoted back to the user.
 const MAX_DETAIL_CHARS: usize = 200;
+
+/// The most a transcription answer may weigh.
+///
+/// The answer is `{"text": "…"}` for one utterance — a few hundred bytes at
+/// the outside, and a megabyte is about eight hours of speech written down.
+/// The cap is not about the honest case: the address is whatever the user
+/// typed, so it may be a mistyped host, a captive portal or a server that has
+/// been replaced by something else entirely, and none of those are obliged to
+/// stop sending. Reading a body to the end with no ceiling makes any of them an
+/// out-of-memory kill of the whole app.
+const MAX_TRANSCRIPT_BYTES: u64 = 1024 * 1024;
+
+/// The most a synthesised reply may weigh.
+///
+/// Eight megabytes is roughly four minutes of the 16-bit mono PCM these servers
+/// return, and an ambient reply is a sentence or two. Same reasoning as
+/// [`MAX_TRANSCRIPT_BYTES`], and the same treatment: over the cap is a server
+/// failure, which the caller already handles.
+const MAX_SPEECH_BYTES: u64 = 8 * 1024 * 1024;
+
+/// The most of a failing server's body that is read before it is clipped to
+/// [`MAX_DETAIL_CHARS`] for display.
+///
+/// Its own cap because the error path must not be the way in: a server that
+/// answers HTTP 500 with a gigabyte would otherwise be read to the end purely
+/// to quote its first 200 characters.
+const MAX_ERROR_BODY_BYTES: u64 = 64 * 1024;
 
 /// A speech server's base URL, validated and normalised.
 ///
@@ -214,16 +242,16 @@ pub(crate) fn transcribe(
         .map_err(|error| format!("speech server did not answer: {error}"))?;
 
     let status = response.status();
-    let body = response
-        .text()
-        .map_err(|error| format!("speech server response could not be read: {error}"))?;
     if !status.is_success() {
         return Err(format!(
             "speech server answered HTTP {}: {}",
             status.as_u16(),
-            clip(&body)
+            clip(&error_body(response))
         ));
     }
+    let declared = response.content_length();
+    let body = read_capped(declared, response, MAX_TRANSCRIPT_BYTES, "transcript")?;
+    let body = String::from_utf8_lossy(&body).into_owned();
     let parsed: serde_json::Value = serde_json::from_str(&body).map_err(|error| {
         format!(
             "speech server did not answer JSON ({error}): {}",
@@ -260,17 +288,64 @@ pub(crate) fn synthesize(
 
     let status = response.status();
     if !status.is_success() {
-        let body = response.text().unwrap_or_default();
         return Err(format!(
             "speech server answered HTTP {}: {}",
             status.as_u16(),
-            clip(&body)
+            clip(&error_body(response))
         ));
     }
-    response
-        .bytes()
-        .map(|bytes| bytes.to_vec())
-        .map_err(|error| format!("speech audio could not be read: {error}"))
+    let declared = response.content_length();
+    read_capped(declared, response, MAX_SPEECH_BYTES, "audio")
+}
+
+/// Read a response body, refusing one that is bigger than `limit`.
+///
+/// Both checks are load-bearing and neither replaces the other: `declared` is
+/// what the server claims, which stops a huge body being transferred at all,
+/// and the read itself is bounded because `Content-Length` may be absent
+/// (chunked), wrong, or a deliberate lie. Reading `limit + 1` is what tells an
+/// over-cap body apart from one that exactly fills the cap — truncating
+/// silently would hand a half a WAV to the decoder and call it corrupt.
+///
+/// Over the cap is an `Err`, which every caller already treats as a server
+/// failure: the utterance falls back to the on-device recogniser, and the reply
+/// simply is not spoken.
+fn read_capped(
+    declared: Option<u64>,
+    reader: impl std::io::Read,
+    limit: u64,
+    what: &str,
+) -> Result<Vec<u8>, String> {
+    if declared.is_some_and(|length| length > limit) {
+        return Err(format!(
+            "speech server offered {} bytes of {what}, over the {limit}-byte limit",
+            declared.unwrap_or_default()
+        ));
+    }
+    let mut body = Vec::new();
+    reader
+        .take(limit + 1)
+        .read_to_end(&mut body)
+        .map_err(|error| format!("speech server {what} could not be read: {error}"))?;
+    if body.len() as u64 > limit {
+        return Err(format!(
+            "speech server sent more than the {limit}-byte {what} limit"
+        ));
+    }
+    Ok(body)
+}
+
+/// A failing server's own words, bounded, for quoting back to the user.
+///
+/// Never fails: this is already the error path, and an unreadable body is
+/// exactly the "(no detail)" case [`clip`] exists for. An error page over the
+/// cap is therefore quoted as nothing rather than as its first 200 characters
+/// — the same rule as everywhere else here, and the HTTP status, which is the
+/// actionable half, is still reported either way.
+fn error_body(response: reqwest::blocking::Response) -> String {
+    let declared = response.content_length();
+    let bytes = read_capped(declared, response, MAX_ERROR_BODY_BYTES, "error").unwrap_or_default();
+    String::from_utf8_lossy(&bytes).into_owned()
 }
 
 /// Build the async client the health probe uses.

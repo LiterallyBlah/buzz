@@ -283,6 +283,118 @@ fn a_server_that_will_not_speak_says_why() {
     assert!(error.contains("voice pack missing"), "{error}");
 }
 
+// ── How much a server is allowed to send back ────────────────────────────────
+
+#[test]
+fn a_body_bigger_than_its_cap_is_refused_however_the_server_describes_it() {
+    // Both halves of the guard, at the seam, because they answer different
+    // attacks. `Content-Length` stops a huge body being transferred at all —
+    // but it is optional, it can be wrong, and a hostile server can simply
+    // lie, so the read itself is bounded too.
+    let limit = 8u64;
+
+    // Declared over the cap: refused before a byte of it is read.
+    let error = read_capped(Some(limit + 1), &b"ignored"[..], limit, "audio")
+        .expect_err("a declared over-cap body");
+    assert!(error.contains("over the 8-byte limit"), "{error}");
+
+    // Undeclared and streamed over the cap: refused on what actually arrived.
+    let error = read_capped(None, &vec![b'x'; 64][..], limit, "audio")
+        .expect_err("an undeclared over-cap body");
+    assert!(error.contains("more than the 8-byte"), "{error}");
+
+    // Declared honestly but sent long anyway.
+    let error = read_capped(Some(1), &vec![b'x'; 64][..], limit, "audio")
+        .expect_err("a body longer than it claimed");
+    assert!(error.contains("more than the 8-byte"), "{error}");
+
+    // Exactly the cap is not over it: the boundary must not cost a legitimate
+    // answer, which is why the read asks for `limit + 1` rather than `limit`.
+    assert_eq!(
+        read_capped(Some(limit), &vec![b'x'; 8][..], limit, "audio"),
+        Ok(vec![b'x'; 8])
+    );
+    assert_eq!(read_capped(None, &b""[..], limit, "audio"), Ok(Vec::new()));
+}
+
+#[test]
+fn an_oversized_transcription_answer_is_a_server_failure_and_not_an_allocation() {
+    // The address is whatever the user typed, so the thing answering may not be
+    // a speech server at all. Reading its answer to the end with no ceiling
+    // makes any of them an out-of-memory kill of the whole app; over the cap is
+    // a failure like any other, which the transcriber already answers by
+    // falling back to the on-device recogniser.
+    let huge = format!(
+        r#"{{"text": "{}"}}"#,
+        "a".repeat(MAX_TRANSCRIPT_BYTES as usize)
+    );
+    let server = StubSpeechServer::always(StubReply::json(&huge));
+    let client = blocking_client().expect("client");
+
+    let error = transcribe(
+        &client,
+        &endpoint(server.base_url()),
+        &[0.0; 320],
+        UTTERANCE_RATE,
+    )
+    .expect_err("an over-cap transcription answer");
+    assert!(error.contains("transcript"), "{error}");
+    assert!(error.contains(&MAX_TRANSCRIPT_BYTES.to_string()), "{error}");
+}
+
+#[test]
+fn an_oversized_speech_answer_is_a_server_failure_and_not_an_allocation() {
+    let server = StubSpeechServer::always(StubReply::wav(vec![0u8; MAX_SPEECH_BYTES as usize + 1]));
+    let client = blocking_client().expect("client");
+
+    let error =
+        synthesize(&client, &endpoint(server.base_url()), "hello").expect_err("an over-cap reply");
+    assert!(error.contains("audio"), "{error}");
+    assert!(error.contains(&MAX_SPEECH_BYTES.to_string()), "{error}");
+}
+
+#[test]
+fn an_answer_that_fits_is_still_delivered_whole() {
+    // The control for both caps: a body one byte under the limit is not
+    // truncated, clipped or refused. A guard that quietly shortened a long but
+    // legitimate reply would be a worse bug than the one it prevents.
+    let audio = vec![7u8; MAX_SPEECH_BYTES as usize - 1];
+    let server = StubSpeechServer::always(StubReply::wav(audio.clone()));
+    let client = blocking_client().expect("client");
+
+    assert_eq!(
+        synthesize(&client, &endpoint(server.base_url()), "hello"),
+        Ok(audio)
+    );
+}
+
+#[test]
+fn a_failing_server_cannot_flood_the_error_path_either() {
+    // The message quotes the server's own words, so the error path reads a body
+    // too — and would read an unbounded one purely to print its first 200
+    // characters.
+    let server = StubSpeechServer::always(StubReply::status(
+        500,
+        &"detail ".repeat(MAX_ERROR_BODY_BYTES as usize),
+    ));
+    let client = blocking_client().expect("client");
+
+    let error = synthesize(&client, &endpoint(server.base_url()), "hello").expect_err("500");
+    // The status still reaches the user — that is the actionable half — but
+    // the body was never read, so there is nothing to quote from it. An error
+    // page over the cap is refused like any other over-cap body rather than
+    // read to the end for its first 200 characters.
+    assert!(error.contains("500"), "{error}");
+    assert!(error.contains("(no detail)"), "{error}");
+    assert!(error.len() < MAX_DETAIL_CHARS, "{}", error.len());
+
+    // A short error page is still quoted in full, so nothing is lost in the
+    // case that actually happens.
+    let short = StubSpeechServer::always(StubReply::status(500, "voice pack missing"));
+    let error = synthesize(&client, &endpoint(short.base_url()), "hello").expect_err("500");
+    assert!(error.contains("voice pack missing"), "{error}");
+}
+
 // ── Health probe ─────────────────────────────────────────────────────────────
 
 #[tokio::test]
