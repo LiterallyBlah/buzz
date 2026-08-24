@@ -487,6 +487,30 @@ test("a role pointed at a server shows the address and names what is sent there"
   );
 });
 
+test("the address field is set off from the picker that revealed it", async () => {
+  // The address block lives inside the same divided row as its picker, so
+  // without top padding the field sits flush against the control above and
+  // reads as part of it. jsdom loads no Tailwind, so the class is the only
+  // thing on the element that can be asserted; the value it carries is what
+  // the reviewer sees on screen.
+  await mountSettings(
+    READY_MODELS,
+    async ({ view }) => {
+      for (const role of ["stt", "tts"]) {
+        const block = view.queryByTestId(`ambient-speech-${role}-address`);
+        if (!block) continue;
+        assert.match(
+          block.className,
+          /\bpt-\d/,
+          `the ${role} address block has no top padding`,
+        );
+      }
+      assert.ok(view.getByTestId("ambient-speech-stt-address"));
+    },
+    { settings: SERVER_STT },
+  );
+});
+
 test("Check reports what the native side answered, at the URL it probed", async () => {
   await mountSettings(
     READY_MODELS,
