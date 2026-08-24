@@ -241,6 +241,19 @@ pub struct AmbientVoiceState {
     tts_active: Arc<AtomicBool>,
     tts_cancel: Arc<AtomicBool>,
     muted: Arc<AtomicBool>,
+    /// Count of mute events, ever. Every capture is bound to the value in force
+    /// when it was armed ([`session::CaptureEpoch`]) and dies the moment the two
+    /// disagree — a mute is a death sentence for the capture in progress, and an
+    /// unmute must not commute it.
+    mute_epochs: Arc<AtomicU64>,
+    /// Serialises a mute against the dispatch of a transcript, so the two
+    /// cannot overlap: mute-on bumps the counter above while holding this, and
+    /// a prepared transcript decides and starts its send while holding it.
+    /// Held for two stores on one side and one decision on the other — never
+    /// across a network round trip, so the mute button stays as immediate as
+    /// the flag it sets. See [`session::apply_mute`] and
+    /// [`publish::DispatchGate`].
+    mute_authority: Arc<Mutex<()>>,
     reported: Arc<Mutex<AmbientStatus>>,
     /// Invalidates in-flight publisher tasks from a previous session.
     generation: Arc<AtomicU64>,
@@ -267,6 +280,8 @@ impl Default for AmbientVoiceState {
             tts_active: Arc::new(AtomicBool::new(false)),
             tts_cancel: Arc::new(AtomicBool::new(false)),
             muted: Arc::new(AtomicBool::new(false)),
+            mute_epochs: Arc::new(AtomicU64::new(0)),
+            mute_authority: Arc::new(Mutex::new(())),
             reported: Arc::new(Mutex::new(AmbientStatus::Off)),
             generation: Arc::new(AtomicU64::new(0)),
             stale_announced: AtomicBool::new(false),
@@ -716,6 +731,8 @@ async fn start_session(state: &AppState, settings: &AmbientVoiceSettings) -> Res
         tts_active: Arc::clone(&ambient.tts_active),
         tts_cancel: Arc::clone(&ambient.tts_cancel),
         muted: Arc::clone(&ambient.muted),
+        mute_epochs: Arc::clone(&ambient.mute_epochs),
+        mute_authority: Arc::clone(&ambient.mute_authority),
         status: Arc::clone(&ambient.reported),
         on_status_change: worker_status_notifier(state),
         input_sample_rate: WORKLET_SAMPLE_RATE,
@@ -733,6 +750,8 @@ async fn start_session(state: &AppState, settings: &AmbientVoiceSettings) -> Res
         Arc::clone(&destination),
         publisher,
         Arc::clone(&ambient.generation),
+        Arc::clone(&ambient.mute_epochs),
+        Arc::clone(&ambient.mute_authority),
     );
 
     {
@@ -769,21 +788,42 @@ fn worker_status_notifier(state: &AppState) -> Option<session::AmbientStatusNoti
 }
 
 /// Drain transcripts and publish them, until the session generation moves.
+///
+/// Two authorities are checked for every transcript, and they answer different
+/// questions: the session generation says whether this *pipeline* is still the
+/// live one, and the transcript's own mute epoch says whether the *capture* it
+/// came from is still allowed to speak. The epoch is checked here on arrival
+/// because a mute can land while the transcript sits in this queue, and again
+/// inside the publisher — there under the mute authority
+/// ([`publish::DispatchGate`]), which is where the question is finally settled
+/// rather than merely asked. A transcript whose epoch has moved is a capture
+/// the user muted, however long ago the audio was spoken.
 fn spawn_publisher_task(
-    mut transcript_rx: tokio::sync::mpsc::Receiver<String>,
+    mut transcript_rx: tokio::sync::mpsc::Receiver<session::Transcript>,
     destination: Arc<AmbientDestination>,
     publisher: AmbientPublisher,
     generation: Arc<AtomicU64>,
+    mute_epochs: Arc<AtomicU64>,
+    mute_authority: Arc<Mutex<()>>,
 ) {
     let spawned_generation = generation.load(Ordering::Acquire);
     tauri::async_runtime::spawn(async move {
-        while let Some(text) = transcript_rx.recv().await {
+        while let Some(transcript) = transcript_rx.recv().await {
             if generation.load(Ordering::Acquire) != spawned_generation {
                 // The session was replaced or torn down; a transcript captured
                 // under the old configuration must not reach the new one.
                 break;
             }
-            destination.publish(&publisher, &text).await;
+            if !session::transcript_still_wanted(&mute_epochs, transcript.mute_epoch) {
+                // A mute landed while this transcript waited in the queue.
+                continue;
+            }
+            let still_wanted =
+                || session::transcript_still_wanted(&mute_epochs, transcript.mute_epoch);
+            let gate = publish::DispatchGate::new(&mute_authority, &still_wanted);
+            destination
+                .publish(&publisher, &transcript.text, &gate)
+                .await;
         }
     });
 }
