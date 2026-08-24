@@ -95,19 +95,116 @@ fn guidelines_tell_the_agent_how_interruption_reaches_it() {
 
 #[test]
 fn empty_and_whitespace_transcripts_are_never_published() {
-    assert_eq!(normalize_transcript(""), None);
-    assert_eq!(normalize_transcript("   \n\t "), None);
+    assert_eq!(normalize_transcript(""), Ok(None));
+    assert_eq!(normalize_transcript("   \n\t "), Ok(None));
     assert_eq!(
         normalize_transcript("  hello there \n"),
-        Some("hello there".to_string())
+        Ok(Some("hello there".to_string()))
     );
 }
 
 #[test]
-fn an_oversized_transcript_is_truncated_rather_than_rejected() {
-    let long = "a".repeat(MAX_TRANSCRIPT_CHARS + 500);
-    let normalized = normalize_transcript(&long).expect("truncated");
-    assert_eq!(normalized.chars().count(), MAX_TRANSCRIPT_CHARS);
+fn a_long_transcript_is_passed_through_whole_and_never_trimmed() {
+    // The regression this replaces its predecessor for: the old cap was 2,000
+    // characters applied by silently cutting the transcript's tail off, and
+    // rolling capture made 2,000 characters two minutes of ordinary speech.
+    // Everything up to the supported bound now passes through verbatim.
+    let long = "words of a long dictation ".repeat(400);
+    assert!(long.len() > 2_000, "{}", long.len());
+    assert_eq!(
+        normalize_transcript(&long).expect("well under the bound"),
+        Some(long.trim().to_string())
+    );
+
+    let at_bound = "b".repeat(MAX_UTTERANCE_TEXT_BYTES);
+    assert_eq!(
+        normalize_transcript(&at_bound).expect("exactly the bound"),
+        Some(at_bound)
+    );
+}
+
+#[test]
+fn a_transcript_past_the_supported_bound_is_refused_with_a_reason_not_trimmed() {
+    // Over the bound is an explicit error naming both numbers — the capture
+    // pipeline fails such an utterance loudly long before this line, so
+    // arriving here means a bug, and a bug may not silently edit the user's
+    // words on its way out.
+    let over = "c".repeat(MAX_UTTERANCE_TEXT_BYTES + 1);
+    let error = normalize_transcript(&over).expect_err("over the bound");
+    assert!(
+        error.contains(&MAX_UTTERANCE_TEXT_BYTES.to_string()),
+        "{error}"
+    );
+    assert!(error.contains(&over.len().to_string()), "{error}");
+}
+
+/// A one-request HTTP stub standing in for the relay's `POST /events`: accepts
+/// the connection, reads the request whole, answers 200, and hands the body
+/// back to the test.
+fn one_post_stub() -> (String, std::sync::mpsc::Receiver<Vec<u8>>) {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let base = format!("http://{}", listener.local_addr().expect("addr"));
+    let (body_tx, body_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let (mut socket, _) = listener.accept().expect("accept");
+        let mut raw = Vec::new();
+        let mut buf = [0u8; 4096];
+        let body = loop {
+            let n = socket.read(&mut buf).expect("read");
+            raw.extend_from_slice(&buf[..n]);
+            if let Some(split) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
+                let headers = String::from_utf8_lossy(&raw[..split]).to_lowercase();
+                let length: usize = headers
+                    .lines()
+                    .find_map(|line| line.strip_prefix("content-length:"))
+                    .and_then(|v| v.trim().parse().ok())
+                    .expect("content-length");
+                let mut body = raw[split + 4..].to_vec();
+                while body.len() < length {
+                    let n = socket.read(&mut buf).expect("read body");
+                    body.extend_from_slice(&buf[..n]);
+                }
+                break body;
+            }
+        };
+        socket
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+            .expect("respond");
+        let _ = body_tx.send(body);
+    });
+    (base, body_rx)
+}
+
+#[tokio::test]
+async fn a_transcript_longer_than_the_old_flat_cap_reaches_the_wire_unclipped() {
+    // End to end through the real publisher — sign, guard, authenticate, POST —
+    // because the truncation this guards against lived exactly one step past
+    // where the previous tests stopped. The transcript on the wire must be the
+    // transcript that was spoken, byte for byte.
+    let (base, body_rx) = one_post_stub();
+    let publisher = AmbientPublisher {
+        http_client: reqwest::Client::new(),
+        keys: keys(),
+        relay_base_url: base,
+    };
+    let transcript = "one more sentence of a long dictation ".repeat(300);
+    assert!(transcript.len() > 2_000, "{}", transcript.len());
+
+    publisher
+        .publish_transcript(Uuid::new_v4(), &"a".repeat(64), &transcript)
+        .await
+        .expect("published");
+
+    let body = body_rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .expect("the stub saw the POST");
+    let event: serde_json::Value = serde_json::from_slice(&body).expect("event json");
+    assert_eq!(
+        event["content"].as_str().expect("content"),
+        transcript.trim(),
+        "the transcript on the wire is not the transcript that was spoken"
+    );
 }
 
 #[tokio::test]

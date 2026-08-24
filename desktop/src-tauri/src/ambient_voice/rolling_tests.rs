@@ -309,6 +309,44 @@ fn the_stop_phrase_is_trimmed_off_the_stitched_utterance() {
 }
 
 #[test]
+fn a_capture_whose_text_outgrows_one_message_fails_loudly_with_bounded_memory() {
+    // The four-chunk bound is on PCM in flight; this one is on the text that
+    // comes back. Real speech cannot reach it — the bound is over an hour of
+    // talking — but a pathological server answering enormous transcripts per
+    // chunk can, and without this it would grow process memory for as long as
+    // the user kept talking. Over the bound: nothing further is queued, the
+    // close fails on the indicator, and what was held never exceeded the bound
+    // by more than the one chunk that crossed it.
+    let big_chunk_text = "x".repeat(16 * 1024);
+    let reply = big_chunk_text.clone();
+    let mut capture = RollingCapture::spawn(move |_| Ok(reply.clone())).expect("spawn");
+
+    let mut worst_resident = 0;
+    for _ in 0..8 {
+        capture.hand_off(chunk(CHUNK_SAMPLES[0]));
+        wait_until_the_transcriber_catches_up(&capture);
+        capture.hand_off(Vec::new()); // a drain pass with nothing to queue
+        worst_resident = worst_resident.max(capture.resident_text_bytes());
+    }
+    assert!(
+        worst_resident <= MAX_UTTERANCE_TEXT_BYTES + big_chunk_text.len(),
+        "{worst_resident} bytes of transcript were held for one capture"
+    );
+
+    let Err(error) = capture.finish(chunk(CHUNK_SAMPLES[1]), None) else {
+        panic!("a capture past the text bound was stitched and sent anyway");
+    };
+    assert_eq!(error, PAST_ONE_MESSAGE);
+
+    // And the failure took the machinery down cleanly: the same capture's next
+    // utterance decodes, collects and sends as if nothing had happened.
+    let text = capture
+        .finish(chunk(CHUNK_SAMPLES[2]), None)
+        .expect("the next utterance");
+    assert_eq!(text.as_deref(), Some(big_chunk_text.as_str()));
+}
+
+#[test]
 fn the_transcription_thread_ends_with_the_capture_that_started_it() {
     // A session torn down mid-roll must not leave a thread holding a
     // microphone's worth of PCM and a recogniser.

@@ -19,12 +19,21 @@ use uuid::Uuid;
 use crate::app_state::AppState;
 use crate::events;
 
-/// Ceiling on a single transcribed utterance, in characters.
+/// Ceiling on a single transcribed utterance, in UTF-8 bytes.
 ///
-/// The utterance machine already caps capture at 30 s of audio; this is the
-/// belt-and-braces text-side bound so a pathological transcript cannot be
-/// posted as an enormous message.
-const MAX_TRANSCRIPT_CHARS: usize = 2_000;
+/// One utterance is one kind:9 message, so the bound is the relay's: it
+/// advertises `max_content_len` 65,536 in its NIP-11 document, and this stops
+/// 4 KiB short of that so no supported transcript is ever the relay's to
+/// refuse. Rolling capture made the old 2,000-character cap reachable —
+/// sixty seconds of ordinary speech — and it was applied by silently cutting
+/// the transcript's tail off, which is the user's words, edited, with nothing
+/// to say so. Sixty kibibytes is over an hour of continuous speech at the
+/// fifteen characters a second `speech_http` budgets by, so no utterance a
+/// person can produce is near it; what it bounds is a pathological
+/// transcription server, and [`super::rolling`] fails such an utterance
+/// loudly at this same line long before it reaches here. This copy of the
+/// bound is the belt-and-braces: over it is an explicit error, never a trim.
+pub(crate) const MAX_UTTERANCE_TEXT_BYTES: usize = 60 * 1024;
 
 /// Voice-mode guidelines posted as kind:48106 before the first ambient
 /// message of a session.
@@ -56,17 +65,27 @@ the same way — one sentence per separate call.
     )
 }
 
-/// Trim a transcript to something publishable, or `None` if there is nothing
-/// worth sending.
-pub fn normalize_transcript(text: &str) -> Option<String> {
+/// Pass a transcript through whole, or say exactly why it cannot be sent.
+///
+/// `Ok(None)` is audio that carried no words — an ordinary outcome, nothing to
+/// send. `Err` is a transcript over [`MAX_UTTERANCE_TEXT_BYTES`], which the
+/// capture pipeline fails loudly before publication ever sees it; if one
+/// arrives here anyway it is refused with a reason, because the one thing this
+/// function may never do is deliver the user's words with the end cut off and
+/// nothing to show for it.
+pub fn normalize_transcript(text: &str) -> Result<Option<String>, String> {
     let trimmed = text.trim();
     if trimmed.is_empty() {
-        return None;
+        return Ok(None);
     }
-    if trimmed.chars().count() <= MAX_TRANSCRIPT_CHARS {
-        return Some(trimmed.to_string());
+    if trimmed.len() > MAX_UTTERANCE_TEXT_BYTES {
+        return Err(format!(
+            "transcript is {} bytes, over the {} this app will post as one message",
+            trimmed.len(),
+            MAX_UTTERANCE_TEXT_BYTES
+        ));
     }
-    Some(trimmed.chars().take(MAX_TRANSCRIPT_CHARS).collect())
+    Ok(Some(trimmed.to_string()))
 }
 
 /// Sign an ambient event and produce the guarded POST body.
@@ -169,7 +188,7 @@ impl AmbientPublisher {
         agent_pubkey: &str,
         text: &str,
     ) -> Result<(), String> {
-        let Some(content) = normalize_transcript(text) else {
+        let Some(content) = normalize_transcript(text)? else {
             return Ok(());
         };
         let builder = events::build_message(

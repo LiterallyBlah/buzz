@@ -31,14 +31,25 @@
 //!
 //! ## What is bounded, and what happens when the bound is reached
 //!
-//! The audio the transcription thread holds at once is capped at
-//! [`MAX_PENDING_CHUNKS`] chunks, each at most a ceiling's worth of PCM, so a
-//! transcriber that has stopped answering holds a bounded amount of it and not
-//! a growing one. Reaching that cap fails the utterance, loudly, on the
-//! indicator — the same as any other chunk failure, and for the same reason: a
-//! message stitched from the chunks that happened to make it back would be the
-//! user's words with a hole in the middle and nothing to show it. A transcriber
-//! that keeps up is never near the cap, however long the capture runs.
+//! Two things, one per direction, and both fail the utterance loudly on the
+//! indicator rather than quietly shedding part of it — a message stitched from
+//! whatever happened to survive would be the user's words with a hole in the
+//! middle and nothing to show it.
+//!
+//! **Audio going out** is capped at [`MAX_PENDING_CHUNKS`] chunks held by the
+//! transcription thread at once, each at most a ceiling's worth of PCM, so a
+//! transcriber that has stopped answering holds a bounded amount and not a
+//! growing one. A transcriber that keeps up is never near it.
+//!
+//! **Text coming back** is collected into the worker as each chunk completes
+//! (every [`RollingCapture::hand_off`] drains what is ready, so nothing
+//! accumulates in the channel between them) and its total is capped at
+//! [`MAX_UTTERANCE_TEXT_BYTES`] — the most one published message may carry.
+//! Real speech cannot reach it: an hour of talking is under the bound. What
+//! can is a pathological transcription server answering close to a mebibyte
+//! per chunk, and without this bound a long capture against one would grow
+//! process memory without end. Over the bound, nothing further is queued and
+//! the close fails with [`PAST_ONE_MESSAGE`].
 //!
 //! Ordering is the channels': one thread takes jobs in order and answers in
 //! order, so the stitched transcript is in the order the user spoke.
@@ -49,6 +60,8 @@ use std::sync::{
     Arc,
 };
 use std::thread;
+
+use super::publish::MAX_UTTERANCE_TEXT_BYTES;
 
 /// Chunks of audio the transcription thread may hold at once, at most.
 ///
@@ -70,6 +83,14 @@ const TOO_FAR_BEHIND: &str = "Speech-to-text fell too far behind to finish this 
 
 /// What it says when the transcription thread is gone.
 const TRANSCRIBER_GONE: &str = "Speech-to-text stopped before this message was finished";
+
+/// What it says when the collected text outgrows what one message may carry.
+///
+/// [`MAX_UTTERANCE_TEXT_BYTES`] of transcript — which real speech does not
+/// produce in one utterance; only a server answering absurd volumes of text
+/// per chunk does, and this is both the memory bound against such a server and
+/// the honest alternative to trimming the user's words at publication.
+const PAST_ONE_MESSAGE: &str = "This message grew longer than one message can carry";
 
 /// One closed chunk on its way to be transcribed.
 struct ChunkJob {
@@ -107,8 +128,17 @@ pub(crate) struct RollingCapture {
     /// Results this utterance is still owed. Unlike `in_flight` this counts to
     /// the end of the capture, because the transcripts are what gets stitched.
     owed: usize,
-    /// Set when a chunk could not be handed off at all. The utterance is over
-    /// as far as this type is concerned; it fails at the close with this text.
+    /// Transcripts of this utterance's chunks, in the order they were spoken.
+    /// Moved here from the results channel as each completes ([`Self::absorb`])
+    /// so the channel never accumulates a capture's worth of text.
+    collected: Vec<String>,
+    /// Total bytes in `collected`. Over [`MAX_UTTERANCE_TEXT_BYTES`] the
+    /// utterance has failed ([`PAST_ONE_MESSAGE`]) and nothing further is
+    /// queued, which is what makes this a memory bound and not a statistic.
+    collected_bytes: usize,
+    /// Set when this utterance can no longer be sent — a chunk that failed to
+    /// decode, one that could not be handed off, or text past the bound above.
+    /// The close fails with this text; until then nothing more is queued.
     failed: Option<String>,
     thread: Option<thread::JoinHandle<()>>,
 }
@@ -158,6 +188,8 @@ impl RollingCapture {
             generation: 0,
             in_flight,
             owed: 0,
+            collected: Vec::new(),
+            collected_bytes: 0,
             failed: None,
             thread: Some(thread),
         })
@@ -167,8 +199,10 @@ impl RollingCapture {
     ///
     /// Never blocks and never waits on the transcriber: the caller is the audio
     /// worker, and every millisecond it spends here is a millisecond its queue
-    /// is not being drained.
+    /// is not being drained. Finished results are collected on the way through,
+    /// which is what keeps the channel from holding a capture's worth of text.
     pub(crate) fn hand_off(&mut self, samples: Vec<f32>) {
+        self.drain_ready();
         if self.failed.is_some() {
             // This utterance is already going to fail at the close. Decoding
             // more of it would spend the bound on audio nobody will read.
@@ -196,6 +230,7 @@ impl RollingCapture {
         samples: Vec<f32>,
         trim: Option<&str>,
     ) -> Result<Option<String>, String> {
+        self.drain_ready();
         if let Some(error) = self.failed.take() {
             self.abort();
             return Err(error);
@@ -204,16 +239,14 @@ impl RollingCapture {
             self.abort();
             return Err(error);
         }
-        let parts = match self.collect() {
-            Ok(parts) => parts,
-            Err(error) => {
-                // Whatever is left in the channel belongs to an utterance that
-                // is not going to be sent, and must not be stitched into the
-                // next one.
-                self.abort();
-                return Err(error);
-            }
-        };
+        if let Err(error) = self.collect_remaining() {
+            // Whatever is still in flight belongs to an utterance that is not
+            // going to be sent, and must not be stitched into the next one.
+            self.abort();
+            return Err(error);
+        }
+        let parts = std::mem::take(&mut self.collected);
+        self.collected_bytes = 0;
         let text = stitch(&parts);
         let text = match trim {
             Some(phrase) => strip_trailing_phrase(&text, phrase),
@@ -234,6 +267,8 @@ impl RollingCapture {
     pub(crate) fn abort(&mut self) {
         self.generation += 1;
         self.owed = 0;
+        self.collected.clear();
+        self.collected_bytes = 0;
         self.failed = None;
     }
 
@@ -272,14 +307,20 @@ impl RollingCapture {
         Ok(())
     }
 
-    /// Wait for every chunk of this utterance, in the order it was sent.
+    /// Take every result the transcription thread has already finished,
+    /// without waiting for the ones it has not.
+    fn drain_ready(&mut self) {
+        while let Ok(done) = self.results.try_recv() {
+            self.absorb(done);
+        }
+    }
+
+    /// Wait for every chunk of this utterance still in flight.
     ///
     /// One chunk that failed fails the utterance, and the rest are still
-    /// collected before it does: a result left in the channel would be stitched
-    /// into whatever the user says next.
-    fn collect(&mut self) -> Result<Vec<String>, String> {
-        let mut parts = Vec::with_capacity(self.owed);
-        let mut failure: Option<String> = None;
+    /// collected before it does: a result left in the channel would be
+    /// stitched into whatever the user says next.
+    fn collect_remaining(&mut self) -> Result<(), String> {
         while self.owed > 0 {
             let Ok(done) = self.results.recv() else {
                 // The thread died. Nothing further is coming, so waiting for the
@@ -287,22 +328,46 @@ impl RollingCapture {
                 self.owed = 0;
                 return Err(TRANSCRIBER_GONE.to_string());
             };
-            if done.generation != self.generation {
-                // An abandoned utterance's chunk, finally decoded.
-                continue;
-            }
-            self.owed -= 1;
-            match done.text {
-                Ok(text) => parts.push(text),
-                Err(error) => {
-                    failure.get_or_insert(error);
+            self.absorb(done);
+        }
+        match self.failed.take() {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+
+    /// File one finished chunk where it belongs: this utterance's transcript,
+    /// its failure, or — for an abandoned utterance's chunk — nowhere.
+    fn absorb(&mut self, done: ChunkDone) {
+        if done.generation != self.generation {
+            // An abandoned utterance's chunk, finally decoded and discarded.
+            return;
+        }
+        self.owed = self.owed.saturating_sub(1);
+        match done.text {
+            Ok(text) => {
+                self.collected_bytes += text.len();
+                self.collected.push(text);
+                if self.collected_bytes > MAX_UTTERANCE_TEXT_BYTES {
+                    // The bound on collected text, enforced where the text
+                    // arrives. `hand_off` stops queueing the moment this is
+                    // set, so what is held stays within one chunk of the
+                    // bound rather than growing with the capture.
+                    self.failed
+                        .get_or_insert_with(|| PAST_ONE_MESSAGE.to_string());
                 }
             }
+            Err(error) => {
+                self.failed.get_or_insert(error);
+            }
         }
-        match failure {
-            Some(error) => Err(error),
-            None => Ok(parts),
-        }
+    }
+
+    /// Bytes of transcript currently held for the utterance in progress.
+    /// Test-facing: the memory-bound regression asserts on it.
+    #[cfg(test)]
+    pub(crate) fn resident_text_bytes(&self) -> usize {
+        self.collected_bytes
     }
 }
 
