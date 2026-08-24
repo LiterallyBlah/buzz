@@ -486,3 +486,57 @@ fn the_check_result_serialises_in_the_shape_the_frontend_parses() {
         })
     );
 }
+
+#[test]
+fn the_budget_for_one_utterance_follows_how_much_of_it_there_is() {
+    // The rule, stated from the sizes it has to serve rather than read off the
+    // implementation: a fixed allowance for the round trip, plus half of what
+    // was actually said, with a ceiling.
+    let seconds = |n: usize| n * UTTERANCE_RATE as usize;
+
+    // Whatever else changes, an ordinary utterance keeps the ten seconds this
+    // shipped with — the flat timeout is the floor, not a value that moved.
+    assert!(transcribe_timeout(seconds(3), UTTERANCE_RATE) >= Duration::from_secs(10));
+    assert_eq!(
+        transcribe_timeout(0, UTTERANCE_RATE),
+        Duration::from_secs(10)
+    );
+    assert_eq!(
+        transcribe_timeout(seconds(3), UTTERANCE_RATE),
+        Duration::from_millis(11_500)
+    );
+
+    // The longest recording the capture machine can make is 230 seconds — the
+    // ten-second silence hold's cap. It has to fit under the ceiling, or the
+    // top of the slider would be a setting that always times out.
+    let longest = transcribe_timeout(seconds(230), UTTERANCE_RATE);
+    assert!(
+        longest < TRANSCRIBE_MAX_TIMEOUT,
+        "the longest utterance this app can record does not fit its own budget: {longest:?}"
+    );
+    assert!(longest >= Duration::from_secs(120), "{longest:?}");
+
+    // And nothing at all may exceed the ceiling, however the buffer got there.
+    assert_eq!(
+        transcribe_timeout(usize::MAX, UTTERANCE_RATE),
+        TRANSCRIBE_MAX_TIMEOUT
+    );
+    // A rate of zero is unreachable through the callers and must still not
+    // divide by zero on the audio thread.
+    assert!(transcribe_timeout(seconds(1), 0) >= Duration::from_secs(10));
+}
+
+#[test]
+fn a_longer_utterance_is_given_longer_than_a_shorter_one() {
+    // Monotonic, which is the property the fallback rests on: a recording that
+    // is twice as long must not be given less room to be transcribed in.
+    let mut previous = Duration::ZERO;
+    for seconds in [0usize, 1, 5, 30, 60, 120, 230] {
+        let budget = transcribe_timeout(seconds * UTTERANCE_RATE as usize, UTTERANCE_RATE);
+        assert!(
+            budget >= previous,
+            "{seconds}s of audio was given less than the length below it"
+        );
+        previous = budget;
+    }
+}

@@ -40,17 +40,41 @@ const TRANSCRIPTIONS_PATH: &str = "/v1/audio/transcriptions";
 const SPEECH_PATH: &str = "/v1/audio/speech";
 const HEALTH_PATH: &str = "/v1/health/ready";
 
-/// Upload-to-transcript budget for one utterance.
+/// The part of an utterance's budget that does not depend on its length.
 ///
-/// The utterance machine has already decided the user stopped talking, so this
-/// is dead air on the user's side; a server that has not answered in ten
-/// seconds has failed as far as a conversation is concerned, and the local
-/// recogniser (when installed) is a better answer than a longer wait.
-const TRANSCRIBE_TIMEOUT: Duration = Duration::from_secs(10);
+/// The connection, the server's own scheduling, and the model warm-up. The
+/// utterance machine has already decided the user stopped talking, so all of
+/// this is dead air on the user's side; ten seconds of it is the value this
+/// shipped with, and it stays the floor so an ordinary utterance behaves
+/// exactly as it did.
+const TRANSCRIBE_BASE_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Synthesis budget for one reply. Longer than transcription because the text
-/// is the whole reply and some servers synthesise it in one pass, and because
-/// nothing is waiting on it — the microphone stays open throughout.
+/// Milliseconds of budget added for every second of audio uploaded.
+///
+/// The flat ten seconds was set when an utterance could not exceed thirty, and
+/// the silence-hold slider raised that ceiling with it: at the ten-second hold
+/// one utterance may carry 230 seconds of audio (see
+/// [`super::utterance::MAX_SILENCE_HOLD_MS`]), which is a seven-megabyte upload
+/// a server is unlikely to transcribe inside a budget meant for a sentence. A
+/// long recording would therefore always have timed out and fallen back to this
+/// computer — the server the user chose being used for exactly the utterances
+/// it was least likely to be needed for.
+///
+/// Half a second per second of audio: a server that needs longer than half of
+/// what was said to write it down cannot hold a conversation, whatever it
+/// eventually answers, and waiting on it is worse than the local recogniser.
+const TRANSCRIBE_MS_PER_AUDIO_SECOND: u64 = 500;
+
+/// The most any one utterance may wait, however long it is.
+///
+/// Set just above what the longest recording this app can make asks for
+/// (230 seconds of audio → 125 seconds), so no honest request is clipped by it
+/// and a wrong address still cannot hold the audio worker indefinitely.
+const TRANSCRIBE_MAX_TIMEOUT: Duration = Duration::from_secs(130);
+
+/// Synthesis budget for one reply. Longer than a short utterance's because the
+/// text is the whole reply and some servers synthesise it in one pass, and
+/// because nothing is waiting on it — the microphone stays open throughout.
 const SPEAK_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// Health-probe budget. The user is watching a button, so this fails fast.
@@ -236,7 +260,7 @@ pub(crate) fn transcribe(
             reqwest::header::CONTENT_TYPE,
             format!("multipart/form-data; boundary={boundary}"),
         )
-        .timeout(TRANSCRIBE_TIMEOUT)
+        .timeout(transcribe_timeout(samples.len(), sample_rate))
         .body(multipart_wav_body(&boundary, "utterance.wav", &wav))
         .send()
         .map_err(|error| format!("speech server did not answer: {error}"))?;
@@ -296,6 +320,22 @@ pub(crate) fn synthesize(
     }
     let declared = response.content_length();
     read_capped(declared, response, MAX_SPEECH_BYTES, "audio")
+}
+
+/// How long this utterance's server is given to answer.
+///
+/// [`TRANSCRIBE_BASE_TIMEOUT`] plus [`TRANSCRIBE_MS_PER_AUDIO_SECOND`] for each
+/// second of audio, up to [`TRANSCRIBE_MAX_TIMEOUT`]. Saturating throughout: the
+/// answer is a wait, and no length of buffer may turn into a shorter one.
+fn transcribe_timeout(samples: usize, sample_rate: u32) -> Duration {
+    // A zero rate is not reachable through the callers — it is a constant — but
+    // dividing by it here would be a panic on the audio thread.
+    let rate = u64::from(sample_rate.max(1));
+    let audio_ms = (samples as u64).saturating_mul(1_000) / rate;
+    let for_the_audio = audio_ms.saturating_mul(TRANSCRIBE_MS_PER_AUDIO_SECOND) / 1_000;
+    TRANSCRIBE_BASE_TIMEOUT
+        .saturating_add(Duration::from_millis(for_the_audio))
+        .min(TRANSCRIBE_MAX_TIMEOUT)
 }
 
 /// Read a response body, refusing one that is bigger than `limit`.
