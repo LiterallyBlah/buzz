@@ -42,6 +42,18 @@
 /// the only honest option a listener can act on.
 const CODE_BLOCK_SPOKEN_AS: &str = "code block.";
 
+/// What a fence that never closes is spoken as instead.
+///
+/// Everything after an opening fence is held back until a closing one, and a
+/// fence that never closes therefore swallows the rest of the reply — which is
+/// CommonMark's own reading of it, and not something to change. What was wrong
+/// is that it sounded exactly like a finished answer with a code block in it.
+/// A reply cut off mid-fence is ordinary: a length cap, a stream that stopped,
+/// an agent that wrote three backticks and moved on. The listener is the only
+/// one who cannot see that the text carries on, so this is the one place that
+/// can tell them.
+const UNFINISHED_CODE_BLOCK_SPOKEN_AS: &str = "unfinished code block.";
+
 /// The longest run of emphasis characters CommonMark can give meaning to.
 const MAX_EMPHASIS_RUN: usize = 3;
 
@@ -53,6 +65,9 @@ const MAX_EMPHASIS_RUN: usize = 3;
 pub(crate) fn flatten_markdown_for_speech(markdown: &str) -> String {
     let mut spoken: Vec<String> = Vec::new();
     let mut fence: Option<String> = None;
+    // Where the open fence's own line landed, so it can be renamed if the
+    // reply ends before the fence does.
+    let mut fence_line: Option<usize> = None;
 
     for raw_line in markdown.lines() {
         let line = raw_line.trim_end();
@@ -67,7 +82,7 @@ pub(crate) fn flatten_markdown_for_speech(markdown: &str) -> String {
         }
         if let Some(open) = opening_fence(trimmed) {
             fence = Some(open);
-            push_line(&mut spoken, CODE_BLOCK_SPOKEN_AS.to_string());
+            fence_line = Some(push_line(&mut spoken, CODE_BLOCK_SPOKEN_AS.to_string()));
             continue;
         }
 
@@ -80,7 +95,7 @@ pub(crate) fn flatten_markdown_for_speech(markdown: &str) -> String {
         let (body, ends_a_sentence) = match strip_heading(body) {
             Some(heading) => (heading, true),
             None => match strip_list_marker(body) {
-                Some(item) => (item, true),
+                Some(item) => (strip_task_marker(item), true),
                 None => (body, false),
             },
         };
@@ -95,20 +110,30 @@ pub(crate) fn flatten_markdown_for_speech(markdown: &str) -> String {
         push_line(&mut spoken, said);
     }
 
+    // A fence still open here never closed, and everything after it went
+    // unspoken. Say which kind of block it was, so the silence has a reason.
+    if fence.is_some() {
+        if let Some(line) = fence_line.and_then(|index| spoken.get_mut(index)) {
+            *line = UNFINISHED_CODE_BLOCK_SPOKEN_AS.to_string();
+        }
+    }
+
     spoken.join("\n")
 }
 
-/// Append `line`, unless it repeats the "code block" line already there.
+/// Append `line`, unless it repeats the "code block" line already there, and
+/// answer where the line that now stands for it is.
 ///
 /// A reply that alternates prose and fences is common; two adjacent fences
 /// with nothing between them are not two pieces of news.
-fn push_line(spoken: &mut Vec<String>, line: String) {
+fn push_line(spoken: &mut Vec<String>, line: String) -> usize {
     if line == CODE_BLOCK_SPOKEN_AS
         && spoken.last().map(String::as_str) == Some(CODE_BLOCK_SPOKEN_AS)
     {
-        return;
+        return spoken.len().saturating_sub(1);
     }
     spoken.push(line);
+    spoken.len().saturating_sub(1)
 }
 
 /// The fence a line opens, if it opens one: three or more backticks or tildes.
@@ -191,6 +216,34 @@ fn strip_list_marker(body: &str) -> Option<&str> {
         return None;
     }
     Some(rest.trim_start())
+}
+
+/// Drop a task-list checkbox from the front of a list item.
+///
+/// `[x]` is a box with a tick in it, drawn out of three characters because
+/// Markdown has no better way to draw one. Left alone it reads as a shortcut
+/// link whose label is the letter x, so "- [x] done two" was spoken as "x done
+/// two" — a stray letter at the head of every finished item.
+///
+/// The state is deliberately not announced either way. A checked item and an
+/// unchecked one both say what they say; a voice that prefixed one of them
+/// would be adding a word the writer did not, on every line of every list.
+fn strip_task_marker(item: &str) -> &str {
+    let rest = match item.strip_prefix('[') {
+        Some(rest) => rest,
+        None => return item,
+    };
+    let mut marks = rest.chars();
+    let state = marks.next().filter(|c| matches!(c, ' ' | 'x' | 'X'));
+    if state.is_none() || marks.next() != Some(']') {
+        return item;
+    }
+    // A box has to be followed by the item it labels: "[x]y" is not a checkbox.
+    let after = &rest[2..];
+    if !after.starts_with([' ', '\t']) {
+        return item;
+    }
+    after.trim_start()
 }
 
 fn ends_with_sentence_punctuation(said: &str) -> bool {

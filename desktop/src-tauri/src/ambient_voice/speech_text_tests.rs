@@ -85,10 +85,11 @@ fn a_fenced_block_is_named_rather_than_read_out_character_by_character() {
         "Here is the fix:\ncode block.\nThen rebuild."
     );
     // Tildes open a fence too, and an unterminated fence still swallows its
-    // contents rather than reading them aloud.
+    // contents rather than reading them aloud — it just says which kind of
+    // block it was, so the swallowing is accounted for rather than silent.
     assert_eq!(
         flatten_markdown_for_speech("~~~\nnever closed\n"),
-        "code block."
+        "unfinished code block."
     );
 }
 
@@ -171,6 +172,47 @@ fn nothing_a_reply_can_contain_makes_this_lose_a_word() {
     for mark in ['*', '`', '#', '[', ']', '>'] {
         assert!(!spoken.contains(mark), "{mark} survived into {spoken:?}");
     }
+}
+
+#[test]
+fn an_unfinished_code_block_is_said_to_be_unfinished() {
+    // A fence that never closes holds back everything after it, which is
+    // CommonMark's own reading and stays. What must not happen is it sounding
+    // identical to a finished answer: a reply cut off mid-fence is ordinary,
+    // and the listener is the only person who cannot see that the text
+    // carries on.
+    let closed = flatten_markdown_for_speech("Here is the fix:\n```\nlet x = 1;\n```\nDone.");
+    let cut_off = flatten_markdown_for_speech("Here is the fix:\n```\nlet x = 1;\nand more");
+    assert_ne!(
+        closed, cut_off,
+        "a reply that stops inside a code block sounds like one that does not"
+    );
+    assert_eq!(closed, "Here is the fix:\ncode block.\nDone.");
+    assert_eq!(cut_off, "Here is the fix:\nunfinished code block.");
+
+    // The code itself still goes unread, both ways round.
+    assert!(!cut_off.contains("let x"), "{cut_off}");
+    assert!(!cut_off.contains("and more"), "{cut_off}");
+}
+
+#[test]
+fn a_task_list_speaks_its_items_and_not_its_boxes() {
+    // `[x]` is a drawing of a ticked box. Spoken, it was the letter x at the
+    // head of every finished item. Neither state is announced: a voice that
+    // said "done" or "not done" would be adding a word the writer did not.
+    assert_eq!(
+        flatten_markdown_for_speech("- [ ] todo one\n- [x] done two\n- [X] done three"),
+        "todo one.\ndone two.\ndone three."
+    );
+    // A bracket that is not a checkbox is left to the ordinary link rules.
+    assert_eq!(
+        flatten_markdown_for_speech("- [the docs](https://example.test) first"),
+        "the docs first."
+    );
+    assert_eq!(
+        flatten_markdown_for_speech("- [xy] not a box"),
+        "xy not a box."
+    );
 }
 
 #[test]
