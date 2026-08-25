@@ -1412,7 +1412,8 @@ let mockInstalledExtensions: Array<Record<string, unknown>> = [];
  * Lets a spec assert the acquire/release pairing — the real leak this guards
  * against is a frame that never releases, leaving a localhost listener behind.
  */
-let mockExtensionFrameHolders = 0;
+let mockExtensionFrameHolders = new Set<string>();
+let mockExtensionFrameLeases = 0;
 
 // ── get_event defer/release seam ────────────────────────────────────────────
 // When `window.__BUZZ_E2E_DEFER_GET_EVENT__` is set to a target event ID,
@@ -9837,7 +9838,8 @@ export function maybeInstallE2eTauriMocks() {
   resetMockPersonas(config);
   resetMockTeams(config);
   mockInstalledExtensions = [];
-  mockExtensionFrameHolders = 0;
+  mockExtensionFrameHolders = new Set<string>();
+  mockExtensionFrameLeases = 0;
   seedMockSearchProfiles(config);
   resetMockWorkflows();
   resetMockMesh();
@@ -12615,14 +12617,21 @@ export function maybeInstallE2eTauriMocks() {
         const frameId = String((payload as { id?: string })?.id ?? "");
         const origin =
           activeConfig?.mock?.extensionFrameOrigin ?? "http://127.0.0.1:51234";
-        mockExtensionFrameHolders += 1;
-        return { url: `${origin}/ext/${frameId}/index.html`, origin };
+        mockExtensionFrameLeases += 1;
+        const lease = `mock-lease-${mockExtensionFrameLeases}`;
+        mockExtensionFrameHolders.add(lease);
+        // The wrapper URL, not the entry: Buzz must never frame the extension
+        // document directly, or the navigation wall has no container.
+        return { url: `${origin}/frame/${frameId}`, origin, lease };
       }
       case "close_extension_frame":
-        mockExtensionFrameHolders = Math.max(0, mockExtensionFrameHolders - 1);
+        // Only the presented lease, mirroring the Rust side.
+        mockExtensionFrameHolders.delete(
+          String((payload as { lease?: string })?.lease ?? ""),
+        );
         return null;
       case "__mock_extension_frame_holders":
-        return mockExtensionFrameHolders;
+        return mockExtensionFrameHolders.size;
       case "list_installed_extensions":
         return mockInstalledExtensions.slice();
       case "pick_extension_directory":

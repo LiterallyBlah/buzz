@@ -139,6 +139,11 @@ pub struct ExtensionFrameTarget {
     pub url: String,
     /// The origin that URL sits on, for the caller to assert against.
     pub origin: String,
+    /// Opaque claim on the frame host, to be handed back on close.
+    ///
+    /// The caller must return *this* lease and no other. A frame whose open
+    /// failed has none, so its cleanup cannot release a lease it never held.
+    pub lease: String,
 }
 
 /// Start (or join) the frame host and resolve an installed extension's page.
@@ -164,11 +169,12 @@ pub async fn open_extension_frame(
             .map_err(|error| format!("extension frame task failed: {error}"))??
     };
 
-    let port = frame_host::acquire(base_dir).await?;
-    let origin = frame_host::origin_for_port(port);
+    let claim = frame_host::acquire(base_dir).await?;
+    let origin = frame_host::origin_for_port(claim.port);
     Ok(ExtensionFrameTarget {
-        url: frame_host::frame_url(&origin, &manifest.id, &manifest.entry),
+        url: frame_host::wrapper_url(&origin, &manifest.id),
         origin,
+        lease: claim.lease,
     })
 }
 
@@ -200,9 +206,13 @@ pub(crate) fn resolve_frame_manifest(
 }
 
 /// Release one live extension frame, stopping the host when it was the last.
+///
+/// Takes the lease `open_extension_frame` issued. Releasing an unknown lease is
+/// a no-op rather than an error: cleanup runs on paths where opening failed,
+/// and making that noisy would only teach callers to ignore it.
 #[tauri::command]
-pub async fn close_extension_frame() -> Result<(), String> {
-    frame_host::release();
+pub async fn close_extension_frame(lease: String) -> Result<(), String> {
+    frame_host::release(&lease);
     Ok(())
 }
 

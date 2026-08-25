@@ -48,15 +48,29 @@ export function ExtensionFrame({ extensionId }: ExtensionFrameProps) {
 
   React.useEffect(() => {
     let live = true;
+    // The lease this effect actually acquired — not "a" lease. Cleanup releases
+    // only what it holds, so an open that failed releases nothing and cannot
+    // stop the host still serving another frame.
+    let held: string | null = null;
     setTarget(null);
     setError(null);
 
+    const releaseHeld = () => {
+      if (held === null) {
+        return;
+      }
+      const lease = held;
+      held = null;
+      void closeExtensionFrame(lease);
+    };
+
     void openExtensionFrame(extensionId)
       .then((opened) => {
+        held = opened.lease;
         if (!live) {
-          // Unmounted while the host was starting. Release immediately or the
-          // listener has a holder that no longer exists.
-          void closeExtensionFrame();
+          // Unmounted while the host was starting: hand the lease straight
+          // back, or it outlives the component that owns it.
+          releaseHeld();
           return;
         }
         setTarget(opened);
@@ -71,7 +85,7 @@ export function ExtensionFrame({ extensionId }: ExtensionFrameProps) {
       live = false;
       // Closing the tab, navigating away, or switching the preview flag off all
       // unmount this component — which is what stops the frame host.
-      void closeExtensionFrame();
+      releaseHeld();
     };
   }, [extensionId]);
 

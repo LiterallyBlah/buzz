@@ -220,9 +220,10 @@ async fn the_host_starts_serves_and_leaves_no_listener_behind() {
     let _guard = lifecycle_guard().await;
     let base = installed(&[("index.html", b"<!doctype html><title>demo</title>")]);
 
-    let port = acquire(base.path().to_path_buf())
+    let claim = acquire(base.path().to_path_buf())
         .await
         .expect("host should start");
+    let port = claim.port;
     assert!(is_listening(port).await, "nothing is listening on {port}");
     assert_eq!(running_port(), Some(port));
 
@@ -254,7 +255,7 @@ async fn the_host_starts_serves_and_leaves_no_listener_behind() {
     );
     assert!(body.text().await.expect("body").contains("demo"));
 
-    release();
+    release(&claim.lease);
     assert!(
         wait_until_closed(port).await,
         "the listener outlived its last frame on port {port}"
@@ -269,17 +270,24 @@ async fn a_second_frame_keeps_the_host_up_until_both_release() {
 
     let first = acquire(base.path().to_path_buf()).await.expect("first");
     let second = acquire(base.path().to_path_buf()).await.expect("second");
-    assert_eq!(first, second, "a second frame must reuse the one listener");
+    assert_eq!(
+        first.port, second.port,
+        "a second frame must reuse the one listener"
+    );
+    assert_ne!(
+        first.lease, second.lease,
+        "each frame must get its own lease, or one can release the other"
+    );
 
-    release();
+    release(&first.lease);
     assert!(
-        is_listening(first).await,
+        is_listening(first.port).await,
         "the host stopped while a frame was still open"
     );
 
-    release();
+    release(&second.lease);
     assert!(
-        wait_until_closed(first).await,
+        wait_until_closed(first.port).await,
         "the last release must stop it"
     );
 }
@@ -291,8 +299,9 @@ async fn shutdown_stops_the_host_even_with_holders_outstanding() {
     let _guard = lifecycle_guard().await;
     let base = installed(&[("index.html", b"x")]);
 
-    let port = acquire(base.path().to_path_buf()).await.expect("acquire");
-    let _ = acquire(base.path().to_path_buf()).await.expect("acquire");
+    let claim = acquire(base.path().to_path_buf()).await.expect("acquire");
+    let port = claim.port;
+    let second = acquire(base.path().to_path_buf()).await.expect("acquire");
     assert!(is_listening(port).await);
 
     shutdown_now();
@@ -303,9 +312,9 @@ async fn shutdown_stops_the_host_even_with_holders_outstanding() {
     assert_eq!(running_port(), None);
 
     // Releasing after shutdown must not underflow or resurrect anything.
-    release();
-    release();
-    release();
+    release(&claim.lease);
+    release(&second.lease);
+    release("never-issued");
     assert_eq!(running_port(), None);
 }
 
@@ -315,13 +324,16 @@ async fn a_restarted_host_serves_again_on_a_fresh_port() {
     let base = installed(&[("index.html", b"x")]);
 
     let first = acquire(base.path().to_path_buf()).await.expect("first");
-    release();
-    assert!(wait_until_closed(first).await);
+    release(&first.lease);
+    assert!(wait_until_closed(first.port).await);
 
     let second = acquire(base.path().to_path_buf()).await.expect("second");
-    assert!(is_listening(second).await, "the host did not come back");
-    release();
-    assert!(wait_until_closed(second).await);
+    assert!(
+        is_listening(second.port).await,
+        "the host did not come back"
+    );
+    release(&second.lease);
+    assert!(wait_until_closed(second.port).await);
 }
 
 #[tokio::test]
@@ -330,7 +342,8 @@ async fn traversal_is_refused_over_the_wire_too() {
     let base = installed(&[("index.html", b"x")]);
     fs::write(base.path().join("secret.txt"), b"top secret").expect("secret");
 
-    let port = acquire(base.path().to_path_buf()).await.expect("acquire");
+    let claim = acquire(base.path().to_path_buf()).await.expect("acquire");
+    let port = claim.port;
     let origin = origin_for_port(port);
 
     // Sent raw so the client cannot normalise the traversal away before it
@@ -357,7 +370,7 @@ async fn traversal_is_refused_over_the_wire_too() {
         );
     }
 
-    release();
+    release(&claim.lease);
     assert!(wait_until_closed(port).await);
 }
 
@@ -407,7 +420,8 @@ async fn every_served_document_carries_the_egress_policy() {
         ("data.json", b"{}"),
     ]);
 
-    let port = acquire(base.path().to_path_buf()).await.expect("acquire");
+    let claim = acquire(base.path().to_path_buf()).await.expect("acquire");
+    let port = claim.port;
     let origin = origin_for_port(port);
 
     for asset in ["index.html", "app.js", "app.css", "icon.png", "data.json"] {
@@ -431,7 +445,7 @@ async fn every_served_document_carries_the_egress_policy() {
         );
     }
 
-    release();
+    release(&claim.lease);
     assert!(wait_until_closed(port).await);
 }
 
@@ -466,4 +480,129 @@ fn the_document_policy_does_not_govern_post_message() {
         !policy.contains("sandbox"),
         "the served policy must not add its own sandbox; got: {policy}"
     );
+}
+
+// ── Blocker 2: a failed open must not release someone else's lease ───────────
+
+#[tokio::test]
+async fn a_failed_open_cannot_stop_a_healthy_frame() {
+    // Hermes's named regression. Frame A opens; frame B's open fails before it
+    // ever acquires; B unmounts and runs its cleanup anyway. With a bare
+    // counter that took the host down under A. With leases, B has nothing to
+    // present, so its cleanup is a no-op.
+    let _guard = lifecycle_guard().await;
+    let base = installed(&[("index.html", b"x")]);
+
+    let healthy = acquire(base.path().to_path_buf()).await.expect("frame A");
+    assert!(is_listening(healthy.port).await);
+
+    // Frame B never got a lease — its open failed. Cleanup still runs.
+    release("");
+    release("lease-b-never-existed");
+    release(&uuid::Uuid::new_v4().to_string());
+
+    assert!(
+        is_listening(healthy.port).await,
+        "a failed frame's cleanup stopped the host still serving a healthy one"
+    );
+    assert_eq!(running_port(), Some(healthy.port));
+
+    release(&healthy.lease);
+    assert!(wait_until_closed(healthy.port).await);
+}
+
+#[tokio::test]
+async fn releasing_the_same_lease_twice_does_not_close_another_frame() {
+    // The unmount/promise race: cleanup can run more than once. A second
+    // release of an already-returned lease must not consume a live one.
+    let _guard = lifecycle_guard().await;
+    let base = installed(&[("index.html", b"x")]);
+
+    let first = acquire(base.path().to_path_buf()).await.expect("first");
+    let second = acquire(base.path().to_path_buf()).await.expect("second");
+
+    release(&first.lease);
+    release(&first.lease);
+    release(&first.lease);
+
+    assert!(
+        is_listening(second.port).await,
+        "a repeated release consumed a different frame's lease"
+    );
+
+    release(&second.lease);
+    assert!(wait_until_closed(second.port).await);
+}
+
+// ── Blocker 1: the wrapper is the navigation container ───────────────────────
+
+#[tokio::test]
+async fn the_wrapper_document_carries_the_navigation_wall() {
+    let _guard = lifecycle_guard().await;
+    let base = tempfile::tempdir().expect("tempdir");
+    let root = base.path().join("demo");
+    fs::create_dir_all(&root).expect("root");
+    fs::write(
+        root.join("extension.json"),
+        br#"{ "id": "demo", "name": "Demo", "version": "1", "entry": "index.html" }"#,
+    )
+    .expect("manifest");
+    fs::write(root.join("index.html"), b"<!doctype html>hello").expect("entry");
+
+    let claim = acquire(base.path().to_path_buf()).await.expect("acquire");
+    let origin = origin_for_port(claim.port);
+
+    let response = reqwest::get(wrapper_url(&origin, "demo"))
+        .await
+        .expect("request");
+    assert_eq!(response.status(), 200);
+    let policy = response
+        .headers()
+        .get(header::CONTENT_SECURITY_POLICY)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    let body = response.text().await.expect("body");
+
+    // `frame-src` pinned to this origin is the wall: a nested context's
+    // navigation is checked against its container's policy, so the extension
+    // cannot navigate itself to an external sink.
+    assert!(
+        policy.contains(&format!("frame-src {origin}")),
+        "the wrapper must bound where its child may navigate; got: {policy}"
+    );
+    assert!(
+        !policy.contains("frame-src *") && !policy.contains("frame-src https:"),
+        "the wall must not admit an external origin; got: {policy}"
+    );
+    // It embeds the entry from the manifest, sandboxed, and nothing else.
+    assert!(
+        body.contains(&frame_url(&origin, "demo", "index.html")),
+        "wrapper should embed the manifest entry; got: {body}"
+    );
+    assert!(
+        body.contains(r#"sandbox="allow-scripts""#),
+        "the inner frame must keep the sandbox; got: {body}"
+    );
+
+    release(&claim.lease);
+    assert!(wait_until_closed(claim.port).await);
+}
+
+#[tokio::test]
+async fn the_wrapper_refuses_an_unknown_or_invalid_extension() {
+    let _guard = lifecycle_guard().await;
+    let base = installed(&[("index.html", b"x")]);
+    let claim = acquire(base.path().to_path_buf()).await.expect("acquire");
+    let origin = origin_for_port(claim.port);
+
+    for id in ["../demo", "nope", "Evil"] {
+        let response = reqwest::get(format!("{origin}/{FRAME_ROUTE_PREFIX}/{id}"))
+            .await
+            .expect("request");
+        assert_eq!(response.status(), 404, "id {id:?} must not get a wrapper");
+    }
+
+    release(&claim.lease);
+    assert!(wait_until_closed(claim.port).await);
 }

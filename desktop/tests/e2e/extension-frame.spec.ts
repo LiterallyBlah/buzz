@@ -59,7 +59,9 @@ test("opening an installed extension renders it in a sandboxed frame", async ({
   // Tauri and bypasses the app ACL, which is the failure decision 002 exists to
   // prevent — so the src must be plain http on a loopback address.
   const src = (await frame.getAttribute("src")) ?? "";
-  expect(src).toMatch(/^http:\/\/127\.0\.0\.1:\d+\/ext\/equation-explorer\//);
+  // The wrapper, not the extension document: framing the extension directly
+  // removes the container whose `frame-src` is the navigation wall.
+  expect(src).toMatch(/^http:\/\/127\.0\.0\.1:\d+\/frame\/equation-explorer$/);
   expect(src.startsWith("tauri://")).toBe(false);
   expect(src.startsWith("buzz-media://")).toBe(false);
   expect(src.startsWith("asset://")).toBe(false);

@@ -98,6 +98,14 @@ export type ExtensionFrameTarget = {
   url: string;
   /** The origin that URL sits on. */
   origin: string;
+  /**
+   * Opaque claim on the frame host. Hand back exactly this on close.
+   *
+   * A frame whose open failed has no lease, so its cleanup must not call close
+   * at all — releasing "a" holder rather than "your" holder is what let a
+   * failed frame stop the server serving a healthy one.
+   */
+  lease: string;
 };
 
 /**
@@ -113,7 +121,7 @@ export function openExtensionFrame(id: string): Promise<ExtensionFrameTarget> {
   return invoke<ExtensionFrameTarget>("open_extension_frame", { id });
 }
 
-/** Release one live frame. The host stops when the last one goes. */
-export function closeExtensionFrame(): Promise<void> {
-  return invoke<void>("close_extension_frame");
+/** Release the lease from a successful {@link openExtensionFrame}. */
+export function closeExtensionFrame(lease: string): Promise<void> {
+  return invoke<void>("close_extension_frame", { lease });
 }
