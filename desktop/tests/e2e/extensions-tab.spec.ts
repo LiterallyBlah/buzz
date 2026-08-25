@@ -59,3 +59,92 @@ test("extensions tab is hidden when the preview flag is off", async ({
   await expect(page.getByTestId("sidebar-primary-menu")).toBeVisible();
   await expect(page.getByTestId("open-extensions-view")).toHaveCount(0);
 });
+
+// ── Should-fix B: the install path, exercised rather than asserted ───────────
+
+const VALID_MANIFEST = JSON.stringify({
+  id: "equation-explorer",
+  name: "Equation Explorer",
+  version: "0.1.0",
+  entry: "index.html",
+  scopes: {
+    identity: true,
+    sign: [{ kind: 9, channels: ["c8fb8f44-993d-4166-810e-ebdad7b8b944"] }],
+  },
+});
+
+test("the Extensions area starts empty", async ({ page }) => {
+  await installMockBridge(page);
+  await page.goto("/#/extensions");
+
+  await expect(page.getByTestId("extensions-view")).toBeVisible();
+  await expect(page.getByText("No extensions installed")).toBeVisible();
+});
+
+test("a successful install appears in the installed list", async ({ page }) => {
+  await installMockBridge(page, {
+    extensionPickPath: "/tmp/equation-explorer",
+    extensionPreviewManifest: VALID_MANIFEST,
+  });
+  await page.goto("/#/extensions");
+
+  await expect(page.getByText("No extensions installed")).toBeVisible();
+  await page.getByTestId("install-extension-from-folder").click();
+
+  const card = page.getByTestId("installed-extension-equation-explorer");
+  await expect(card).toBeVisible();
+  await expect(card).toContainText("Equation Explorer");
+  await expect(card).toContainText("0.1.0");
+  // The declared scopes are rendered, which is what P5's grant UI builds on.
+  await expect(card).toContainText("Identity");
+  await expect(card).toContainText("Sign kind 9 in 1 channel");
+  await expect(page.getByText("No extensions installed")).toBeHidden();
+});
+
+test("an authoritative Rust rejection is surfaced verbatim", async ({
+  page,
+}) => {
+  // The loader can refuse a package whose shape the frontend accepted. That
+  // message is written for the user and must reach them unaltered.
+  const rejection = 'extension id "../evil" is not valid';
+  await installMockBridge(page, {
+    extensionPickPath: "/tmp/hostile",
+    extensionPreviewManifest: VALID_MANIFEST,
+    extensionInstallError: rejection,
+  });
+  await page.goto("/#/extensions");
+
+  await page.getByTestId("install-extension-from-zip").click();
+
+  const error = page.getByTestId("extension-install-error");
+  await expect(error).toBeVisible();
+  await expect(error).toContainText(rejection);
+  await expect(page.getByText("No extensions installed")).toBeVisible();
+});
+
+test("a manifest that fails frontend shape validation never reaches install", async ({
+  page,
+}) => {
+  // Decision 006's frontend half: zod explains the problem before the install
+  // command is called. `extensionInstallError` is set to a message that must
+  // NOT appear — if it does, the shape gate did not hold.
+  await installMockBridge(page, {
+    extensionPickPath: "/tmp/broken",
+    extensionPreviewManifest: JSON.stringify({
+      id: "../evil",
+      name: "Broken",
+      version: "0.1.0",
+      entry: "index.html",
+    }),
+    extensionInstallError: "RUST-LOADER-WAS-CALLED",
+  });
+  await page.goto("/#/extensions");
+
+  await page.getByTestId("install-extension-from-folder").click();
+
+  const error = page.getByTestId("extension-install-error");
+  await expect(error).toBeVisible();
+  await expect(error).toContainText("extension.json");
+  await expect(error).toContainText("id must match");
+  await expect(error).not.toContainText("RUST-LOADER-WAS-CALLED");
+});

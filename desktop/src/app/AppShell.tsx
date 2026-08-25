@@ -892,9 +892,7 @@ export function AppShell() {
                         onBrowseChannels={handleOpenBrowseChannels}
                         onOpenDm={async ({ pubkeys }) => {
                           const directMessage =
-                            await openDmMutation.mutateAsync({
-                              pubkeys,
-                            });
+                            await openDmMutation.mutateAsync({ pubkeys });
                           await goChannel(directMessage.id);
                         }}
                         onSelectAgents={() => void goAgents()}

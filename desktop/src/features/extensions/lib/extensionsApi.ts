@@ -50,6 +50,29 @@ export function pickExtensionZip(): Promise<string | null> {
   return invoke<string | null>("pick_extension_zip");
 }
 
+export type ExtensionPackagePreview = {
+  /** The directory or zip that was inspected. */
+  source: string;
+  /** Raw `extension.json` contents — not parsed and not validated by the host. */
+  manifestJson: string;
+};
+
+/**
+ * Read a candidate package's manifest without installing it.
+ *
+ * The webview cannot read local paths, so this is how decision 006's frontend
+ * validation half gets something to validate. Read-only and non-authoritative:
+ * a package that previews cleanly can still be rejected at install. P5's
+ * grant-review UI reads the same preview.
+ */
+export function previewExtensionPackage(
+  source: string,
+): Promise<ExtensionPackagePreview> {
+  return invoke<ExtensionPackagePreview>("preview_extension_package", {
+    source,
+  });
+}
+
 export function installExtensionFromDirectory(
   sourceDir: string,
 ): Promise<InstalledExtension> {

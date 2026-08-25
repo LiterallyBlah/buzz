@@ -4,12 +4,13 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 
 import {
   type InstalledExtension,
-  installExtensionFromDirectory,
-  installExtensionFromZip,
   listInstalledExtensions,
-  pickExtensionDirectory,
-  pickExtensionZip,
 } from "@/features/extensions/lib/extensionsApi";
+import {
+  type InstallSource,
+  ManifestShapeError,
+  installFromPickedSource,
+} from "@/features/extensions/lib/installFlow";
 import { ExtensionCard } from "@/features/extensions/ui/ExtensionCard";
 import { Button } from "@/shared/ui/button";
 import { Card } from "@/shared/ui/card";
@@ -17,20 +18,34 @@ import { Skeleton } from "@/shared/ui/skeleton";
 
 const installedExtensionsQueryKey = ["installed-extensions"] as const;
 
+type InstallFailure = {
+  /** Headline: which half of validation refused the package. */
+  title: string;
+  /** One line per problem. */
+  issues: string[];
+};
+
 /**
- * Install rejections arrive as the Rust command's error string, which is
- * already written for the user ("extension id \"../evil\" is not valid"). Show
- * it verbatim rather than replacing it with a generic failure message — the
- * specific reason is the whole point of validating.
+ * Rejections arrive from two places and both are already written for the user:
+ * zod's shape complaints from the frontend preview, and the Rust loader's
+ * string ("extension id \"../evil\" is not valid"). Show either verbatim rather
+ * than replacing it with a generic failure — the specific reason is the whole
+ * point of validating.
  */
-function formatInstallError(error: unknown): string {
+function toInstallFailure(error: unknown): InstallFailure {
+  if (error instanceof ManifestShapeError) {
+    return {
+      title: "This package's extension.json isn't valid",
+      issues: error.issues,
+    };
+  }
   if (typeof error === "string") {
-    return error;
+    return { title: "Install failed", issues: [error] };
   }
   if (error instanceof Error) {
-    return error.message;
+    return { title: "Install failed", issues: [error.message] };
   }
-  return String(error);
+  return { title: "Install failed", issues: [String(error)] };
 }
 
 function ExtensionsListSkeleton() {
@@ -53,7 +68,9 @@ function ExtensionsListSkeleton() {
 
 export function ExtensionsScreen() {
   const queryClient = useQueryClient();
-  const [installError, setInstallError] = React.useState<string | null>(null);
+  const [installError, setInstallError] = React.useState<InstallFailure | null>(
+    null,
+  );
 
   const installedQuery = useQuery({
     queryKey: installedExtensionsQueryKey,
@@ -62,20 +79,10 @@ export function ExtensionsScreen() {
   });
 
   const installMutation = useMutation({
-    mutationFn: async (source: "directory" | "zip") => {
-      const path =
-        source === "directory"
-          ? await pickExtensionDirectory()
-          : await pickExtensionZip();
-      // The picker resolves to null when the user cancels — not an error, and
-      // not something to report.
-      if (path === null) {
-        return null;
-      }
-      return source === "directory"
-        ? await installExtensionFromDirectory(path)
-        : await installExtensionFromZip(path);
-    },
+    // pick → preview → zod shape check → install. The preview step is what
+    // makes decision 006's frontend validation real rather than ornamental;
+    // Rust validates again and remains authoritative.
+    mutationFn: (source: InstallSource) => installFromPickedSource(source),
     onMutate: () => setInstallError(null),
     onSuccess: (installed: InstalledExtension | null) => {
       if (installed === null) {
@@ -85,7 +92,7 @@ export function ExtensionsScreen() {
         queryKey: installedExtensionsQueryKey,
       });
     },
-    onError: (error: unknown) => setInstallError(formatInstallError(error)),
+    onError: (error: unknown) => setInstallError(toInstallFailure(error)),
   });
 
   const isInstalling = installMutation.isPending;
@@ -131,11 +138,18 @@ export function ExtensionsScreen() {
             data-testid="extension-install-error"
           >
             <p className="text-sm font-medium text-destructive">
-              Install failed
+              {installError.title}
             </p>
-            <p className="mt-1 break-words text-sm text-muted-foreground">
-              {installError}
-            </p>
+            <ul className="mt-1 space-y-1">
+              {installError.issues.map((issue) => (
+                <li
+                  className="break-words text-sm text-muted-foreground"
+                  key={issue}
+                >
+                  {issue}
+                </li>
+              ))}
+            </ul>
           </Card>
         ) : null}
 

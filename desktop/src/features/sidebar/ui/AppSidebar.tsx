@@ -321,12 +321,7 @@ export function AppSidebar({
   }, [isCreateChannelOpenProp, openCreateDialog]);
   const [collapsedGroups, setCollapsedGroups] = React.useState<
     Record<CollapsibleSidebarGroup, boolean>
-  >({
-    starred: false,
-    channels: false,
-    forums: false,
-    directMessages: false,
-  });
+  >({ starred: false, channels: false, forums: false, directMessages: false });
 
   const toggleCollapsedGroup = React.useCallback(
     (group: CollapsibleSidebarGroup) => {

@@ -338,6 +338,19 @@ type MockBridgeOptions = {
    */
   archivedIdentities?: string[];
   /**
+   * Extension install flow (preview-flagged Extensions area).
+   *
+   * `extensionPickPath` is what the mocked folder/zip pickers return — `null`
+   * models the user cancelling. `extensionPreviewManifest` is the raw
+   * `extension.json` the read-only preview command returns, which is what the
+   * frontend's zod shape check runs over. `extensionInstallError` makes the
+   * authoritative Rust install command reject, so a spec can prove a loader
+   * rejection reaches the screen rather than being swallowed.
+   */
+  extensionPickPath?: string | null;
+  extensionPreviewManifest?: string;
+  extensionInstallError?: string;
+  /**
    * Drives the `is_me` field of `resolve_oa_owner`. When true, the harness
    * reports the active identity as the verified NIP-OA owner of the viewee
    * (owner-path branch of the gate).

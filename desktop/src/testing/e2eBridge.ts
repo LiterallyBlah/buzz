@@ -358,6 +358,14 @@ type E2eConfig = {
     // equals this is treated as a moderation DM (composer disabled). Absent →
     // fail open (no mod-DM detection), matching the Rust command's contract.
     relaySelf?: string | null;
+    // Extension install flow. `extensionPickPath` is what the mocked pickers
+    // return (null = the user cancelled); `extensionPreviewManifest` is the raw
+    // extension.json the read-only preview command hands back for zod to check;
+    // `extensionInstallError` makes the authoritative Rust install command
+    // reject, so a spec can prove a loader rejection reaches the screen.
+    extensionPickPath?: string | null;
+    extensionPreviewManifest?: string;
+    extensionInstallError?: string;
     oaOwnerIsMe?: boolean;
     /** Whether the mock relay advertises NIP-43 membership support. Defaults to false. */
     relayRequiresMembership?: boolean;
@@ -1389,6 +1397,14 @@ const STARTER_WELCOME_CHANNEL_NAME = "welcome-everyone";
 let mockIdentityLostCleared = false;
 // Same pattern for `mock.identityLocked`.
 let mockIdentityLockedCleared = false;
+/**
+ * Installed extensions the mocked host reports.
+ *
+ * Starts empty so the Extensions area's empty state is the default, and a
+ * successful install is observable by the package appearing here — the spec
+ * asserts on inventory rather than on the command having been called.
+ */
+let mockInstalledExtensions: Array<Record<string, unknown>> = [];
 
 // ── get_event defer/release seam ────────────────────────────────────────────
 // When `window.__BUZZ_E2E_DEFER_GET_EVENT__` is set to a target event ID,
@@ -9812,6 +9828,7 @@ export function maybeInstallE2eTauriMocks() {
   resetMockManagedAgents(config);
   resetMockPersonas(config);
   resetMockTeams(config);
+  mockInstalledExtensions = [];
   seedMockSearchProfiles(config);
   resetMockWorkflows();
   resetMockMesh();
@@ -12575,6 +12592,67 @@ export function maybeInstallE2eTauriMocks() {
           ? (identity?.pubkey ?? DEFAULT_MOCK_IDENTITY.pubkey)
           : "ff".repeat(32);
         return { owner, is_me: isMe };
+      }
+      // ── Extensions (preview flag) ─────────────────────────────────────────
+      // Inventory lives in `mockInstalledExtensions` so a successful install is
+      // observable in the list afterwards, rather than the spec asserting the
+      // command was called.
+      case "list_installed_extensions":
+        return mockInstalledExtensions.slice();
+      case "pick_extension_directory":
+      case "pick_extension_zip":
+        return activeConfig?.mock?.extensionPickPath ?? "/tmp/mock-extension";
+      case "preview_extension_package":
+        return {
+          source:
+            (payload as { source?: string })?.source ?? "/tmp/mock-extension",
+          manifestJson:
+            activeConfig?.mock?.extensionPreviewManifest ??
+            JSON.stringify({
+              id: "mock-extension",
+              name: "Mock Extension",
+              version: "0.1.0",
+              entry: "index.html",
+            }),
+        };
+      case "install_extension_from_directory":
+      case "install_extension_from_zip": {
+        // The Rust loader is authoritative and can refuse a package the
+        // frontend's shape check accepted; this is that path.
+        const rejection = activeConfig?.mock?.extensionInstallError;
+        if (rejection) {
+          throw rejection;
+        }
+        const manifest = JSON.parse(
+          activeConfig?.mock?.extensionPreviewManifest ??
+            JSON.stringify({
+              id: "mock-extension",
+              name: "Mock Extension",
+              version: "0.1.0",
+              entry: "index.html",
+            }),
+        ) as Record<string, unknown>;
+        const installed = {
+          id: String(manifest.id ?? "mock-extension"),
+          name: String(manifest.name ?? "Mock Extension"),
+          version: String(manifest.version ?? "0.1.0"),
+          entry: String(manifest.entry ?? "index.html"),
+          path: `/mock/app-data/extensions/${String(manifest.id ?? "mock-extension")}`,
+          installedAt: 1_700_000_000,
+          scopes: {
+            identity: false,
+            storage: false,
+            extensionData: false,
+            sign: [],
+            read: [],
+            ...(manifest.scopes as Record<string, unknown> | undefined),
+          },
+          egress: (manifest.egress as string[] | undefined) ?? [],
+        };
+        mockInstalledExtensions = mockInstalledExtensions
+          .filter((entry) => entry.id !== installed.id)
+          .concat(installed);
+        return installed;
       }
       case "list_archived_identities": {
         const archived = activeConfig?.mock?.archivedIdentities ?? [];
