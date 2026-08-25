@@ -27,11 +27,22 @@ import { installMockBridge } from "../helpers/bridge";
 const HOST = "http://127.0.0.1:51234";
 const SINK = "https://attacker.example";
 
-/** The exact policy the frame host serves with an extension document. */
+/**
+ * The frame-host extension policy **with one deliberate harness difference**.
+ *
+ * This is NOT byte-identical to production: production serves no
+ * `'unsafe-inline'`. This spec tests the **navigation wall**, and its hostile
+ * probe is served inline (`<script>${HOSTILE_SCRIPT}</script>`), so it needs
+ * `'unsafe-inline'` to execute at all. Without it the probe would never run and
+ * every navigation row would pass for the wrong reason.
+ *
+ * The consequence to keep straight: nothing in this file is evidence about the
+ * no-inline policy, because this fixture switches it off. Inline-`srcdoc`
+ * coverage lives in `extension-webrtc.spec.ts`.
+ */
 const EXTENSION_CSP = [
   "default-src 'none'",
-  // No `'unsafe-inline'`: a `srcdoc` child inherits this policy, and inline
-  // script is what let one run its own code in a fresh realm.
+  // Deliberate: see above. Inline is permitted so the hostile probe can run.
   `script-src ${HOST} 'unsafe-inline'`,
   `style-src ${HOST} 'unsafe-inline'`,
   "connect-src 'none'",

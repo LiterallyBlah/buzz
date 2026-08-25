@@ -176,18 +176,29 @@ test("the realm lockdown stops WebRTC before a packet leaves", async ({
 });
 
 /**
- * Drive the fresh-realm escape probe, with the one wall under test toggled.
+ * Drive the **inline-`srcdoc`** escape probe, with the one wall under test
+ * toggled.
  *
- * This is the argument the lockdown rests on, asserted rather than assumed.
- * Neutralising a global is theatre if the page can open a clean realm and read
- * a pristine constructor — and it WAS theatre in the first attempt: with
- * `'unsafe-inline'` allowed, a `srcdoc` child ran its own script and built a
- * peer connection from its own realm. `frame-src 'none'` does not stop a
- * `srcdoc` child; it inherits the policy instead. What closes it is inheriting
- * a policy with no inline script, which is what ships.
+ * **Scope, precisely — this exercises the INLINE child form only.** The child
+ * markup below is `<script>…</script>` with its code inline. With
+ * `'unsafe-inline'` allowed that child runs and builds a peer connection from
+ * its own realm; without it, it does not. That is the whole claim.
  *
- * The probe is therefore an EXTERNAL script, exactly as a real package must
- * now ship its code.
+ * **It does NOT exercise route 1.** The open route is a `srcdoc` child loading
+ * an *external* package script:
+ *
+ * ```html
+ * <iframe srcdoc="<script src='/ext/demo/escape.js'></script>">
+ * ```
+ *
+ * which inherits `script-src <origin>` and therefore still runs. Nothing in
+ * this file tests that, and no-inline does not close it. Route 1 is open and
+ * assigned to the isolation phase — do not read a green run here as covering
+ * it.
+ *
+ * (The *outer* probe is an external script, as a real package must ship its
+ * code. That is a property of the harness, not of the child under test — an
+ * earlier version of this comment conflated the two.)
  *
  * `allowInline` is the *only* difference between the control and protected
  * rows, so the control cannot drift away from what it is controlling for.
@@ -308,7 +319,7 @@ async function realmEscapeRun(
   return { result, packets };
 }
 
-test("CONTROL: with inline script allowed, the nested realm really does escape", async ({
+test("CONTROL: with inline script allowed, the inline srcdoc child really does escape", async ({
   page,
 }) => {
   // Permanent, and the reason the row below is worth anything. `escapes` being
@@ -327,7 +338,7 @@ test("CONTROL: with inline script allowed, the nested realm really does escape",
   expect(packets).toBeGreaterThan(0);
 });
 
-test("the extension realm cannot reach a fresh realm to undo the lockdown", async ({
+test("an inline srcdoc child cannot run under the shipped no-inline policy", async ({
   page,
 }) => {
   const { result, packets } = await realmEscapeRun(page, {
@@ -338,11 +349,18 @@ test("the extension realm cannot reach a fresh realm to undo the lockdown", asyn
   expect(result.report.afterReassign).toBe("undefined");
   expect(result.report.sibling).toBe("SecurityError");
   expect(result.report.popup).toBe("null");
-  // A worker realm exists but has no RTCPeerConnection to hand back.
+  // A worker hands back no usable RTCPeerConnection. Note the measured reason
+  // is stronger than "workers lack the API": the worker realm is not reachable
+  // from here at all — same-origin throws SecurityError against the opaque
+  // origin, and blob: is not a script-src source.
   expect(result.report.worker ?? "undefined").not.toBe("function");
-  // No nested frame ran a single line of script. Meaningful because the
-  // CONTROL row above observes this same route succeeding when the wall is
-  // removed.
+  // No **inline** srcdoc child ran. Meaningful because the CONTROL row above
+  // observes this same inline route succeeding when the wall is removed.
+  //
+  // Scope: this says nothing about a srcdoc child loading an EXTERNAL package
+  // script. That route inherits script-src <origin> and still runs — route 1,
+  // open, assigned to isolation. An empty `escapes` here is not evidence
+  // against it, because nothing here attempts it.
   expect(result.escapes).toEqual([]);
   expect(packets).toBe(0);
 });
@@ -375,8 +393,9 @@ test("the wall is frame-scoped: Buzz's own WebRTC still works", async ({
 test("no pristine realm via aliases, parents, or a pre-lockdown reference", async ({
   page,
 }) => {
-  // Hermes probes three recovery routes. Nested frames and workers are covered
-  // above; this covers the third — a constructor alias reached through another
+  // Hermes probes three recovery routes. Inline nested frames and workers are
+  // covered above (external-script srcdoc is NOT — that is route 1, open);
+  // this covers the third — a constructor alias reached through another
   // realm, or a reference captured before neutralisation.
   const sink = await turnSink();
   const csp = extensionCsp(true);
@@ -481,7 +500,12 @@ test("no pristine realm via aliases, parents, or a pre-lockdown reference", asyn
 // ── Round 4: the nested-frame control Hermes specified ──────────────────────
 
 /**
- * Drive the srcdoc-child probe under a given policy and report the whole chain.
+ * Drive the **inline**-srcdoc-child probe under a given policy and report the
+ * whole chain.
+ *
+ * Scope, as above: the child below is inline `<script>`. A `srcdoc` child that
+ * loads an **external** package script is route 1, is open, and is not
+ * exercised here.
  *
  * The point is that every link is *witnessed*, not inferred: the previous
  * version asserted an empty array, which is equally true when the child was
@@ -575,7 +599,7 @@ async function srcdocChain(
   return { steps, step: (name: string) => steps.find((s) => s.step === name) };
 }
 
-test("CONTROL: the srcdoc child really does run and reach the sink", async ({
+test("CONTROL: the inline srcdoc child really does run and reach the sink", async ({
   page,
 }) => {
   // Permanent packet-positive control. Every link is witnessed: parent ran,
@@ -598,7 +622,7 @@ test("CONTROL: the srcdoc child really does run and reach the sink", async ({
   expect(packets).toBeGreaterThan(0);
 });
 
-test("PROTECTED: the same chain stops at the child under the shipped policy", async ({
+test("PROTECTED: the same inline chain stops at the child under the shipped policy", async ({
   page,
 }) => {
   // Only the policy changes from the control — same probe, same fixture. The
@@ -615,7 +639,8 @@ test("PROTECTED: the same chain stops at the child under the shipped policy", as
 
   expect(chain.step("parent-ran")).toBeTruthy();
   expect(chain.step("appended")?.connected).toBe(true);
-  // The child never executes, so there is no fresh realm to recover from.
+  // The inline child never executes. Scope: an EXTERNAL-script srcdoc child
+  // still would — route 1, open, not exercised here.
   expect(chain.step("child-ran")).toBeUndefined();
   expect(chain.step("child-attempted")).toBeUndefined();
   expect(packets).toBe(0);

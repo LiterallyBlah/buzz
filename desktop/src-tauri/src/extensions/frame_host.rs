@@ -26,20 +26,24 @@
 //! |---|---|
 //! | `fetch`, `XMLHttpRequest`, `WebSocket`, `EventSource`, `navigator.sendBeacon` | `connect-src 'none'` |
 //! | `location` / link / `window.open` / form submission | wrapper `frame-src <loopback>`; sandbox omits `allow-top-navigation` and `allow-popups` |
-//! | `RTCPeerConnection` (STUN/TURN) | `webrtc 'block'` where honoured, **plus** the realm lockdown below |
+//! | `RTCPeerConnection` (STUN/TURN) | `webrtc 'block'` where honoured, **plus** the realm lockdown below — which governs the **initial document only** |
 //! | `img`, `script`, `style`, `font`, `media`, `object` | `default-src 'none'`, widened only to the loopback origin per type |
 //! | `<iframe>` / `blob:` frame | `frame-src 'none'` (from `default-src`) |
-//! | `srcdoc` frame | not a load, so `frame-src` misses it — closed instead by the inherited policy having **no inline script** |
-//! | `Worker` / `SharedWorker` | a worker realm is reachable, but it inherits this CSP, so its own `fetch` is `connect-src 'none'` |
+//! | `srcdoc` frame, **inline** child script | not a load, so `frame-src` misses it — the inherited policy has no `'unsafe-inline'`, so inline child script does not run |
+//! | `srcdoc` frame, **external** child script | **OPEN — this is route 1.** The child inherits `script-src <loopback>`, so `<script src="…">` pointing at a package asset still runs, in a fresh realm the prologue never reached. Assigned to the isolation phase; **no wall in this file closes it** |
+//! | `Worker` / `SharedWorker` | **unreachable** under the measured sandbox — a same-origin worker throws `SecurityError` (opaque origin) and `blob:` is not a `script-src` source. Measured on Chromium and WebKitGTK |
 //! | `import()` / dynamic module | `script-src` is loopback-only |
-//! | `<link rel=prefetch/prerender/dns-prefetch>`, speculation rules | `default-src 'none'` (`prefetch-src` falls back to it) |
+//! | `<link rel=prefetch/prerender/dns-prefetch/preconnect>`, speculation rules | **Engine-specific, not a CSP theorem.** CSP's treatment of resource hints is unresolved upstream (`prefetch-src` was removed), so do not credit `default-src 'none'` generically. *Measured* on the shipping WebKitGTK: `preconnect` reached a live external TCP sink under a widened policy (1 connection) and reached it **0** times under the shipped default-deny policy, with `preconnect-attempted` true in both — and DNS prefetching is removed from that engine outright (getter deprecated, always FALSE). Treat as a per-engine row: re-measure on WebView2/WKWebView rather than assuming |
 //! | Navigation by `<base>` retarget | `base-uri 'none'` |
 //! | Form action retarget | `form-action 'none'` |
 //! | `ping` attribute | `connect-src 'none'` |
 //!
 //! Not walls, and deliberately not relied upon: a `load`/reset handler (the
 //! request has already gone), and any engine-wide switch — Buzz's own huddles
-//! use WebRTC, so the wall must bind this frame, not the webview.
+//! share this webview and use WebRTC, so a webview-wide switch would break them.
+//! A per-webview engine policy (e.g. WebKitGTK's `enable-webrtc=false`) becomes
+//! viable **only after** extensions move to a dedicated webview; until then the
+//! wall must bind this frame, not the webview.
 //!
 //! # Lifecycle
 //!
@@ -303,7 +307,8 @@ fn wrapper_document(entry_url: &str) -> String {
 
 /// The realm lockdown, served as a file and injected as an external script.
 ///
-/// **The third egress wall.** `connect-src 'none'` closes fetch/WebSocket/
+/// **The third egress wall, and it governs the initial document only.**
+/// `connect-src 'none'` closes fetch/WebSocket/
 /// EventSource/`sendBeacon`; the wrapper's `frame-src` closes navigation.
 /// Neither touches `RTCPeerConnection`, which reaches the network on its own — a
 /// controlled TURN sink received attacker-chosen data in the TURN `username`
@@ -320,21 +325,40 @@ fn wrapper_document(entry_url: &str) -> String {
 /// from its own clean realm. `frame-src 'none'` does not stop a `srcdoc` child,
 /// because that is not a network load; the child simply inherits this policy.
 ///
-/// What closes it is inheriting a policy with **no inline script**. Under
-/// `script-src {origin}` with no `'unsafe-inline'`:
+/// Inheriting a policy with **no inline script** closes the *inline* form of
+/// that route, and only that form. Under `script-src {origin}` with no
+/// `'unsafe-inline'`:
 ///
-/// - a `srcdoc` child inherits the policy, so its inline script does not run;
+/// - a `srcdoc` child inherits the policy, so its **inline** script does not
+///   run;
 /// - a `blob:` child is a load, so `frame-src 'none'` refuses it;
 /// - a popup cannot open — the sandbox omits `allow-popups`;
 /// - a sibling realm is unreachable: every sandboxed context gets its own
 ///   opaque origin, so `contentWindow` access throws `SecurityError`;
-/// - a worker realm is reachable but has no `RTCPeerConnection` — it is a
-///   `Window` API.
+/// - a worker realm is **unreachable** — a same-origin worker throws
+///   `SecurityError` against the opaque origin, and `blob:` is not a
+///   `script-src` source. Measured on Chromium and WebKitGTK.
 ///
-/// So the document has exactly one realm that could construct a peer
-/// connection, and this file runs before any extension byte. Each of those
-/// properties is asserted in the browser tests; they are the argument, so they
-/// are not left as prose.
+/// # What this does NOT close: route 1
+///
+/// A `srcdoc` child may load an **external** script from the package, because
+/// it inherits `script-src {origin}` and package assets are served from that
+/// origin:
+///
+/// ```html
+/// <iframe srcdoc="<script src='/ext/<id>/escape.js'></script>">
+/// ```
+///
+/// That script runs in a fresh realm the prologue never reached, with a
+/// pristine `RTCPeerConnection`. **No wall in this file closes it.** It is
+/// route 1, it is open, and it is assigned to the isolation phase — the
+/// boundary there is process/webview isolation, not another script-layer
+/// mechanism.
+///
+/// So the initial document has exactly one realm this file governs; it is
+/// **not** the only realm the page can reach. The properties listed above are
+/// asserted in the browser tests, and the external-script route is deliberately
+/// left unasserted because it is known-open rather than covered.
 ///
 /// **Consequence for extension authors:** packages must ship their code as
 /// `.js` files. Inline `<script>` and inline event handlers do not run.
