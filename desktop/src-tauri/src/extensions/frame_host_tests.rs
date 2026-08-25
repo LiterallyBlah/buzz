@@ -735,8 +735,9 @@ async fn html_is_locked_down_over_the_wire_and_other_types_are_untouched() {
         .expect("body");
     assert!(lockdown.contains("configurable:false"), "got: {lockdown}");
 
-    // A script asset is not a realm and must be served byte-for-byte, or the
-    // host would be rewriting the package's own code.
+    // A script asset is a subresource, not a realm, and is served byte-for-byte:
+    // a worker derives its policy from its own response, so rewriting served
+    // JavaScript would break legitimate workers and `importScripts`.
     let js = reqwest::get(format!("{origin}/{EXTENSION_ROUTE_PREFIX}/demo/app.js"))
         .await
         .expect("request")
@@ -785,4 +786,115 @@ fn the_wrapper_relay_carries_only_handshake_envelopes() {
         "the up-relay must not carry ports: {}",
         &document[up..up_line_end]
     );
+}
+
+// ── Round 5: the script layer is the wall for realms the prologue misses ─────
+
+#[tokio::test]
+async fn a_post_install_non_utf8_html_asset_is_refused() {
+    // Hermes should-fix 1: the fail-closed serving branch had no direct test.
+    let _guard = lifecycle_guard().await;
+    let base = installed(&[("index.html", b"<!doctype html>")]);
+    let mut broken = b"<!doctype html><script src=\"x.js\"></script>".to_vec();
+    broken.push(0xff);
+    fs::write(base.path().join("demo").join("broken.html"), &broken).expect("broken");
+
+    let claim = acquire(base.path().to_path_buf()).await.expect("acquire");
+    let origin = origin_for_port(claim.port);
+    let response = reqwest::get(format!(
+        "{origin}/{EXTENSION_ROUTE_PREFIX}/demo/broken.html"
+    ))
+    .await
+    .expect("request");
+    assert_eq!(
+        response.status(),
+        404,
+        "a non-UTF-8 HTML body must be refused, not served untouched"
+    );
+
+    release(&claim.lease);
+    assert!(wait_until_closed(claim.port).await);
+}
+
+// ── Route 2: non-HTML active documents cannot execute ───────────────────────
+
+#[test]
+fn svg_and_xml_documents_are_refused_script() {
+    let origin = "http://127.0.0.1:4321";
+    for kind in [
+        "image/svg+xml",
+        "application/xhtml+xml",
+        "application/xml",
+        "text/xml",
+    ] {
+        let policy = asset_content_security_policy(origin, kind);
+        assert!(
+            policy.contains("script-src 'none'"),
+            "{kind} is a realm the host cannot write a prologue into: {policy}"
+        );
+        assert!(
+            !policy.contains(&format!("script-src {origin}")),
+            "{kind} must not keep the executable script source: {policy}"
+        );
+    }
+}
+
+#[test]
+fn subresources_keep_the_policy_they_need() {
+    let origin = "http://127.0.0.1:4321";
+    // Scripts especially: a worker takes its execution policy from its own
+    // response headers, so `script-src 'none'` here would break legitimate
+    // workers and `importScripts`.
+    for kind in [
+        "text/javascript; charset=utf-8",
+        "text/css; charset=utf-8",
+        "image/png",
+        "font/woff2",
+        "application/json; charset=utf-8",
+        "text/html; charset=utf-8",
+    ] {
+        let policy = asset_content_security_policy(origin, kind);
+        assert!(
+            policy.contains(&format!("script-src {origin}")),
+            "{kind} should keep the ordinary policy: {policy}"
+        );
+        assert!(!policy.contains("script-src 'none'"), "{kind}: {policy}");
+    }
+}
+
+#[tokio::test]
+async fn an_svg_asset_is_served_renderable_but_inert() {
+    let _guard = lifecycle_guard().await;
+    let base = installed(&[
+        ("index.html", b"<!doctype html>"),
+        (
+            "asset.svg",
+            b"<svg xmlns=\"http://www.w3.org/2000/svg\"></svg>",
+        ),
+    ]);
+    let claim = acquire(base.path().to_path_buf()).await.expect("acquire");
+    let origin = origin_for_port(claim.port);
+
+    let response = reqwest::get(format!("{origin}/{EXTENSION_ROUTE_PREFIX}/demo/asset.svg"))
+        .await
+        .expect("request");
+    assert_eq!(response.status(), 200, "the SVG must still be servable");
+    assert_eq!(
+        response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok()),
+        Some("image/svg+xml"),
+        "rendering as an image must keep working"
+    );
+    let policy = response
+        .headers()
+        .get(header::CONTENT_SECURITY_POLICY)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    assert!(policy.contains("script-src 'none'"), "got: {policy}");
+
+    release(&claim.lease);
+    assert!(wait_until_closed(claim.port).await);
 }

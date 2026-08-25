@@ -69,15 +69,20 @@ const DM_KIND_RANGE: std::ops::RangeInclusive<u32> = 41000..=41999;
 
 /// Extensions an entry document may have.
 ///
-/// The entry is the one file that becomes a *realm*, and the frame host can
-/// only guarantee its lockdown for a document it writes a prologue into. So the
-/// permitted set is defined here, at install, rather than left to whatever the
-/// serving layer happens to recognise:
+/// The entry is the document the host writes its prologue into. It is **not**
+/// the only file that can become a realm — a `srcdoc` child and an SVG asset
+/// reached by navigation are realms too, and neither receives the prologue.
+/// Those are covered separately, at the script layer, because every realm needs
+/// a script from this host to execute anything at all.
+///
+/// This restriction is still worth having: it keeps the *entry* to a shape the
+/// host can write into, so the accurate claim is "accepted entry documents and
+/// all served HTML receive the prologue", not "every active document does".
 ///
 /// - **HTML only.** An SVG entry is a document too — it is served
 ///   `image/svg+xml`, can load package script, and would receive no lockdown.
-///   Rejecting it at install is what makes "every active document is locked
-///   down" an invariant instead of a coincidence of MIME tables.
+///   Rejecting it at install keeps the entry to a document the host can write a
+///   prologue into, rather than relying on the serving layer's MIME table.
 /// - **UTF-8 only.** A body that fails `str::from_utf8` used to be served
 ///   untouched on the assumption it could not execute. That is wrong: a browser
 ///   replacement-decodes it and a valid prefix runs normally.
