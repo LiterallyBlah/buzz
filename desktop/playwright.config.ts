@@ -25,6 +25,7 @@ export default defineConfig({
         "**/key-import-reveal.spec.ts",
         "**/navigation.spec.ts",
         "**/extensions-tab.spec.ts",
+        "**/extension-frame.spec.ts",
         "**/channels.spec.ts",
         "**/channel-shared-header-backdrop.spec.ts",
         "**/channel-composer-overflow.spec.ts",

@@ -20,6 +20,7 @@
 //! The directory convention (`<app-data>/<feature>/`) matches
 //! `custom_harnesses` and `managed_agents`.
 
+mod frame_host;
 mod install;
 // `pub(crate)` so the signer enforcement in the bridge (P4) can import
 // `manifest::EXTENSION_SIGNABLE_KINDS` rather than re-declare the allowlist.
@@ -120,6 +121,89 @@ pub async fn install_extension_from_zip(
     tokio::task::spawn_blocking(move || install_zip_in(&base_dir, &archive))
         .await
         .map_err(|error| format!("extension install task failed: {error}"))?
+}
+
+/// Stop the frame host, whatever the live-frame count says.
+///
+/// Called from app shutdown so a listener can never outlive the process, even
+/// if a frame never released — a crashed or reloaded webview does exactly that.
+pub(crate) fn shutdown_frame_host() {
+    frame_host::shutdown_now();
+}
+
+/// Where an installed extension's page is served from.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExtensionFrameTarget {
+    /// Absolute URL of the package's entry document.
+    pub url: String,
+    /// The origin that URL sits on, for the caller to assert against.
+    pub origin: String,
+}
+
+/// Start (or join) the frame host and resolve an installed extension's page.
+///
+/// The URL is built host-side from the *validated installed manifest*, never
+/// from anything the caller supplies beyond the id — the frontend should not be
+/// in the business of composing URLs into a security boundary.
+///
+/// Pairs with [`close_extension_frame`]: every successful call registers a live
+/// frame, and the host stops when the last one is released (decision 002's
+/// containment says nothing about lifetime, but a listener serving a user's
+/// files with no frame open is surface for nothing).
+#[tauri::command]
+pub async fn open_extension_frame(
+    app: AppHandle,
+    id: String,
+) -> Result<ExtensionFrameTarget, String> {
+    let base_dir = extensions_base_dir(&app)?;
+    let manifest = {
+        let base_dir = base_dir.clone();
+        tokio::task::spawn_blocking(move || resolve_frame_manifest(&base_dir, &id))
+            .await
+            .map_err(|error| format!("extension frame task failed: {error}"))??
+    };
+
+    let port = frame_host::acquire(base_dir).await?;
+    let origin = frame_host::origin_for_port(port);
+    Ok(ExtensionFrameTarget {
+        url: frame_host::frame_url(&origin, &manifest.id, &manifest.entry),
+        origin,
+    })
+}
+
+/// The validated manifest of the installed package `id` names.
+///
+/// The grammar check comes **before** the join, not after. `id` arrives from the
+/// webview, and `base_dir.join(id)` with an unchecked `id` is a path traversal
+/// waiting for a directory to exist — validating the manifest afterwards would
+/// be checking the wrong thing, since by then the read has already happened
+/// somewhere it should not have.
+///
+/// The manifest's own id must also match the directory, so a package cannot
+/// claim to be one extension while installed as another.
+pub(crate) fn resolve_frame_manifest(
+    base_dir: &Path,
+    id: &str,
+) -> Result<ExtensionManifest, String> {
+    if !manifest::is_valid_extension_id(id) {
+        return Err(format!("extension id {id:?} is not valid"));
+    }
+    let manifest = manifest::load_and_validate_manifest(&base_dir.join(id))?;
+    if manifest.id != id {
+        return Err(format!(
+            "extension folder {id:?} holds a manifest claiming id {:?}",
+            manifest.id
+        ));
+    }
+    Ok(manifest)
+}
+
+/// Release one live extension frame, stopping the host when it was the last.
+#[tauri::command]
+pub async fn close_extension_frame() -> Result<(), String> {
+    frame_host::release();
+    Ok(())
 }
 
 /// Read a candidate package's `extension.json` without installing it.

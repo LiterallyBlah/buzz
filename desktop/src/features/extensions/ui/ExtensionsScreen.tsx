@@ -12,6 +12,7 @@ import {
   installFromPickedSource,
 } from "@/features/extensions/lib/installFlow";
 import { ExtensionCard } from "@/features/extensions/ui/ExtensionCard";
+import { useAppNavigation } from "@/app/navigation/useAppNavigation";
 import { Button } from "@/shared/ui/button";
 import { Card } from "@/shared/ui/card";
 import { Skeleton } from "@/shared/ui/skeleton";
@@ -68,6 +69,7 @@ function ExtensionsListSkeleton() {
 
 export function ExtensionsScreen() {
   const queryClient = useQueryClient();
+  const { goExtension } = useAppNavigation();
   const [installError, setInstallError] = React.useState<InstallFailure | null>(
     null,
   );
@@ -180,7 +182,11 @@ export function ExtensionsScreen() {
         ) : (
           <div className="space-y-2">
             {installed.map((extension) => (
-              <ExtensionCard extension={extension} key={extension.id} />
+              <ExtensionCard
+                extension={extension}
+                key={extension.id}
+                onOpen={(id) => void goExtension(id)}
+              />
             ))}
           </div>
         )}

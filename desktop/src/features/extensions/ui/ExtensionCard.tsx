@@ -1,13 +1,15 @@
 import type { InstalledExtension } from "@/features/extensions/lib/extensionsApi";
 import { summarizeScopes } from "@/features/extensions/lib/scopeSummary";
 import { Badge } from "@/shared/ui/badge";
+import { Button } from "@/shared/ui/button";
 import { Card } from "@/shared/ui/card";
 
 type ExtensionCardProps = {
   extension: InstalledExtension;
+  onOpen: (id: string) => void;
 };
 
-export function ExtensionCard({ extension }: ExtensionCardProps) {
+export function ExtensionCard({ extension, onOpen }: ExtensionCardProps) {
   const scopes = summarizeScopes(extension.scopes);
 
   return (
@@ -21,6 +23,15 @@ export function ExtensionCard({ extension }: ExtensionCardProps) {
           <span className="truncate text-xs text-muted-foreground">
             {extension.id}
           </span>
+          <Button
+            className="ml-auto"
+            data-testid={`open-extension-${extension.id}`}
+            onClick={() => onOpen(extension.id)}
+            size="sm"
+            variant="outline"
+          >
+            Open
+          </Button>
         </div>
 
         {scopes.length > 0 ? (

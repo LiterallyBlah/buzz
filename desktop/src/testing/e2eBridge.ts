@@ -364,6 +364,7 @@ type E2eConfig = {
     // `extensionInstallError` makes the authoritative Rust install command
     // reject, so a spec can prove a loader rejection reaches the screen.
     extensionPickPath?: string | null;
+    extensionFrameOrigin?: string;
     extensionPreviewManifest?: string;
     extensionInstallError?: string;
     oaOwnerIsMe?: boolean;
@@ -1405,6 +1406,13 @@ let mockIdentityLockedCleared = false;
  * asserts on inventory rather than on the command having been called.
  */
 let mockInstalledExtensions: Array<Record<string, unknown>> = [];
+/**
+ * Live extension frames the mocked host believes it has.
+ *
+ * Lets a spec assert the acquire/release pairing — the real leak this guards
+ * against is a frame that never releases, leaving a localhost listener behind.
+ */
+let mockExtensionFrameHolders = 0;
 
 // ── get_event defer/release seam ────────────────────────────────────────────
 // When `window.__BUZZ_E2E_DEFER_GET_EVENT__` is set to a target event ID,
@@ -9829,6 +9837,7 @@ export function maybeInstallE2eTauriMocks() {
   resetMockPersonas(config);
   resetMockTeams(config);
   mockInstalledExtensions = [];
+  mockExtensionFrameHolders = 0;
   seedMockSearchProfiles(config);
   resetMockWorkflows();
   resetMockMesh();
@@ -12597,6 +12606,23 @@ export function maybeInstallE2eTauriMocks() {
       // Inventory lives in `mockInstalledExtensions` so a successful install is
       // observable in the list afterwards, rather than the spec asserting the
       // command was called.
+      case "open_extension_frame": {
+        // The mock stands in for the localhost frame host, which cannot run in
+        // the E2E harness. It returns the same *shape* the Rust command does —
+        // a remote-class http origin — so the spec can assert what the DOM does
+        // with it. It does NOT reproduce the containment itself; that is
+        // platform-probed (probe/bx09), not CI-pinned.
+        const frameId = String((payload as { id?: string })?.id ?? "");
+        const origin =
+          activeConfig?.mock?.extensionFrameOrigin ?? "http://127.0.0.1:51234";
+        mockExtensionFrameHolders += 1;
+        return { url: `${origin}/ext/${frameId}/index.html`, origin };
+      }
+      case "close_extension_frame":
+        mockExtensionFrameHolders = Math.max(0, mockExtensionFrameHolders - 1);
+        return null;
+      case "__mock_extension_frame_holders":
+        return mockExtensionFrameHolders;
       case "list_installed_extensions":
         return mockInstalledExtensions.slice();
       case "pick_extension_directory":

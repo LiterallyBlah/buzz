@@ -214,3 +214,73 @@ fn installed_extension_serializes_in_camel_case() {
     assert_eq!(scopes["sign"][0]["kind"], serde_json::json!(9));
     assert_eq!(scopes["read"][0]["kinds"], serde_json::json!([9]));
 }
+
+// ── Frame target resolution (P3) ─────────────────────────────────────────────
+
+#[test]
+fn a_frame_id_is_grammar_checked_before_it_is_joined_to_a_path() {
+    // The id arrives from the webview. Joining it first and validating the
+    // manifest afterwards would mean the traversing read already happened.
+    let base = tempfile::tempdir().expect("tempdir");
+    // Something loadable one level above the extensions dir, so a traversal
+    // would have a real target rather than failing for want of a file.
+    let outside = base.path().join("outside");
+    std::fs::create_dir_all(&outside).expect("outside");
+    std::fs::write(
+        outside.join("extension.json"),
+        br#"{ "id": "outside", "name": "Outside", "version": "1", "entry": "index.html" }"#,
+    )
+    .expect("manifest");
+    std::fs::write(outside.join("index.html"), b"<!doctype html>").expect("entry");
+
+    let extensions = base.path().join("extensions");
+    std::fs::create_dir_all(&extensions).expect("extensions dir");
+
+    for id in ["../outside", "..", "../../etc", "a/b", "Evil", ""] {
+        let Err(error) = resolve_frame_manifest(&extensions, id) else {
+            panic!("id {id:?} must not resolve to a frame target");
+        };
+        assert!(
+            error.contains("is not valid"),
+            "id {id:?} should fail the grammar, got: {error}"
+        );
+    }
+    // The outside package really is loadable when addressed directly, so the
+    // rejections above are the grammar working, not a missing fixture.
+    resolve_frame_manifest(base.path(), "outside").expect("fixture should load directly");
+}
+
+#[test]
+fn a_frame_target_resolves_for_an_installed_package() {
+    let base = tempfile::tempdir().expect("tempdir");
+    let root = base.path().join("demo");
+    std::fs::create_dir_all(&root).expect("root");
+    std::fs::write(
+        root.join("extension.json"),
+        br#"{ "id": "demo", "name": "Demo", "version": "1", "entry": "index.html" }"#,
+    )
+    .expect("manifest");
+    std::fs::write(root.join("index.html"), b"<!doctype html>").expect("entry");
+
+    let manifest = resolve_frame_manifest(base.path(), "demo").expect("should resolve");
+    assert_eq!(manifest.id, "demo");
+    assert_eq!(manifest.entry, "index.html");
+}
+
+#[test]
+fn a_package_may_not_claim_an_id_other_than_its_folder() {
+    let base = tempfile::tempdir().expect("tempdir");
+    let root = base.path().join("demo");
+    std::fs::create_dir_all(&root).expect("root");
+    std::fs::write(
+        root.join("extension.json"),
+        br#"{ "id": "other", "name": "Other", "version": "1", "entry": "index.html" }"#,
+    )
+    .expect("manifest");
+    std::fs::write(root.join("index.html"), b"<!doctype html>").expect("entry");
+
+    let Err(error) = resolve_frame_manifest(base.path(), "demo") else {
+        panic!("a mismatched manifest id must be refused");
+    };
+    assert!(error.contains("claiming id"), "got: {error}");
+}

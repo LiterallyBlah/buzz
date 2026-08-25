@@ -887,6 +887,8 @@ pub fn run() {
             archive::index_observer_channel_id,
             archive::read_unindexed_observer_rows,
             extensions::preview_extension_package,
+            extensions::open_extension_frame,
+            extensions::close_extension_frame,
             extensions::install_extension_from_directory,
             extensions::install_extension_from_zip,
             extensions::list_installed_extensions,

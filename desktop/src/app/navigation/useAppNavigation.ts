@@ -79,6 +79,18 @@ export function useAppNavigation() {
     [commitNavigation],
   );
 
+  const goExtension = React.useCallback(
+    (extensionId: string, behavior?: NavigationBehavior) =>
+      commitNavigation(
+        {
+          to: "/extensions/$extensionId",
+          params: { extensionId },
+        },
+        behavior,
+      ),
+    [commitNavigation],
+  );
+
   const goExtensions = React.useCallback(
     (behavior?: NavigationBehavior) =>
       commitNavigation(
@@ -323,6 +335,7 @@ export function useAppNavigation() {
     closeWorkflowDetail,
     goAgents,
     goChannel,
+    goExtension,
     goExtensions,
     goForumPost,
     goHome,

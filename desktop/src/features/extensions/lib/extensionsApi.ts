@@ -92,3 +92,28 @@ export function installExtensionFromZip(
 export function listInstalledExtensions(): Promise<InstalledExtension[]> {
   return invoke<InstalledExtension[]>("list_installed_extensions");
 }
+
+export type ExtensionFrameTarget = {
+  /** Absolute URL of the package's entry document. */
+  url: string;
+  /** The origin that URL sits on. */
+  origin: string;
+};
+
+/**
+ * Start (or join) the frame host and get the URL of an extension's page.
+ *
+ * The URL is composed host-side from the validated installed manifest — the
+ * frontend deliberately does not build URLs into this boundary.
+ *
+ * Every successful call registers a live frame; pair it with
+ * {@link closeExtensionFrame} or the localhost listener outlives the tab.
+ */
+export function openExtensionFrame(id: string): Promise<ExtensionFrameTarget> {
+  return invoke<ExtensionFrameTarget>("open_extension_frame", { id });
+}
+
+/** Release one live frame. The host stops when the last one goes. */
+export function closeExtensionFrame(): Promise<void> {
+  return invoke<void>("close_extension_frame");
+}

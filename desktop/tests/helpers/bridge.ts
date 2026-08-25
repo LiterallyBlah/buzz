@@ -348,6 +348,8 @@ type MockBridgeOptions = {
    * rejection reaches the screen rather than being swallowed.
    */
   extensionPickPath?: string | null;
+  /** Origin the mocked frame host claims to serve from. */
+  extensionFrameOrigin?: string;
   extensionPreviewManifest?: string;
   extensionInstallError?: string;
   /**
