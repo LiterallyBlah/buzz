@@ -606,3 +606,146 @@ async fn the_wrapper_refuses_an_unknown_or_invalid_extension() {
     release(&claim.lease);
     assert!(wait_until_closed(claim.port).await);
 }
+
+// ── Blocker 1 (round 3): the WebRTC wall ─────────────────────────────────────
+
+#[test]
+fn the_document_policy_blocks_webrtc() {
+    let policy = content_security_policy("http://127.0.0.1:4321");
+    assert!(policy.contains("webrtc 'block'"), "got: {policy}");
+}
+
+#[test]
+fn the_lockdown_runs_before_any_extension_script() {
+    let html = "<!DOCTYPE html>\n<html><head><script src=\"theirs.js\"></script></head></html>";
+    let injected = inject_realm_lockdown(html, "http://127.0.0.1:4321");
+    let lockdown = injected.find(LOCKDOWN_ROUTE).expect("lockdown present");
+    let theirs = injected.find("theirs.js").expect("their script present");
+    assert!(
+        lockdown < theirs,
+        "the wall must run first, or it is not a wall: {injected}"
+    );
+    // After the doctype, not before: a script ahead of it forces quirks mode.
+    assert!(
+        injected.to_ascii_lowercase().starts_with("<!doctype html>"),
+        "doctype must stay first: {injected}"
+    );
+}
+
+#[test]
+fn the_lockdown_is_injected_even_without_a_doctype() {
+    let injected = inject_realm_lockdown("<html><body>hi</body></html>", "http://127.0.0.1:4321");
+    assert!(injected.starts_with("<script src="), "got: {injected}");
+}
+
+#[test]
+fn the_lockdown_makes_the_constructor_unrestorable() {
+    // `configurable: false` is the load-bearing part: a plain assignment or
+    // `delete` could be undone by extension script running afterwards.
+    assert!(
+        REALM_LOCKDOWN_SOURCE.contains("configurable:false"),
+        "the neutralisation must not be reversible"
+    );
+    assert!(REALM_LOCKDOWN_SOURCE.contains("webkitRTCPeerConnection"));
+}
+
+#[test]
+fn the_extension_policy_forbids_inline_script() {
+    // This is what actually closes the nested-realm escape: a `srcdoc` child
+    // inherits this policy, so with no `'unsafe-inline'` its inline script does
+    // not run and it cannot hand back a pristine RTCPeerConnection. The first
+    // attempt here allowed inline script and was defeated exactly that way.
+    let policy = content_security_policy("http://127.0.0.1:4321");
+    let script_src = policy
+        .split(';')
+        .map(str::trim)
+        .find(|clause| clause.starts_with("script-src"))
+        .expect("script-src present");
+    assert!(
+        !script_src.contains("'unsafe-inline'"),
+        "inline script re-opens the nested-realm escape; got: {script_src}"
+    );
+    assert_eq!(script_src, "script-src http://127.0.0.1:4321");
+}
+
+#[tokio::test]
+async fn html_is_locked_down_over_the_wire_and_other_types_are_untouched() {
+    let _guard = lifecycle_guard().await;
+    let base = installed(&[
+        ("index.html", b"<!doctype html><title>x</title>"),
+        ("app.js", b"// RTCPeerConnection stays a word in JS source"),
+        ("data.json", b"{}"),
+    ]);
+    let claim = acquire(base.path().to_path_buf()).await.expect("acquire");
+    let origin = origin_for_port(claim.port);
+
+    let html = reqwest::get(format!("{origin}/{EXTENSION_ROUTE_PREFIX}/demo/index.html"))
+        .await
+        .expect("request")
+        .text()
+        .await
+        .expect("body");
+    assert!(
+        html.contains(LOCKDOWN_ROUTE),
+        "served HTML must pull in the lockdown; got: {html}"
+    );
+    // And the lockdown itself is actually served.
+    let lockdown = reqwest::get(format!("{origin}/{LOCKDOWN_ROUTE}"))
+        .await
+        .expect("request")
+        .text()
+        .await
+        .expect("body");
+    assert!(lockdown.contains("configurable:false"), "got: {lockdown}");
+
+    // A script asset is not a realm and must be served byte-for-byte, or the
+    // host would be rewriting the package's own code.
+    let js = reqwest::get(format!("{origin}/{EXTENSION_ROUTE_PREFIX}/demo/app.js"))
+        .await
+        .expect("request")
+        .text()
+        .await
+        .expect("body");
+    assert_eq!(js, "// RTCPeerConnection stays a word in JS source");
+
+    release(&claim.lease);
+    assert!(wait_until_closed(claim.port).await);
+}
+
+// ── Blocker 2 (round 3): the wrapper's own style must not be blocked ─────────
+
+#[test]
+fn the_wrapper_policy_permits_its_own_layout_style() {
+    // The wrapper carries inline CSS that makes the extension fill the surface.
+    // With `default-src 'none'` and no `style-src`, that CSS was rejected and
+    // the extension rendered in a 300x150 default box with a border.
+    let policy = wrapper_content_security_policy("http://127.0.0.1:4321");
+    assert!(
+        policy.contains("style-src 'unsafe-inline'"),
+        "got: {policy}"
+    );
+}
+
+#[test]
+fn the_wrapper_relay_carries_only_handshake_envelopes() {
+    let document = wrapper_document("http://127.0.0.1:4321/ext/demo/index.html");
+    assert!(
+        document.contains(r#"envelope(event.data, "ready")"#),
+        "{document}"
+    );
+    assert!(
+        document.contains(r#"envelope(event.data, "port")"#),
+        "{document}"
+    );
+    // Ports are forwarded down but never up: the host originates the channel
+    // and must not adopt one arriving from the frame side (BRIDGE_SPEC §2).
+    let up = document
+        .find(r#"parent.postMessage(event.data, "*")"#)
+        .expect("up-relay present");
+    let up_line_end = document[up..].find('\n').map_or(document.len(), |n| up + n);
+    assert!(
+        !document[up..up_line_end].contains("event.ports"),
+        "the up-relay must not carry ports: {}",
+        &document[up..up_line_end]
+    );
+}

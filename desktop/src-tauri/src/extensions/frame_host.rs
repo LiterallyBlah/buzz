@@ -16,6 +16,31 @@
 //! outside an installed package. It grants no Buzz capability at all — there is
 //! no bridge here, and P4's `window.buzz` is not injected by this module.
 //!
+//! # Egress surface — the full enumeration
+//!
+//! Two review rounds each found a new way out (navigation, then WebRTC), so
+//! this lists every way a contained document can reach the network and names
+//! the wall for each. A vector missing from this list is a bug in the list.
+//!
+//! | Vector | Wall |
+//! |---|---|
+//! | `fetch`, `XMLHttpRequest`, `WebSocket`, `EventSource`, `navigator.sendBeacon` | `connect-src 'none'` |
+//! | `location` / link / `window.open` / form submission | wrapper `frame-src <loopback>`; sandbox omits `allow-top-navigation` and `allow-popups` |
+//! | `RTCPeerConnection` (STUN/TURN) | `webrtc 'block'` where honoured, **plus** the realm lockdown below |
+//! | `img`, `script`, `style`, `font`, `media`, `object` | `default-src 'none'`, widened only to the loopback origin per type |
+//! | `<iframe>` / `blob:` frame | `frame-src 'none'` (from `default-src`) |
+//! | `srcdoc` frame | not a load, so `frame-src` misses it — closed instead by the inherited policy having **no inline script** |
+//! | `Worker` / `SharedWorker` | a worker realm is reachable, but it inherits this CSP, so its own `fetch` is `connect-src 'none'` |
+//! | `import()` / dynamic module | `script-src` is loopback-only |
+//! | `<link rel=prefetch/prerender/dns-prefetch>`, speculation rules | `default-src 'none'` (`prefetch-src` falls back to it) |
+//! | Navigation by `<base>` retarget | `base-uri 'none'` |
+//! | Form action retarget | `form-action 'none'` |
+//! | `ping` attribute | `connect-src 'none'` |
+//!
+//! Not walls, and deliberately not relied upon: a `load`/reset handler (the
+//! request has already gone), and any engine-wide switch — Buzz's own huddles
+//! use WebRTC, so the wall must bind this frame, not the webview.
+//!
 //! # Lifecycle
 //!
 //! The listener is reference-counted by live frames, not started at boot:
@@ -51,6 +76,13 @@ pub(crate) const EXTENSION_ROUTE_PREFIX: &str = "ext";
 
 /// Path prefix of the trusted wrapper document that hosts an extension.
 pub(crate) const FRAME_ROUTE_PREFIX: &str = "frame";
+
+/// Path of the host-authored lockdown script.
+///
+/// Served from the frame host rather than inlined, because the extension
+/// document's `script-src` deliberately does **not** allow inline script — see
+/// [`REALM_LOCKDOWN_SOURCE`].
+pub(crate) const LOCKDOWN_ROUTE: &str = "host/extension-lockdown.js";
 
 /// Why a request did not resolve to a servable file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -166,12 +198,13 @@ fn content_type_for(path: &Path) -> &'static str {
 fn content_security_policy(origin: &str) -> String {
     format!(
         "default-src 'none'; \
-         script-src {origin} 'unsafe-inline'; \
+         script-src {origin}; \
          style-src {origin} 'unsafe-inline'; \
          img-src {origin} data: blob:; \
          font-src {origin}; \
          media-src {origin}; \
          connect-src 'none'; \
+         webrtc 'block'; \
          base-uri 'none'; \
          form-action 'none'"
     )
@@ -193,13 +226,16 @@ fn content_security_policy(origin: &str) -> String {
 /// document we serve, and any attempt to navigate itself anywhere but back to
 /// this origin is refused before a request is made.
 ///
-/// The wrapper is trusted (we author its bytes), so it may run its own script —
-/// but it is granted nothing else: no network, no images, no styles.
+/// The wrapper is trusted (we author its bytes), so it may run its own script
+/// and carry its own layout style — but nothing else: no network, no images,
+/// no fonts, no media. Its `style-src` exists because its inline rules are what
+/// make the extension fill the surface instead of a 300x150 default box.
 fn wrapper_content_security_policy(origin: &str) -> String {
     format!(
         "default-src 'none'; \
          frame-src {origin}; \
          script-src 'unsafe-inline'; \
+         style-src 'unsafe-inline'; \
          connect-src 'none'; \
          base-uri 'none'; \
          form-action 'none'"
@@ -233,20 +269,95 @@ fn wrapper_document(entry_url: &str) -> String {
 (function () {{
   var frame = document.getElementById("ext");
   // Extension -> Buzz. Only messages from the one frame we embed.
+  // Only handshake envelopes cross this relay. Everything else is either the
+  // extension's own business or, after the port transfer, travels on the port
+  // directly — so a wider relay would be surface for nothing.
+  function envelope(data, name) {{
+    return data && typeof data === "object" && data.buzz === name;
+  }}
   window.addEventListener("message", function (event) {{
     if (event.source === frame.contentWindow) {{
-      parent.postMessage(event.data, "*", event.ports);
+      if (envelope(event.data, "ready")) {{
+        // No ports forwarded up: the host originates the channel (BRIDGE_SPEC
+        // §2) and must not adopt one arriving from the frame side.
+        parent.postMessage(event.data, "*");
+      }}
       return;
     }}
-    // Buzz -> extension, ports carried through so a MessageChannel survives.
     if (event.source === parent) {{
-      frame.contentWindow.postMessage(event.data, "*", event.ports);
+      if (envelope(event.data, "port")) {{
+        frame.contentWindow.postMessage(event.data, "*", event.ports);
+      }}
     }}
   }});
 }})();
 </script>
 "#
     )
+}
+
+/// The realm lockdown, served as a file and injected as an external script.
+///
+/// **The third egress wall.** `connect-src 'none'` closes fetch/WebSocket/
+/// EventSource/`sendBeacon`; the wrapper's `frame-src` closes navigation.
+/// Neither touches `RTCPeerConnection`, which reaches the network on its own — a
+/// controlled TURN sink received attacker-chosen data in the TURN `username`
+/// with no fetch and no navigation.
+///
+/// `webrtc 'block'` is served too, but it is **not** honoured everywhere: the
+/// browser harness used here reports *"Unrecognized Content-Security-Policy
+/// directive 'webrtc'"* and delivered the sink identical packets with and
+/// without it. It cannot be the only wall.
+///
+/// Neutralising a global is theatre if the page can open a fresh realm and read
+/// a pristine copy — and it **was** theatre in the first attempt here: a
+/// `srcdoc` child ran its own inline script and constructed a peer connection
+/// from its own clean realm. `frame-src 'none'` does not stop a `srcdoc` child,
+/// because that is not a network load; the child simply inherits this policy.
+///
+/// What closes it is inheriting a policy with **no inline script**. Under
+/// `script-src {origin}` with no `'unsafe-inline'`:
+///
+/// - a `srcdoc` child inherits the policy, so its inline script does not run;
+/// - a `blob:` child is a load, so `frame-src 'none'` refuses it;
+/// - a popup cannot open — the sandbox omits `allow-popups`;
+/// - a sibling realm is unreachable: every sandboxed context gets its own
+///   opaque origin, so `contentWindow` access throws `SecurityError`;
+/// - a worker realm is reachable but has no `RTCPeerConnection` — it is a
+///   `Window` API.
+///
+/// So the document has exactly one realm that could construct a peer
+/// connection, and this file runs before any extension byte. Each of those
+/// properties is asserted in the browser tests; they are the argument, so they
+/// are not left as prose.
+///
+/// **Consequence for extension authors:** packages must ship their code as
+/// `.js` files. Inline `<script>` and inline event handlers do not run.
+pub(crate) const REALM_LOCKDOWN_SOURCE: &str = concat!(
+    "(function(){try{",
+    "var gone=[\"RTCPeerConnection\",\"webkitRTCPeerConnection\",",
+    "\"mozRTCPeerConnection\",\"RTCDataChannel\",\"webkitRTCDataChannel\"];",
+    "for(var i=0;i<gone.length;i++){try{Object.defineProperty(window,gone[i],",
+    "{value:undefined,writable:false,configurable:false});}catch(e){}}",
+    "}catch(e){}})();"
+);
+
+/// Insert the lockdown script tag so it runs before any script the package ships.
+///
+/// Placed after the doctype when there is one: a script before the doctype puts
+/// the document into quirks mode, which would change how an extension renders
+/// as a side effect of a security control. A classic (non-async, non-defer)
+/// external script blocks parsing, so it executes before any later script.
+fn inject_realm_lockdown(html: &str, origin: &str) -> String {
+    let tag = format!(r#"<script src="{origin}/{LOCKDOWN_ROUTE}"></script>"#);
+    let lower = html.to_ascii_lowercase();
+    if let Some(start) = lower.find("<!doctype") {
+        if let Some(offset) = lower[start..].find('>') {
+            let split = start + offset + 1;
+            return format!("{}{}{}", &html[..split], tag, &html[split..]);
+        }
+    }
+    format!("{tag}{html}")
 }
 
 #[derive(Clone)]
@@ -261,6 +372,7 @@ fn build_router(base_dir: PathBuf, port: u16) -> Router {
         origin: origin_for_port(port),
     };
     Router::new()
+        .route(&format!("/{LOCKDOWN_ROUTE}"), get(serve_lockdown))
         .route(&format!("/{FRAME_ROUTE_PREFIX}/{{id}}"), get(serve_wrapper))
         .route(
             &format!("/{EXTENSION_ROUTE_PREFIX}/{{id}}/{{*asset}}"),
@@ -318,6 +430,24 @@ pub(crate) fn frame_url(origin: &str, id: &str, entry: &str) -> String {
     )
 }
 
+async fn serve_lockdown(State(state): State<HostState>) -> Response {
+    let mut response = Response::new(Body::from(REALM_LOCKDOWN_SOURCE));
+    let headers = response.headers_mut();
+    insert(
+        headers,
+        header::CONTENT_TYPE,
+        "text/javascript; charset=utf-8",
+    );
+    insert(
+        headers,
+        header::CONTENT_SECURITY_POLICY,
+        &content_security_policy(&state.origin),
+    );
+    insert(headers, header::X_CONTENT_TYPE_OPTIONS, "nosniff");
+    insert(headers, header::CACHE_CONTROL, "no-store");
+    response
+}
+
 async fn serve_wrapper(
     State(state): State<HostState>,
     RoutePath(id): RoutePath<String>,
@@ -355,9 +485,22 @@ async fn serve_asset(
         return empty(StatusCode::NOT_FOUND);
     };
 
+    let content_type = content_type_for(&path);
+    // HTML is the only thing that gets a realm, so it is the only thing that
+    // needs the lockdown. A non-UTF-8 body is served untouched rather than
+    // mangled — it cannot execute anyway.
+    let bytes = if content_type.starts_with("text/html") {
+        match std::str::from_utf8(&bytes) {
+            Ok(html) => inject_realm_lockdown(html, &state.origin).into_bytes(),
+            Err(_) => bytes,
+        }
+    } else {
+        bytes
+    };
+
     let mut response = Response::new(Body::from(bytes));
     let headers = response.headers_mut();
-    insert(headers, header::CONTENT_TYPE, content_type_for(&path));
+    insert(headers, header::CONTENT_TYPE, content_type);
     insert(
         headers,
         header::CONTENT_SECURITY_POLICY,

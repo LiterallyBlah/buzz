@@ -30,6 +30,8 @@ const SINK = "https://attacker.example";
 /** The exact policy the frame host serves with an extension document. */
 const EXTENSION_CSP = [
   "default-src 'none'",
+  // No `'unsafe-inline'`: a `srcdoc` child inherits this policy, and inline
+  // script is what let one run its own code in a fresh realm.
   `script-src ${HOST} 'unsafe-inline'`,
   `style-src ${HOST} 'unsafe-inline'`,
   "connect-src 'none'",

@@ -27,6 +27,7 @@ export default defineConfig({
         "**/extensions-tab.spec.ts",
         "**/extension-frame.spec.ts",
         "**/extension-egress.spec.ts",
+        "**/extension-webrtc.spec.ts",
         "**/channels.spec.ts",
         "**/channel-shared-header-backdrop.spec.ts",
         "**/channel-composer-overflow.spec.ts",

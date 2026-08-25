@@ -122,46 +122,65 @@ test("a sandboxed document under the served policy can still reach its parent", 
   page,
 }) => {
   // BRIDGE_SPEC §2's handshake — the frame posts `{buzz:"ready"}` and the host
-  // replies by transferring a MessagePort — has to remain possible after P3.
-  // Asserting that by reading the CSP spec would be reasoning; this runs it.
+  // replies by transferring a MessagePort — has to remain possible. Asserting
+  // that from the CSP spec would be reasoning; this runs it.
   //
-  // What is pinned here is the *property* of a policy shaped like the one the
-  // frame host serves (default-src/connect-src 'none', inline scripts allowed,
-  // no `sandbox` directive) under the exact sandbox token the app ships. The
-  // shipped policy string itself is pinned by the Rust tests, which is where it
-  // is written; this spec cannot import it.
+  // The policy and the sandbox token are the ones the frame host serves,
+  // including **no** `'unsafe-inline'`, so the probe ships as an external
+  // script exactly as a real package must.
+  const origin = "http://127.0.0.1:51234";
+  const policy = [
+    "default-src 'none'",
+    `script-src ${origin}`,
+    "connect-src 'none'",
+    "webrtc 'block'",
+    "base-uri 'none'",
+    "form-action 'none'",
+  ].join("; ");
+
+  await page.route(`${origin}/**`, async (route) => {
+    const url = route.request().url();
+    if (url.endsWith("ready.js")) {
+      await route.fulfill({
+        status: 200,
+        contentType: "text/javascript; charset=utf-8",
+        headers: { "Content-Security-Policy": policy },
+        body: `parent.postMessage({ buzz: "ready" }, "*");`,
+      });
+      return;
+    }
+    await route.fulfill({
+      status: 200,
+      contentType: "text/html; charset=utf-8",
+      headers: { "Content-Security-Policy": policy },
+      body: `<!doctype html><script src="${origin}/ext/demo/ready.js"></script>`,
+    });
+  });
+
   await installMockBridge(page);
   await page.goto("/#/extensions");
 
-  const outcome = await page.evaluate(async () => {
-    const policy = [
-      "default-src 'none'",
-      "script-src 'unsafe-inline'",
-      "connect-src 'none'",
-      "base-uri 'none'",
-      "form-action 'none'",
-    ].join("; ");
-    const html = `<!doctype html><meta http-equiv="Content-Security-Policy" content="${policy}"><script>parent.postMessage({ buzz: "ready" }, "*");</script>`;
+  const outcome = await page.evaluate(
+    (host) =>
+      new Promise<{ got: unknown; origin: string }>((resolve) => {
+        const frame = document.createElement("iframe");
+        frame.setAttribute("sandbox", "allow-scripts");
+        frame.src = `${host}/ext/demo/index.html`;
 
-    return await new Promise<{ got: unknown; origin: string }>((resolve) => {
-      const frame = document.createElement("iframe");
-      // The exact token list the app ships.
-      frame.setAttribute("sandbox", "allow-scripts");
-      frame.srcdoc = html;
-
-      const timer = window.setTimeout(
-        () => resolve({ got: null, origin: "" }),
-        3000,
-      );
-      window.addEventListener("message", function onMessage(event) {
-        if (event.source !== frame.contentWindow) return;
-        window.clearTimeout(timer);
-        window.removeEventListener("message", onMessage);
-        resolve({ got: event.data, origin: event.origin });
-      });
-      document.body.append(frame);
-    });
-  });
+        const timer = window.setTimeout(
+          () => resolve({ got: null, origin: "" }),
+          5000,
+        );
+        window.addEventListener("message", function onMessage(event) {
+          if (event.source !== frame.contentWindow) return;
+          window.clearTimeout(timer);
+          window.removeEventListener("message", onMessage);
+          resolve({ got: event.data, origin: event.origin });
+        });
+        document.body.append(frame);
+      }),
+    origin,
+  );
 
   expect(outcome.got).toEqual({ buzz: "ready" });
   // §2 relies on source-identity, not origin, precisely because a sandboxed
@@ -237,4 +256,69 @@ test("the app really does load a frame from a remote-class localhost origin", as
   // The frame loaded, ran its script, and reached the parent — so nothing in
   // the app blocked framing this origin.
   expect(await handshake).toBe("null");
+});
+
+test("the extension fills the wrapper instead of a default 300x150 box", async ({
+  page,
+}) => {
+  // Regression for the wrapper's own CSP blocking its own inline style. With
+  // `default-src 'none'` and no `style-src`, the wrapper's layout rules were
+  // rejected and the extension rendered in the browser's default iframe box
+  // with a border — a security header quietly becoming a layout bug.
+  //
+  // The wrapper markup and CSP below are the ones the frame host serves. It is
+  // served from the page's own origin purely so the test can measure inside it:
+  // a cross-origin frame's `contentDocument` is null, and `style-src
+  // 'unsafe-inline'` behaves identically either way. The production origin is
+  // asserted by the other tests in this file.
+  const wrapperCsp = [
+    "default-src 'none'",
+    "frame-src 'self'",
+    "script-src 'unsafe-inline'",
+    "style-src 'unsafe-inline'",
+    "connect-src 'none'",
+  ].join("; ");
+
+  await page.route("**/__wrapper-under-test", async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: "text/html; charset=utf-8",
+      headers: { "Content-Security-Policy": wrapperCsp },
+      body: `<!doctype html><meta charset="utf-8"><style>html,body{margin:0;height:100%}iframe{display:block;border:0;width:100%;height:100%}</style><iframe id="ext" sandbox="allow-scripts" src="about:blank"></iframe>`,
+    });
+  });
+
+  await installMockBridge(page);
+  await page.goto("/#/extensions");
+
+  const box = await page.evaluate(
+    () =>
+      new Promise<{ outer: number[]; inner: number[]; border: string }>(
+        (resolve) => {
+          const outer = document.createElement("iframe");
+          outer.style.cssText = "width:800px;height:600px;border:0";
+          outer.src = "/__wrapper-under-test";
+          outer.onload = () => {
+            window.setTimeout(() => {
+              const doc = outer.contentDocument;
+              const inner = doc?.getElementById("ext") as HTMLIFrameElement;
+              const rect = inner.getBoundingClientRect();
+              const style = doc?.defaultView?.getComputedStyle(inner);
+              resolve({
+                outer: [outer.clientWidth, outer.clientHeight],
+                inner: [Math.round(rect.width), Math.round(rect.height)],
+                border: style?.borderTopWidth ?? "?",
+              });
+            }, 200);
+          };
+          document.body.append(outer);
+        },
+      ),
+  );
+
+  expect(box.inner[0]).toBe(box.outer[0]);
+  expect(box.inner[1]).toBe(box.outer[1]);
+  expect(box.border).toBe("0px");
+  // The bug this guards: the browser's default iframe box.
+  expect(box.inner).not.toEqual([300, 150]);
 });
