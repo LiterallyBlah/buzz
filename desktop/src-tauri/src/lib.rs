@@ -886,6 +886,7 @@ pub fn run() {
             archive::read_archived_observer_events_for_channel,
             archive::index_observer_channel_id,
             archive::read_unindexed_observer_rows,
+            extensions::preview_extension_package,
             extensions::install_extension_from_directory,
             extensions::install_extension_from_zip,
             extensions::list_installed_extensions,

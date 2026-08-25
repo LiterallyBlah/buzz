@@ -330,30 +330,61 @@ fn sign_scope_rejects_non_canonical_uuid_casing() {
 
 // ── Read scopes ──────────────────────────────────────────────────────────────
 
-#[test]
-fn read_denylist_floor_covers_the_buzz_core_sets() {
-    // Derived from buzz-core's maintained sets rather than copied numbers, so
-    // a kind added to either set is covered here the moment it is added.
-    let mut denied: Vec<u32> = Vec::new();
-    denied.extend_from_slice(kind::AUTHOR_ONLY_KINDS);
-    denied.extend_from_slice(kind::P_GATED_KINDS);
-    denied.push(kind::KIND_GIFT_WRAP);
-    denied.extend([41001, 41010, 41011, 41012]);
-    denied.extend([
-        kind::KIND_NIP43_MEMBERSHIP_LIST,
-        kind::KIND_CHANNEL_SUMMARY,
-        kind::KIND_PRESENCE_SNAPSHOT,
-    ]);
-    assert!(
-        denied.len() >= 8,
-        "the denylist floor sample looks empty: {denied:?}"
-    );
+/// The read-deny floor exactly as `docs/BRIDGE_SPEC.md` §5 (`640f482`) writes
+/// it, transcribed from the spec rather than from the implementation:
+///
+/// > `AUTHOR_ONLY_KINDS` ∪ `P_GATED_KINDS` ∪ `{1059}` (gift wrap) ∪ the `41xxx`
+/// > DM kinds
+///
+/// plus kind 30800, which §5 excludes from the query surface separately because
+/// its only read path is `extensionData.get`.
+///
+/// Nothing else belongs here. This function is the oracle the implementation is
+/// checked against; if the spec changes, this changes first and the
+/// implementation follows — not the other way round.
+fn spec_read_deny_floor(kind_value: u32) -> bool {
+    kind::AUTHOR_ONLY_KINDS.contains(&kind_value)
+        || kind::P_GATED_KINDS.contains(&kind_value)
+        || kind_value == 1059
+        || (41000..=41999).contains(&kind_value)
+        || kind_value == 30800
+}
 
-    for kind_value in denied {
-        assert!(
+#[test]
+fn read_deny_predicate_matches_the_spec_floor_exactly() {
+    // An earlier revision of this suite listed the kinds the code rejected and
+    // asserted it rejected them — which blessed the implementation instead of
+    // testing it, and hid an extra `is_relay_only_kind` clause the spec does
+    // not have. Comparing against an independent transcription of the spec is
+    // what catches a policy the spec never authorised, in either direction.
+    let mut denied = 0usize;
+    for kind_value in 0..=50_000u32 {
+        assert_eq!(
             is_read_denied_kind(kind_value),
-            "kind {kind_value} must be on the read denylist floor"
+            spec_read_deny_floor(kind_value),
+            "kind {kind_value}: read-deny disagrees with BRIDGE_SPEC §5"
         );
+        if spec_read_deny_floor(kind_value) {
+            denied += 1;
+        }
+    }
+    assert!(
+        denied >= 1000,
+        "the floor looks empty ({denied} kinds); the oracle is probably broken"
+    );
+}
+
+#[test]
+fn every_kind_on_the_spec_floor_is_rejected_at_install() {
+    let mut sample: Vec<u32> = Vec::new();
+    sample.extend_from_slice(kind::AUTHOR_ONLY_KINDS);
+    sample.extend_from_slice(kind::P_GATED_KINDS);
+    sample.push(kind::KIND_GIFT_WRAP);
+    sample.extend([41001, 41010, 41011, 41012]);
+    assert!(sample.len() >= 8, "floor sample looks empty: {sample:?}");
+
+    for kind_value in sample {
+        assert!(spec_read_deny_floor(kind_value));
         let scopes = format!(
             r#"{{ "read": [ {{ "kinds": [{kind_value}], "channels": ["{CHANNEL_A}"] }} ] }}"#
         );
@@ -363,6 +394,45 @@ fn read_denylist_floor_covers_the_buzz_core_sets() {
         assert!(
             error.contains(&format!("scopes.read requests kind {kind_value}")),
             "got: {error}"
+        );
+    }
+}
+
+#[test]
+fn relay_only_kinds_are_readable_but_never_signable() {
+    // BRIDGE_SPEC §5 does not put relay-only kinds on the read floor: "relay
+    // only" means a client may not AUTHOR the kind. Reads are channel-scoped,
+    // so a relay-authored event in a granted channel is channel-public to the
+    // user granting it — denying it costs capability (thread summaries, system
+    // messages) for no threat-model gain.
+    let relay_only: Vec<u32> = (0..=50_000u32)
+        .filter(|k| kind::is_relay_only_kind(*k) && !spec_read_deny_floor(*k))
+        .collect();
+    assert!(
+        !relay_only.is_empty(),
+        "expected at least one relay-only kind off the spec floor"
+    );
+
+    for kind_value in &relay_only {
+        assert!(
+            !is_read_denied_kind(*kind_value),
+            "relay-only kind {kind_value} must stay readable"
+        );
+        let scopes = format!(
+            r#"{{ "read": [ {{ "kinds": [{kind_value}], "channels": ["{CHANNEL_A}"] }} ] }}"#
+        );
+        parse_and_validate(&manifest_with_scopes(&scopes))
+            .unwrap_or_else(|error| panic!("read on relay-only {kind_value} rejected: {error}"));
+
+        // The sign side still refuses them — §4's allowlist admits only the
+        // seven content kinds, so a relay-only kind is non-signable by
+        // construction rather than by a second rule that could drift.
+        assert!(!EXTENSION_SIGNABLE_KINDS.contains(kind_value));
+        let sign =
+            format!(r#"{{ "sign": [ {{ "kind": {kind_value}, "channels": ["{CHANNEL_A}"] }} ] }}"#);
+        assert!(
+            parse_and_validate(&manifest_with_scopes(&sign)).is_err(),
+            "relay-only kind {kind_value} must not be signable"
         );
     }
 }
@@ -452,7 +522,7 @@ fn only_extension_data_is_both_signable_and_read_denied() {
     // the query surface. Naming the exception explicitly keeps this test able
     // to catch an accidental read-denial of any of the other six.
     for kind_value in EXTENSION_SIGNABLE_KINDS {
-        if *kind_value == KIND_EXTENSION_DATA {
+        if *kind_value == kind::KIND_EXTENSION_DATA {
             assert!(
                 is_read_denied_kind(*kind_value),
                 "kind 30800 must stay off the query surface"

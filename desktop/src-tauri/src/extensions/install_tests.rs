@@ -443,3 +443,251 @@ fn install_creates_the_extensions_folder_when_absent() {
     assert_eq!(path, base.join("demo"));
     assert!(base.is_dir());
 }
+
+// ── B1: depth and implicit-parent accounting on the zip path ─────────────────
+
+#[test]
+fn rejects_a_zip_nested_deeper_than_the_depth_cap() {
+    // Hermes installed a depth-33 archive against a declared cap of 32: the cap
+    // was enforced only by `copy_tree`'s recursion, which the zip path does not
+    // use. Both sources must honour the same advertised bound.
+    let manifest = manifest_json("demo", "index.html");
+    let deep = format!("{}/deep.txt", vec!["d"; MAX_PACKAGE_DEPTH + 1].join("/"));
+    let base = tempfile::tempdir().expect("tempdir");
+    let archive = write_zip(&[
+        ("extension.json", Some(manifest.as_bytes())),
+        ("index.html", Some(b"<!doctype html>")),
+        (deep.as_str(), Some(b"too deep")),
+    ]);
+
+    let Err(error) = install_from_zip(base.path(), archive.path()) else {
+        panic!("a zip deeper than MAX_PACKAGE_DEPTH was installed");
+    };
+    assert!(
+        error.contains(&format!("more than {MAX_PACKAGE_DEPTH} levels deep")),
+        "got: {error}"
+    );
+    // Rejected before any write — no destination, no staging leftover.
+    assert!(
+        entries_in(base.path()).is_empty(),
+        "a too-deep zip left {:?} behind",
+        entries_in(base.path())
+    );
+}
+
+#[test]
+fn accepts_a_zip_exactly_at_the_depth_cap() {
+    // The boundary matters: one level shallower must still install, or the fix
+    // would be a silent capability cut rather than a bound.
+    let manifest = manifest_json("demo", "index.html");
+    let deep = format!("{}/ok.txt", vec!["d"; MAX_PACKAGE_DEPTH].join("/"));
+    let base = tempfile::tempdir().expect("tempdir");
+    let archive = write_zip(&[
+        ("extension.json", Some(manifest.as_bytes())),
+        ("index.html", Some(b"<!doctype html>")),
+        (deep.as_str(), Some(b"deep but legal")),
+    ]);
+
+    install_from_zip(base.path(), archive.path())
+        .unwrap_or_else(|error| panic!("a zip at exactly the depth cap was rejected: {error}"));
+}
+
+#[test]
+fn charges_implicit_parent_directories_to_the_entry_budget() {
+    // `create_dir_all` during extraction materialises every ancestor, so an
+    // archive of few records can create many directories. Counting records
+    // alone let an archive blow well past the advertised entry cap; the count
+    // that matters is distinct paths caused to exist.
+    let manifest = manifest_json("demo", "index.html");
+    let mut names: Vec<String> = Vec::new();
+    // Each record contributes ~30 fresh directories, so a few hundred records
+    // exceed MAX_PACKAGE_ENTRIES while archive.len() stays far below it.
+    let per_record = 30usize;
+    let records = (MAX_PACKAGE_ENTRIES / per_record) + 5;
+    for record in 0..records {
+        let mut path = String::new();
+        for level in 0..per_record {
+            path.push_str(&format!("r{record}l{level}/"));
+        }
+        path.push_str("leaf.txt");
+        names.push(path);
+    }
+    assert!(
+        records < MAX_PACKAGE_ENTRIES,
+        "the archive must stay under the cap by record count ({records} records)"
+    );
+
+    let mut entries: Vec<(&str, Option<&[u8]>)> = vec![
+        ("extension.json", Some(manifest.as_bytes())),
+        ("index.html", Some(b"<!doctype html>" as &[u8])),
+    ];
+    for name in &names {
+        entries.push((name.as_str(), Some(b"x" as &[u8])));
+    }
+
+    let base = tempfile::tempdir().expect("tempdir");
+    let archive = write_zip(&entries);
+    let Err(error) = install_from_zip(base.path(), archive.path()) else {
+        panic!("implicit parent directories were not charged to the entry budget");
+    };
+    assert!(
+        error.contains(&format!(
+            "more than {MAX_PACKAGE_ENTRIES} files and folders"
+        )),
+        "got: {error}"
+    );
+    assert!(
+        entries_in(base.path()).is_empty(),
+        "an over-budget zip left {:?} behind",
+        entries_in(base.path())
+    );
+}
+
+#[test]
+fn counts_a_shared_parent_once() {
+    // Sibling files under one directory must not each be charged for it, or the
+    // budget would reject ordinary packages.
+    let manifest = manifest_json("demo", "index.html");
+    let mut entries: Vec<(&str, Option<&[u8]>)> = vec![
+        ("extension.json", Some(manifest.as_bytes())),
+        ("index.html", Some(b"<!doctype html>" as &[u8])),
+    ];
+    let names: Vec<String> = (0..64).map(|n| format!("assets/file{n}.txt")).collect();
+    for name in &names {
+        entries.push((name.as_str(), Some(b"x" as &[u8])));
+    }
+
+    let base = tempfile::tempdir().expect("tempdir");
+    let archive = write_zip(&entries);
+    install_from_zip(base.path(), archive.path())
+        .unwrap_or_else(|error| panic!("a shared parent was over-charged: {error}"));
+}
+
+// ── Should-fix C: a failed rollback must not destroy the parked tree ─────────
+
+#[test]
+fn a_failed_rollback_preserves_the_previous_install_and_says_where() {
+    // The dangerous ordering is: park the previous tree, fail to install, then
+    // fail to put it back. Dropping the holder there would delete the user's
+    // only remaining copy. Rollback is forced to fail by pointing it at a
+    // destination whose parent does not exist.
+    let base = tempfile::tempdir().expect("tempdir");
+    let holder = tempfile::Builder::new()
+        .prefix(REPLACED_PREFIX)
+        .tempdir_in(base.path())
+        .expect("holder");
+    let slot = holder.path().join("previous");
+    fs::create_dir_all(&slot).expect("slot");
+    fs::write(slot.join("marker.txt"), b"the user's data").expect("marker");
+
+    let unreachable = base.path().join("no-such-dir").join("demo");
+    let io_error = std::io::Error::other("simulated rename failure");
+    let message = restore_or_preserve(holder, &slot, &unreachable, &io_error);
+
+    // The bytes still exist somewhere, and the message says where.
+    let preserved: Vec<PathBuf> = walk_files(base.path())
+        .into_iter()
+        .filter(|path| path.file_name().is_some_and(|name| name == "marker.txt"))
+        .collect();
+    assert_eq!(
+        preserved.len(),
+        1,
+        "the parked install was destroyed; found {:?}",
+        entries_in(base.path())
+    );
+    let preserved_dir = preserved[0].parent().expect("parent");
+    assert!(
+        message.contains(&preserved_dir.display().to_string()),
+        "the error must name where the bytes are; got: {message}"
+    );
+    assert!(
+        message.contains("preserved"),
+        "the error must say the files were kept; got: {message}"
+    );
+}
+
+#[test]
+fn a_successful_rollback_restores_the_previous_install() {
+    let base = tempfile::tempdir().expect("tempdir");
+    let destination = base.path().join("demo");
+    let holder = tempfile::Builder::new()
+        .prefix(REPLACED_PREFIX)
+        .tempdir_in(base.path())
+        .expect("holder");
+    let slot = holder.path().join("previous");
+    fs::create_dir_all(&slot).expect("slot");
+    fs::write(slot.join("marker.txt"), b"the user's data").expect("marker");
+
+    let io_error = std::io::Error::other("simulated rename failure");
+    let message = restore_or_preserve(holder, &slot, &destination, &io_error);
+
+    assert!(
+        destination.join("marker.txt").is_file(),
+        "the previous install was not restored"
+    );
+    assert!(
+        !message.contains("preserved"),
+        "a successful rollback must not claim files were left elsewhere; got: {message}"
+    );
+}
+
+/// Every regular file under `root`, recursively.
+fn walk_files(root: &Path) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    let Ok(entries) = fs::read_dir(root) else {
+        return found;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            found.extend(walk_files(&path));
+        } else {
+            found.push(path);
+        }
+    }
+    found
+}
+
+// ── Queued: signpost the "zipped the folder, not its contents" mistake ───────
+
+#[test]
+fn a_wrapper_directory_zip_is_rejected_with_a_signpost() {
+    // Behaviour is unchanged — v1 never auto-unwraps (decision 008). Only the
+    // error improves, because "no extension.json at its root" sends an author
+    // looking in the wrong place when the manifest is right there one level in.
+    let manifest = manifest_json("demo", "index.html");
+    let base = tempfile::tempdir().expect("tempdir");
+    let archive = write_zip(&[
+        ("my-ext/extension.json", Some(manifest.as_bytes())),
+        ("my-ext/index.html", Some(b"<!doctype html>")),
+    ]);
+
+    let Err(error) = install_from_zip(base.path(), archive.path()) else {
+        panic!("a wrapped package must still be rejected");
+    };
+    assert!(
+        error.contains("my-ext/") && error.contains("contents"),
+        "the error must name the wrapper and say what to do; got: {error}"
+    );
+    assert!(
+        entries_in(base.path()).is_empty(),
+        "a rejected zip left {:?} behind",
+        entries_in(base.path())
+    );
+}
+
+#[test]
+fn a_package_missing_its_manifest_entirely_gets_the_plain_error() {
+    // The signpost must not fire when there is no wrapper to point at, or it
+    // would be a confident wrong guess.
+    let base = tempfile::tempdir().expect("tempdir");
+    let archive = write_zip(&[("index.html", Some(b"<!doctype html>"))]);
+
+    let Err(error) = install_from_zip(base.path(), archive.path()) else {
+        panic!("a package with no manifest must be rejected");
+    };
+    assert!(
+        !error.contains("contents"),
+        "the signpost fired without a wrapper; got: {error}"
+    );
+}

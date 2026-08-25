@@ -36,14 +36,6 @@ pub(crate) const MANIFEST_FILE_NAME: &str = "extension.json";
 /// `str::len()` is the byte length the spec means.
 const MAX_EXTENSION_ID_LEN: usize = 64;
 
-/// Reserved extension-data kind.
-///
-/// buzz-extensions decision 009 / `docs/BRIDGE_SPEC.md` §4 assign kind 30800 to
-/// extension-owned addressable state. It is not (yet) in `buzz-core`'s kind
-/// registry — the relay accept-and-store change is a separate M1 work item — so
-/// it is named here and will move to `buzz-core` when that lands.
-pub(crate) const KIND_EXTENSION_DATA: u32 = 30800;
-
 /// The v1 signable-kind allowlist.
 ///
 /// Source of truth: buzz-extensions `docs/BRIDGE_SPEC.md` §4, "v1 signable-kind
@@ -62,7 +54,7 @@ pub(crate) const KIND_EXTENSION_DATA: u32 = 30800;
 pub(crate) const EXTENSION_SIGNABLE_KINDS: &[u32] = &[
     kind::KIND_REACTION,            // 7     — reaction
     kind::KIND_STREAM_MESSAGE,      // 9     — channel message
-    KIND_EXTENSION_DATA,            // 30800 — extension data (decision 009)
+    kind::KIND_EXTENSION_DATA,      // 30800 — extension data (decision 009)
     kind::KIND_STREAM_MESSAGE_EDIT, // 40003 — edit of the user's own event
     kind::KIND_FORUM_POST,          // 45001 — forum post
     kind::KIND_FORUM_VOTE,          // 45002 — forum vote
@@ -171,10 +163,17 @@ pub(crate) fn is_valid_extension_id(id: &str) -> bool {
 
 /// The read denylist floor from `docs/BRIDGE_SPEC.md` §5.
 ///
-/// `AUTHOR_ONLY_KINDS` ∪ `P_GATED_KINDS` ∪ `{1059}` ∪ the `41xxx` DM kinds,
-/// plus relay-only kinds, plus kind 30800. The first two are read from
-/// `buzz-core`'s maintained sets rather than copied as numbers, so the floor
-/// tracks the kind registry instead of drifting from it.
+/// Exactly the spec's enumeration — `AUTHOR_ONLY_KINDS` ∪ `P_GATED_KINDS` ∪
+/// `{1059}` ∪ the `41xxx` DM kinds — plus kind 30800. The first two are read
+/// from `buzz-core`'s maintained sets rather than copied as numbers, so the
+/// floor tracks the kind registry instead of drifting from it.
+///
+/// **Relay-only kinds are deliberately NOT on this floor.** "Relay-only" means
+/// a client may not *author* the kind; it says nothing about reading it. Reads
+/// are channel-scoped, so a relay-authored event in a granted channel is
+/// channel-public to the user doing the granting — denying it costs real
+/// capability (thread summaries, system messages) for no threat-model gain. The
+/// sign side still refuses relay-only kinds, which is §4's separate rule.
 ///
 /// The **read-allowed set** §7 refers to is this predicate's complement — v1
 /// has no separately enumerated read allowlist (§5). Reach is then bounded
@@ -189,9 +188,8 @@ pub(crate) fn is_read_denied_kind(kind_value: u32) -> bool {
     kind::AUTHOR_ONLY_KINDS.contains(&kind_value)
         || kind::P_GATED_KINDS.contains(&kind_value)
         || kind_value == kind::KIND_GIFT_WRAP
-        || kind_value == KIND_EXTENSION_DATA
+        || kind_value == kind::KIND_EXTENSION_DATA
         || DM_KIND_RANGE.contains(&kind_value)
-        || kind::is_relay_only_kind(kind_value)
 }
 
 /// Parse a manifest from raw bytes with unknown fields rejected.
@@ -241,9 +239,10 @@ pub(crate) fn validate_manifest(manifest: &ExtensionManifest) -> Result<(), Stri
             // (BRIDGE_SPEC §5/§7). Say so rather than emitting the generic
             // "may never read", which would send an author looking for the
             // wrong fix.
-            if *kind_value == KIND_EXTENSION_DATA {
+            if *kind_value == kind::KIND_EXTENSION_DATA {
                 return Err(format!(
-                    "{MANIFEST_FILE_NAME}: scopes.read requests kind {KIND_EXTENSION_DATA}; extension data is read through extensionData.get under the \"extensionData\" scope, not a read grant"
+                    "{MANIFEST_FILE_NAME}: scopes.read requests kind {}; extension data is read through extensionData.get under the \"extensionData\" scope, not a read grant",
+                    kind::KIND_EXTENSION_DATA
                 ));
             }
             if is_read_denied_kind(*kind_value) {
@@ -312,9 +311,43 @@ pub(crate) fn validate_entry_file(root: &Path, entry: &str) -> Result<(), String
 }
 
 /// Load `extension.json` from a package root and apply every rule.
+/// The name of the single top-level directory that itself holds the manifest,
+/// if the package is shaped that way.
+///
+/// This is detection only — it never changes what installs. v1 does not
+/// auto-unwrap (decision 008: an inference step in a security-sensitive install
+/// path, and with re-install-as-update a silent unwrap would quietly redefine
+/// what "the package root" means). But "zip the folder" is the obvious mistake
+/// to make, and an error that only says "no extension.json at its root" sends
+/// the author looking in the wrong place.
+fn single_wrapper_directory(root: &Path) -> Option<String> {
+    let mut directories = Vec::new();
+    for entry in std::fs::read_dir(root).ok()? {
+        let entry = entry.ok()?;
+        // Any file at the top level means this is not a plain wrapper.
+        if entry.path().is_dir() {
+            directories.push(entry);
+        } else {
+            return None;
+        }
+    }
+    let [only] = directories.as_slice() else {
+        return None;
+    };
+    if !only.path().join(MANIFEST_FILE_NAME).is_file() {
+        return None;
+    }
+    only.file_name().into_string().ok()
+}
+
 pub(crate) fn load_and_validate_manifest(root: &Path) -> Result<ExtensionManifest, String> {
     let manifest_path = root.join(MANIFEST_FILE_NAME);
     if !manifest_path.is_file() {
+        if let Some(wrapper) = single_wrapper_directory(root) {
+            return Err(format!(
+                "{MANIFEST_FILE_NAME}: the package has no {MANIFEST_FILE_NAME} at its root — it is wrapped in \"{wrapper}/\". Package the folder's *contents*, not the folder."
+            ));
+        }
         return Err(format!(
             "{MANIFEST_FILE_NAME}: the package has no {MANIFEST_FILE_NAME} at its root"
         ));

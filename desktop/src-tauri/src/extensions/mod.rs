@@ -26,6 +26,7 @@ mod install;
 // One writer, two consumers.
 pub(crate) mod manifest;
 mod package_path;
+mod preview;
 
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
@@ -34,6 +35,7 @@ use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager};
 
 pub use manifest::ExtensionScopes;
+pub use preview::ExtensionPackagePreview;
 
 use manifest::ExtensionManifest;
 
@@ -118,6 +120,24 @@ pub async fn install_extension_from_zip(
     tokio::task::spawn_blocking(move || install_zip_in(&base_dir, &archive))
         .await
         .map_err(|error| format!("extension install task failed: {error}"))?
+}
+
+/// Read a candidate package's `extension.json` without installing it.
+///
+/// This is the seam decision 006's frontend half needs: the webview cannot read
+/// local paths, so it asks the host for the manifest, validates its shape with
+/// zod, and only then offers to install. It is also what P5's grant-review UI
+/// reads to show what an extension is asking for *before* the user agrees —
+/// hence a whole manifest rather than a summary.
+///
+/// Read-only and non-authoritative: nothing is written, nothing is validated
+/// here, and a package that previews cleanly can still be rejected at install.
+#[tauri::command]
+pub async fn preview_extension_package(source: String) -> Result<ExtensionPackagePreview, String> {
+    let path = PathBuf::from(source);
+    tokio::task::spawn_blocking(move || preview::preview_package(&path))
+        .await
+        .map_err(|error| format!("extension preview task failed: {error}"))?
 }
 
 /// List every installed extension package.

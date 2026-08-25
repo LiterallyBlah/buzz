@@ -155,13 +155,37 @@ fn swap_into_place(base_dir: &Path, staged: &Path, destination: &Path) -> Result
     match fs::rename(staged, destination) {
         // Dropping the holder removes the replaced tree.
         Ok(()) => Ok(()),
-        Err(error) => {
-            if let Some((_holder, slot)) = &parked {
-                let _ = fs::rename(slot, destination);
-            }
-            Err(format!("could not install the extension: {error}"))
-        }
+        Err(error) => match parked {
+            Some((holder, slot)) => Err(restore_or_preserve(holder, &slot, destination, &error)),
+            None => Err(format!("could not install the extension: {error}")),
+        },
     }
+}
+
+/// Put the parked previous install back, or — if that also fails — keep it.
+///
+/// The failure that matters is the second one. Dropping the holder is what
+/// removes the replaced tree, so ignoring a failed rollback and letting the
+/// holder drop would delete the user's only remaining copy in exactly the
+/// situation where they still need it. Instead the holder is kept and its
+/// location is named in the error, so a rare filesystem fault costs the user a
+/// manual move rather than their installed extension.
+fn restore_or_preserve(
+    holder: tempfile::TempDir,
+    slot: &Path,
+    destination: &Path,
+    install_error: &std::io::Error,
+) -> String {
+    if fs::rename(slot, destination).is_ok() {
+        // Restored; dropping the (now empty) holder is correct.
+        return format!("could not install the extension: {install_error}");
+    }
+    let kept = holder.keep();
+    format!(
+        "could not install the extension: {install_error}. The previously installed version could not be restored automatically — its files have been preserved at {} and can be moved back to {}",
+        kept.join("previous").display(),
+        destination.display()
+    )
 }
 
 // ── Directory source ─────────────────────────────────────────────────────────
@@ -270,12 +294,40 @@ fn stage_zip(staging: &Path, archive_path: &Path) -> Result<(), String> {
 /// over the central directory *before* a single byte is written, so a hostile
 /// archive is rejected without creating any files; extraction then re-checks
 /// every entry through `zip`'s own `enclosed_name()`.
+/// Path components of a zip entry name, ignoring empty ones.
+///
+/// Split on both separators for the same reason
+/// [`check_package_relative_path`] does: a zip is written by some other host
+/// and its own grammar must not decide what a component is here.
+fn zip_entry_components(name: &str) -> Vec<&str> {
+    name.split(['/', '\\'])
+        .filter(|component| !component.is_empty())
+        .collect()
+}
+
+/// Validate every zip entry against the central directory, before a byte is
+/// written.
+///
+/// Three rules, all enforced here rather than during extraction so a hostile
+/// archive is rejected before it can create anything:
+///
+/// 1. **Traversal** — the platform-neutral relative-path rules.
+/// 2. **Depth** — an entry nested deeper than [`MAX_PACKAGE_DEPTH`] is
+///    rejected. The directory installer bounds depth by recursion; the zip path
+///    has no recursion to bound, so without this check the cap applied to one
+///    source and not the other.
+/// 3. **Entry count, including implicit parents** — extraction calls
+///    `create_dir_all`, so one record `a/b/c/d.txt` materialises four paths. The
+///    count that matters is the number of *distinct* paths the archive causes to
+///    exist, not the number of records it declares; charging records alone let
+///    an archive create far more directories than [`MAX_PACKAGE_ENTRIES`]
+///    suggests.
 fn validate_extension_zip_entries(archive: &zip::ZipArchive<fs::File>) -> Result<(), String> {
-    if archive.len() > MAX_PACKAGE_ENTRIES {
-        return Err(format!(
-            "package has more than {MAX_PACKAGE_ENTRIES} files and folders"
-        ));
-    }
+    // Distinct paths the archive will cause to exist: every record plus every
+    // directory implied by one. A `BTreeSet` because the same parent is implied
+    // by many records and must only be charged once.
+    let mut distinct_paths: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+
     for index in 0..archive.len() {
         let name = archive
             .name_for_index(index)
@@ -283,7 +335,44 @@ fn validate_extension_zip_entries(archive: &zip::ZipArchive<fs::File>) -> Result
         if let Err(reason) = check_package_relative_path(name) {
             return Err(format!("package contains {}: {name}", reason.describe()));
         }
+
+        let components = zip_entry_components(name);
+        if components.is_empty() {
+            continue;
+        }
+
+        // Depth is the number of ancestor directories, matching `copy_tree`,
+        // where a child of the package root is handled at depth 0. A trailing
+        // separator marks a directory record, whose own depth is its component
+        // count rather than one less.
+        let is_directory_record = name.ends_with('/') || name.ends_with('\\');
+        let depth = if is_directory_record {
+            components.len()
+        } else {
+            components.len() - 1
+        };
+        if depth > MAX_PACKAGE_DEPTH {
+            return Err(format!(
+                "package nests folders more than {MAX_PACKAGE_DEPTH} levels deep: {name}"
+            ));
+        }
+
+        // Charge the record and every directory it implies.
+        let mut prefix = String::new();
+        for component in &components {
+            if !prefix.is_empty() {
+                prefix.push('/');
+            }
+            prefix.push_str(component);
+            distinct_paths.insert(prefix.clone());
+            if distinct_paths.len() > MAX_PACKAGE_ENTRIES {
+                return Err(format!(
+                    "package has more than {MAX_PACKAGE_ENTRIES} files and folders"
+                ));
+            }
+        }
     }
+
     Ok(())
 }
 
