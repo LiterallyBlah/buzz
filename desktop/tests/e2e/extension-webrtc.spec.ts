@@ -175,19 +175,27 @@ test("the realm lockdown stops WebRTC before a packet leaves", async ({
   expect(packets).toBe(0);
 });
 
-test("the extension realm cannot reach a fresh realm to undo the lockdown", async ({
-  page,
-}) => {
-  // This is the argument the lockdown rests on, asserted rather than assumed.
-  // Neutralising a global is theatre if the page can open a clean realm and read
-  // a pristine constructor — and it WAS theatre in the first attempt: with
-  // `'unsafe-inline'` allowed, a `srcdoc` child ran its own script and built a
-  // peer connection from its own realm. `frame-src 'none'` does not stop a
-  // `srcdoc` child; it inherits the policy instead. What closes it is inheriting
-  // a policy with no inline script, which is what ships.
-  //
-  // The probe is therefore an EXTERNAL script, exactly as a real package must
-  // now ship its code.
+/**
+ * Drive the fresh-realm escape probe, with the one wall under test toggled.
+ *
+ * This is the argument the lockdown rests on, asserted rather than assumed.
+ * Neutralising a global is theatre if the page can open a clean realm and read
+ * a pristine constructor — and it WAS theatre in the first attempt: with
+ * `'unsafe-inline'` allowed, a `srcdoc` child ran its own script and built a
+ * peer connection from its own realm. `frame-src 'none'` does not stop a
+ * `srcdoc` child; it inherits the policy instead. What closes it is inheriting
+ * a policy with no inline script, which is what ships.
+ *
+ * The probe is therefore an EXTERNAL script, exactly as a real package must
+ * now ship its code.
+ *
+ * `allowInline` is the *only* difference between the control and protected
+ * rows, so the control cannot drift away from what it is controlling for.
+ */
+async function realmEscapeRun(
+  page: import("@playwright/test").Page,
+  options: { allowInline: boolean },
+) {
   const sink = await turnSink();
   const embed = (value: string) =>
     JSON.stringify(value).replace(/<\//g, "<\\/");
@@ -234,7 +242,7 @@ test("the extension realm cannot reach a fresh realm to undo the lockdown", asyn
     setTimeout(function () { parent.postMessage({ report: report }, "*"); }, 2500);
   `;
 
-  const csp = extensionCsp(true);
+  const csp = extensionCsp(true, options.allowInline);
   await page.route(`${HOST}/**`, async (route) => {
     const url = route.request().url();
     if (url === LOCKDOWN_PATH) {
@@ -297,6 +305,34 @@ test("the extension realm cannot reach a fresh realm to undo the lockdown", asyn
   await page.waitForTimeout(2000);
   const packets = sink.packets.length;
   sink.close();
+  return { result, packets };
+}
+
+test("CONTROL: with inline script allowed, the nested realm really does escape", async ({
+  page,
+}) => {
+  // Permanent, and the reason the row below is worth anything. `escapes` being
+  // empty proves containment only if this harness can observe an escape when
+  // one happens — otherwise a probe that silently failed to build its frames
+  // would produce exactly the same empty array. It did, once: an embedded
+  // `</script>` truncated the payload and the vector read as closed.
+  //
+  // So: same probe, same serving path, `'unsafe-inline'` restored. The nested
+  // frame must run and must reach the sink.
+  const { result, packets } = await realmEscapeRun(page, {
+    allowInline: true,
+  });
+
+  expect(result.escapes).toContain("nested-frame-ran");
+  expect(packets).toBeGreaterThan(0);
+});
+
+test("the extension realm cannot reach a fresh realm to undo the lockdown", async ({
+  page,
+}) => {
+  const { result, packets } = await realmEscapeRun(page, {
+    allowInline: false,
+  });
 
   expect(result.report.top).toBe("undefined");
   expect(result.report.afterReassign).toBe("undefined");
@@ -304,7 +340,9 @@ test("the extension realm cannot reach a fresh realm to undo the lockdown", asyn
   expect(result.report.popup).toBe("null");
   // A worker realm exists but has no RTCPeerConnection to hand back.
   expect(result.report.worker ?? "undefined").not.toBe("function");
-  // No nested frame ran a single line of script.
+  // No nested frame ran a single line of script. Meaningful because the
+  // CONTROL row above observes this same route succeeding when the wall is
+  // removed.
   expect(result.escapes).toEqual([]);
   expect(packets).toBe(0);
 });

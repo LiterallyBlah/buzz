@@ -8,14 +8,18 @@
  * Both recover a fresh realm the document prologue never reached, and both
  * produced a working `RTCPeerConnection` and live sink packets.
  *
- * Two walls close them, and the second is the general one:
- *   - the wrapper's `frame-src` names the **exact entry URL**, so the frame
- *     cannot navigate itself to another package asset;
- *   - **every script this host serves carries the neutralisation first.**
- *     `script-src` names only this origin with no `'unsafe-inline'` and no
- *     `'unsafe-eval'`, and `data:`/`blob:` are not sources — so a realm cannot
- *     execute a statement without loading one of our scripts, and every one of
- *     ours locks the realm down before the package's bytes run.
+ * **This round closes route 2 only.**
+ *   - Route 2 is closed by the host setting `script-src 'none'` on the active
+ *     non-HTML document family (`asset_content_security_policy`). The document
+ *     still loads and still renders as an image; it cannot execute.
+ *   - **Route 1 remains open.** It is assigned to the isolation phase, not
+ *     closed here.
+ *
+ * Two mechanisms that earlier revisions of this comment claimed are **not** in
+ * production and were deliberately reverted: the wrapper's `frame-src` does
+ * *not* pin the exact entry URL (it names the origin, so multi-page packages
+ * keep working), and this host does *not* prepend neutralisation to every
+ * served script. Do not re-derive route-1 coverage from either.
  *
  * Chromium only, as ever. WebKitGTK confirmation is Hermes's.
  */
@@ -54,8 +58,14 @@ async function runRealms(
     "style-src 'unsafe-inline'",
   ].join("; ");
 
+  // Server-side request witnesses. The page-side marks alone cannot distinguish
+  // "the script was blocked" from "the navigation never happened", so the
+  // protected row asserts the document *was* fetched and the script was *not*.
+  const requested: string[] = [];
+
   await page.route(`${HOST}/**`, async (route) => {
     const url = new URL(route.request().url());
+    requested.push(url.pathname);
     const send = (body: string, contentType: string, csp: string) =>
       route.fulfill({
         status: 200,
@@ -106,7 +116,12 @@ async function runRealms(
          img.onload = function () { top.postMessage({ mark: "img-rendered" }, "*"); };
          img.onerror = function () { top.postMessage({ mark: "img-failed" }, "*"); };
          img.src = "${HOST}/ext/demo/plain.svg";
-         setTimeout(function () { location.href = "${HOST}/ext/demo/asset.svg"; }, 1200);`,
+         setTimeout(function () {
+           // Posted before navigating so a broken timer is distinguishable from
+           // a blocked script: no mark means the row never attempted the route.
+           top.postMessage({ mark: "svg-nav-attempted" }, "*");
+           location.href = "${HOST}/ext/demo/asset.svg";
+         }, 1200);`,
         "text/javascript; charset=utf-8",
         extCsp,
       );
@@ -143,6 +158,7 @@ async function runRealms(
   return {
     marks,
     of: (name: string) => marks.find((m) => m.mark === name),
+    fetched: (suffix: string) => requested.some((p) => p.endsWith(suffix)),
   };
 }
 
@@ -155,8 +171,12 @@ test("CONTROL: the SVG document really does execute package script", async ({
 
   expect(result.of("parent-ran")).toBeTruthy();
   expect(result.of("img-rendered")).toBeTruthy();
+  // Navigation witnesses: the route was attempted and the document was served.
+  expect(result.of("svg-nav-attempted")).toBeTruthy();
+  expect(result.fetched("asset.svg")).toBe(true);
   // The external script is the live route: it executes in the SVG's own realm
   // with a working constructor, which is what shed the initial lockdown.
+  expect(result.fetched("svg.js")).toBe(true);
   expect(result.of("svg-external-ran")?.rtc).toBe("function");
   // The inline handler is already dead — closed earlier by the no-inline
   // ratification, not by this repair. Asserted so the distinction is on record
@@ -173,7 +193,17 @@ test("the SVG document loads but cannot execute under the repair", async ({
   // Ordinary rendering is untouched: an image never runs script.
   expect(result.of("img-rendered")).toBeTruthy();
   expect(result.of("img-failed")).toBeUndefined();
-  // The external route — the one that was live — no longer executes.
+
+  // The witnesses that make the silence below mean something. Without these,
+  // a timer that never fired would satisfy "no script ran" just as well as the
+  // repair does. The document must be reached before its emptiness is evidence.
+  expect(result.of("svg-nav-attempted")).toBeTruthy();
+  expect(result.fetched("asset.svg")).toBe(true);
+
+  // The external route — the one that was live — no longer executes. Under
+  // `script-src 'none'` the script is not even fetched, so the server-side
+  // witness is the stronger assertion of the two.
+  expect(result.fetched("svg.js")).toBe(false);
   expect(result.of("svg-external-ran")).toBeUndefined();
   expect(result.of("svg-inline-ran")).toBeUndefined();
 });
@@ -183,10 +213,17 @@ test("the SVG document loads but cannot execute under the repair", async ({
 /**
  * Measure what a worker can do from inside the extension realm.
  *
- * Run twice — with and without the route-2 repair — and compared. Asserting
- * "workers still work" in the abstract would be a claim about the engine;
- * asserting the *same* outcome either side of the change is a claim about the
- * change, which is what was actually asked.
+ * **What this row is, precisely:** engine-capability evidence. It hand-writes
+ * the CSP headers below; it does **not** invoke the production selector
+ * `asset_content_security_policy()`. And because this row's frame goes straight
+ * to `index.html` → `probe.js`, the one asset the repair downgrades is never
+ * requested — so the two runs are identical by construction rather than
+ * differing by the repair.
+ *
+ * It therefore does not independently test the Rust policy selector. That
+ * coupling is established by the Rust policy test; the two together are what
+ * cover the claim. Read this row only for what a worker can reach from inside
+ * the extension realm.
  */
 async function workerBehaviour(
   page: import("@playwright/test").Page,
@@ -209,8 +246,10 @@ async function workerBehaviour(
         body,
       });
 
-    // The asset the route-2 repair downgrades — present so the two runs differ
-    // in exactly the way the repair differs.
+    // The asset the route-2 repair downgrades. Note it is **never requested in
+    // this row** — the frame loads `index.html` → `probe.js` and stops — so it
+    // does not make the two runs differ. Kept only so the fixture's policy
+    // shape matches the other rows; it is not what makes this test meaningful.
     if (url.pathname.endsWith("asset.svg")) {
       return send(
         `<svg xmlns="http://www.w3.org/2000/svg" width="4" height="4"></svg>`,
@@ -301,8 +340,12 @@ test("the route-2 repair leaves worker behaviour unchanged", async ({
 }) => {
   // Hermes flagged that response CSP is contextual and workers derive their
   // execution policy from their own response. The repair deliberately does not
-  // touch `text/javascript`, and this is the behavioural proof of that — the
-  // same probe, either side of the change, must report the same thing.
+  // touch `text/javascript`.
+  //
+  // Read the equality below for what it is: the downgraded asset is never
+  // requested in this row, so `before === after` is expected by construction
+  // and is a regression guard, not proof that the repair spares workers. The
+  // load-bearing assertions are the concrete outcomes pinned underneath it.
   const before = await workerBehaviour(page, false);
   const after = await workerBehaviour(page, true);
 

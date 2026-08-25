@@ -788,7 +788,10 @@ fn the_wrapper_relay_carries_only_handshake_envelopes() {
     );
 }
 
-// ── Round 5: the script layer is the wall for realms the prologue misses ─────
+// ── Round 5: `script-src 'none'` on active non-HTML documents (route 2) ──────
+//
+// Scope: route 2 only. Route 1 (the `srcdoc` child) is open and belongs to the
+// isolation phase — nothing below covers it.
 
 #[tokio::test]
 async fn a_post_install_non_utf8_html_asset_is_refused() {

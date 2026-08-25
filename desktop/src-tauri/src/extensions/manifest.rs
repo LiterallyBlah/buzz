@@ -72,8 +72,13 @@ const DM_KIND_RANGE: std::ops::RangeInclusive<u32> = 41000..=41999;
 /// The entry is the document the host writes its prologue into. It is **not**
 /// the only file that can become a realm — a `srcdoc` child and an SVG asset
 /// reached by navigation are realms too, and neither receives the prologue.
-/// Those are covered separately, at the script layer, because every realm needs
-/// a script from this host to execute anything at all.
+///
+/// Their coverage differs, and the difference matters:
+/// - the **SVG/XML asset** is closed, by the host serving that document family
+///   with `script-src 'none'` (see `asset_content_security_policy`);
+/// - the **`srcdoc` child** is **not** closed. It is assigned to the isolation
+///   phase. There is no script-layer wall covering it — an earlier revision of
+///   this comment claimed one, and that mechanism was deliberately reverted.
 ///
 /// This restriction is still worth having: it keeps the *entry* to a shape the
 /// host can write into, so the accurate claim is "accepted entry documents and
