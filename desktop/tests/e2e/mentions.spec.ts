@@ -37,6 +37,37 @@ const DM_THREAD_AGENT_MENTION_ERROR_TEXT =
 const DM_THREAD_MEMBERS_LOADING_ERROR_TEXT =
   "Checking conversation members. Try again in a moment.";
 
+async function expectTextContrast(
+  locator: import("@playwright/test").Locator,
+  minimum = 4.5,
+) {
+  const contrastRatio = await locator.evaluate((element) => {
+    const parseRgb = (value: string) =>
+      (value.match(/[\d.]+/g) ?? []).slice(0, 3).map(Number);
+    const luminance = (color: number[]) =>
+      color
+        .map((channel) => {
+          const value = channel / 255;
+          return value <= 0.04045
+            ? value / 12.92
+            : ((value + 0.055) / 1.055) ** 2.4;
+        })
+        .reduce(
+          (sum, channel, index) =>
+            sum + channel * [0.2126, 0.7152, 0.0722][index],
+          0,
+        );
+    const style = getComputedStyle(element);
+    const foreground = luminance(parseRgb(style.color));
+    const background = luminance(parseRgb(style.backgroundColor));
+    return (
+      (Math.max(foreground, background) + 0.05) /
+      (Math.min(foreground, background) + 0.05)
+    );
+  });
+  expect(contrastRatio).toBeGreaterThanOrEqual(minimum);
+}
+
 /** Locator scoped to the mention autocomplete dropdown inside the composer. */
 function autocomplete(page: import("@playwright/test").Page) {
   return page
@@ -379,19 +410,25 @@ test("duplicate owned agents preserve provenance and exact pubkey selection", as
     0,
   );
   await expect(relayRow).toContainText("agent");
-  await expect(
-    relayRow.getByTestId("mention-agent-provenance"),
-  ).toHaveAttribute("aria-label", "From another Buzz setup");
-  await expect(
-    relayRow.getByText("Other setup", { exact: true }),
-  ).toBeVisible();
+  const relayProvenanceMarker = relayRow.getByTestId(
+    "mention-agent-provenance",
+  );
+  await expect(relayProvenanceMarker).toHaveAttribute(
+    "aria-label",
+    "From another Buzz setup",
+  );
+  await expect(relayProvenanceMarker).toHaveAttribute(
+    "title",
+    "From another Buzz setup",
+  );
+  await expect(relayProvenanceMarker).toBeVisible();
+  await expect(relayProvenanceMarker).toHaveText("");
+  await expect(relayProvenanceMarker.locator("svg")).toBeVisible();
   await expect(managedRow).not.toContainText("managed by you");
   await expect(relayRow).not.toContainText("managed by you");
 
   await page.setViewportSize({ width: 760, height: 640 });
-  await expect(
-    relayRow.getByText("Other setup", { exact: true }),
-  ).toBeVisible();
+  await expect(relayProvenanceMarker).toBeVisible();
   const rowBox = await relayRow.boundingBox();
   const dropdownBox = await dropdown.boundingBox();
   expect(rowBox).not.toBeNull();
@@ -464,7 +501,8 @@ test("duplicate owned agents preserve provenance and exact pubkey selection", as
     "aria-label",
     "From another Buzz setup",
   );
-  await expect(remoteSidebarMarker).toHaveText("Other setup");
+  await expect(remoteSidebarMarker).toHaveText("");
+  await expect(remoteSidebarMarker.locator("svg")).toBeVisible();
   const remoteSidebarRow = page.getByTestId(`sidebar-member-${relayPubkey}`);
   const localSidebarMarker = page.getByTestId(
     `sidebar-member-agent-provenance-${managedPubkey}`,
@@ -2598,6 +2636,9 @@ test("sent non-member person mention uses the normal mention style", async ({
 test("sent managed non-member agent mention uses the agent mention style", async ({
   page,
 }) => {
+  await page.addInitScript(() => {
+    window.localStorage.setItem("buzz-theme", "buzz-dark");
+  });
   await installMockBridge(page, {
     managedAgents: [
       {
@@ -2627,6 +2668,13 @@ test("sent managed non-member agent mention uses the agent mention style", async
   await expect(mentionChip).toBeVisible();
   await expect(mentionChip).toHaveText("charlie");
   await expect(mentionChip).toHaveClass(/agent-mention-highlight/);
+  await expect(mentionChip).toHaveCSS("background-color", "rgb(252, 223, 105)");
+  await expect(mentionChip).toHaveCSS("color", "rgb(26, 26, 26)");
+  await expectTextContrast(mentionChip);
+  await mentionChip.hover();
+  await expect(mentionChip).toHaveCSS("background-color", "rgb(251, 214, 65)");
+  await expect(mentionChip).toHaveCSS("color", "rgb(26, 26, 26)");
+  await expectTextContrast(mentionChip);
 });
 
 test("mention button opens autocomplete and inserts a selected member", async ({
@@ -2732,6 +2780,13 @@ test("mention text is highlighted in sent messages", async ({ page }) => {
   await expect(mentionChip).toBeVisible();
   await expect(mentionChip).toHaveText("bob");
   await expect(mentionChip).toHaveClass(/inline-chip-icon-human/);
+  await expect(mentionChip).toHaveCSS("background-color", "rgb(252, 223, 105)");
+  await expect(mentionChip).toHaveCSS("color", "rgb(26, 26, 26)");
+  await expectTextContrast(mentionChip);
+  await mentionChip.hover();
+  await expect(mentionChip).toHaveCSS("background-color", "rgb(251, 214, 65)");
+  await expect(mentionChip).toHaveCSS("color", "rgb(26, 26, 26)");
+  await expectTextContrast(mentionChip);
 });
 
 test("clicking author name opens user profile panel", async ({ page }) => {

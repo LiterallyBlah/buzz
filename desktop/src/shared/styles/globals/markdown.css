@@ -211,6 +211,11 @@
   white-space: nowrap;
 }
 
+.message-markdown
+  .inline-chip-leading-fragment.inline-chip-with-icon:empty::after {
+  content: "\200b";
+}
+
 .message-markdown .inline-chip-leading-fragment.inline-chip-with-icon::before {
   display: block;
   left: 0;
@@ -300,6 +305,21 @@
 .mention-chip-hover:hover {
   background: hsl(var(--primary) / 0.25);
   color: hsl(var(--primary) / 0.9);
+}
+
+/* @mentions use an opaque highlighter-yellow treatment so they scan
+   differently from channel links while retaining AA contrast on every theme.
+   Shared by human and agent chips in both timeline and composer. */
+.message-markdown .mention-chip.inline-chip-icon-human,
+.message-markdown .mention-chip.inline-chip-icon-agent {
+  background: hsl(var(--mention-highlight));
+  color: hsl(var(--buzz-content-dark));
+}
+
+.message-markdown .mention-chip-hover.inline-chip-icon-human:hover,
+.message-markdown .mention-chip-hover.inline-chip-icon-agent:hover {
+  background: hsl(var(--mention-highlight-hover));
+  color: hsl(var(--buzz-content-dark));
 }
 
 .message-markdown .mention-prefix-hidden {
