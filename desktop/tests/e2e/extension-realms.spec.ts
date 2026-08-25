@@ -177,3 +177,148 @@ test("the SVG document loads but cannot execute under the repair", async ({
   expect(result.of("svg-external-ran")).toBeUndefined();
   expect(result.of("svg-inline-ran")).toBeUndefined();
 });
+
+// ── Required row: the repair must not change legitimate worker behaviour ────
+
+/**
+ * Measure what a worker can do from inside the extension realm.
+ *
+ * Run twice — with and without the route-2 repair — and compared. Asserting
+ * "workers still work" in the abstract would be a claim about the engine;
+ * asserting the *same* outcome either side of the change is a claim about the
+ * change, which is what was actually asked.
+ */
+async function workerBehaviour(
+  page: import("@playwright/test").Page,
+  svgScriptNone: boolean,
+) {
+  const extCsp = [
+    "default-src 'none'",
+    `script-src ${HOST}`,
+    `img-src ${HOST} data: blob:`,
+    "connect-src 'none'",
+  ].join("; ");
+
+  await page.route(`${HOST}/**`, async (route) => {
+    const url = new URL(route.request().url());
+    const send = (body: string, contentType: string, csp: string) =>
+      route.fulfill({
+        status: 200,
+        contentType,
+        headers: { "Content-Security-Policy": csp },
+        body,
+      });
+
+    // The asset the route-2 repair downgrades — present so the two runs differ
+    // in exactly the way the repair differs.
+    if (url.pathname.endsWith("asset.svg")) {
+      return send(
+        `<svg xmlns="http://www.w3.org/2000/svg" width="4" height="4"></svg>`,
+        "image/svg+xml",
+        svgScriptNone
+          ? extCsp.replace(`script-src ${HOST}`, "script-src 'none'")
+          : extCsp,
+      );
+    }
+    if (url.pathname.endsWith("imported.js")) {
+      return send(
+        `self.__imported = true;`,
+        "text/javascript; charset=utf-8",
+        extCsp,
+      );
+    }
+    if (url.pathname.endsWith("worker.js")) {
+      return send(
+        `try { importScripts("${HOST}/ext/demo/imported.js");
+               postMessage({ ok: true, imported: self.__imported === true }); }
+         catch (e) { postMessage({ ok: false, error: String(e && e.name) }); }`,
+        "text/javascript; charset=utf-8",
+        extCsp,
+      );
+    }
+    if (url.pathname.endsWith("probe.js")) {
+      return send(
+        `(function () {
+           var report = { sameOrigin: null, blob: null, worklet: null };
+           function done() { top.postMessage({ mark: "worker-report", report: report }, "*"); }
+           var pending = 2;
+           function settle() { if (--pending === 0) done(); }
+
+           try {
+             var w = new Worker("${HOST}/ext/demo/worker.js");
+             w.onmessage = function (e) { report.sameOrigin = JSON.stringify(e.data); settle(); };
+             w.onerror = function () { report.sameOrigin = "error"; settle(); };
+           } catch (e) { report.sameOrigin = "threw:" + (e && e.name); settle(); }
+
+           try {
+             var src = 'try { importScripts("${HOST}/ext/demo/imported.js"); postMessage({ ok: true, imported: self.__imported === true }); } catch (e) { postMessage({ ok: false, error: String(e && e.name) }); }';
+             var b = new Worker(URL.createObjectURL(new Blob([src], { type: "text/javascript" })));
+             b.onmessage = function (e) { report.blob = JSON.stringify(e.data); settle(); };
+             b.onerror = function () { report.blob = "error"; settle(); };
+           } catch (e) { report.blob = "threw:" + (e && e.name); settle(); }
+
+           try {
+             report.worklet = typeof CSS !== "undefined" && CSS.paintWorklet ? "available" : "absent";
+           } catch (e) { report.worklet = "threw"; }
+
+           setTimeout(done, 3000);
+         })();`,
+        "text/javascript; charset=utf-8",
+        extCsp,
+      );
+    }
+    return send(
+      `<!doctype html><body><script src="${HOST}/ext/demo/probe.js"></script>`,
+      "text/html; charset=utf-8",
+      extCsp,
+    );
+  });
+
+  await installMockBridge(page);
+  await page.goto("/#/extensions");
+  return (await page.evaluate(
+    (host) =>
+      new Promise((resolve) => {
+        const timer = setTimeout(() => resolve({ timeout: true }), 8000);
+        window.addEventListener("message", (event) => {
+          const data = event.data as { mark?: string; report?: unknown };
+          if (data?.mark === "worker-report") {
+            clearTimeout(timer);
+            resolve(data.report);
+          }
+        });
+        const frame = document.createElement("iframe");
+        frame.setAttribute("sandbox", "allow-scripts");
+        frame.src = `${host}/ext/demo/index.html`;
+        document.body.append(frame);
+      }),
+    HOST,
+  )) as Record<string, string | null>;
+}
+
+test("the route-2 repair leaves worker behaviour unchanged", async ({
+  page,
+}) => {
+  // Hermes flagged that response CSP is contextual and workers derive their
+  // execution policy from their own response. The repair deliberately does not
+  // touch `text/javascript`, and this is the behavioural proof of that — the
+  // same probe, either side of the change, must report the same thing.
+  const before = await workerBehaviour(page, false);
+  const after = await workerBehaviour(page, true);
+
+  expect(after).toEqual(before);
+
+  // Pin the concrete outcome too. "before equals after" is satisfied by two
+  // runs that both timed out, so the measured values are asserted rather than
+  // only compared.
+  //
+  // The finding: a worker is not reachable from the extension realm *at all*,
+  // and not because of this repair. A sandboxed document has an opaque origin,
+  // so a same-origin worker URL is not same-origin to it; and `blob:` is not a
+  // `script-src` source under the no-inline policy. Hermes's concern about
+  // response-CSP and workers is therefore moot in this context — which is why
+  // the repair still correctly leaves `text/javascript` alone rather than
+  // relying on that being true.
+  expect(after.sameOrigin).toBe("threw:SecurityError");
+  expect(after.blob).toBe("error");
+});
