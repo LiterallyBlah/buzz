@@ -21,7 +21,10 @@
 //! `custom_harnesses` and `managed_agents`.
 
 mod install;
-mod manifest;
+// `pub(crate)` so the signer enforcement in the bridge (P4) can import
+// `manifest::EXTENSION_SIGNABLE_KINDS` rather than re-declare the allowlist.
+// One writer, two consumers.
+pub(crate) mod manifest;
 mod package_path;
 
 use std::path::{Path, PathBuf};

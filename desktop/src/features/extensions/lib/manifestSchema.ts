@@ -1,14 +1,21 @@
 // Schema for an extension package's `extension.json`.
 //
 // Decision 006 (BX-01) makes the manifest strict JSON validated on BOTH sides
-// of the bridge: zod here in the install UI, serde in the Rust loader. The
-// Rust loader is the security boundary — it is what actually gates the
-// install. This layer exists so the UI can explain a bad manifest in the same
-// terms before/alongside the Rust call, not to be relied on for enforcement.
+// of the bridge — but the two sides are split by AUTHORITY, not duplicated:
 //
-// Field layout follows BRIDGE_SPEC.md §7. That spec is DRAFT/in review;
-// decision 006 names the fields but not their layout, so §7 is the only
-// concrete schema available.
+//   this layer  — shape, field types, and unknown-field strictness, so the
+//                 install UI can explain a malformed manifest in its own terms.
+//   Rust loader — AUTHORITATIVE for the semantic checks: the §4 signable-kind
+//                 allowlist and the §5 read denylist floor, which it reads from
+//                 `buzz-core`'s own maintained kind sets.
+//
+// The kind sets are deliberately NOT mirrored here. A second copy in another
+// language has nothing binding it to the first, so it drifts silently — and the
+// copy that drifts is the one that decides nothing, which is the worst kind of
+// wrong. A manifest requesting a non-signable kind therefore parses fine here
+// and is rejected by the loader, which is the intended division.
+//
+// Field layout follows BRIDGE_SPEC.md §7 (authoritative for M1 per Fable).
 
 import { z } from "zod";
 
@@ -23,27 +30,24 @@ import { z } from "zod";
 export const EXTENSION_ID_PATTERN = /^[a-z0-9_][a-z0-9_-]*$/;
 
 /**
- * The v1 signable-kind allowlist (BRIDGE_SPEC.md §4).
+ * Longest accepted extension id, in bytes (BRIDGE_SPEC.md §7).
  *
- * Grantability is an allowlist, not a blocklist: a manifest requesting a kind
- * outside this set is rejected at install rather than silently undefaulted.
- * Growing this list is a spec change with a decision record — keep it as this
- * one const so the change stays one line.
- *
- * 9 channel message · 7 reaction · 45001/45002/45003 forum post/vote/comment ·
- * 40003 edit (own events only) · 30800 extension data.
+ * Unbounded ids can name a kind-30800 `d`-tag coordinate the relay refuses
+ * (`D_TAG_MAX_LEN` = 1024), so an over-long id would install and then fail at
+ * publish time. Bytes and UTF-16 length coincide for anything that satisfies
+ * the ASCII-only grammar above, so `.max()` is the byte cap the spec means.
  */
-export const V1_SIGNABLE_KINDS = [
-  9, 7, 45001, 45002, 45003, 40003, 30800,
-] as const;
-
-const SIGNABLE_KIND_SET = new Set<number>(V1_SIGNABLE_KINDS);
+export const MAX_EXTENSION_ID_LENGTH = 64;
 
 const ExtensionIdSchema = z
   .string()
   .regex(
     EXTENSION_ID_PATTERN,
     "id must match [a-z0-9_][a-z0-9_-]* (lowercase, no dots, no separators)",
+  )
+  .max(
+    MAX_EXTENSION_ID_LENGTH,
+    `id must be at most ${MAX_EXTENSION_ID_LENGTH} bytes`,
   );
 
 // Channels are an explicit, non-empty list of channel UUIDs. BRIDGE_SPEC §7:
@@ -67,15 +71,13 @@ const GrantedChannelsSchema = z
   )
   .min(1, "channels must list at least one channel UUID");
 
+// `kind` is shape-checked only. Whether the kind is *signable* is the §4
+// allowlist question, and the Rust loader's `EXTENSION_SIGNABLE_KINDS` is the
+// single source of truth for it (the bridge's signer enforcement imports that
+// same const). See the authority split at the top of this file.
 const SignScopeSchema = z.strictObject({
   channels: GrantedChannelsSchema,
-  kind: z
-    .number()
-    .int()
-    .refine((kind) => SIGNABLE_KIND_SET.has(kind), {
-      error: (issue) =>
-        `kind ${issue.input} is not in the v1 signable-kind allowlist (${V1_SIGNABLE_KINDS.join(", ")})`,
-    }),
+  kind: z.number().int().nonnegative(),
 });
 
 const ReadScopeSchema = z.strictObject({

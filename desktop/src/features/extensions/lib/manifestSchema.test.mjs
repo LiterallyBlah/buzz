@@ -3,7 +3,7 @@ import test from "node:test";
 
 import {
   EXTENSION_ID_PATTERN,
-  V1_SIGNABLE_KINDS,
+  MAX_EXTENSION_ID_LENGTH,
   parseExtensionManifest,
 } from "./manifestSchema.ts";
 
@@ -109,29 +109,47 @@ for (const id of ["a", "0", "_", "equation-explorer", "ee_2", "a-b_c9"]) {
   });
 }
 
-test("parseExtensionManifest rejects a sign kind outside the v1 allowlist", () => {
+test("parseExtensionManifest leaves the signable-kind question to the Rust loader", () => {
   // 30177 (managed-agent redefinition) is exactly the kind BRIDGE_SPEC §4 names
-  // as the reason grantability is an allowlist rather than a blocklist.
+  // as the reason grantability is an allowlist rather than a blocklist — and it
+  // is the Rust loader that enforces that, from `EXTENSION_SIGNABLE_KINDS`.
+  // This layer must NOT carry a second copy of the set, so a non-signable kind
+  // is well-formed here and rejected there. This test pins that division: if
+  // someone reintroduces the allowlist to the frontend, it fails.
   const result = parseExtensionManifest(
     validManifest({
       scopes: { sign: [{ kind: 30177, channels: [CHANNEL] }] },
     }),
   );
-  assert.equal(result.ok, false);
-  assert.ok(
-    result.errors.some((message) => message.includes("30177")),
-    `expected the rejected kind to be named, got: ${result.errors.join(" | ")}`,
-  );
+  assert.equal(result.ok, true);
 });
 
-for (const kind of V1_SIGNABLE_KINDS) {
-  test(`parseExtensionManifest accepts allowlisted sign kind ${kind}`, () => {
+test("parseExtensionManifest still rejects a malformed sign kind", () => {
+  for (const kind of [-1, 1.5, "9", null]) {
     const result = parseExtensionManifest(
       validManifest({ scopes: { sign: [{ kind, channels: [CHANNEL] }] } }),
     );
-    assert.equal(result.ok, true);
-  });
-}
+    assert.equal(result.ok, false, `kind ${JSON.stringify(kind)} should fail`);
+  }
+});
+
+test("parseExtensionManifest accepts an id at exactly the byte cap", () => {
+  const id = "a".repeat(MAX_EXTENSION_ID_LENGTH);
+  assert.equal(id.length, 64);
+  assert.equal(parseExtensionManifest(validManifest({ id })).ok, true);
+});
+
+test("parseExtensionManifest rejects an id one byte over the cap", () => {
+  // BRIDGE_SPEC §7: ids are <= 64 bytes, because an unbounded id can name a
+  // kind-30800 d-tag coordinate the relay refuses (D_TAG_MAX_LEN = 1024).
+  const id = "a".repeat(MAX_EXTENSION_ID_LENGTH + 1);
+  const result = parseExtensionManifest(validManifest({ id }));
+  assert.equal(result.ok, false);
+  assert.ok(
+    result.errors.some((message) => message.includes("64 bytes")),
+    `expected the cap to be named, got: ${result.errors.join(" | ")}`,
+  );
+});
 
 test("parseExtensionManifest rejects an empty channel list on a sign scope", () => {
   const result = parseExtensionManifest(

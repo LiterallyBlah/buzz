@@ -383,6 +383,36 @@ fn read_denylist_rejects_a_denied_kind_mixed_into_an_allowed_list() {
 }
 
 #[test]
+fn read_scope_rejects_extension_data_and_says_where_to_read_it() {
+    // BRIDGE_SPEC §5/§7: kind 30800 is never served through
+    // `query.events`/`subscribe`; its only read path is `extensionData.get`,
+    // gated by the boolean `extensionData` scope. A manifest asking to *read*
+    // it is asking for a path that does not exist, so it is rejected at
+    // install with a message naming the scope that does work.
+    let scopes =
+        format!(r#"{{ "read": [ {{ "kinds": [30800], "channels": ["{CHANNEL_A}"] }} ] }}"#);
+    let Err(error) = parse_and_validate(&manifest_with_scopes(&scopes)) else {
+        panic!("a read grant on kind 30800 must be rejected");
+    };
+    assert!(
+        error.contains("extensionData.get") && error.contains("extensionData"),
+        "the error must point at the scope that does work; got: {error}"
+    );
+
+    // Mixed into an otherwise-legal list, it must still be caught.
+    let mixed =
+        format!(r#"{{ "read": [ {{ "kinds": [9, 30800], "channels": ["{CHANNEL_A}"] }} ] }}"#);
+    assert!(
+        parse_and_validate(&manifest_with_scopes(&mixed)).is_err(),
+        "30800 mixed into a read scope must be rejected"
+    );
+
+    // 30800 stays *signable* — the write path is `publish.extensionData`.
+    assert!(EXTENSION_SIGNABLE_KINDS.contains(&30800));
+    assert!(is_read_denied_kind(30800));
+}
+
+#[test]
 fn read_scope_accepts_ordinary_channel_kinds() {
     let scopes =
         format!(r#"{{ "read": [ {{ "kinds": [9, 45001], "channels": ["{CHANNEL_A}"] }} ] }}"#);
@@ -411,8 +441,24 @@ fn read_scope_requires_kinds_and_channels() {
 }
 
 #[test]
-fn nothing_signable_is_also_read_denied() {
+fn only_extension_data_is_both_signable_and_read_denied() {
+    // A channel-content kind an extension may publish must also be readable
+    // back through `query.events`/`subscribe`, or a grant lets it write
+    // something it can never see.
+    //
+    // Kind 30800 is the one deliberate asymmetry (BRIDGE_SPEC §4/§5): it is
+    // written with `publish.extensionData` and read with `extensionData.get`,
+    // both gated by the `extensionData` scope, and it is never served through
+    // the query surface. Naming the exception explicitly keeps this test able
+    // to catch an accidental read-denial of any of the other six.
     for kind_value in EXTENSION_SIGNABLE_KINDS {
+        if *kind_value == KIND_EXTENSION_DATA {
+            assert!(
+                is_read_denied_kind(*kind_value),
+                "kind 30800 must stay off the query surface"
+            );
+            continue;
+        }
         assert!(
             !is_read_denied_kind(*kind_value),
             "signable kind {kind_value} must not sit on the read denylist floor"

@@ -7,7 +7,8 @@
 //!   traversal-blocking rule from `managed_agents::custom_harnesses`.
 //! - `docs/BRIDGE_SPEC.md` §7 — the concrete field layout implemented here.
 //! - `docs/BRIDGE_SPEC.md` §4 — the v1 signable-kind allowlist.
-//! - `docs/BRIDGE_SPEC.md` §5 — the read denylist floor.
+//! - `docs/BRIDGE_SPEC.md` §5 — the read denylist floor, whose complement is
+//!   the "read-allowed set" §7 refers to; v1 has no enumerated read allowlist.
 //! - decision 004 — egress is default-deny, widened only per declared origin.
 //!
 //! Everything in this module is pure validation over an already-staged package
@@ -23,11 +24,16 @@ use super::package_path::check_package_relative_path;
 /// File name of the manifest, at the root of the package.
 pub(crate) const MANIFEST_FILE_NAME: &str = "extension.json";
 
-/// Longest accepted extension id.
+/// Longest accepted extension id, in bytes.
 ///
-/// The id is also the directory name under `<app-data>/extensions/`, so this
-/// keeps a manifest from producing a name the filesystem rejects with an
-/// opaque errno instead of a readable message.
+/// `docs/BRIDGE_SPEC.md` §7: `[a-z0-9_][a-z0-9_-]*, ≤ 64 bytes`. The cap exists
+/// because an unbounded id can name a kind-30800 `d`-tag coordinate the relay
+/// refuses (`D_TAG_MAX_LEN` = 1024) — so an over-long id would install fine and
+/// then fail at publish time. It also keeps a manifest from producing a
+/// directory name the filesystem rejects with an opaque errno.
+///
+/// Bytes and characters coincide here: the grammar admits ASCII only, so
+/// `str::len()` is the byte length the spec means.
 const MAX_EXTENSION_ID_LEN: usize = 64;
 
 /// Reserved extension-data kind.
@@ -46,6 +52,13 @@ pub(crate) const KIND_EXTENSION_DATA: u32 = 30800;
 /// dropped, so a kind added to Buzz later is non-grantable by construction
 /// until someone edits this list. Growing it is a spec change with a decision
 /// record — which is exactly this one line.
+///
+/// **This const is the single source of truth for what an extension may sign.**
+/// Install-time validation here is one consumer; the bridge's signer
+/// enforcement (P4) is the other and must import this rather than re-declare
+/// the set. The frontend deliberately does not mirror it — zod validates shape
+/// and unknown fields, this side owns the semantics, so there is no second copy
+/// to drift.
 pub(crate) const EXTENSION_SIGNABLE_KINDS: &[u32] = &[
     kind::KIND_REACTION,            // 7     — reaction
     kind::KIND_STREAM_MESSAGE,      // 9     — channel message
@@ -159,13 +172,24 @@ pub(crate) fn is_valid_extension_id(id: &str) -> bool {
 /// The read denylist floor from `docs/BRIDGE_SPEC.md` §5.
 ///
 /// `AUTHOR_ONLY_KINDS` ∪ `P_GATED_KINDS` ∪ `{1059}` ∪ the `41xxx` DM kinds,
-/// plus relay-only kinds. The first two are read from `buzz-core`'s maintained
-/// sets rather than copied as numbers, so the floor tracks the kind registry
-/// instead of drifting from it.
+/// plus relay-only kinds, plus kind 30800. The first two are read from
+/// `buzz-core`'s maintained sets rather than copied as numbers, so the floor
+/// tracks the kind registry instead of drifting from it.
+///
+/// The **read-allowed set** §7 refers to is this predicate's complement — v1
+/// has no separately enumerated read allowlist (§5). Reach is then bounded
+/// twice more at query time, by the user's channel grants and the granted-kind
+/// intersection.
+///
+/// Kind 30800 is included because extension data is never served through
+/// `query.events`/`subscribe` (§5); its only read path is `extensionData.get`.
+/// Keeping it here means the bridge's query proxy (P4) inherits the rule from
+/// the same predicate install-time validation uses, rather than re-deriving it.
 pub(crate) fn is_read_denied_kind(kind_value: u32) -> bool {
     kind::AUTHOR_ONLY_KINDS.contains(&kind_value)
         || kind::P_GATED_KINDS.contains(&kind_value)
         || kind_value == kind::KIND_GIFT_WRAP
+        || kind_value == KIND_EXTENSION_DATA
         || DM_KIND_RANGE.contains(&kind_value)
         || kind::is_relay_only_kind(kind_value)
 }
@@ -180,7 +204,7 @@ pub(crate) fn parse_manifest(bytes: &[u8]) -> Result<ExtensionManifest, String> 
 pub(crate) fn validate_manifest(manifest: &ExtensionManifest) -> Result<(), String> {
     if !is_valid_extension_id(&manifest.id) {
         return Err(format!(
-            "extension id {:?} is not valid; ids must match [a-z0-9_][a-z0-9_-]* and be at most {MAX_EXTENSION_ID_LEN} characters",
+            "extension id {:?} is not valid; ids must match [a-z0-9_][a-z0-9_-]* and be at most {MAX_EXTENSION_ID_LEN} bytes",
             manifest.id
         ));
     }
@@ -212,6 +236,16 @@ pub(crate) fn validate_manifest(manifest: &ExtensionManifest) -> Result<(), Stri
             ));
         }
         for kind_value in &scope.kinds {
+            // 30800 is not a grantable read kind: its only read path is
+            // `extensionData.get`, gated by the `extensionData` boolean scope
+            // (BRIDGE_SPEC §5/§7). Say so rather than emitting the generic
+            // "may never read", which would send an author looking for the
+            // wrong fix.
+            if *kind_value == KIND_EXTENSION_DATA {
+                return Err(format!(
+                    "{MANIFEST_FILE_NAME}: scopes.read requests kind {KIND_EXTENSION_DATA}; extension data is read through extensionData.get under the \"extensionData\" scope, not a read grant"
+                ));
+            }
             if is_read_denied_kind(*kind_value) {
                 return Err(format!(
                     "{MANIFEST_FILE_NAME}: scopes.read requests kind {kind_value}, which extensions may never read"
