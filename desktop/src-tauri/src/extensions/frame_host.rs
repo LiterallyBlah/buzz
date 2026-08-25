@@ -342,22 +342,31 @@ pub(crate) const REALM_LOCKDOWN_SOURCE: &str = concat!(
     "}catch(e){}})();"
 );
 
-/// Insert the lockdown script tag so it runs before any script the package ships.
+/// Emit the served document with the lockdown guaranteed to execute first.
 ///
-/// Placed after the doctype when there is one: a script before the doctype puts
-/// the document into quirks mode, which would change how an extension renders
-/// as a side effect of a security control. A classic (non-async, non-defer)
-/// external script blocks parsing, so it executes before any later script.
-fn inject_realm_lockdown(html: &str, origin: &str) -> String {
-    let tag = format!(r#"<script src="{origin}/{LOCKDOWN_ROUTE}"></script>"#);
-    let lower = html.to_ascii_lowercase();
-    if let Some(start) = lower.find("<!doctype") {
-        if let Some(offset) = lower[start..].find('>') {
-            let split = start + offset + 1;
-            return format!("{}{}{}", &html[..split], tag, &html[split..]);
-        }
-    }
-    format!("{tag}{html}")
+/// **Do not splice into the package's markup.** The previous version searched
+/// for the first `<!doctype` and inserted after its `>`, which a package
+/// defeats simply by opening with a commented-out doctype:
+///
+/// ```html
+/// <!-- <!doctype html> -->
+/// <!doctype html>
+/// <script src="theirs.js"></script>
+/// ```
+///
+/// The tag lands *inside the comment*, never runs, and the real document below
+/// executes unprotected. Any rule of the form "find a landmark in attacker
+/// markup and insert next to it" has this shape; the attacker chooses the
+/// markup, so they choose where the landmark appears.
+///
+/// So the host writes its own prologue and the package's bytes follow it
+/// verbatim. Nothing the package contains can execute before bytes that precede
+/// it, and no later construct can retroactively comment out what came earlier.
+/// A doctype of our own leads, so the document is still standards-mode; a second
+/// doctype inside the package body is ignored by the parser, which is the
+/// correct outcome for a document that already declared one.
+fn document_with_lockdown(html: &str, origin: &str) -> String {
+    format!("<!doctype html>\n<script src=\"{origin}/{LOCKDOWN_ROUTE}\"></script>\n{html}")
 }
 
 #[derive(Clone)]
@@ -491,8 +500,13 @@ async fn serve_asset(
     // mangled — it cannot execute anyway.
     let bytes = if content_type.starts_with("text/html") {
         match std::str::from_utf8(&bytes) {
-            Ok(html) => inject_realm_lockdown(html, &state.origin).into_bytes(),
-            Err(_) => bytes,
+            Ok(html) => document_with_lockdown(html, &state.origin).into_bytes(),
+            // Install-time validation rejects non-UTF-8 entry documents, so
+            // reaching here means the tree changed under us. Refuse rather than
+            // serve an active document the lockdown could not be written into —
+            // "it cannot execute anyway" is false, since a browser
+            // replacement-decodes and runs the valid prefix.
+            Err(_) => return empty(StatusCode::NOT_FOUND),
         }
     } else {
         bytes

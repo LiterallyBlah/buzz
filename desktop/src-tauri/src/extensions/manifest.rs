@@ -67,6 +67,22 @@ pub(crate) const EXTENSION_SIGNABLE_KINDS: &[u32] = &[
 /// `buzz-core` later is denied from the moment it exists.
 const DM_KIND_RANGE: std::ops::RangeInclusive<u32> = 41000..=41999;
 
+/// Extensions an entry document may have.
+///
+/// The entry is the one file that becomes a *realm*, and the frame host can
+/// only guarantee its lockdown for a document it writes a prologue into. So the
+/// permitted set is defined here, at install, rather than left to whatever the
+/// serving layer happens to recognise:
+///
+/// - **HTML only.** An SVG entry is a document too — it is served
+///   `image/svg+xml`, can load package script, and would receive no lockdown.
+///   Rejecting it at install is what makes "every active document is locked
+///   down" an invariant instead of a coincidence of MIME tables.
+/// - **UTF-8 only.** A body that fails `str::from_utf8` used to be served
+///   untouched on the assumption it could not execute. That is wrong: a browser
+///   replacement-decodes it and a valid prefix runs normally.
+const ENTRY_DOCUMENT_EXTENSIONS: &[&str] = &["html", "htm"];
+
 /// URL schemes an `egress` origin may use.
 ///
 /// `http`/`ws` are kept alongside the TLS schemes because a localhost
@@ -305,6 +321,34 @@ pub(crate) fn validate_entry_file(root: &Path, entry: &str) -> Result<(), String
     if !real_entry.starts_with(&real_root) {
         return Err(format!(
             "{MANIFEST_FILE_NAME}: \"entry\" escapes the package directory: {entry}"
+        ));
+    }
+    validate_entry_document(&real_entry, entry)?;
+    Ok(())
+}
+
+/// The entry must be an HTML document the host can lock down, and it must
+/// decode as UTF-8 so the prologue can be prepended to real text.
+///
+/// Fail-closed on both counts: a package the host cannot protect is not
+/// installed, rather than installed and served unprotected.
+fn validate_entry_document(path: &Path, entry: &str) -> Result<(), String> {
+    let extension = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if !ENTRY_DOCUMENT_EXTENSIONS.contains(&extension.as_str()) {
+        return Err(format!(
+            "{MANIFEST_FILE_NAME}: \"entry\" must be an HTML document ({}), got: {entry}",
+            ENTRY_DOCUMENT_EXTENSIONS.join(", ")
+        ));
+    }
+    let bytes = std::fs::read(path)
+        .map_err(|error| format!("{MANIFEST_FILE_NAME}: could not read \"entry\": {error}"))?;
+    if std::str::from_utf8(&bytes).is_err() {
+        return Err(format!(
+            "{MANIFEST_FILE_NAME}: \"entry\" is not valid UTF-8 text: {entry}"
         ));
     }
     Ok(())

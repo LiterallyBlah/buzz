@@ -616,26 +616,63 @@ fn the_document_policy_blocks_webrtc() {
 }
 
 #[test]
-fn the_lockdown_runs_before_any_extension_script() {
+fn the_lockdown_precedes_every_package_byte() {
     let html = "<!DOCTYPE html>\n<html><head><script src=\"theirs.js\"></script></head></html>";
-    let injected = inject_realm_lockdown(html, "http://127.0.0.1:4321");
-    let lockdown = injected.find(LOCKDOWN_ROUTE).expect("lockdown present");
-    let theirs = injected.find("theirs.js").expect("their script present");
+    let served = document_with_lockdown(html, "http://127.0.0.1:4321");
+    let lockdown = served.find(LOCKDOWN_ROUTE).expect("lockdown present");
+    let theirs = served.find("theirs.js").expect("their script present");
+    assert!(lockdown < theirs, "the wall must run first: {served}");
+    // Our own doctype leads, so the document is standards-mode regardless of
+    // what the package declared.
     assert!(
-        lockdown < theirs,
-        "the wall must run first, or it is not a wall: {injected}"
-    );
-    // After the doctype, not before: a script ahead of it forces quirks mode.
-    assert!(
-        injected.to_ascii_lowercase().starts_with("<!doctype html>"),
-        "doctype must stay first: {injected}"
+        served.to_ascii_lowercase().starts_with("<!doctype html>"),
+        "got: {served}"
     );
 }
 
 #[test]
-fn the_lockdown_is_injected_even_without_a_doctype() {
-    let injected = inject_realm_lockdown("<html><body>hi</body></html>", "http://127.0.0.1:4321");
-    assert!(injected.starts_with("<script src="), "got: {injected}");
+fn a_commented_out_doctype_cannot_hide_the_lockdown() {
+    // The reported bypass: splicing after the first `<!doctype` put the tag
+    // inside a comment, so it never ran while the real document below executed
+    // unprotected. The host writes its own prologue now, so attacker markup
+    // cannot choose where the lockdown lands.
+    let hostile = "<!-- <!doctype html> -->\n<!doctype html>\n<script src=\"theirs.js\"></script>";
+    let served = document_with_lockdown(hostile, "http://127.0.0.1:4321");
+
+    let lockdown = served.find(LOCKDOWN_ROUTE).expect("lockdown present");
+    let comment_open = served.find("<!--").expect("comment present");
+    let comment_close = served.find("-->").expect("comment close present");
+    assert!(
+        lockdown < comment_open || lockdown > comment_close,
+        "the lockdown must not sit inside the package's comment: {served}"
+    );
+    // And it still precedes their script.
+    assert!(
+        lockdown < served.find("theirs.js").expect("their script"),
+        "got: {served}"
+    );
+}
+
+#[test]
+fn no_package_markup_can_precede_the_lockdown() {
+    // Whatever a package opens with, the host's prologue is earlier in the byte
+    // stream — which is the property the previous landmark-splicing lacked.
+    for opener in [
+        "<!-- <!doctype html> -->",
+        "<!DoCtYpE html>",
+        "<script src=\"first.js\"></script>",
+        "\u{feff}<!doctype html>",
+        "<!--",
+        "",
+    ] {
+        let served = document_with_lockdown(opener, "http://127.0.0.1:4321");
+        let lockdown = served.find(LOCKDOWN_ROUTE).expect("lockdown present");
+        let package_starts = served.len() - opener.len();
+        assert!(
+            lockdown < package_starts,
+            "package markup {opener:?} preceded the lockdown: {served}"
+        );
+    }
 }
 
 #[test]

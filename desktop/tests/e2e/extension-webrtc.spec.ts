@@ -439,3 +439,146 @@ test("no pristine realm via aliases, parents, or a pre-lockdown reference", asyn
   expect(report.afterRedefine).toMatch(/undefined|threw/);
   expect(packets).toBe(0);
 });
+
+// ── Round 4: the nested-frame control Hermes specified ──────────────────────
+
+/**
+ * Drive the srcdoc-child probe under a given policy and report the whole chain.
+ *
+ * The point is that every link is *witnessed*, not inferred: the previous
+ * version asserted an empty array, which is equally true when the child was
+ * blocked and when the probe never appended it. Hermes hit the same shape from
+ * the other side — his first harness ran `document.body.appendChild` while
+ * `document.body` was null, so nothing executed and the silence looked like
+ * safety.
+ */
+async function srcdocChain(
+  page: import("@playwright/test").Page,
+  options: { allowInline: boolean; turnPort: number },
+) {
+  const embed = (value: string) =>
+    JSON.stringify(value).replace(/<\//g, "<\\/");
+  const child = `<script>
+    top.postMessage({ step: "child-ran", rtc: typeof RTCPeerConnection }, "*");
+    try {
+      const pc = new RTCPeerConnection({ iceServers: [{
+        urls: "turn:127.0.0.1:${options.turnPort}?transport=udp",
+        username: "S", credential: "x" }] });
+      pc.createDataChannel("x");
+      pc.createOffer().then((o) => pc.setLocalDescription(o)).catch(() => {});
+      top.postMessage({ step: "child-attempted" }, "*");
+    } catch (e) { top.postMessage({ step: "child-threw" }, "*"); }
+  </script>`;
+
+  const probeSource = `
+    top.postMessage({ step: "parent-ran" }, "*");
+    var f = document.createElement("iframe");
+    f.srcdoc = ${embed(child)};
+    document.body.appendChild(f);
+    top.postMessage({ step: "appended", connected: f.isConnected }, "*");
+  `;
+
+  const csp = extensionCsp(true, options.allowInline);
+  await page.route(`${HOST}/**`, async (route) => {
+    const url = route.request().url();
+    if (url === LOCKDOWN_PATH) {
+      await route.fulfill({
+        status: 200,
+        contentType: "text/javascript; charset=utf-8",
+        headers: { "Content-Security-Policy": csp },
+        body: LOCKDOWN_SOURCE,
+      });
+      return;
+    }
+    if (url.endsWith("probe.js")) {
+      await route.fulfill({
+        status: 200,
+        contentType: "text/javascript; charset=utf-8",
+        headers: { "Content-Security-Policy": csp },
+        body: probeSource,
+      });
+      return;
+    }
+    await route.fulfill({
+      status: 200,
+      contentType: "text/html; charset=utf-8",
+      headers: { "Content-Security-Policy": csp },
+      // The host's prologue shape: its own doctype, then the lockdown, then
+      // the package's bytes.
+      body: `<!doctype html>${LOCKDOWN_TAG}<body><script src="${HOST}/ext/demo/probe.js"></script>`,
+    });
+  });
+
+  await installMockBridge(page);
+  await page.goto("/#/extensions");
+
+  const steps = await page.evaluate(
+    (host) =>
+      new Promise<Array<Record<string, unknown>>>((resolve) => {
+        const seen: Array<Record<string, unknown>> = [];
+        const timer = setTimeout(() => resolve(seen), 5000);
+        window.addEventListener("message", (event) => {
+          const data = event.data as { step?: string };
+          if (!data?.step) return;
+          seen.push(data as Record<string, unknown>);
+          if (data.step === "child-attempted" || data.step === "child-threw") {
+            clearTimeout(timer);
+            setTimeout(() => resolve(seen), 400);
+          }
+        });
+        const frame = document.createElement("iframe");
+        frame.setAttribute("sandbox", "allow-scripts");
+        frame.src = `${host}/ext/demo/index.html`;
+        document.body.append(frame);
+      }),
+    HOST,
+  );
+  await page.waitForTimeout(2500);
+  return { steps, step: (name: string) => steps.find((s) => s.step === name) };
+}
+
+test("CONTROL: the srcdoc child really does run and reach the sink", async ({
+  page,
+}) => {
+  // Permanent packet-positive control. Every link is witnessed: parent ran,
+  // frame appended and connected, child ran with a real constructor, a
+  // connection was attempted, and the sink saw packets. Without this, the
+  // protected row below could pass because nothing happened at all.
+  const sink = await turnSink();
+  const chain = await srcdocChain(page, {
+    allowInline: true,
+    turnPort: sink.port,
+  });
+  const packets = sink.packets.length;
+  sink.close();
+
+  expect(chain.step("parent-ran")).toBeTruthy();
+  expect(chain.step("appended")?.connected).toBe(true);
+  expect(chain.step("child-ran")).toBeTruthy();
+  expect(chain.step("child-ran")?.rtc).toBe("function");
+  expect(chain.step("child-attempted")).toBeTruthy();
+  expect(packets).toBeGreaterThan(0);
+});
+
+test("PROTECTED: the same chain stops at the child under the shipped policy", async ({
+  page,
+}) => {
+  // Only the policy changes from the control — same probe, same fixture. The
+  // parent must still run and still append the frame, so a regression that
+  // breaks the probe fails here as a missing witness rather than passing as
+  // silence.
+  const sink = await turnSink();
+  const chain = await srcdocChain(page, {
+    allowInline: false,
+    turnPort: sink.port,
+  });
+  const packets = sink.packets.length;
+  sink.close();
+
+  expect(chain.step("parent-ran")).toBeTruthy();
+  expect(chain.step("appended")?.connected).toBe(true);
+  // The child never executes, so there is no fresh realm to recover from.
+  expect(chain.step("child-ran")).toBeUndefined();
+  expect(chain.step("child-attempted")).toBeUndefined();
+  expect(packets).toBe(0);
+});

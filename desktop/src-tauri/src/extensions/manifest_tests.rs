@@ -662,3 +662,87 @@ fn load_and_validate_reports_a_missing_manifest() {
         "got: {error}"
     );
 }
+
+// ── Round 4: only documents the host can lock down may be an entry ───────────
+
+/// A package directory with `entry` written as raw bytes.
+fn package_with_entry(entry: &str, bytes: &[u8]) -> tempfile::TempDir {
+    let base = tempfile::tempdir().expect("tempdir");
+    let path = base.path().join(entry);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).expect("mkdir");
+    }
+    std::fs::write(&path, bytes).expect("entry");
+    base
+}
+
+#[test]
+fn an_html_entry_is_accepted() {
+    for entry in ["index.html", "web/index.htm", "INDEX.HTML"] {
+        let package = package_with_entry(entry, b"<!doctype html><title>ok</title>");
+        validate_entry_file(package.path(), entry)
+            .unwrap_or_else(|error| panic!("{entry} should be accepted: {error}"));
+    }
+}
+
+#[test]
+fn a_non_html_entry_is_rejected_at_install() {
+    // An SVG entry is a document: served `image/svg+xml`, able to load package
+    // script, and it would never receive the lockdown. Rejecting it here is
+    // what makes "every active document is locked down" an invariant rather
+    // than a property of the serving layer's MIME table.
+    for (entry, body) in [
+        (
+            "index.svg",
+            b"<svg xmlns=\"http://www.w3.org/2000/svg\"></svg>" as &[u8],
+        ),
+        ("index.xhtml", b"<html/>"),
+        ("index.js", b"//"),
+        ("index", b"<!doctype html>"),
+        ("index.html.txt", b"<!doctype html>"),
+    ] {
+        let package = package_with_entry(entry, body);
+        let Err(error) = validate_entry_file(package.path(), entry) else {
+            panic!("{entry} must not be an entry document");
+        };
+        assert!(
+            error.contains("must be an HTML document"),
+            "{entry}: {error}"
+        );
+    }
+}
+
+#[test]
+fn a_non_utf8_html_entry_is_rejected_at_install() {
+    // "It cannot execute anyway" was the wrong assumption: a browser
+    // replacement-decodes the body and runs the valid prefix normally. Since
+    // the host cannot write a prologue into bytes it cannot decode, the package
+    // is refused instead of served unprotected.
+    let mut body = b"<!doctype html><script src=\"theirs.js\"></script>".to_vec();
+    body.push(0xff);
+    let package = package_with_entry("index.html", &body);
+
+    let Err(error) = validate_entry_file(package.path(), "index.html") else {
+        panic!("a non-UTF-8 entry must be rejected");
+    };
+    assert!(error.contains("not valid UTF-8"), "got: {error}");
+}
+
+#[test]
+fn a_rejected_entry_document_fails_the_whole_manifest() {
+    // The check has to run as part of manifest validation, not beside it.
+    let base = tempfile::tempdir().expect("tempdir");
+    let root = base.path().join("demo");
+    std::fs::create_dir_all(&root).expect("root");
+    std::fs::write(
+        root.join("extension.json"),
+        br#"{ "id": "demo", "name": "Demo", "version": "1", "entry": "index.svg" }"#,
+    )
+    .expect("manifest");
+    std::fs::write(root.join("index.svg"), b"<svg/>").expect("entry");
+
+    let Err(error) = load_and_validate_manifest(&root) else {
+        panic!("a package with an SVG entry must not install");
+    };
+    assert!(error.contains("must be an HTML document"), "got: {error}");
+}
