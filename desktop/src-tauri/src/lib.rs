@@ -8,6 +8,7 @@ mod deep_link;
 mod egress_guard;
 mod event_sync;
 mod events;
+mod extensions;
 mod huddle;
 mod identity_storage;
 mod initial_window;
@@ -885,6 +886,11 @@ pub fn run() {
             archive::read_archived_observer_events_for_channel,
             archive::index_observer_channel_id,
             archive::read_unindexed_observer_rows,
+            extensions::install_extension_from_directory,
+            extensions::install_extension_from_zip,
+            extensions::list_installed_extensions,
+            extensions::pick_extension_directory,
+            extensions::pick_extension_zip,
             is_auto_update_supported,
             set_window_vibrancy,
             #[cfg(target_os = "macos")]
