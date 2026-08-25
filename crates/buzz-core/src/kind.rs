@@ -73,6 +73,12 @@ pub const KIND_USER_STATUS: u32 = 30315;
 /// Stored globally (channel_id = NULL); user-owned personal data, not channel-scoped.
 /// Content is NIP-44 encrypted to the user's own keypair.
 pub const KIND_READ_STATE: u32 = 30078;
+/// Buzz Extensions: durable per-extension state (parameterized replaceable).
+///
+/// User-owned global state keyed by `(pubkey, kind, d_tag)`, where the host
+/// builds `d = "ext:<extension-id>:<key>"`. The relay stores and serves these
+/// events as ordinary NIP-33 data; it assigns no execution semantics.
+pub const KIND_EXTENSION_DATA: u32 = 30800;
 /// NIP-42 auth event — never stored (carries bearer tokens).
 pub const KIND_AUTH: u32 = 22242;
 /// BUD-01: Blossom upload auth (used in upload.rs, not stored).
@@ -723,6 +729,7 @@ pub const ALL_KINDS: &[u32] = &[
     KIND_LONG_FORM,
     KIND_USER_STATUS,
     KIND_READ_STATE,
+    KIND_EXTENSION_DATA,
     KIND_FORUM_POST,
     KIND_FORUM_VOTE,
     KIND_FORUM_COMMENT,
@@ -855,6 +862,7 @@ const _: () = assert!(is_parameterized_replaceable(KIND_WORKFLOW_DEF)); // 30620
 const _: () = assert!(is_parameterized_replaceable(KIND_EVENT_REMINDER)); // 30300 ∈ 30000–39999
 const _: () = assert!(is_parameterized_replaceable(KIND_DM_VISIBILITY)); // 30622 ∈ 30000–39999
 const _: () = assert!(is_parameterized_replaceable(KIND_PROJECT)); // 30621 ∈ 30000–39999
+const _: () = assert!(is_parameterized_replaceable(KIND_EXTENSION_DATA)); // 30800 ∈ 30000–39999
 const _: () = assert!(is_parameterized_replaceable(KIND_THREAD_SUMMARY)); // 39005 ∈ 30000–39999
 const _: () = assert!(is_parameterized_replaceable(KIND_WINDOW_BOUNDS)); // 39006 ∈ 30000–39999
 
