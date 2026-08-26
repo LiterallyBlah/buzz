@@ -443,3 +443,104 @@ fn canonicalisation_carries_tags_and_content_verbatim() {
     assert_eq!(canonical.tags, template.tags);
     assert_eq!(canonical.kind, template.kind);
 }
+
+// ── proof 4: commit-then-drop-response ───────────────────────────────────────
+
+/// A relay that **commits** every submission and drops the response the first
+/// time, modelling transport ambiguity: the effect happened, the caller cannot
+/// know it.
+///
+/// Deliberately scoped to transport. It records what it was sent and how often;
+/// it does **not** implement `ON CONFLICT DO NOTHING`, because a fake that
+/// implements the deduplication under test would be reciting the conclusion.
+/// Whether Buzz's relay really deduplicates is proved against the real relay,
+/// not here.
+fn ambiguous_relay() -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+    use std::io::{Read as _, Write as _};
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let committed: std::sync::Arc<std::sync::Mutex<Vec<String>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let log = committed.clone();
+
+    std::thread::spawn(move || {
+        let mut seen = 0usize;
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { break };
+            let mut buf = [0u8; 16384];
+            let read = stream.read(&mut buf).unwrap_or(0);
+            let body = String::from_utf8_lossy(&buf[..read]).to_string();
+            let id = submitted_event_id(&body);
+
+            // The commit happens either way — that is the whole point.
+            log.lock().expect("log").push(id.clone());
+            seen += 1;
+
+            if seen == 1 {
+                // First attempt: committed, then the connection dies before the
+                // caller learns anything.
+                drop(stream);
+                continue;
+            }
+            let payload =
+                format!(r#"{{"event_id":"{id}","accepted":true,"message":"duplicate:"}}"#);
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+                payload.len()
+            );
+            let _ = stream.write_all(response.as_bytes());
+            let _ = stream.flush();
+        }
+    });
+
+    (format!("http://{addr}"), committed)
+}
+
+#[tokio::test]
+async fn a_dropped_response_then_an_exact_retry_yields_one_event_id() {
+    // Proof 4. The first publish commits and the response is lost, so the
+    // caller sees a failure for work that actually happened. Retrying the
+    // *exact same template* must send the identical event id — which is what
+    // lets the relay recognise it as the same operation rather than a second
+    // one, and what makes the caller's retry safe.
+    let (relay_url, committed) = ambiguous_relay();
+    let keys = nostr::Keys::generate();
+    let state = crate::app_state::build_app_state();
+    *state.keys.lock().unwrap() = keys.clone();
+    *state.relay_url_override.lock().unwrap() = Some(relay_url);
+
+    // One template, retained by the caller and resubmitted unchanged.
+    let now = 1_700_000_000i64;
+    let params = template_params(Some(now));
+
+    let first_event = canonicalise(&parse_template(Some(params.clone()), now).expect("parse"));
+    let first = sign_and_publish(&first_event, &keys, &state, || Ok(())).await;
+    assert!(
+        first.is_err(),
+        "a dropped response must surface as a failure, not a false success"
+    );
+
+    let retry_event = canonicalise(&parse_template(Some(params), now + 90).expect("reparse"));
+    let retry = sign_and_publish(&retry_event, &keys, &state, || Ok(()))
+        .await
+        .expect("the retry must succeed once the relay answers");
+
+    let log = committed.lock().expect("log");
+    assert_eq!(log.len(), 2, "both attempts reached the relay");
+    assert_eq!(
+        log[0], log[1],
+        "the retry must submit the identical event id — that is what makes it \
+         the same operation rather than a second publish"
+    );
+    assert_eq!(
+        retry["event"]["id"],
+        serde_json::json!(log[1]),
+        "and the reported id is the one that was committed"
+    );
+    // Normalisation: the caller sees an ordinary success, with no trace of the
+    // relay's duplicate marker.
+    assert_eq!(retry["relay"]["accepted"], serde_json::json!(true));
+    let rendered = serde_json::to_string(&retry).expect("serialise");
+    assert!(!rendered.contains("duplicate"), "no duplicate marker leaks");
+}

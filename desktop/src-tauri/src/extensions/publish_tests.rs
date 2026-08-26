@@ -372,3 +372,58 @@ fn a_non_integer_created_at_is_rejected() {
         code::INVALID_PARAMS
     );
 }
+
+// ── the identity the signer acts under ───────────────────────────────────────
+
+/// An `AppState` in the shape recovery actually produces: a **real ephemeral
+/// key** plus the flag. `app_state.rs`: "Both states boot with an ephemeral
+/// key."
+fn recovery_state(lost: bool) -> crate::AppState {
+    use std::sync::atomic::Ordering;
+    let state = crate::app_state::build_app_state();
+    *state.keys.lock().unwrap() = nostr::Keys::generate();
+    if lost {
+        state.identity_lost.store(true, Ordering::Release);
+    } else {
+        state.keyring_locked.store(true, Ordering::Release);
+    }
+    state
+}
+
+#[test]
+fn the_signer_never_acts_under_a_recovery_key() {
+    // The line this increment reintroduced and then removed again: reading
+    // `state.keys` directly would hand back a real-looking ephemeral key and
+    // sign under an identity the user does not control.
+    //
+    // Both recovery flags, because they are distinct states that boot the same
+    // way — asserting one would leave the other untested.
+    for lost in [true, false] {
+        let state = recovery_state(lost);
+        let ephemeral = state.keys.lock().unwrap().public_key().to_hex();
+        assert_eq!(ephemeral.len(), 64, "recovery carries a real-looking key");
+
+        let refused = signing_identity(&state).expect_err("recovery must not yield signing keys");
+        assert_eq!(
+            refused.error.expect("error").code,
+            code::DENIED,
+            "recovery is refused as an ungranted caller, not distinguishable"
+        );
+    }
+}
+
+#[test]
+fn a_healthy_identity_is_the_one_the_signer_uses() {
+    // The positive control: without it, `signing_identity` returning `Err`
+    // unconditionally would satisfy the test above.
+    let state = crate::app_state::build_app_state();
+    let keys = nostr::Keys::generate();
+    *state.keys.lock().unwrap() = keys.clone();
+
+    let resolved = signing_identity(&state).expect("a healthy identity resolves");
+    assert_eq!(
+        resolved.public_key(),
+        keys.public_key(),
+        "and it is the identity actually loaded"
+    );
+}

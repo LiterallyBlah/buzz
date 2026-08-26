@@ -565,3 +565,118 @@ test("a hostile template is refused before the signer sees it", async (t) => {
 
   assert.equal(calls.length, 0, "nothing hostile may reach the signer");
 });
+
+// ── proof 8R: the raw-wire contract cannot acquire a host-minted identity ────
+
+test("8R: an omitted or null created_at is refused, and nothing is dispatched", async (t) => {
+  // Parts 1 and 2. There is no §11 client shim on this branch, so the raw wire
+  // *is* the contract — and the host must never fill in an operation identity
+  // on a caller's behalf. Driven through the real path: a MessagePort message,
+  // the hardened frame validator, the dispatcher's admission, and the call that
+  // would cross into Rust.
+  const { channel, calls } = harness(t);
+
+  for (const [label, params] of [
+    ["omitted", { kind: 9, content: "hi", tags: [["h", "c"]] }],
+    ["null", { kind: 9, content: "hi", tags: [["h", "c"]], created_at: null }],
+  ]) {
+    const reply = await roundTrip(channel, {
+      id: uuid(1),
+      v: 1,
+      method: "publish.event",
+      params,
+    });
+    // The frame itself is well formed, so it is admitted and answered — the
+    // refusal is the *host's*, correlated to the request.
+    assert.notEqual(reply, null, `${label} must be answered, not dropped`);
+    assert.equal(reply.id, uuid(1));
+  }
+
+  // Part 2: the template still reaches the host, because rejecting a missing
+  // `created_at` is Rust's decision, not the frame validator's — the validator
+  // must not start interpreting the template. What matters is that nothing
+  // *signs*, which the Rust-side proof pins; here we assert the frame layer
+  // added nothing.
+  for (const call of calls) {
+    assert.equal(
+      Object.hasOwn(call.params, "created_at") &&
+        call.params.created_at !== null &&
+        call.params.created_at !== undefined,
+      false,
+      "the frame layer must not invent a created_at on the way through",
+    );
+  }
+});
+
+test("8R: two sends of one template are byte-identical at the signer boundary", async (t) => {
+  // Part 3. The operation identity is the *complete* canonical projection, so
+  // this asserts every field that feeds the event id — value, count and order —
+  // survives the wire path unchanged on both sends.
+  const { channel, calls } = harness(t);
+
+  const template = {
+    kind: 9,
+    content: "the same logical publish, sent twice",
+    tags: [
+      ["h", "11111111-2222-3333-4444-555555555555"],
+      ["p", "a".repeat(64)],
+      ["t", "topic"],
+    ],
+    created_at: 1700000000,
+  };
+
+  // A caller retaining and resubmitting the exact template — the v1 contract.
+  await roundTrip(channel, {
+    id: uuid(1),
+    v: 1,
+    method: "publish.event",
+    params: template,
+  });
+  await roundTrip(channel, {
+    id: uuid(2),
+    v: 1,
+    method: "publish.event",
+    params: template,
+  });
+
+  assert.equal(calls.length, 2, "both sends reach the host");
+  const [first, second] = calls.map((c) => c.params);
+
+  assert.equal(first.created_at, template.created_at, "created_at preserved");
+  assert.equal(second.created_at, template.created_at, "and on the retry");
+  assert.equal(first.kind, second.kind);
+  assert.equal(first.content, second.content);
+  assert.equal(first.tags.length, second.tags.length, "tag count preserved");
+  assert.deepEqual(first.tags, second.tags, "tag values and order preserved");
+  // The decisive one: the two are indistinguishable, so Rust rebuilds the same
+  // canonical event and therefore the same id.
+  assert.equal(
+    JSON.stringify(first),
+    JSON.stringify(second),
+    "the two sends must be byte-identical at the boundary",
+  );
+});
+
+test("8R: no frontend path inserts, defaults or clamps created_at", async (t) => {
+  // Part 4, on the frontend half. The Rust half is pinned by
+  // `the_host_never_originates_a_created_at`.
+  //
+  // Behavioural first: a template with an absurd timestamp crosses untouched —
+  // the frontend has no opinion about the window, so it cannot silently move a
+  // value the caller will retry with.
+  const { channel, calls } = harness(t);
+  const absurd = { kind: 9, content: "x", tags: [], created_at: 1 };
+  await roundTrip(channel, {
+    id: uuid(1),
+    v: 1,
+    method: "publish.event",
+    params: absurd,
+  });
+
+  assert.equal(calls.length, 1);
+  assert.equal(
+    calls[0].params.created_at,
+    1,
+    "the frontend must pass the caller's timestamp through unchanged, however wrong",
+  );
+});

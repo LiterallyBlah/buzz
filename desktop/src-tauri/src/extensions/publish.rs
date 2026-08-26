@@ -436,6 +436,30 @@ fn now_unix() -> i64 {
         .unwrap_or_default()
 }
 
+/// The identity the signer may act under, or a refusal.
+///
+/// Extracted so the recovery path is testable against a production-shaped
+/// `AppState` rather than only through a Tauri command. Increment 2 removed
+/// this exact bypass from the identity handler and the signer reintroduced it,
+/// so the seam is worth having a name and a test of its own.
+///
+/// `signing_keys()` refuses while `identity_lost` or `keyring_locked` is set;
+/// `state.keys` does not, and hands back the real-looking **ephemeral** key
+/// those states boot with. Signing under that would publish, with a valid
+/// signature, as an identity the user does not control.
+///
+/// The refusal is `denied`, not `identity_unavailable`: §7 grants are keyed by
+/// identity, so with no usable identity nothing can be granted, and the caller
+/// is refused exactly as an ungranted one is. Recovery stays invisible.
+pub(crate) fn signing_identity(
+    state: &crate::AppState,
+) -> Result<nostr::Keys, super::dispatch::BridgeReply> {
+    use super::dispatch::{code, BridgeReply};
+    state
+        .signing_keys()
+        .map_err(|_| BridgeReply::err(code::DENIED, "missing scope: sign"))
+}
+
 /// §4 `publish.event(template) → { event, relay }`.
 ///
 /// The ordering is the security property: parse, canonicalise, **authorise**,
@@ -471,9 +495,9 @@ pub(crate) async fn publish_event<R: tauri::Runtime>(
     // identity, so with no usable identity there is nothing to key a lookup by,
     // nothing can be granted, and the caller is `denied` exactly as an
     // ungranted one is. Recovery stays invisible.
-    let keys = match state.signing_keys() {
+    let keys = match signing_identity(&state) {
         Ok(keys) => keys,
-        Err(_) => return BridgeReply::err(code::DENIED, "missing scope: sign"),
+        Err(reply) => return reply,
     };
     let identity_pubkey = keys.public_key().to_hex();
 
