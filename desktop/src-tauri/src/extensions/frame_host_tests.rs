@@ -652,6 +652,7 @@ async fn the_wrapper_is_not_served_from_the_extension_origin() {
     );
 
     release(&claim.lease);
+    assert!(wait_until_closed(claim.extension_port).await);
 }
 
 #[tokio::test]
@@ -681,6 +682,7 @@ async fn package_content_is_not_served_from_the_wrapper_origin() {
     );
 
     release(&claim.lease);
+    assert!(wait_until_closed(claim.extension_port).await);
 }
 
 /// Origin the committed E2E fixture is generated for. Any literal works; it
