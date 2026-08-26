@@ -115,13 +115,19 @@ const PERMITTED_TAG_NAMES: &[&str] = &["h", "p", "e", "q", "t", "emoji"];
 /// The channel tag. Exactly one, and it must name a granted channel.
 const CHANNEL_TAG: &str = "h";
 
-/// How far from now a caller-supplied `created_at` may sit before the host
-/// pulls it back (§4: "the host clamps it to a sane window").
+/// How far from now a caller-supplied `created_at` may sit.
 ///
-/// Clamped rather than refused: a client with a skewed clock should still be
-/// able to post, and a timestamp is not an authority claim. Five minutes is
-/// wide enough for ordinary skew and narrow enough that an extension cannot
-/// backdate an event into someone's scrollback or park one in the future.
+/// §4 says the host "clamps it to a sane window"; this **rejects** instead,
+/// and that refinement is the whole idempotency mechanism rather than a
+/// stylistic preference. A nostr event id is a hash *over* `created_at`, so
+/// silently adjusting a caller's timestamp changes the id — and a retry that
+/// rebuilt the same template would then produce a *different* event, publish a
+/// second time, and defeat the relay's deduplication. A clamp here would be an
+/// invisible double-publish.
+///
+/// Five minutes is wide enough for ordinary clock skew and narrow enough that
+/// an extension cannot backdate an event into someone's scrollback or park one
+/// in the future.
 const CREATED_AT_SKEW_SECONDS: i64 = 300;
 
 /// What the extension supplies (§4 `template`).
@@ -130,7 +136,13 @@ pub(crate) struct EventTemplate {
     pub(crate) kind: u32,
     pub(crate) content: String,
     pub(crate) tags: Vec<Vec<String>>,
-    pub(crate) created_at: Option<i64>,
+    /// Required, and validated against the window before this exists.
+    ///
+    /// Not an `Option`: there is no default-to-now path, because a caller who
+    /// omits it gets a different id on every retry and double-publishes the
+    /// first time anything goes wrong. The client shim sets it once per logical
+    /// publish and reuses it, which is what makes a retry idempotent.
+    pub(crate) created_at: i64,
 }
 
 /// The event the host will actually sign.
@@ -167,17 +179,21 @@ impl CanonicalEvent {
 /// Drops nothing and interprets nothing: the only transformation is resolving
 /// and clamping `created_at`. Tags are carried across verbatim so that what the
 /// checks inspect is exactly what gets signed.
-pub(crate) fn canonicalise(template: &EventTemplate, now: i64) -> CanonicalEvent {
-    let created_at = template
-        .created_at
-        .unwrap_or(now)
-        .clamp(now - CREATED_AT_SKEW_SECONDS, now + CREATED_AT_SKEW_SECONDS);
+pub(crate) fn canonicalise(template: &EventTemplate) -> CanonicalEvent {
     CanonicalEvent {
         kind: template.kind,
         content: template.content.clone(),
         tags: template.tags.clone(),
-        created_at,
+        created_at: template.created_at,
     }
+}
+
+/// Is this timestamp inside the window the host will sign?
+///
+/// Separate and pure so the boundary is testable on both sides without
+/// building a template.
+pub(crate) fn timestamp_in_window(created_at: i64, now: i64) -> bool {
+    created_at >= now - CREATED_AT_SKEW_SECONDS && created_at <= now + CREATED_AT_SKEW_SECONDS
 }
 
 /// Does this kind-9 content match the agent-control directive convention?
@@ -323,7 +339,10 @@ pub(crate) fn authorise(
 /// input is exactly the thing worth refusing. `params.extensionId` is not
 /// merely ignored here — it makes the whole call `invalid_params`, because a
 /// caller sending one has misunderstood who decides identity.
-fn parse_template(params: Option<Value>) -> Result<EventTemplate, super::dispatch::BridgeReply> {
+fn parse_template(
+    params: Option<Value>,
+    now: i64,
+) -> Result<EventTemplate, super::dispatch::BridgeReply> {
     use super::dispatch::{code, BridgeReply};
 
     let invalid = |message: &str| BridgeReply::err(code::INVALID_PARAMS, message.to_string());
@@ -372,14 +391,19 @@ fn parse_template(params: Option<Value>) -> Result<EventTemplate, super::dispatc
         Some(_) => return Err(invalid("tags must be an array")),
     };
 
-    let created_at = match map.get("created_at") {
-        None | Some(Value::Null) => None,
-        Some(value) => Some(
-            value
-                .as_i64()
-                .ok_or_else(|| invalid("created_at must be a unix timestamp"))?,
-        ),
-    };
+    // Required. Omitting it is the double-publish footgun: without a stable
+    // timestamp a retry rebuilds a different event id, so the relay cannot
+    // recognise it as the same operation.
+    let created_at = map
+        .get("created_at")
+        .and_then(Value::as_i64)
+        .ok_or_else(|| invalid("created_at is required and must be a unix timestamp"))?;
+    if !timestamp_in_window(created_at, now) {
+        // Rejected, never adjusted. Silently moving it would change the event
+        // id the caller will retry with, which is exactly the deduplication
+        // this requires.
+        return Err(invalid("created_at is outside the acceptable window"));
+    }
 
     Ok(EventTemplate {
         kind,
@@ -404,16 +428,17 @@ fn now_unix() -> i64 {
 pub(crate) async fn publish_event<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
     extension_id: &str,
+    lease: &str,
     params: Option<Value>,
 ) -> super::dispatch::BridgeReply {
     use super::dispatch::{code, BridgeReply};
     use tauri::Manager as _;
 
-    let template = match parse_template(params) {
+    let template = match parse_template(params, now_unix()) {
         Ok(template) => template,
         Err(reply) => return reply,
     };
-    let event = canonicalise(&template, now_unix());
+    let event = canonicalise(&template);
 
     let state = app.state::<crate::AppState>();
     let keys = match state.keys.lock() {
@@ -434,6 +459,20 @@ pub(crate) async fn publish_event<R: tauri::Runtime>(
         })
     }) {
         return refusal.into();
+    }
+
+    // A cheap complement, explicitly **not** load-bearing: if the frame has
+    // already gone there is no one to answer, so skip the work. Correctness
+    // rests on the event id being deterministic, not on winning this race —
+    // the frame can still vanish between this check and the relay accepting,
+    // and that case is safe because the retry rebuilds the same id.
+    //
+    // Signing has already happened and is harmless on its own: with egress
+    // default-deny a signed-but-unpublished event has nowhere to go, which is
+    // §4's own reason for cutting `sign.event`. The irreversible step is the
+    // submit below, so this is the last useful moment to check.
+    if super::frame_host::extension_for_lease(lease).is_none() {
+        return BridgeReply::err(code::DENIED, "no live extension frame for this lease");
     }
 
     match sign_and_publish(&event, &keys, &state).await {
@@ -480,6 +519,14 @@ async fn sign_and_publish(
     // Every relay failure collapses to one §8 code with a fixed message. The
     // relay's own text is discarded rather than wrapped — it is written for an
     // operator, not for an extension.
+    //
+    // A **suppressed duplicate is a success**, and deliberately indistinguishable
+    // from a fresh publish. The relay answers `accepted: true` with
+    // `message: "duplicate:"` when its `ON CONFLICT DO NOTHING` recognised the
+    // id, and the event is committed either way — so an idempotent operation
+    // returns the same success on retry. The relay's `message` is not forwarded,
+    // so "you already did this" is not even observable: the caller is told
+    // "committed", which is the only fact that matters to it.
     let accepted = crate::relay::submit_signed_event_with_keys(&signed, state, keys, None)
         .await
         .map_err(|_| BridgeReply::err(code::RELAY_ERROR, "the relay did not accept the event"))?;

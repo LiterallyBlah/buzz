@@ -56,7 +56,12 @@ type StartOptions = {
   /** The opaque host-minted lease identifying which extension this port serves. */
   lease: string;
   /** Injected for tests; defaults to Tauri's `invoke`. */
-  call?: (lease: string, v: number, method: string) => Promise<BridgeReply>;
+  call?: (
+    lease: string,
+    v: number,
+    method: string,
+    params: unknown,
+  ) => Promise<BridgeReply>;
   /**
    * Injected for tests, so budget exhaustion is reachable without driving
    * twenty thousand real round trips through the port.
@@ -81,11 +86,12 @@ export function startBridgeDispatch(options: StartOptions): DispatchHandle {
   }
   const call =
     options.call ??
-    ((l: string, v: number, method: string) =>
+    ((l: string, v: number, method: string, params: unknown) =>
       tauriInvoke<BridgeReply>("plugin:extension-bridge|invoke", {
         lease: l,
         v,
         method,
+        params,
       }));
 
   const registry = options.registry ?? createRegistry();
@@ -149,7 +155,11 @@ export function startBridgeDispatch(options: StartOptions): DispatchHandle {
       return;
     }
 
-    void call(lease, frame.v, frame.method)
+    // `params` is carried through untouched. This layer bounds and type-checks
+    // the frame (`bridgeFrame`), but it does not interpret the template: the
+    // signer checks the canonical event it will actually sign, and a second
+    // opinion here would be a second place for the two to disagree.
+    void call(lease, frame.v, frame.method, frame.params)
       .then((body) => reply(frame.id, body))
       .catch(() => {
         // An IPC failure is the host's fault, not the extension's, and §8 has

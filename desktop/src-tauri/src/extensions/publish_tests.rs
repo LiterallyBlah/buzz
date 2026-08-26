@@ -278,42 +278,124 @@ fn ordinary_content_that_merely_starts_with_a_bang_is_allowed() {
 
 // ── canonicalisation ─────────────────────────────────────────────────────────
 
+/// `parse_template` over a minimal valid publish body.
+fn template_params(created_at: Option<i64>) -> Value {
+    let mut map = serde_json::Map::new();
+    map.insert("kind".into(), serde_json::json!(9));
+    map.insert("content".into(), serde_json::json!("hello"));
+    map.insert("tags".into(), serde_json::json!([["h", CHANNEL]]));
+    if let Some(value) = created_at {
+        map.insert("created_at".into(), serde_json::json!(value));
+    }
+    Value::Object(map)
+}
+
+fn parse_code(params: Value, now: i64) -> Result<EventTemplate, String> {
+    parse_template(Some(params), now).map_err(|reply| {
+        reply
+            .error
+            .map(|e| e.code)
+            .unwrap_or_else(|| "(none)".to_string())
+    })
+}
+
 #[test]
-fn created_at_defaults_to_now_and_is_clamped_to_the_window() {
+fn created_at_is_required() {
+    // No default-to-now path. A caller that omits it would get a different
+    // event id on every retry and double-publish the first time anything went
+    // wrong — the id is a hash over the timestamp, so an unstable timestamp is
+    // an unstable operation identity.
     let now = 1_700_000_000i64;
-    let template = EventTemplate {
-        kind: kind::KIND_STREAM_MESSAGE,
-        content: "hi".to_string(),
-        tags: vec![tag(&["h", CHANNEL])],
-        created_at: None,
-    };
-    assert_eq!(canonicalise(&template, now).created_at, now);
-
-    // Backdating into someone's scrollback, and parking an event in the
-    // future, are both pulled back to the edge of the window.
-    let far_past = EventTemplate {
-        created_at: Some(now - 86_400),
-        ..template.clone()
-    };
     assert_eq!(
-        canonicalise(&far_past, now).created_at,
-        now - CREATED_AT_SKEW_SECONDS
+        parse_code(template_params(None), now).unwrap_err(),
+        code::INVALID_PARAMS
     );
-    let far_future = EventTemplate {
-        created_at: Some(now + 86_400),
-        ..template.clone()
-    };
-    assert_eq!(
-        canonicalise(&far_future, now).created_at,
-        now + CREATED_AT_SKEW_SECONDS
-    );
+}
 
-    // Ordinary skew inside the window is preserved rather than flattened.
-    let slight = EventTemplate {
-        created_at: Some(now - 30),
-        ..template
-    };
-    assert_eq!(canonicalise(&slight, now).created_at, now - 30);
+#[test]
+fn a_timestamp_inside_the_window_is_used_exactly() {
+    // The load-bearing half: it must arrive unmodified, because adjusting it
+    // would change the id the caller will retry with.
+    let now = 1_700_000_000i64;
+    for offset in [
+        0,
+        -30,
+        30,
+        -CREATED_AT_SKEW_SECONDS,
+        CREATED_AT_SKEW_SECONDS,
+    ] {
+        let pinned = now + offset;
+        let template =
+            parse_template(Some(template_params(Some(pinned))), now).expect("inside the window");
+        assert_eq!(
+            template.created_at, pinned,
+            "offset {offset} must be preserved exactly, not adjusted"
+        );
+        assert_eq!(
+            canonicalise(&template).created_at,
+            pinned,
+            "and must survive canonicalisation unchanged"
+        );
+    }
+}
+
+#[test]
+fn a_timestamp_outside_the_window_is_rejected_not_clamped() {
+    // The other half, and the one a clamp would silently break: an
+    // out-of-window timestamp must be refused, never pulled to the edge. A
+    // clamp would hand back an event whose id the caller cannot reproduce.
+    let now = 1_700_000_000i64;
+    for offset in [
+        -CREATED_AT_SKEW_SECONDS - 1,
+        CREATED_AT_SKEW_SECONDS + 1,
+        -86_400,
+        86_400,
+    ] {
+        assert_eq!(
+            parse_code(template_params(Some(now + offset)), now).unwrap_err(),
+            code::INVALID_PARAMS,
+            "offset {offset} must be refused"
+        );
+    }
+}
+
+#[test]
+fn the_window_boundary_is_inclusive_on_both_sides() {
+    // Both sides, individually — the edge is where an off-by-one lives, and
+    // asserting only the inside would not see it.
+    let now = 1_700_000_000i64;
+    assert!(timestamp_in_window(now - CREATED_AT_SKEW_SECONDS, now));
+    assert!(timestamp_in_window(now + CREATED_AT_SKEW_SECONDS, now));
+    assert!(!timestamp_in_window(now - CREATED_AT_SKEW_SECONDS - 1, now));
+    assert!(!timestamp_in_window(now + CREATED_AT_SKEW_SECONDS + 1, now));
+}
+
+#[test]
+fn a_retry_of_the_same_template_rebuilds_the_same_event() {
+    // The property the whole mechanism rests on: same template in, byte-identical
+    // canonical event out, so the signed id is the same and the relay recognises
+    // the retry as the operation it already committed.
+    let now = 1_700_000_000i64;
+    let params = template_params(Some(now - 5));
+    let first = canonicalise(&parse_template(Some(params.clone()), now).expect("first"));
+    // A later "now" must not perturb it — only the pinned value is used.
+    let second = canonicalise(&parse_template(Some(params), now + 120).expect("retry"));
+    assert_eq!(
+        first, second,
+        "a retry must rebuild the identical canonical event"
+    );
+}
+
+#[test]
+fn a_non_integer_created_at_is_rejected() {
+    let now = 1_700_000_000i64;
+    let mut map = serde_json::Map::new();
+    map.insert("kind".into(), serde_json::json!(9));
+    map.insert("created_at".into(), serde_json::json!("1700000000"));
+    assert_eq!(
+        parse_code(Value::Object(map), now).unwrap_err(),
+        code::INVALID_PARAMS
+    );
 }
 
 // ── the real signing + submission path ───────────────────────────────────────
@@ -430,6 +512,57 @@ async fn the_signed_event_on_the_wire_is_the_canonical_event() {
 }
 
 #[tokio::test]
+async fn a_suppressed_duplicate_is_reported_as_success() {
+    // Ruling B, and the payoff of requiring a stable `created_at`: when the
+    // relay recognises the id and answers `accepted: true, message:
+    // "duplicate:"`, the event is committed — so the caller gets the *same*
+    // success a fresh publish returns.
+    //
+    // Two things this pins. That a duplicate is not an error, and that it is
+    // not even distinguishable: the relay's `message` must not reach the
+    // reply, or "you already did this" becomes an observable side channel and
+    // an idempotent retry stops looking idempotent.
+    use std::io::{Read as _, Write as _};
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    std::thread::spawn(move || {
+        if let Ok((mut stream, _)) = listener.accept() {
+            let mut buf = [0u8; 8192];
+            let _ = stream.read(&mut buf);
+            let body = r#"{"event_id":"served","accepted":true,"message":"duplicate:"}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(response.as_bytes());
+            let _ = stream.flush();
+        }
+    });
+
+    let keys = nostr::Keys::generate();
+    let state = crate::app_state::build_app_state();
+    *state.keys.lock().unwrap() = keys.clone();
+    *state.relay_url_override.lock().unwrap() = Some(format!("http://{addr}"));
+
+    let event = message(vec![tag(&["h", CHANNEL])], "a retry of an earlier publish");
+    let result = sign_and_publish(&event, &keys, &state)
+        .await
+        .expect("a suppressed duplicate must not be an error");
+
+    assert_eq!(
+        result["relay"]["accepted"],
+        serde_json::json!(true),
+        "a duplicate is committed, so it reports accepted"
+    );
+    let rendered = serde_json::to_string(&result).expect("serialise");
+    assert!(
+        !rendered.contains("duplicate"),
+        "the relay's duplicate marker must not reach the caller: {rendered}"
+    );
+}
+
+#[tokio::test]
 async fn a_relay_refusal_is_normalised_and_leaks_nothing() {
     // §8: the relay's message is written for an operator and can name hosts,
     // kinds and internal reasons. An extension gets a stable code and a fixed
@@ -483,9 +616,9 @@ fn canonicalisation_carries_tags_and_content_verbatim() {
         kind: kind::KIND_STREAM_MESSAGE,
         content: "  spaces preserved  ".to_string(),
         tags: vec![tag(&["h", CHANNEL]), tag(&["p", &"a".repeat(64)])],
-        created_at: Some(now),
+        created_at: now,
     };
-    let canonical = canonicalise(&template, now);
+    let canonical = canonicalise(&template);
     assert_eq!(canonical.content, template.content);
     assert_eq!(canonical.tags, template.tags);
     assert_eq!(canonical.kind, template.kind);

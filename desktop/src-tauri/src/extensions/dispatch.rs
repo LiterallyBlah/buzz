@@ -257,7 +257,9 @@ pub(crate) async fn dispatch<R: tauri::Runtime>(
     ) {
         Route::Refuse { code, message } => BridgeReply::err(code, message),
         Route::PublishEvent { extension_id } => {
-            super::publish::publish_event(app, &extension_id, params).await
+            // The lease travels for *liveness* only; attribution already came
+            // from `route`, which resolved it without seeing `params`.
+            super::publish::publish_event(app, &extension_id, lease, params).await
         }
         Route::IdentityGetPublicKey { extension_id } => {
             let state = app.state::<crate::AppState>();

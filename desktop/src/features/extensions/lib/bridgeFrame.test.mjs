@@ -447,3 +447,34 @@ test("a wide object stops reading values once the budget is spent", () => {
     `must stop at the node ceiling, read ${reads} of 50000`,
   );
 });
+
+test("a realistic publish template fits well inside the bounds", () => {
+  // The bounds must not be so tight that the method they guard is unusable.
+  // A chatty kind-9 message with mentions and a long body, measured rather
+  // than assumed.
+  const template = {
+    kind: 9,
+    content: "Here is a reasonably long extension-authored message. ".repeat(
+      20,
+    ),
+    tags: [
+      ["h", "11111111-2222-3333-4444-555555555555"],
+      ...Array.from({ length: 20 }, (_, i) => [
+        "p",
+        String(i).repeat(64).slice(0, 64),
+      ]),
+      ["e", "b".repeat(64)],
+      ["t", "topic"],
+      ["emoji", "shortcode", "https://example.invalid/e.png"],
+    ],
+    created_at: 1700000000,
+  };
+  const frame = { id: ID, v: 1, method: "publish.event", params: template };
+
+  const encoded = new TextEncoder().encode(JSON.stringify(frame)).byteLength;
+  assert.ok(
+    encoded < MAX_FRAME_BYTES / 2,
+    `a normal template should sit well under the cap (used ${encoded} of ${MAX_FRAME_BYTES})`,
+  );
+  assert.equal(checkFrame(frame).kind, "ok");
+});

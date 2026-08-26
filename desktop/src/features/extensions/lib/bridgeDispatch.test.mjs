@@ -27,9 +27,9 @@ function harness(t, options = {}) {
   } = options;
   const channel = new MessageChannel();
   const calls = [];
-  const record = (lease, v, method) => {
-    calls.push({ lease, v, method });
-    return call ? call(lease, v, method) : Promise.resolve(reply);
+  const record = (lease, v, method, params) => {
+    calls.push({ lease, v, method, params });
+    return call ? call(lease, v, method, params) : Promise.resolve(reply);
   };
   let closeCount = 0;
   const realClose = channel.port1.close.bind(channel.port1);
@@ -114,7 +114,7 @@ test("a well-formed request is forwarded and its reply correlated", async (t) =>
     method: "identity.getPublicKey",
   });
   assert.deepEqual(calls, [
-    { lease: LEASE, v: 1, method: "identity.getPublicKey" },
+    { lease: LEASE, v: 1, method: "identity.getPublicKey", params: undefined },
   ]);
   assert.equal(reply.id, uuid(1));
   assert.equal(reply.ok, true);
@@ -495,4 +495,73 @@ test("ordinary teardown closes the port once", async (t) => {
   assert.equal(closeCount(), 1, "teardown closes the channel it served");
   handle.dispose();
   assert.equal(closeCount(), 1, "and is idempotent");
+});
+
+test("a publish template reaches the host byte-for-byte", async (t) => {
+  // §4's template rides `params`. The dispatcher bounds and type-checks the
+  // frame but must not reshape the template — the signer checks the canonical
+  // event it will actually sign, and a rewrite here would be a second opinion
+  // for the two to disagree over.
+  const { channel, calls } = harness(t);
+
+  const template = {
+    kind: 9,
+    content: "hello from an extension",
+    tags: [
+      ["h", "11111111-2222-3333-4444-555555555555"],
+      ["p", "a".repeat(64)],
+      ["e", "b".repeat(64)],
+    ],
+    created_at: 1700000000,
+  };
+  await roundTrip(channel, {
+    id: uuid(1),
+    v: 1,
+    method: "publish.event",
+    params: template,
+  });
+
+  assert.equal(calls.length, 1, "a legitimate template must reach the host");
+  assert.deepEqual(
+    calls[0].params,
+    template,
+    "and must arrive exactly as sent",
+  );
+});
+
+test("a hostile template is refused before the signer sees it", async (t) => {
+  // The bound has to hold on the publish path specifically, since that is the
+  // one that reaches a key. Each of these is refused by the frame validator,
+  // so `calls` never grows.
+  const { channel, calls } = harness(t);
+
+  const cyclic = { kind: 9, content: "x" };
+  cyclic.self = cyclic;
+
+  for (const [label, params] of [
+    [
+      "an ArrayBuffer smuggled in a tag",
+      { kind: 9, blob: new ArrayBuffer(8 * 1024 * 1024) },
+    ],
+    [
+      "an oversized content string",
+      { kind: 9, content: "x".repeat(70 * 1024) },
+    ],
+    ["a cyclic template", cyclic],
+    ["a Map instead of a tag array", { kind: 9, tags: new Map() }],
+  ]) {
+    const reply = await roundTrip(channel, {
+      id: uuid(2),
+      v: 1,
+      method: "publish.event",
+      params,
+    });
+    assert.equal(
+      reply.error.code,
+      "invalid_params",
+      `${label} must be refused`,
+    );
+  }
+
+  assert.equal(calls.length, 0, "nothing hostile may reach the signer");
 });
