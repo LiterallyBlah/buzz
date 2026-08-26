@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "extension-bridge",
+  "description": "Lets Buzz's own main window call the extension bridge. The window holds the MessagePort an extension talks over, so it is the caller; the extension itself is a sandboxed remote-origin frame and is never granted this. Scoped to 'main' only — huddle windows host no extensions. Local by default and deliberately no 'remote' block: no web origin may reach this command.",
+  "windows": ["main"],
+  "permissions": ["extension-bridge:allow-invoke"]
+}

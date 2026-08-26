@@ -26,6 +26,7 @@ mod install;
 // `manifest::EXTENSION_SIGNABLE_KINDS` rather than re-declare the allowlist.
 // One writer, two consumers.
 pub(crate) mod bridge;
+pub(crate) mod dispatch;
 pub(crate) mod grants;
 pub(crate) mod manifest;
 mod package_path;
@@ -80,7 +81,9 @@ pub struct InstalledExtension {
 ///
 /// Mirrors `managed_agents::storage::managed_agents_base_dir` and the
 /// `custom_harnesses` convention.
-pub(crate) fn extensions_base_dir(app: &AppHandle) -> Result<PathBuf, String> {
+pub(crate) fn extensions_base_dir<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+) -> Result<PathBuf, String> {
     let dir = app
         .path()
         .app_data_dir()

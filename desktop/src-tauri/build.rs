@@ -140,7 +140,7 @@ fn main() {
             // and Buzz has no `__app__` manifest to grant app commands through.
             .plugin(
                 "extension-bridge",
-                tauri_build::InlinedPlugin::new().commands(&["resolve_identity"]),
+                tauri_build::InlinedPlugin::new().commands(&["resolve_identity", "invoke"]),
             ),
     )
     .expect("failed to build Tauri application");

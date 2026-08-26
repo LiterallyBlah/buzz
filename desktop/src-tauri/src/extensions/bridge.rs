@@ -66,13 +66,33 @@ pub(crate) async fn resolve_identity(lease: String) -> Result<BridgeIdentity, St
     }
 }
 
+/// The §2 request entry point: one frame in, one reply out.
+///
+/// `params` is deliberately **not** a parameter yet. No method in this
+/// increment takes any, and leaving it out keeps §2's "attribute by the held
+/// handle, never by the payload" true by signature rather than by discipline.
+/// The increment that adds the first method with params threads it to that
+/// method only — never to attribution.
+///
+/// The frontend correlates: it holds the port, so it knows which `id` this
+/// answers. Nothing here needs the request id.
+#[tauri::command]
+pub(crate) async fn invoke<R: Runtime>(
+    app: tauri::AppHandle<R>,
+    lease: String,
+    v: u32,
+    method: String,
+) -> super::dispatch::BridgeReply {
+    super::dispatch::dispatch(&app, &lease, v, &method)
+}
+
 /// Plugin name. Must match the `tauri_build::InlinedPlugin` entry in `build.rs`
 /// or the generated ACL manifest will not resolve and every grant fails.
 pub(crate) const PLUGIN_NAME: &str = "extension-bridge";
 
 pub(crate) fn init<R: Runtime>() -> TauriPlugin<R> {
     tauri::plugin::Builder::new(PLUGIN_NAME)
-        .invoke_handler(tauri::generate_handler![resolve_identity])
+        .invoke_handler(tauri::generate_handler![resolve_identity, invoke])
         .build()
 }
 
