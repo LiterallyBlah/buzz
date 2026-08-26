@@ -909,15 +909,6 @@ pub(crate) fn running_port() -> Option<u16> {
         .map(|running| running.extension_port)
 }
 
-/// The running trusted-wrapper port, if any. Test and diagnostic use.
-#[cfg(test)]
-pub(crate) fn running_wrapper_port() -> Option<u16> {
-    host_state()
-        .running
-        .as_ref()
-        .map(|running| running.wrapper_port)
-}
-
 // ── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
