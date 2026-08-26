@@ -56,6 +56,17 @@ const MAX_U32 = 0xff_ff_ff_ff;
 
 /** §8 codes this module can produce. */
 const INVALID_PARAMS = "invalid_params";
+/**
+ * §2: "The host MUST reject a request whose `v` it does not support with
+ * `unsupported_version`."
+ *
+ * Every numeric `v` that is not the supported integer lands here, whether or
+ * not Rust could have received it — `1.5` is a version this host does not
+ * support just as `2` is. Splitting "numeric but unrepresentable" from
+ * "numeric but unsupported" would hand a client a distinction it cannot act
+ * on, where "send `v: 1` or get `unsupported_version`" is one rule it can.
+ */
+const UNSUPPORTED_VERSION = "unsupported_version";
 
 /**
  * Exact v4-shaped UUID, as `uuid::Uuid::new_v4().to_string()` produces and as
@@ -231,12 +242,14 @@ export function checkFrame(data: unknown): FrameCheck {
     return { kind: "drop" };
   }
   const id = frame.id;
-  const refuse = (message: string): FrameCheck => ({
+  const refuseWith = (code: string, message: string): FrameCheck => ({
     kind: "refuse",
     id,
-    code: INVALID_PARAMS,
+    code,
     message,
   });
+  const refuse = (message: string): FrameCheck =>
+    refuseWith(INVALID_PARAMS, message);
 
   for (const key of Object.keys(data)) {
     if (!FRAME_FIELDS.has(key)) {
@@ -244,22 +257,21 @@ export function checkFrame(data: unknown): FrameCheck {
     }
   }
 
-  // Size and type before shape: walking an enormous or exotic frame field by
-  // field to discover what it is, is the work the bound exists to avoid.
-  const budget: Budget = { bytes: 0, nodes: 0 };
-  const problem = checkValue(data, budget);
-  if (problem !== null) {
-    return refuse(problem);
-  }
-
   if (typeof frame.v !== "number") {
+    // Absent or wrong-typed is a malformed frame, not a version question:
+    // `v: "1"` is a shape error and says nothing about which versions exist.
     return refuse("request frame has no usable version");
   }
-  // A `v` Rust cannot receive as a `u32` is settled here rather than allowed
-  // to fail deserialisation and arrive as `internal`. Representable integers
-  // are forwarded, and Rust decides which of those it supports.
+  // A number, but not one `u32` can carry. Settled here rather than allowed to
+  // fail deserialisation and arrive as `internal` — but under the *same* code a
+  // representable-yet-unsupported `v` gets from Rust, so a caller sees one rule
+  // rather than a split it cannot act on. Representable integers are forwarded,
+  // and Rust decides which of those it supports.
   if (!Number.isSafeInteger(frame.v) || frame.v < 0 || frame.v > MAX_U32) {
-    return refuse("request frame has no usable version");
+    return refuseWith(
+      UNSUPPORTED_VERSION,
+      `this host speaks bridge version ${WIRE_VERSION}`,
+    );
   }
 
   if (typeof frame.method !== "string") {
@@ -268,6 +280,17 @@ export function checkFrame(data: unknown): FrameCheck {
   const methodBytes = utf8Length(frame.method);
   if (frame.method.length === 0 || methodBytes > MAX_METHOD_BYTES) {
     return refuse("request frame has no usable method");
+  }
+
+  // The envelope scalars are settled first — each is O(1) or bounded by the
+  // method cap — so a frame with a bad version is refused without walking a
+  // large `params` tree at all. It also keeps `v` out of the traversal's
+  // non-finite check, which would otherwise claim `NaN` as a malformed value
+  // before the version rule could call it an unsupported one.
+  const budget: Budget = { bytes: 0, nodes: 0 };
+  const problem = checkValue(data, budget);
+  if (problem !== null) {
+    return refuse(problem);
   }
 
   return {

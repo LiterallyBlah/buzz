@@ -329,6 +329,10 @@ test("an uncorrelatable frame is dropped and a malformed one is answered", async
     method: "identity.getPublicKey",
   });
   assert.equal(answered.id, uuid(1));
-  assert.equal(answered.error.code, "invalid_params");
+  assert.equal(
+    answered.error.code,
+    "unsupported_version",
+    "a numeric v that is not 1 is unsupported, whatever u32 can carry",
+  );
   assert.equal(calls.length, 0);
 });

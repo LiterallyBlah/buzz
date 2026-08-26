@@ -234,14 +234,17 @@ test("an unrecognised top-level field makes the frame malformed", () => {
 });
 
 test("version classification", () => {
-  const ok = (v) => checkFrame({ id: ID, v, method: "m" }).kind;
-  // Representable integers are forwarded; Rust decides which it supports.
-  assert.equal(ok(1), "ok");
-  assert.equal(ok(0), "ok");
-  assert.equal(ok(99), "ok");
-  assert.equal(ok(0xff_ff_ff_ff), "ok");
-  // Anything Rust's u32 cannot hold is settled here, never left to become
-  // `internal` on the far side of the IPC boundary.
+  const checked = (v) => checkFrame({ id: ID, v, method: "m" });
+
+  // Representable integers are forwarded; Rust decides which it supports and
+  // answers `unsupported_version` for anything that is not 1.
+  for (const v of [1, 0, 2, 99, 0xff_ff_ff_ff]) {
+    assert.equal(checked(v).kind, "ok", `v=${v} must reach the host`);
+  }
+
+  // A number that is not the supported integer — whether or not `u32` could
+  // carry it — is a version this host does not support. §2 names the code, and
+  // one rule ("send v:1") is something a client can act on.
   for (const v of [
     1.5,
     -1,
@@ -250,14 +253,31 @@ test("version classification", () => {
     Number.NEGATIVE_INFINITY,
     0x1_00_00_00_00,
     Number.MAX_SAFE_INTEGER,
-    "1",
-    null,
-    undefined,
   ]) {
-    const checked = checkFrame({ id: ID, v, method: "m" });
-    assert.equal(checked.kind, "refuse", `v=${String(v)} must be refused`);
-    assert.equal(checked.code, "invalid_params");
+    const result = checked(v);
+    assert.equal(result.kind, "refuse", `v=${String(v)} must be refused`);
+    assert.equal(
+      result.code,
+      "unsupported_version",
+      `v=${String(v)} is a numeric version this host does not support`,
+    );
   }
+
+  // Absent or wrong-typed is a malformed frame, not a version question.
+  for (const v of ["1", null, undefined, true, {}]) {
+    const result = checked(v);
+    assert.equal(result.kind, "refuse", `v=${String(v)} must be refused`);
+    assert.equal(
+      result.code,
+      "invalid_params",
+      `v=${String(v)} is a shape error, not a version`,
+    );
+  }
+  assert.equal(
+    checkFrame({ id: ID, method: "m" }).code,
+    "invalid_params",
+    "an absent version is a malformed frame",
+  );
 });
 
 test("method must be a non-empty string within the cap", () => {
