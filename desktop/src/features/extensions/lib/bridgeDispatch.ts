@@ -19,19 +19,40 @@
  * what a method does. Those live behind the IPC boundary so that a bug here
  * cannot widen a grant.
  *
- * # Malformed frames are ignored, not answered
+ * # If it can be correlated, it is answered
  *
- * §2 gives no error shape for a frame that has no usable `id`, and answering
- * one would mean inventing a correlation the caller never established. A frame
- * that is not an object, or whose `id` is not a string, is dropped silently.
- * Anything that *is* correlatable but wrong — bad version, unknown method — is
- * Rust's to refuse, so it gets a proper `{ id, ok:false, error }`.
+ * §9 requires that in-flight requests settle rather than dangle, so silence is
+ * reserved for the one case where an answer is impossible: a frame with no
+ * usable `id`. Answering that would mean inventing a correlation the caller
+ * never established, so it is dropped.
+ *
+ * Everything else gets a reply. A frame that is correlatable but outside the
+ * wire shape — no version, no method, over the size caps — is refused here
+ * with §8 `invalid_params` and never reaches a handler. A frame that is well
+ * shaped but wrong — unsupported version, unknown method, missing scope — is
+ * Rust's to refuse, because those are authority decisions and this layer makes
+ * none.
  */
 
 import { invoke as tauriInvoke } from "@tauri-apps/api/core";
 
 /** Wire version this client speaks (§2). */
 const WIRE_VERSION = 1;
+
+/**
+ * Wire limits. The spec sets no numbers, so these are ours.
+ *
+ * Each is far above any legitimate caller and far below anything that could
+ * make the host do unbounded work. `MAX_FRAME_CHARS` is measured on the
+ * frame's JSON encoding — characters, not bytes — which is the cheapest bound
+ * that covers `params` however deeply it nests.
+ */
+const MAX_ID_CHARS = 128;
+const MAX_METHOD_CHARS = 64;
+const MAX_FRAME_CHARS = 64 * 1024;
+
+/** §8 code for a frame that never reaches a handler. */
+const INVALID_PARAMS = "invalid_params";
 
 type RequestFrame = {
   id: string;
@@ -47,28 +68,77 @@ type BridgeReply = {
 };
 
 /**
- * A frame is dispatchable only if it can be answered.
- *
- * `id` must be a non-empty string: without it there is nothing to correlate a
- * reply to. `v` and `method` are checked for *type* here and for *value* in
- * Rust — this layer must not decide that a version is unsupported, because that
- * is a §8 error with a defined code and Rust owns those.
+ * The three things a frame can be: dispatchable, refusable, or unanswerable.
  */
-function asRequestFrame(data: unknown): RequestFrame | null {
+type FrameCheck =
+  | { kind: "ok"; frame: RequestFrame }
+  | { kind: "invalid"; id: string; reason: string }
+  | { kind: "drop" };
+
+/**
+ * Classify an inbound frame without letting it reach a handler.
+ *
+ * `id` decides whether a reply is even possible, so it is checked first: a
+ * missing, non-string, empty or over-length `id` leaves nothing to correlate
+ * against and the frame is dropped.
+ *
+ * Size is checked before shape. Walking an enormous object field by field to
+ * discover it is enormous is the work the bound exists to avoid.
+ *
+ * `v` and `method` are checked for *type and size* here and for *value* in
+ * Rust. This layer must not decide that a version is unsupported or a method
+ * unknown — those are §8 codes with defined semantics that Rust owns.
+ */
+function checkFrame(data: unknown): FrameCheck {
   if (typeof data !== "object" || data === null) {
-    return null;
+    return { kind: "drop" };
   }
   const frame = data as Partial<RequestFrame>;
-  if (typeof frame.id !== "string" || frame.id.length === 0) {
-    return null;
+  if (
+    typeof frame.id !== "string" ||
+    frame.id.length === 0 ||
+    frame.id.length > MAX_ID_CHARS
+  ) {
+    return { kind: "drop" };
   }
+  const id = frame.id;
+
+  let encoded: string;
+  try {
+    encoded = JSON.stringify(data);
+  } catch {
+    // Structured clone carries shapes JSON cannot — cycles, BigInt — so a
+    // hostile frame reaches this. It cannot be measured, so it is refused
+    // rather than guessed at.
+    return { kind: "invalid", id, reason: "request frame is not serialisable" };
+  }
+  if (encoded.length > MAX_FRAME_CHARS) {
+    return {
+      kind: "invalid",
+      id,
+      reason: "request frame exceeds the wire limits",
+    };
+  }
+
   if (typeof frame.v !== "number" || !Number.isFinite(frame.v)) {
-    return null;
+    return {
+      kind: "invalid",
+      id,
+      reason: "request frame has no usable version",
+    };
   }
-  if (typeof frame.method !== "string") {
-    return null;
+  if (
+    typeof frame.method !== "string" ||
+    frame.method.length === 0 ||
+    frame.method.length > MAX_METHOD_CHARS
+  ) {
+    return {
+      kind: "invalid",
+      id,
+      reason: "request frame has no usable method",
+    };
   }
-  return { id: frame.id, v: frame.v, method: frame.method };
+  return { kind: "ok", frame: { id, v: frame.v, method: frame.method } };
 }
 
 export type DispatchHandle = {
@@ -105,33 +175,50 @@ export function startBridgeDispatch(options: StartOptions): DispatchHandle {
 
   let disposed = false;
 
+  /**
+   * The single write path to the port.
+   *
+   * Every reply goes through here so the disposed check cannot be forgotten on
+   * one branch: after teardown the port belongs to the handshake, which closes
+   * it, and writing to it then is a late write to a dead channel.
+   */
+  const reply = (id: string, body: BridgeReply) => {
+    if (disposed) {
+      return;
+    }
+    port.postMessage({ id, ...body });
+  };
+
   const onMessage = (event: MessageEvent) => {
     if (disposed) {
       return;
     }
-    const frame = asRequestFrame(event.data);
-    if (!frame) {
+    const checked = checkFrame(event.data);
+    if (checked.kind === "drop") {
       // Not correlatable: there is no id to answer to. Dropping is the only
       // honest response.
       return;
     }
+    if (checked.kind === "invalid") {
+      // Refused here, never handed to a handler — the frame is outside the
+      // wire shape, which is a §8 `invalid_params` and not an authority call.
+      reply(checked.id, {
+        ok: false,
+        error: { code: INVALID_PARAMS, message: checked.reason },
+      });
+      return;
+    }
+    const { frame } = checked;
     void call(lease, frame.v, frame.method)
-      .then((reply) => {
-        if (!disposed) {
-          port.postMessage({ id: frame.id, ...reply });
-        }
-      })
+      .then((body) => reply(frame.id, body))
       .catch(() => {
         // An IPC failure is the host's fault, not the extension's, and §8 has
         // a code for it. The request still gets an answer so the client's
         // promise settles rather than hanging.
-        if (!disposed) {
-          port.postMessage({
-            id: frame.id,
-            ok: false,
-            error: { code: "internal", message: "the bridge call failed" },
-          });
-        }
+        reply(frame.id, {
+          ok: false,
+          error: { code: "internal", message: "the bridge call failed" },
+        });
       });
   };
 
