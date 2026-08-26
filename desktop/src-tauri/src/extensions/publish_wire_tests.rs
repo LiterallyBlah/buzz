@@ -339,14 +339,40 @@ async fn an_acknowledgement_naming_a_different_event_is_a_relay_error() {
 }
 
 #[tokio::test]
-async fn revoked_authority_during_the_wait_produces_no_post() {
-    // Proof 9. The rate-limit gate is global and unbounded from the caller's
-    // point of view, so authority checked before it is checked at the wrong
-    // time. The revalidation runs after that wait and immediately before the
-    // POST; a refusal there must mean the request never reaches the socket.
+async fn revoking_the_grant_during_a_real_rate_limit_wait_produces_no_post() {
+    // Proof 9, exercising the production transition rather than an injected
+    // refusal.
     //
-    // The listener counts connections, so "no POST" is observed rather than
-    // inferred from a return value.
+    // The previous version passed a closure that returned `Err` immediately.
+    // That proved a refusal emits zero POSTs; it did **not** prove the
+    // transition that creates one — the gate is global and unbounded from the
+    // caller's view, and authority checked before it is checked at the wrong
+    // time. This arms a real wait, revokes a real grant from a real store while
+    // the request is parked in it, and lets the production revalidator see the
+    // change.
+    //
+    // The shared guard is mandatory: the gate is a process-wide static, so
+    // without it another suite's armed expiry bleeds into this one.
+    let _serial = crate::relay_admission::TEST_SERIAL.lock().await;
+    crate::relay_admission::reset_rate_limit_gate();
+
+    // A real grant store, granted at entry.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("grants").join("extension-grants.db");
+    let identity = "a".repeat(64);
+    {
+        let conn = crate::extensions::grants::open_grant_db(&db_path).expect("open");
+        crate::extensions::grants::grant_sign_scope(
+            &conn,
+            &identity,
+            "demo",
+            kind::KIND_STREAM_MESSAGE,
+            CHANNEL,
+        )
+        .expect("grant");
+    }
+
+    // A listener that counts connections, so "no POST" is observed.
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
     let addr = listener.local_addr().expect("addr");
     let connections = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -363,22 +389,63 @@ async fn revoked_authority_during_the_wait_produces_no_post() {
     *state.relay_url_override.lock().unwrap() = Some(format!("http://{addr}"));
 
     let event = message(vec![tag(&["h", CHANNEL])], "hello");
-    let reply = sign_and_publish(&event, &keys, &state, || Err(code::DENIED))
-        .await
-        .expect_err("a revoked grant must not publish");
-    assert_eq!(
-        reply.error.expect("error").code,
-        code::DENIED,
-        "a revoked grant is a denial, not a relay fault — the request never \
-         reached the relay, so blaming it would be false"
+
+    // The revalidator reads the real store, exactly as production does.
+    let revalidate = || -> Result<(), &'static str> {
+        let granted = crate::extensions::grants::open_grant_db(&db_path)
+            .ok()
+            .is_some_and(|conn| {
+                crate::extensions::grants::has_sign_scope(
+                    &conn,
+                    &identity,
+                    "demo",
+                    kind::KIND_STREAM_MESSAGE,
+                    CHANNEL,
+                )
+            });
+        if granted {
+            Ok(())
+        } else {
+            Err(code::DENIED)
+        }
+    };
+
+    // Arm a real wait, then revoke while the submission is parked in it.
+    crate::relay_admission::activate_rate_limit(Some(1));
+    let armed_at = std::time::Instant::now();
+
+    let submit = sign_and_publish(&event, &keys, &state, revalidate);
+    let revoke = async {
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let conn = crate::extensions::grants::open_grant_db(&db_path).expect("reopen");
+        let removed =
+            crate::extensions::grants::revoke_all(&conn, &identity, "demo").expect("revoke");
+        assert_eq!(removed, 1, "the grant must have existed to be revoked");
+    };
+    let (result, ()) = tokio::join!(submit, revoke);
+
+    crate::relay_admission::reset_rate_limit_gate();
+
+    // The wait is what makes this a proof rather than a coincidence: the
+    // revocation fires 300ms in, so without a real armed gate the submission
+    // would already have completed and the revocation would be irrelevant.
+    assert!(
+        armed_at.elapsed() >= std::time::Duration::from_millis(900),
+        "the submission must actually have parked in the gate (elapsed {:?})",
+        armed_at.elapsed()
     );
 
-    // The decisive assertion: nothing was sent.
-    std::thread::sleep(std::time::Duration::from_millis(80));
+    let refused = result.expect_err("a revoked grant must not publish");
+    assert_eq!(
+        refused.error.expect("error").code,
+        code::DENIED,
+        "a revocation during the wait is a denial, not a relay fault"
+    );
+    std::thread::sleep(std::time::Duration::from_millis(50));
     assert_eq!(
         connections.load(std::sync::atomic::Ordering::SeqCst),
         0,
-        "revalidation refused, so no request may have reached the relay"
+        "the grant was revoked while parked, so nothing may have reached the relay"
     );
 }
 
@@ -543,4 +610,52 @@ async fn a_dropped_response_then_an_exact_retry_yields_one_event_id() {
     assert_eq!(retry["relay"]["accepted"], serde_json::json!(true));
     let rendered = serde_json::to_string(&retry).expect("serialise");
     assert!(!rendered.contains("duplicate"), "no duplicate marker leaks");
+}
+
+#[tokio::test]
+async fn a_missing_created_at_is_refused_before_signing_or_network() {
+    // The Rust half of 8R, and the half that actually observes the refusal.
+    //
+    // Driven from the production entry point — `parse_template`, the same call
+    // `publish_event` makes — with a listener counting connections, so "zero
+    // network" is observed rather than inferred. Signing cannot have happened
+    // either: `parse_template` returns before any key is touched.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let connections = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = connections.clone();
+    std::thread::spawn(move || {
+        for _ in listener.incoming() {
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    });
+
+    let now = 1_700_000_000i64;
+    for (label, params) in [
+        ("omitted", template_params(None)),
+        ("null", {
+            let mut map = serde_json::Map::new();
+            map.insert("kind".into(), serde_json::json!(9));
+            map.insert("content".into(), serde_json::json!("hi"));
+            map.insert("tags".into(), serde_json::json!([["h", CHANNEL]]));
+            map.insert("created_at".into(), Value::Null);
+            Value::Object(map)
+        }),
+    ] {
+        let refused = parse_template(Some(params), now)
+            .err()
+            .and_then(|reply| reply.error)
+            .expect("must be refused");
+        assert_eq!(
+            refused.code,
+            code::INVALID_PARAMS,
+            "{label} created_at must be invalid_params"
+        );
+    }
+
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    assert_eq!(
+        connections.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "a refused template must reach neither the signer nor the network"
+    );
 }

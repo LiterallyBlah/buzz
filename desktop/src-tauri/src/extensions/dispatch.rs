@@ -257,8 +257,12 @@ pub(crate) async fn dispatch<R: tauri::Runtime>(
     ) {
         Route::Refuse { code, message } => BridgeReply::err(code, message),
         Route::PublishEvent { extension_id } => {
-            // The lease travels for *liveness* only; attribution already came
-            // from `route`, which resolved it without seeing `params`.
+            // The lease travels so the signer can **revalidate authority**
+            // before the irreversible step — not as a liveness signal, a term
+            // the design explicitly rejected: budget exhaustion closes a port
+            // without releasing its lease, so a live lease does not mean a live
+            // port. Attribution already came from `route`, which resolved it
+            // without seeing `params`.
             super::publish::publish_event(app, &extension_id, lease, params).await
         }
         Route::IdentityGetPublicKey { extension_id } => {

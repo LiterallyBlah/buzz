@@ -568,12 +568,16 @@ test("a hostile template is refused before the signer sees it", async (t) => {
 
 // ── proof 8R: the raw-wire contract cannot acquire a host-minted identity ────
 
-test("8R: an omitted or null created_at is refused, and nothing is dispatched", async (t) => {
-  // Parts 1 and 2. There is no §11 client shim on this branch, so the raw wire
-  // *is* the contract — and the host must never fill in an operation identity
-  // on a caller's behalf. Driven through the real path: a MessagePort message,
-  // the hardened frame validator, the dispatcher's admission, and the call that
-  // would cross into Rust.
+test("8R: the frame layer forwards a missing created_at without inventing one", async (t) => {
+  // Part of 8R, and **only** this part: the frame layer must not invent an
+  // operation identity on the caller's behalf.
+  //
+  // The title used to say "is refused, and nothing is dispatched" — which this
+  // test never observed. The injected host call returns the harness's ordinary
+  // success, so `calls` is deliberately non-empty and no `invalid_params` is
+  // reached from here. The refusal is Rust's, and it is proved in Rust by
+  // `a_missing_created_at_is_refused_before_signing_or_network`. Claiming it
+  // here would have been a title asserting more than its body.
   const { channel, calls } = harness(t);
 
   for (const [label, params] of [
@@ -592,11 +596,10 @@ test("8R: an omitted or null created_at is refused, and nothing is dispatched", 
     assert.equal(reply.id, uuid(1));
   }
 
-  // Part 2: the template still reaches the host, because rejecting a missing
-  // `created_at` is Rust's decision, not the frame validator's — the validator
-  // must not start interpreting the template. What matters is that nothing
-  // *signs*, which the Rust-side proof pins; here we assert the frame layer
-  // added nothing.
+  // The template *does* reach the host: rejecting a missing `created_at` is
+  // Rust's decision, not the validator's, and a validator that began
+  // interpreting templates would be a second opinion for the two to disagree
+  // over. What this pins is that the frame layer added nothing on the way.
   for (const call of calls) {
     assert.equal(
       Object.hasOwn(call.params, "created_at") &&

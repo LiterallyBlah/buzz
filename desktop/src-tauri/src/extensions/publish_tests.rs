@@ -137,6 +137,43 @@ fn a_message_in_an_ungranted_channel_is_denied() {
 }
 
 #[test]
+fn a_valueless_channel_tag_still_counts_as_a_channel_tag() {
+    // The counterexample the two-valid-`h` test did not reach. `["h"]` parses
+    // as a tag, and the relay's `extract_channel_id` skips it and takes the
+    // later valid UUID — so if the host counts only *valued* `h` tags, a
+    // malformed pair is signed and ingested with the second one deciding the
+    // channel.
+    //
+    // Both orderings, because the bug was order-dependent: it only appeared
+    // when the valueless tag came first.
+    for tags in [
+        vec![tag(&["h"]), tag(&["h", CHANNEL])],
+        vec![tag(&["h", CHANNEL]), tag(&["h"])],
+    ] {
+        let event = message(tags, "hello");
+        assert_eq!(
+            refusal_with_everything_granted(&event),
+            Some(Refusal::ChannelTagNotSingular),
+            "two h tags must be refused however few of them carry a value"
+        );
+    }
+}
+
+#[test]
+fn a_lone_valueless_channel_tag_is_malformed_not_unscoped() {
+    // A single `["h"]` is a channel tag the caller did send — it is simply not
+    // usable. Reporting it as malformed is more honest than reporting the event
+    // as having no channel, and it is `invalid_params` rather than an authority
+    // refusal.
+    for tags in [vec![tag(&["h"])], vec![tag(&["h", ""])]] {
+        let event = message(tags, "hello");
+        let refused = refusal_with_everything_granted(&event).expect("must refuse");
+        assert_eq!(refused, Refusal::MalformedTag);
+        assert_eq!(refused.code(), code::INVALID_PARAMS);
+    }
+}
+
+#[test]
 fn a_second_channel_tag_cannot_redirect_the_event() {
     // The D-2a escape, in its tag form: a grant for channel X plus a smuggled
     // second `h` naming channel Y. Both orderings are refused, so the check

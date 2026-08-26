@@ -561,7 +561,9 @@ pub async fn submit_signed_event_with_keys(
     keys: &Keys,
     auth_tag: Option<&str>,
 ) -> Result<SubmitEventResponse, String> {
-    submit_prepared_event(state, keys, auth_tag, || Ok(event.clone())).await
+    submit_prepared_event(state, keys, auth_tag, || Ok(event.clone()))
+        .await
+        .map(|(response, _)| response)
 }
 
 /// Wait for the shared rate-limit gate, then build and submit the event.
@@ -582,7 +584,7 @@ pub async fn submit_prepared_event(
     keys: &Keys,
     auth_tag: Option<&str>,
     prepare: impl FnOnce() -> Result<nostr::Event, String>,
-) -> Result<SubmitEventResponse, String> {
+) -> Result<(SubmitEventResponse, nostr::Event), String> {
     // The wait comes first, and `prepare` runs *after* it. That ordering is the
     // point: the gate is global and unbounded from this caller's view, so an
     // authority check made before it is a check made at the wrong time, and an
@@ -624,7 +626,9 @@ pub async fn submit_prepared_event(
         return Err(format!("relay rejected event: {}", result.message));
     }
 
-    Ok(result)
+    // The event travels back with the response: an effectful caller needs the
+    // bytes that were actually signed and sent, not a reconstruction of them.
+    Ok((result, event))
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────────

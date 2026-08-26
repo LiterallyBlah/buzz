@@ -100,14 +100,20 @@ pub fn reset_rate_limit_gate() {
     *GATE_EXPIRY.lock().unwrap_or_else(|e| e.into_inner()) = None;
 }
 
+/// The one guard every test that arms or traverses the gate must hold.
+///
+/// The gate is a process-wide static shared by every test in this binary, so
+/// armed expiries bleed between parallel test threads unless they serialize.
+/// It lives beside the gate rather than inside one module's `mod tests` so
+/// that *any* suite crossing `wait_for_rate_limit` can take it — a suite that
+/// traverses the gate without holding this is exposed to whatever another test
+/// armed, and will fail in ways that look like its own flakiness.
+#[cfg(test)]
+pub(crate) static TEST_SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // The gate is a process-wide static shared by every test in this binary,
-    // so all gate tests serialize on one async lock to keep armed expiries
-    // from bleeding between parallel test threads.
-    pub(crate) static TEST_SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     #[tokio::test(start_paused = true)]
     async fn wait_returns_immediately_when_gate_is_inactive() {

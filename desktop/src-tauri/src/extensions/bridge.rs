@@ -28,14 +28,18 @@
 //! controlled — whereas a token the host minted cannot be guessed, and the map
 //! that interprets it lives in Rust.
 //!
-//! # What this is not, yet
+//! # What this is, and what still is not
 //!
-//! Scaffolding. The BRIDGE_SPEC §2 mediator contracts — request/response
-//! schemas, request-id correlation, method allowlist, byte limits,
-//! cancellation, subscription ownership, backpressure — are deliberately absent
-//! and are held pending the Windows attribution measurement. This module exists
-//! so the *shape* is right: a plugin command, ACL-gated, with host-derived
-//! identity.
+//! The §2 mediator contracts are **present**: request/response schemas and
+//! id correlation in `bridgeDispatch`, the method allowlist in
+//! [`super::dispatch::route`], byte and shape limits in `bridgeFrame`, and
+//! per-port admission, replay-safe ids and teardown settlement in
+//! `bridgeRegistry`.
+//!
+//! Still absent, and honestly so: **subscription ownership and backpressure**
+//! (§5, a later increment), and **cancellation** — closing a port does not
+//! recall work already running in Rust, which is why `publish.event` rests on
+//! content-addressed idempotency rather than on cancelling anything.
 
 use tauri::plugin::TauriPlugin;
 use tauri::Runtime;
@@ -68,11 +72,12 @@ pub(crate) async fn resolve_identity(lease: String) -> Result<BridgeIdentity, St
 
 /// The §2 request entry point: one frame in, one reply out.
 ///
-/// `params` is deliberately **not** a parameter yet. No method in this
-/// increment takes any, and leaving it out keeps §2's "attribute by the held
-/// handle, never by the payload" true by signature rather than by discipline.
-/// The increment that adds the first method with params threads it to that
-/// method only — never to attribution.
+/// `params` is threaded to the handler that needs it and **never** to
+/// attribution. §2's "attribute by the held handle, never by the payload" stays
+/// true by signature rather than by discipline:
+/// [`super::dispatch::route`] — which decides *who the caller is* — takes no
+/// `params` argument at all, so no payload can reach that decision. The
+/// template travels separately, to the signer alone.
 ///
 /// The frontend correlates: it holds the port, so it knows which `id` this
 /// answers. Nothing here needs the request id.

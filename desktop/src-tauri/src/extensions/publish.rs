@@ -7,9 +7,12 @@
 //! # Checked on the canonical event, never on the page's description
 //!
 //! §4 is explicit that the checks run on "the canonical event the host will
-//! actually sign". So [`canonicalise`] builds that event first — normalising
-//! tags, resolving `created_at` — and every check reads *it*. A check that
-//! read the inbound template could pass while the thing actually signed
+//! actually sign". So [`canonicalise`] builds that event first and every check
+//! reads *it*. It normalises nothing and resolves nothing — `created_at` is
+//! required and window-checked during parsing, and tags cross verbatim —
+//! because any adjustment here would change the event id the caller will retry
+//! with. A check that read the inbound template could pass while the thing
+//! actually signed
 //! differed from what was inspected.
 //!
 //! # Two independent gates, not one
@@ -150,11 +153,16 @@ pub(crate) struct EventTemplate {
     /// lifecycle can retire a frame, and identity held only in that frame's
     /// JavaScript goes with it.
     ///
-    /// The horizon is bounded and worth stating plainly: the host accepts a
-    /// five-minute window and the relay retains for fifteen. Past the host
-    /// window a reused template is **rejected**, which is safe — it will not
-    /// duplicate — but `publish.event` alone can no longer confirm the earlier
-    /// commit. That is bounded idempotency, not indefinite result retrieval.
+    /// The horizon is bounded and worth stating precisely, because the two
+    /// numbers are different mechanisms rather than one policy: the **host**
+    /// accepts a five-minute window around now, and the **relay** accepts
+    /// timestamps within a ±15-minute drift window. Neither is a retention
+    /// policy — the relay does not discard the event after fifteen minutes.
+    ///
+    /// Past the host window a reused template is **rejected**, which is safe —
+    /// it will not duplicate — but `publish.event` alone can no longer confirm
+    /// the earlier commit, and a read is needed instead. Bounded idempotency,
+    /// not indefinite result retrieval.
     pub(crate) created_at: i64,
 }
 
@@ -172,18 +180,37 @@ pub(crate) struct CanonicalEvent {
 }
 
 impl CanonicalEvent {
-    /// The single `h` value, if the event carries exactly one.
-    fn channel(&self) -> Option<&str> {
-        let mut found = None;
+    /// The one channel this event names, or why it does not name exactly one.
+    ///
+    /// **Occurrences are counted independently of whether they carry a value.**
+    /// An earlier version used a single `Option` as both the count and the
+    /// extracted value, so a valueless `["h"]` left it `None` and the *next*
+    /// `["h", granted]` read as the first channel tag — a two-`h` event slipped
+    /// through the exactly-one gate. `nostr::Tag::parse(["h"])` succeeds and the
+    /// relay's `extract_channel_id` skips the valueless one and takes the later
+    /// UUID, so that event would have been signed and ingested.
+    ///
+    /// A valueless `h` is classified as malformed rather than as a missing
+    /// channel: the caller sent a channel tag, it is simply not usable, and
+    /// saying so is more honest than reporting the event as unscoped.
+    fn channel(&self) -> Result<&str, Refusal> {
+        let mut seen = 0usize;
+        let mut value: Option<&str> = None;
         for tag in &self.tags {
             if tag.first().map(String::as_str) == Some(CHANNEL_TAG) {
-                if found.is_some() {
-                    return None;
-                }
-                found = tag.get(1).map(String::as_str);
+                seen += 1;
+                value = tag.get(1).map(String::as_str);
             }
         }
-        found
+        // One decision point. An early `return` for `seen > 1` inside the loop
+        // would be redundant with the match below and — being unobservable
+        // through it — could be deleted without a single test noticing, which
+        // is not a property a channel-scope guard should have.
+        match (seen, value) {
+            (1, Some(channel)) if !channel.is_empty() => Ok(channel),
+            (1, _) => Err(Refusal::MalformedTag),
+            _ => Err(Refusal::ChannelTagNotSingular),
+        }
     }
 }
 
@@ -333,10 +360,8 @@ pub(crate) fn authorise(
     }
 
     // Check 3 — channel scope. Exactly one `h`, naming a granted channel.
-    let Some(channel) = event.channel() else {
-        return Err(Refusal::ChannelTagNotSingular);
-    };
-    if channel.is_empty() || !has_sign_scope(event.kind, channel) {
+    let channel = event.channel()?;
+    if !has_sign_scope(event.kind, channel) {
         return Err(Refusal::ChannelNotGranted);
     }
 
@@ -572,6 +597,38 @@ pub(crate) async fn publish_event<R: tauri::Runtime>(
     }
 }
 
+/// Discriminants for the refusal carrier.
+///
+/// A plain integer rather than a lock: this cell exists only to move a §8 code
+/// out past a submit path that speaks `String`, and a diagnostic channel must
+/// not be able to panic the command it is diagnosing.
+const REFUSAL_NONE: u8 = 0;
+const REFUSAL_DENIED: u8 = 1;
+const REFUSAL_INVALID_PARAMS: u8 = 2;
+const REFUSAL_INTERNAL: u8 = 3;
+
+fn refusal_tag(code: &str) -> u8 {
+    use super::dispatch::code;
+    if code == code::DENIED {
+        REFUSAL_DENIED
+    } else if code == code::INVALID_PARAMS {
+        REFUSAL_INVALID_PARAMS
+    } else {
+        REFUSAL_INTERNAL
+    }
+}
+
+fn refusal_code(tag: u8) -> &'static str {
+    use super::dispatch::code;
+    match tag {
+        REFUSAL_DENIED => code::DENIED,
+        REFUSAL_INVALID_PARAMS => code::INVALID_PARAMS,
+        REFUSAL_INTERNAL => code::INTERNAL,
+        // Nothing was recorded, so the failure came from the relay itself.
+        _ => code::RELAY_ERROR,
+    }
+}
+
 /// A §8 code and the message that goes with it.
 ///
 /// Kept as one mapping so a refusal raised deep in `prepare` cannot arrive at
@@ -637,18 +694,40 @@ async fn sign_and_publish(
     // between that confirmation and the POST.
     let signing_keys = keys.clone();
     // The refusal reason has to survive out through a submit path that only
-    // speaks `String`, so `prepare` records the §8 code here on its way out.
-    let refusal: std::sync::Mutex<Option<&'static str>> = std::sync::Mutex::new(None);
+    // speaks `String`, so `prepare` records a discriminant here on its way out.
+    //
+    // An atomic rather than a `Mutex`: the repository forbids new production
+    // `unwrap`/`expect`, and a poisoned lock on a *diagnostic* cell would panic
+    // the bridge command rather than produce a normalised refusal. A failure
+    // path that can crash is a worse failure path than the one it reports.
+    let refusal = std::sync::atomic::AtomicU8::new(REFUSAL_NONE);
     let refusal_ref = &refusal;
     let prepare = move || -> Result<nostr::Event, String> {
+        use std::sync::atomic::Ordering;
         if let Err(code) = revalidate() {
-            *refusal_ref.lock().expect("refusal cell") = Some(code);
+            refusal_ref.store(refusal_tag(code), Ordering::Release);
             return Err("refused before submission".to_string());
         }
-        builder.sign_with_keys(&signing_keys).map_err(|_| {
-            *refusal_ref.lock().expect("refusal cell") = Some(super::dispatch::code::INTERNAL);
+        let signed = builder.sign_with_keys(&signing_keys).map_err(|_| {
+            refusal_ref.store(REFUSAL_INTERNAL, Ordering::Release);
             "the event could not be signed".to_string()
-        })
+        })?;
+        // Before the irreversible step: the bytes actually signed must be the
+        // ones the id was precomputed from. The relay's acknowledgement is
+        // checked *after* the POST and so cannot prevent a divergent
+        // submission; this can.
+        // Unreachable with a correct signer — `sign_with_keys` derives the id
+        // from the same canonical projection `build()` did, so the two agree by
+        // construction. No fixture can isolate this branch, and the mutation
+        // battery does not claim one. It is kept because it guards the one
+        // thing the relay acknowledgement check cannot: the acknowledgement is
+        // read *after* the POST, so it can report a divergence but not prevent
+        // the submission.
+        if signed.id != expected_id {
+            refusal_ref.store(REFUSAL_INTERNAL, Ordering::Release);
+            return Err("the signed event diverged from the canonical projection".to_string());
+        }
+        Ok(signed)
     };
 
     // Every relay failure collapses to one §8 code with a fixed message. The
@@ -662,14 +741,13 @@ async fn sign_and_publish(
     // returns the same success on retry. The relay's `message` is not forwarded,
     // so "you already did this" is not even observable: the caller is told
     // "committed", which is the only fact that matters to it.
-    let accepted = crate::relay::submit_prepared_event(state, keys, None, prepare)
+    let (accepted, signed) = crate::relay::submit_prepared_event(state, keys, None, prepare)
         .await
         .map_err(|_| {
             // A refusal recorded by `prepare` outranks the generic relay error:
             // the request never reached the relay, so blaming it would be
             // false.
-            let recorded = refusal.lock().expect("refusal cell").take();
-            let code = recorded.unwrap_or(code::RELAY_ERROR);
+            let code = refusal_code(refusal.load(std::sync::atomic::Ordering::Acquire));
             BridgeReply::err(code, message_for(code))
         })?;
 
@@ -687,14 +765,18 @@ async fn sign_and_publish(
         ));
     }
 
+    // §4's result is the **signed** event, `sig` included. Returning an
+    // unsigned projection plus an id would be a different contract, and one the
+    // caller cannot verify.
     Ok(serde_json::json!({
         "event": {
-            "id": signed_id,
-            "pubkey": keys.public_key().to_hex(),
+            "id": signed.id.to_hex(),
+            "pubkey": signed.pubkey.to_hex(),
             "kind": event.kind,
-            "content": event.content,
+            "content": signed.content,
             "created_at": event.created_at,
             "tags": event.tags,
+            "sig": signed.sig.to_string(),
         },
         "relay": { "accepted": accepted.accepted },
     }))
