@@ -57,9 +57,11 @@ pub struct BridgeIdentity {
 
 /// Resolve who is calling, from the host-minted lease.
 ///
-/// Deliberately the whole surface for now. It proves the plumbing — plugin
-/// command, ACL-gated, identity from host state — without committing to the §2
-/// contracts that are still held.
+/// One entry point among several: the §2 contracts now dispatch through
+/// [`super::dispatch`], which serves `identity.getPublicKey` and
+/// `publish.event` over the framed port. This command remains the plumbing
+/// proof — plugin command, ACL-gated, identity from host state. Subscriptions
+/// and request cancellation are what is still held.
 #[tauri::command]
 pub(crate) async fn resolve_identity(lease: String) -> Result<BridgeIdentity, String> {
     match frame_host::extension_for_lease(&lease) {

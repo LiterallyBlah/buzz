@@ -1,6 +1,9 @@
 use super::*;
 
 pub(super) const CHANNEL: &str = "11111111-2222-3333-4444-555555555555";
+/// A host-minted lease, registered in the real frame-host map by the tests
+/// that need the production lease check to resolve.
+pub(super) const LEASE: &str = "lease-for-publish-tests";
 pub(super) const OTHER_CHANNEL: &str = "99999999-8888-7777-6666-555555555555";
 
 /// A grant of kind 9 in `CHANNEL`, and nothing else.

@@ -111,6 +111,20 @@ pub fn reset_rate_limit_gate() {
 #[cfg(test)]
 pub(crate) static TEST_SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+/// Take [`TEST_SERIAL`] and start from a known-inactive gate.
+///
+/// The one fixture for every test that arms *or merely traverses* the gate.
+/// Holding the lock without resetting still inherits a previous test's armed
+/// expiry, and traversing without holding it races a test that arms one — so
+/// pairing the two in a single call is what makes "every traversing test is
+/// guarded" checkable rather than a convention each test restates.
+#[cfg(test)]
+pub(crate) async fn gate_guard() -> tokio::sync::MutexGuard<'static, ()> {
+    let guard = TEST_SERIAL.lock().await;
+    reset_rate_limit_gate();
+    guard
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

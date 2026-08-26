@@ -306,7 +306,10 @@ impl Refusal {
             Refusal::NotAllowlisted => "this kind is not in the v1 signable allowlist",
             Refusal::WrongMethodForKind => "this kind must be published through its own method",
             Refusal::TagNotPermitted => "this event carries a tag an extension may not set",
-            Refusal::MalformedTag => "a tag must have a name",
+            // Covers both a tag with no name at all and a channel tag whose
+            // value is absent or empty. Naming only the first would be false
+            // for the second, which is the case that actually reaches a caller.
+            Refusal::MalformedTag => "a tag is malformed",
             Refusal::ChannelTagNotSingular => {
                 "a channel-scoped event must carry exactly one channel tag"
             }
@@ -485,18 +488,117 @@ pub(crate) fn signing_identity(
         .map_err(|_| BridgeReply::err(code::DENIED, "missing scope: sign"))
 }
 
+/// Does the grant store give `pubkey` the sign scope for this (kind, channel)?
+///
+/// Fail closed: a store that cannot be opened has granted nothing, so every
+/// lookup answers `false` rather than erroring.
+///
+/// Re-opened per call rather than held: a `rusqlite` `Connection` is not
+/// `Sync`, so keeping one alive across the submit await would make the command
+/// future non-`Send`. Re-opening is also what lets [`Revalidation`] read the
+/// store *as it is then*, which is the point of revalidating at all.
+fn grant_lookup(
+    grant_db: Option<&std::path::Path>,
+    extension_id: &str,
+    kind_value: u32,
+    channel: &str,
+    pubkey: &str,
+) -> bool {
+    grant_db
+        .and_then(|path| super::grants::open_grant_db(path).ok())
+        .is_some_and(|conn| {
+            super::grants::has_sign_scope(&conn, pubkey, extension_id, kind_value, channel)
+        })
+}
+
+/// The authority recheck run at the last moment before the POST.
+///
+/// **One owner, called by production and by its proof.** This was an inline
+/// closure, and the held-wait test supplied a hand-written stand-in that
+/// consulted only its own grant row. That test stayed green while the
+/// production lease, identity, full-authorisation and timestamp checks were
+/// deleted — it was measuring a replica. A named type means the test can
+/// invoke the same code the signer does, so removing any check below turns
+/// that proof red.
+///
+/// Deliberately **not** described as liveness or cancellation: budget
+/// exhaustion closes the port without releasing the lease, so a live lease
+/// does not mean a live port, and nothing here recalls a request already on
+/// the wire. Correctness rests on the event id being deterministic; this only
+/// avoids publishing under authority that has since been withdrawn.
+pub(crate) struct Revalidation<'a> {
+    pub(crate) lease: &'a str,
+    pub(crate) extension_id: &'a str,
+    pub(crate) identity_at_entry: &'a str,
+    pub(crate) event: &'a CanonicalEvent,
+    pub(crate) state: &'a crate::AppState,
+    pub(crate) grant_db: Option<std::path::PathBuf>,
+}
+
+impl Revalidation<'_> {
+    /// Re-run every authority decision against the exact event being signed.
+    pub(crate) fn check(&self) -> Result<(), &'static str> {
+        use super::dispatch::code;
+
+        // The lease must still resolve to *this* extension — not merely to
+        // something. A reissued lease pointing elsewhere is a different caller.
+        match super::frame_host::extension_for_lease(self.lease) {
+            Some(current) if current == self.extension_id => {}
+            _ => return Err(code::DENIED),
+        }
+
+        // The signing identity must still be available and unchanged. Recovery
+        // swaps in an ephemeral key, so "available" is not enough on its own.
+        let now_pubkey =
+            super::dispatch::resolve_identity_pubkey(self.state).ok_or(code::DENIED)?;
+        if now_pubkey != self.identity_at_entry {
+            return Err(code::DENIED);
+        }
+
+        // The whole authority decision, re-run against the exact canonical
+        // event — not just the grant row. Re-running `authorise` means a
+        // revocation, a denylist change or a tag that no longer passes is
+        // caught by the same code that admitted it, rather than by a
+        // hand-copied subset of it that could drift.
+        authorise(self.event, |kind_value, channel| {
+            grant_lookup(
+                self.grant_db.as_deref(),
+                self.extension_id,
+                kind_value,
+                channel,
+                &now_pubkey,
+            )
+        })
+        .map_err(Refusal::code)?;
+
+        // The wait is unbounded, so a template that was inside the window when
+        // it arrived may not be now. Signing it anyway would put an event on
+        // the relay that the host would refuse if asked again.
+        if !timestamp_in_window(self.event.created_at, now_unix()) {
+            return Err(code::INVALID_PARAMS);
+        }
+        Ok(())
+    }
+}
+
 /// §4 `publish.event(template) → { event, relay }`.
 ///
 /// The ordering is the security property: parse, canonicalise, **authorise**,
-/// and only then sign. Nothing touches the user's key until every check has
-/// passed on the exact event that will be signed.
+/// and only then sign. Nothing is **signed** until every check has passed on
+/// the exact event that will be signed.
+///
+/// Note the claim is about signing, not about touching the key at all:
+/// [`signing_identity`] clones the keys before the grant check, because the
+/// identity is what §7 grants are keyed *by* — there is nothing to look up
+/// until it is known. Holding the key is not using it; the private half is
+/// applied only inside `sign_and_publish`, after the recheck.
 pub(crate) async fn publish_event<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
     extension_id: &str,
     lease: &str,
     params: Option<Value>,
 ) -> super::dispatch::BridgeReply {
-    use super::dispatch::{code, BridgeReply};
+    use super::dispatch::BridgeReply;
     use tauri::Manager as _;
 
     let template = match parse_template(params, now_unix()) {
@@ -534,17 +636,16 @@ pub(crate) async fn publish_event<R: tauri::Runtime>(
     // would make this command's future non-`Send`. Re-opening also means the
     // revalidation below reads the grant store *as it is then*, which is the
     // point of revalidating at all.
-    let has_grant = |kind_value: u32, channel: &str, pubkey: &str| -> bool {
-        super::dispatch::grant_db_path(app)
-            .ok()
-            .and_then(|path| super::grants::open_grant_db(&path).ok())
-            .is_some_and(|conn| {
-                super::grants::has_sign_scope(&conn, pubkey, extension_id, kind_value, channel)
-            })
-    };
+    let grant_db = super::dispatch::grant_db_path(app).ok();
 
     if let Err(refusal) = authorise(&event, |kind_value, channel| {
-        has_grant(kind_value, channel, &identity_pubkey)
+        grant_lookup(
+            grant_db.as_deref(),
+            extension_id,
+            kind_value,
+            channel,
+            &identity_pubkey,
+        )
     }) {
         return refusal.into();
     }
@@ -556,42 +657,16 @@ pub(crate) async fn publish_event<R: tauri::Runtime>(
     // recalls a request already on the wire. Correctness rests on the event id
     // being deterministic; this only avoids publishing under authority that
     // has since been withdrawn.
-    let identity_at_entry = identity_pubkey.clone();
-    let event_ref = &event;
-    let state_ref = &*state;
-    let revalidate = || -> Result<(), &'static str> {
-        // The lease must still resolve to *this* extension — not merely to
-        // something. A reissued lease pointing elsewhere is a different caller.
-        match super::frame_host::extension_for_lease(lease) {
-            Some(current) if current == extension_id => {}
-            _ => return Err(code::DENIED),
-        }
-        // The signing identity must still be available and unchanged. Recovery
-        // swaps in an ephemeral key, so "available" is not enough on its own.
-        let now_pubkey = super::dispatch::resolve_identity_pubkey(state_ref).ok_or(code::DENIED)?;
-        if now_pubkey != identity_at_entry {
-            return Err(code::DENIED);
-        }
-        // The whole authority decision, re-run against the exact canonical
-        // event — not just the grant row. Re-running `authorise` means a
-        // revocation, a denylist change or a tag that no longer passes is
-        // caught by the same code that admitted it, rather than by a
-        // hand-copied subset of it that could drift.
-        authorise(event_ref, |kind_value, channel| {
-            has_grant(kind_value, channel, &now_pubkey)
-        })
-        .map_err(Refusal::code)?;
-
-        // The wait is unbounded, so a template that was inside the window when
-        // it arrived may not be now. Signing it anyway would put an event on
-        // the relay that the host would refuse if asked again.
-        if !timestamp_in_window(event_ref.created_at, now_unix()) {
-            return Err(code::INVALID_PARAMS);
-        }
-        Ok(())
+    let revalidation = Revalidation {
+        lease,
+        extension_id,
+        identity_at_entry: &identity_pubkey,
+        event: &event,
+        state: &state,
+        grant_db,
     };
 
-    match sign_and_publish(&event, &keys, &state, revalidate).await {
+    match sign_and_publish(&event, &keys, &state, || revalidation.check()).await {
         Ok(signed) => BridgeReply::ok(signed),
         Err(reply) => reply,
     }

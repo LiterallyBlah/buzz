@@ -900,6 +900,22 @@ pub(crate) async fn lifecycle_guard() -> tokio::sync::MutexGuard<'static, ()> {
     guard
 }
 
+/// Register a lease in the real host map without starting a host.
+///
+/// The lease map is the single producer of extension identity, so a test that
+/// wants the production lease check to *pass* must put an entry in the map the
+/// production code reads. Starting two axum servers to obtain one is a slower
+/// way to reach the same state, and a test that instead skips the lease check
+/// is not testing it.
+///
+/// Callers must hold [`lifecycle_guard`], which clears whatever this leaves.
+#[cfg(test)]
+pub(crate) fn insert_lease_for_test(lease: &str, extension_id: &str) {
+    host_state()
+        .leases
+        .insert(lease.to_string(), extension_id.to_string());
+}
+
 /// The running extension-content port, if any. Test and diagnostic use.
 #[cfg(test)]
 pub(crate) fn running_port() -> Option<u16> {

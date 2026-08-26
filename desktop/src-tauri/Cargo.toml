@@ -147,6 +147,11 @@ tracing = "0.1"
 
 [dev-dependencies]
 tauri-utils = "2"
+# `test` enables `tauri::test::mock_app`, so the publish composition tests can
+# drive the real `publish_event` entry point instead of a nearby replica of its
+# ordering. Dev-only: `cargo build` does not resolve dev-dependencies, so the
+# shipped binary is unaffected.
+tauri = { version = "2", features = ["test"] }
 # `test-util` enables tokio's paused-clock (`start_paused`) so the relay
 # admission gate tests can assert exact wait durations without real sleeps.
 tokio = { version = "1", features = ["test-util"] }

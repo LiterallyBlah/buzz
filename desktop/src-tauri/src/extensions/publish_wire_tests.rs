@@ -74,6 +74,7 @@ fn one_shot_relay() -> (String, std::sync::mpsc::Receiver<String>) {
 
 #[tokio::test]
 async fn the_signed_event_on_the_wire_is_the_canonical_event() {
+    let _gate = crate::relay_admission::gate_guard().await;
     // The checks are worthless if the bytes that reach the relay differ from
     // the ones that were checked. This drives the real path —
     // `sign_and_publish` → `submit_signed_event_with_keys` → HTTP POST — and
@@ -131,6 +132,7 @@ async fn the_signed_event_on_the_wire_is_the_canonical_event() {
 
 #[tokio::test]
 async fn a_suppressed_duplicate_is_reported_as_success() {
+    let _gate = crate::relay_admission::gate_guard().await;
     // Ruling B, and the payoff of requiring a stable `created_at`: when the
     // relay recognises the id and answers `accepted: true, message:
     // "duplicate:"`, the event is committed — so the caller gets the *same*
@@ -300,6 +302,7 @@ fn changing_any_canonical_field_changes_the_event_id() {
 
 #[tokio::test]
 async fn an_acknowledgement_naming_a_different_event_is_a_relay_error() {
+    let _gate = crate::relay_admission::gate_guard().await;
     // The relay must be talking about the event we signed. Reporting a
     // mismatch as success would tell the caller some *other* event had
     // committed — and under an idempotent contract they would then stop
@@ -353,24 +356,13 @@ async fn revoking_the_grant_during_a_real_rate_limit_wait_produces_no_post() {
     //
     // The shared guard is mandatory: the gate is a process-wide static, so
     // without it another suite's armed expiry bleeds into this one.
-    let _serial = crate::relay_admission::TEST_SERIAL.lock().await;
-    crate::relay_admission::reset_rate_limit_gate();
+    let _gate = crate::relay_admission::gate_guard().await;
 
-    // A real grant store, granted at entry.
-    let dir = tempfile::tempdir().expect("tempdir");
-    let db_path = dir.path().join("grants").join("extension-grants.db");
-    let identity = "a".repeat(64);
-    {
-        let conn = crate::extensions::grants::open_grant_db(&db_path).expect("open");
-        crate::extensions::grants::grant_sign_scope(
-            &conn,
-            &identity,
-            "demo",
-            kind::KIND_STREAM_MESSAGE,
-            CHANNEL,
-        )
-        .expect("grant");
-    }
+    // The lease map is a process-wide global too, and this registers a real
+    // entry in it so the production lease check resolves rather than being
+    // stepped around.
+    let _host = crate::extensions::frame_host::lifecycle_guard().await;
+    crate::extensions::frame_host::insert_lease_for_test(LEASE, "demo");
 
     // A listener that counts connections, so "no POST" is observed.
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
@@ -388,27 +380,51 @@ async fn revoking_the_grant_during_a_real_rate_limit_wait_produces_no_post() {
     *state.keys.lock().unwrap() = keys.clone();
     *state.relay_url_override.lock().unwrap() = Some(format!("http://{addr}"));
 
-    let event = message(vec![tag(&["h", CHANNEL])], "hello");
-
-    // The revalidator reads the real store, exactly as production does.
-    let revalidate = || -> Result<(), &'static str> {
-        let granted = crate::extensions::grants::open_grant_db(&db_path)
-            .ok()
-            .is_some_and(|conn| {
-                crate::extensions::grants::has_sign_scope(
-                    &conn,
-                    &identity,
-                    "demo",
-                    kind::KIND_STREAM_MESSAGE,
-                    CHANNEL,
-                )
-            });
-        if granted {
-            Ok(())
-        } else {
-            Err(code::DENIED)
-        }
+    // A current timestamp, because the production revalidator checks the
+    // window and the shared fixture is dated 2023. The hand-written stand-in
+    // this replaces checked only a grant row, so it never noticed.
+    let event = CanonicalEvent {
+        created_at: now_unix(),
+        ..message(vec![tag(&["h", CHANNEL])], "hello")
     };
+
+    // A real grant store, keyed by the pubkey that will actually sign. The
+    // previous fixture granted to a literal `"aaaa..."` identity that no part
+    // of the run ever signed with, which is what let it pass while production
+    // checked something else entirely.
+    let identity = keys.public_key().to_hex();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("grants").join("extension-grants.db");
+    {
+        let conn = crate::extensions::grants::open_grant_db(&db_path).expect("open");
+        crate::extensions::grants::grant_sign_scope(
+            &conn,
+            &identity,
+            "demo",
+            kind::KIND_STREAM_MESSAGE,
+            CHANNEL,
+        )
+        .expect("grant");
+    }
+
+    // The production revalidator itself — the same type `publish_event`
+    // constructs, so the lease, identity, full `authorise` and timestamp
+    // checks under test are the ones that run in the signer. A hand-written
+    // stand-in here is why this proof previously survived deleting them.
+    let revalidation = Revalidation {
+        lease: LEASE,
+        extension_id: "demo",
+        identity_at_entry: &identity,
+        event: &event,
+        state: &state,
+        grant_db: Some(db_path.clone()),
+    };
+    let revalidate = || revalidation.check();
+
+    // The grant is live before the wait is armed, so the refusal below can
+    // only come from the revocation rather than from a fixture that never
+    // granted anything.
+    revalidate().expect("authority must hold at entry");
 
     // Arm a real wait, then revoke while the submission is parked in it.
     crate::relay_admission::activate_rate_limit(Some(1));
@@ -451,6 +467,7 @@ async fn revoking_the_grant_during_a_real_rate_limit_wait_produces_no_post() {
 
 #[tokio::test]
 async fn a_relay_refusal_is_normalised_and_leaks_nothing() {
+    let _gate = crate::relay_admission::gate_guard().await;
     // §8: the relay's message is written for an operator and can name hosts,
     // kinds and internal reasons. An extension gets a stable code and a fixed
     // string instead.
@@ -566,6 +583,7 @@ fn ambiguous_relay() -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) 
 
 #[tokio::test]
 async fn a_dropped_response_then_an_exact_retry_yields_one_event_id() {
+    let _gate = crate::relay_admission::gate_guard().await;
     // Proof 4. The first publish commits and the response is lost, so the
     // caller sees a failure for work that actually happened. Retrying the
     // *exact same template* must send the identical event id — which is what
@@ -657,5 +675,141 @@ async fn a_missing_created_at_is_refused_before_signing_or_network() {
         connections.load(std::sync::atomic::Ordering::SeqCst),
         0,
         "a refused template must reach neither the signer nor the network"
+    );
+}
+
+/// A listener that accepts and counts connections without answering.
+///
+/// Counting connections rather than parsed requests is deliberate: the claim
+/// under test is that nothing was *sent*, and a TCP connection is the earliest
+/// observable evidence that it was.
+fn counting_listener() -> (
+    std::net::SocketAddr,
+    std::sync::Arc<std::sync::atomic::AtomicUsize>,
+) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let connections = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = connections.clone();
+    std::thread::spawn(move || {
+        for _ in listener.incoming() {
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    });
+    (addr, connections)
+}
+
+#[tokio::test]
+async fn the_returned_event_is_the_signed_event_the_relay_received() {
+    // §4's result is the **signed** event. The caller has to be able to verify
+    // what it was told had been published, and until this test existed it
+    // could not: the only assertion on the returned event compared its `id`,
+    // so deleting `"sig"` from the result broke nothing.
+    let _gate = crate::relay_admission::gate_guard().await;
+    use nostr::JsonUtil as _;
+
+    let (relay_url, received) = one_shot_relay();
+    let keys = nostr::Keys::generate();
+    let state = crate::app_state::build_app_state();
+    *state.keys.lock().unwrap() = keys.clone();
+    *state.relay_url_override.lock().unwrap() = Some(relay_url);
+
+    let event = message(
+        vec![tag(&["h", CHANNEL]), tag(&["p", &"b".repeat(64)])],
+        "verify me",
+    );
+
+    let result = sign_and_publish(&event, &keys, &state, || Ok(()))
+        .await
+        .expect("the publish path must succeed against an accepting relay");
+
+    let body = received
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("the relay must have received a POST body");
+    let on_wire = nostr::Event::from_json(&body).expect("the body must be a nostr event");
+
+    // The returned event stands on its own: it parses as a nostr event, and
+    // its signature covers its own bytes. A projection without `sig` cannot
+    // reach this line.
+    let returned = nostr::Event::from_json(result["event"].to_string())
+        .expect("the returned event must deserialize as a signed nostr event");
+    returned
+        .verify()
+        .expect("the returned event must verify against its own signature");
+
+    // And it is the same event that crossed the socket — compared field by
+    // field rather than with `==`, which for a nostr event is an id
+    // comparison and would pass with a different signature attached.
+    assert_eq!(
+        returned.sig, on_wire.sig,
+        "the returned signature must be the one that was submitted"
+    );
+    assert_eq!(returned.id, on_wire.id);
+    assert_eq!(returned.pubkey, on_wire.pubkey);
+    assert_eq!(returned.kind, on_wire.kind);
+    assert_eq!(returned.content, on_wire.content);
+    assert_eq!(returned.created_at, on_wire.created_at);
+    let returned_tags: Vec<Vec<String>> =
+        returned.tags.iter().map(|t| t.clone().to_vec()).collect();
+    let wire_tags: Vec<Vec<String>> = on_wire.tags.iter().map(|t| t.clone().to_vec()).collect();
+    assert_eq!(returned_tags, wire_tags);
+}
+
+#[tokio::test]
+async fn a_refused_template_reaches_neither_key_nor_socket_on_the_production_path() {
+    // Proof 8R's production witness. The previous version called
+    // `parse_template` directly against a listener that was never wired into
+    // any state — zero connections were inevitable, because nothing in the
+    // test could have connected. This drives the real `publish_event` entry
+    // point with the listener reachable from the state it uses.
+    let _gate = crate::relay_admission::gate_guard().await;
+    use tauri::Manager as _;
+
+    let (addr, connections) = counting_listener();
+    let keys = nostr::Keys::generate();
+    let state = crate::app_state::build_app_state();
+    *state.keys.lock().unwrap() = keys.clone();
+    *state.relay_url_override.lock().unwrap() = Some(format!("http://{addr}"));
+
+    // Control: this exact state does reach that socket. Without it, the zero
+    // below is unfalsifiable — an unreachable listener reports zero whatever
+    // the code under test does.
+    let control = message(vec![tag(&["h", CHANNEL])], "control");
+    let _ = sign_and_publish(&control, &keys, &state, || Ok(())).await;
+    assert_eq!(
+        connections.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "the listener must be reachable through this state for the assertion below to mean anything"
+    );
+
+    // The identity is now marked lost, which makes the ordering observable:
+    // `signing_identity` refuses with `denied`, so if the key boundary were
+    // reached before the template was parsed this test would see `denied`
+    // instead of `invalid_params`.
+    state
+        .identity_lost
+        .store(true, std::sync::atomic::Ordering::Release);
+
+    let app = tauri::test::mock_app();
+    app.manage(state);
+
+    let reply = crate::extensions::publish::publish_event(
+        app.handle(),
+        "demo",
+        LEASE,
+        Some(template_params(None)),
+    )
+    .await;
+
+    assert!(!reply.ok);
+    assert_eq!(
+        reply.error.as_ref().map(|e| e.code.as_str()),
+        Some(code::INVALID_PARAMS),
+        "a template with no created_at must be refused by the parser, before the key is consulted"
+    );
+    assert_eq!(
+        connections.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "the refused template must not have produced a second connection"
     );
 }
