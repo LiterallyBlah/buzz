@@ -607,6 +607,93 @@ async fn the_wrapper_document_carries_the_navigation_wall() {
     assert!(wait_until_closed(claim.extension_port).await);
 }
 
+// ── §2 mediator: the wrapper is a conduit, not an endpoint ───────────────────
+
+#[test]
+fn the_wrapper_transfers_the_port_through_rather_than_bridging_it() {
+    // BRIDGE_SPEC §2: "the wrapper re-posts with the received port in the
+    // transfer list, so after the handshake the MessageChannel runs directly
+    // between the host's port1 and the extension's port2; the wrapper holds no
+    // port. A wrapper that instead kept the port and bridged two channels would
+    // be a permanent man-in-the-middle and is non-conformant."
+    //
+    // A bridging wrapper is indistinguishable from a conforming one by
+    // observation from either end — both deliver working messaging. What
+    // separates them is that a bridge must *construct its own channel* and
+    // *retain* a port. So those are what this asserts against the served
+    // document.
+    let document = wrapper_document("http://127.0.0.1:51234/ext/demo/index.html");
+
+    // The through-transfer itself: the received ports travel onward in the
+    // transfer list of the re-post.
+    assert!(
+        document.contains(r#"postMessage(event.data, "*", event.ports)"#),
+        "the wrapper must re-post the port through; got: {document}"
+    );
+
+    // A bridge needs a channel of its own. There must be none.
+    assert!(
+        !document.contains("MessageChannel"),
+        "a wrapper that constructs a channel is bridging, not relaying; got: {document}"
+    );
+
+    // And it must not keep a reference. `event.ports` may appear only as the
+    // transfer argument above — never on the right-hand side of an assignment
+    // and never indexed into.
+    assert_eq!(
+        document.matches("event.ports").count(),
+        1,
+        "event.ports may be referenced exactly once, as the transfer list; got: {document}"
+    );
+    assert!(
+        !document.contains("event.ports["),
+        "indexing event.ports means taking a reference to a port; got: {document}"
+    );
+}
+
+#[test]
+fn the_wrapper_relays_each_direction_only_from_its_one_expected_source() {
+    // §2: up only when the source is its single embedded extension frame, down
+    // only when the source is its parent. Mirrored source-identity, because an
+    // opaque frame has no usable origin.
+    let document = wrapper_document("http://127.0.0.1:51234/ext/demo/index.html");
+    assert!(
+        document.contains("event.source === frame.contentWindow"),
+        "upward relay must be gated on the embedded frame's identity; got: {document}"
+    );
+    assert!(
+        document.contains("event.source === parent"),
+        "downward relay must be gated on the parent's identity; got: {document}"
+    );
+}
+
+#[test]
+fn the_wrapper_relays_only_the_two_handshake_envelopes() {
+    // §2: narrowing to the handshake keeps "relays the handshake" literal and
+    // avoids disclosing unrelated parent messages to the extension.
+    let document = wrapper_document("http://127.0.0.1:51234/ext/demo/index.html");
+    assert!(
+        document.contains(r#"envelope(event.data, "ready")"#),
+        "upward relay must be limited to the ready envelope; got: {document}"
+    );
+    assert!(
+        document.contains(r#"envelope(event.data, "port")"#),
+        "downward relay must be limited to the port envelope; got: {document}"
+    );
+}
+
+#[test]
+fn the_wrapper_forwards_no_port_upward() {
+    // §2: the host originates the channel and MUST NOT adopt a port arriving
+    // from the frame side. The wrapper's upward re-post therefore carries no
+    // transfer list at all.
+    let document = wrapper_document("http://127.0.0.1:51234/ext/demo/index.html");
+    assert!(
+        document.contains(r#"parent.postMessage(event.data, "*")"#),
+        "the upward relay must post without a transfer list; got: {document}"
+    );
+}
+
 // ── Distinct origins (P4 scaffolding) ────────────────────────────────────────
 //
 // The wrapper and package content are served from separate origins so a hostile

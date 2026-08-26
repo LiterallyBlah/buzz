@@ -255,6 +255,101 @@ async function wrapperLoadsWhenFramed(
   return await ran;
 }
 
+/**
+ * Drive the real §2 handshake end to end: the real `ExtensionFrame` (which
+ * starts `startHostHandshake`), a real browser, and a served document standing
+ * in for the wrapper's relay.
+ *
+ * The wrapper's own conformance — through-transfer, mirrored source checks,
+ * handshake-only relay — is pinned by the Rust tests against the served
+ * document, each falsified against a deliberately non-conformant wrapper. What
+ * those cannot show is that the two ends *compose*. That is this test.
+ */
+async function handshakeOutcome(
+  page: import("@playwright/test").Page,
+  options: { relayReady: boolean },
+) {
+  const origin = "http://127.0.0.1:51234";
+  const production = readFileSync(
+    new URL("./fixtures/wrapper-csp.txt", import.meta.url),
+    "utf8",
+  ).trim();
+
+  // Stands in for the wrapper: relays `ready` up, and on `port` coming down,
+  // starts talking on the transferred port — which is only possible if the
+  // port arrived by transfer rather than being bridged.
+  const wrapper = `<!doctype html><title>wrapper</title><script>
+    ${options.relayReady ? 'parent.postMessage({ buzz: "ready" }, "*");' : "/* no ready */"}
+    window.addEventListener("message", function (event) {
+      if (event.source === parent && event.data && event.data.buzz === "port") {
+        var port = event.ports[0];
+        port.onmessage = function (m) {
+          port.postMessage({ echo: m.data });
+        };
+        port.start();
+        parent.postMessage({ buzz: "port-received", v: event.data.v }, "*");
+      }
+    });
+  </script>`;
+
+  await page.route(`${origin}/**`, async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: "text/html; charset=utf-8",
+      headers: { "Content-Security-Policy": production },
+      body: wrapper,
+    });
+  });
+
+  await installMockBridge(page, {
+    extensionPickPath: "/tmp/equation-explorer",
+    extensionPreviewManifest: MANIFEST,
+    extensionFrameOrigin: origin,
+  });
+  await installOne(page);
+
+  const observed = page.evaluate(
+    () =>
+      new Promise<{ received: boolean; version: number | null }>((resolve) => {
+        const timer = window.setTimeout(
+          () => resolve({ received: false, version: null }),
+          4000,
+        );
+        window.addEventListener("message", function onMessage(event) {
+          const data = event.data as { buzz?: string; v?: number };
+          if (data?.buzz === "port-received") {
+            window.clearTimeout(timer);
+            window.removeEventListener("message", onMessage);
+            resolve({ received: true, version: data.v ?? null });
+          }
+        });
+      }),
+  );
+
+  await page.getByTestId("open-extension-equation-explorer").click();
+  return await observed;
+}
+
+test("the host completes the §2 handshake and the frame receives the port", async ({
+  page,
+}) => {
+  const outcome = await handshakeOutcome(page, { relayReady: true });
+  expect(outcome.received).toBe(true);
+  // The wire version travels with the envelope, so a future bump is visible
+  // here rather than silently accepted.
+  expect(outcome.version).toBe(1);
+});
+
+test("CONTROL: no port is issued when the frame never says ready", async ({
+  page,
+}) => {
+  // Without this, the test above could pass because the host hands out a port
+  // unconditionally — which is exactly the failure the source-identity and
+  // envelope rules exist to prevent.
+  const outcome = await handshakeOutcome(page, { relayReady: false });
+  expect(outcome.received).toBe(false);
+});
+
 test("REGRESSION: the wrapper still loads inside the iframe Buzz renders", async ({
   page,
 }) => {

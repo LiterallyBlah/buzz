@@ -1,5 +1,6 @@
 import * as React from "react";
 
+import { startHostHandshake } from "@/features/extensions/lib/bridgeHandshake";
 import {
   type ExtensionFrameTarget,
   closeExtensionFrame,
@@ -34,12 +35,16 @@ type ExtensionFrameProps = {
 /**
  * Hosts one installed extension's page.
  *
- * There is no bridge here. The frame gets no `window.buzz`, no port and no
- * Tauri IPC — a page loaded in it can render itself and nothing else. P4 adds
- * the handshake; this component only has to leave that door open, which it does
- * by keeping a ref to the iframe (the host must later verify
- * `event.source === frame.contentWindow`, an identity check — an opaque frame's
- * `event.origin` is the string `"null"` and cannot be used).
+ * The iframe points at the **wrapper**, not the extension — Route A puts a
+ * trusted host-authored document in between, and `target.url` is its URL. So
+ * the §2 handshake this component starts is with the wrapper's
+ * `contentWindow`, which is the handle the host itself created; the wrapper
+ * relays to the one extension it embeds, keeping attribution 1:1.
+ *
+ * The frame still gets no `window.buzz` and no Tauri IPC. What it gets is one
+ * `MessagePort`, and only after the host has attributed the `ready` by
+ * identity — an opaque frame's `event.origin` is the string `"null"` and
+ * cannot be used. See `bridgeHandshake.ts` for the four rules.
  */
 export function ExtensionFrame({ extensionId }: ExtensionFrameProps) {
   const [target, setTarget] = React.useState<ExtensionFrameTarget | null>(null);
@@ -88,6 +93,20 @@ export function ExtensionFrame({ extensionId }: ExtensionFrameProps) {
       releaseHeld();
     };
   }, [extensionId]);
+
+  // Started only once the wrapper frame exists, and torn down with it. The
+  // effect depends on `target.url` because a new url means a new document, and
+  // therefore a new `contentWindow` that must be attributed afresh.
+  React.useEffect(() => {
+    const frame = frameRef.current;
+    if (!target || !frame) {
+      return;
+    }
+    const handshake = startHostHandshake({ frame });
+    return () => {
+      handshake.dispose();
+    };
+  }, [target]);
 
   if (error) {
     return (
