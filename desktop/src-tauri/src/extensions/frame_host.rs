@@ -693,7 +693,11 @@ struct FrameHostState {
     /// somebody else's — which is exactly the defect a bare counter had: one
     /// healthy frame plus one failed-open frame unmounting stopped the server
     /// still serving the healthy one.
-    leases: std::collections::BTreeSet<String>,
+    ///
+    /// Maps the opaque lease to the extension id it was issued for. The map
+    /// (rather than a set) is what lets the bridge resolve identity from a
+    /// host-minted token instead of trusting a caller-supplied id.
+    leases: std::collections::BTreeMap<String, String>,
 }
 
 static FRAME_HOST: OnceLock<Mutex<FrameHostState>> = OnceLock::new();
@@ -726,13 +730,13 @@ pub(crate) struct FrameLease {
 ///
 /// Idempotent in the sense that matters: a second frame reuses the running
 /// listener, but gets its **own** lease.
-pub(crate) async fn acquire(base_dir: PathBuf) -> Result<FrameLease, String> {
+pub(crate) async fn acquire(base_dir: PathBuf, extension_id: &str) -> Result<FrameLease, String> {
     let lease = uuid::Uuid::new_v4().to_string();
     {
         let mut state = host_state();
         if let Some(running) = &state.running {
             let (extension_port, wrapper_port) = (running.extension_port, running.wrapper_port);
-            state.leases.insert(lease.clone());
+            state.leases.insert(lease.clone(), extension_id.to_string());
             return Ok(FrameLease {
                 extension_port,
                 wrapper_port,
@@ -787,7 +791,7 @@ pub(crate) async fn acquire(base_dir: PathBuf) -> Result<FrameLease, String> {
         let (extension_port, wrapper_port) = (running.extension_port, running.wrapper_port);
         let _ = shutdown_extension.send(());
         let _ = shutdown_wrapper.send(());
-        state.leases.insert(lease.clone());
+        state.leases.insert(lease.clone(), extension_id.to_string());
         return Ok(FrameLease {
             extension_port,
             wrapper_port,
@@ -800,7 +804,7 @@ pub(crate) async fn acquire(base_dir: PathBuf) -> Result<FrameLease, String> {
         shutdown_extension,
         shutdown_wrapper,
     });
-    state.leases.insert(lease.clone());
+    state.leases.insert(lease.clone(), extension_id.to_string());
     Ok(FrameLease {
         extension_port,
         wrapper_port,
@@ -815,7 +819,7 @@ pub(crate) async fn acquire(base_dir: PathBuf) -> Result<FrameLease, String> {
 /// no lease to present, so its cleanup is a no-op instead of a theft.
 pub(crate) fn release(lease: &str) {
     let mut state = host_state();
-    if !state.leases.remove(lease) {
+    if state.leases.remove(lease).is_none() {
         return;
     }
     if state.leases.is_empty() {
@@ -838,6 +842,19 @@ pub(crate) fn shutdown_now() {
         let _ = running.shutdown_extension.send(());
         let _ = running.shutdown_wrapper.send(());
     }
+}
+
+/// Resolve a host-minted lease to the extension it was issued for.
+///
+/// **This is the single producer of extension identity for the bridge.** The
+/// caller supplies only the opaque lease the host handed it; the id comes from
+/// host state. A caller that invents an id gets nowhere, because no parameter
+/// it can set is consulted.
+///
+/// Returns `None` for an unknown or already-released lease, which is what makes
+/// "released" terminal rather than advisory.
+pub(crate) fn extension_for_lease(lease: &str) -> Option<String> {
+    host_state().leases.get(lease).cloned()
 }
 
 /// The running extension-content port, if any. Test and diagnostic use.

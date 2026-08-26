@@ -25,6 +25,7 @@ mod install;
 // `pub(crate)` so the signer enforcement in the bridge (P4) can import
 // `manifest::EXTENSION_SIGNABLE_KINDS` rather than re-declare the allowlist.
 // One writer, two consumers.
+pub(crate) mod bridge;
 pub(crate) mod manifest;
 mod package_path;
 mod preview;
@@ -169,7 +170,7 @@ pub async fn open_extension_frame(
             .map_err(|error| format!("extension frame task failed: {error}"))??
     };
 
-    let claim = frame_host::acquire(base_dir).await?;
+    let claim = frame_host::acquire(base_dir, &manifest.id).await?;
     // Buzz frames the *wrapper*, so the origin the caller asserts against is
     // the wrapper origin — a different origin from the one serving package
     // content, which is the point of the split.

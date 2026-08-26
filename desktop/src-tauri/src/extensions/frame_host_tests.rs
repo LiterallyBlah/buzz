@@ -220,7 +220,7 @@ async fn the_host_starts_serves_and_leaves_no_listener_behind() {
     let _guard = lifecycle_guard().await;
     let base = installed(&[("index.html", b"<!doctype html><title>demo</title>")]);
 
-    let claim = acquire(base.path().to_path_buf())
+    let claim = acquire(base.path().to_path_buf(), "demo")
         .await
         .expect("host should start");
     let port = claim.extension_port;
@@ -268,8 +268,12 @@ async fn a_second_frame_keeps_the_host_up_until_both_release() {
     let _guard = lifecycle_guard().await;
     let base = installed(&[("index.html", b"x")]);
 
-    let first = acquire(base.path().to_path_buf()).await.expect("first");
-    let second = acquire(base.path().to_path_buf()).await.expect("second");
+    let first = acquire(base.path().to_path_buf(), "demo")
+        .await
+        .expect("first");
+    let second = acquire(base.path().to_path_buf(), "demo")
+        .await
+        .expect("second");
     assert_eq!(
         first.extension_port, second.extension_port,
         "a second frame must reuse the one listener"
@@ -299,9 +303,13 @@ async fn shutdown_stops_the_host_even_with_holders_outstanding() {
     let _guard = lifecycle_guard().await;
     let base = installed(&[("index.html", b"x")]);
 
-    let claim = acquire(base.path().to_path_buf()).await.expect("acquire");
+    let claim = acquire(base.path().to_path_buf(), "demo")
+        .await
+        .expect("acquire");
     let port = claim.extension_port;
-    let second = acquire(base.path().to_path_buf()).await.expect("acquire");
+    let second = acquire(base.path().to_path_buf(), "demo")
+        .await
+        .expect("acquire");
     assert!(is_listening(port).await);
 
     shutdown_now();
@@ -323,11 +331,15 @@ async fn a_restarted_host_serves_again_on_a_fresh_port() {
     let _guard = lifecycle_guard().await;
     let base = installed(&[("index.html", b"x")]);
 
-    let first = acquire(base.path().to_path_buf()).await.expect("first");
+    let first = acquire(base.path().to_path_buf(), "demo")
+        .await
+        .expect("first");
     release(&first.lease);
     assert!(wait_until_closed(first.extension_port).await);
 
-    let second = acquire(base.path().to_path_buf()).await.expect("second");
+    let second = acquire(base.path().to_path_buf(), "demo")
+        .await
+        .expect("second");
     assert!(
         is_listening(second.extension_port).await,
         "the host did not come back"
@@ -342,7 +354,9 @@ async fn traversal_is_refused_over_the_wire_too() {
     let base = installed(&[("index.html", b"x")]);
     fs::write(base.path().join("secret.txt"), b"top secret").expect("secret");
 
-    let claim = acquire(base.path().to_path_buf()).await.expect("acquire");
+    let claim = acquire(base.path().to_path_buf(), "demo")
+        .await
+        .expect("acquire");
     let port = claim.extension_port;
     let origin = origin_for_port(port);
 
@@ -420,7 +434,9 @@ async fn every_served_document_carries_the_egress_policy() {
         ("data.json", b"{}"),
     ]);
 
-    let claim = acquire(base.path().to_path_buf()).await.expect("acquire");
+    let claim = acquire(base.path().to_path_buf(), "demo")
+        .await
+        .expect("acquire");
     let port = claim.extension_port;
     let origin = origin_for_port(port);
 
@@ -493,7 +509,9 @@ async fn a_failed_open_cannot_stop_a_healthy_frame() {
     let _guard = lifecycle_guard().await;
     let base = installed(&[("index.html", b"x")]);
 
-    let healthy = acquire(base.path().to_path_buf()).await.expect("frame A");
+    let healthy = acquire(base.path().to_path_buf(), "demo")
+        .await
+        .expect("frame A");
     assert!(is_listening(healthy.extension_port).await);
 
     // Frame B never got a lease — its open failed. Cleanup still runs.
@@ -518,8 +536,12 @@ async fn releasing_the_same_lease_twice_does_not_close_another_frame() {
     let _guard = lifecycle_guard().await;
     let base = installed(&[("index.html", b"x")]);
 
-    let first = acquire(base.path().to_path_buf()).await.expect("first");
-    let second = acquire(base.path().to_path_buf()).await.expect("second");
+    let first = acquire(base.path().to_path_buf(), "demo")
+        .await
+        .expect("first");
+    let second = acquire(base.path().to_path_buf(), "demo")
+        .await
+        .expect("second");
 
     release(&first.lease);
     release(&first.lease);
@@ -549,7 +571,9 @@ async fn the_wrapper_document_carries_the_navigation_wall() {
     .expect("manifest");
     fs::write(root.join("index.html"), b"<!doctype html>hello").expect("entry");
 
-    let claim = acquire(base.path().to_path_buf()).await.expect("acquire");
+    let claim = acquire(base.path().to_path_buf(), "demo")
+        .await
+        .expect("acquire");
     let origin = origin_for_port(claim.extension_port);
     let wrapper_origin = origin_for_port(claim.wrapper_port);
     assert_ne!(
@@ -614,7 +638,9 @@ async fn the_wrapper_is_not_served_from_the_extension_origin() {
     .expect("manifest");
     fs::write(root.join("index.html"), b"<!doctype html>hello").expect("entry");
 
-    let claim = acquire(base.path().to_path_buf()).await.expect("acquire");
+    let claim = acquire(base.path().to_path_buf(), "demo")
+        .await
+        .expect("acquire");
     let extension_origin = origin_for_port(claim.extension_port);
     let wrapper_origin = origin_for_port(claim.wrapper_port);
 
@@ -643,7 +669,9 @@ async fn the_wrapper_is_not_served_from_the_extension_origin() {
 async fn package_content_is_not_served_from_the_wrapper_origin() {
     let _guard = lifecycle_guard().await;
     let base = installed(&[("index.html", b"<!doctype html>hello")]);
-    let claim = acquire(base.path().to_path_buf()).await.expect("acquire");
+    let claim = acquire(base.path().to_path_buf(), "demo")
+        .await
+        .expect("acquire");
     let extension_origin = origin_for_port(claim.extension_port);
     let wrapper_origin = origin_for_port(claim.wrapper_port);
 
@@ -695,7 +723,9 @@ fn the_wrapper_frames_the_extension_origin_not_its_own() {
 async fn the_wrapper_refuses_an_unknown_or_invalid_extension() {
     let _guard = lifecycle_guard().await;
     let base = installed(&[("index.html", b"x")]);
-    let claim = acquire(base.path().to_path_buf()).await.expect("acquire");
+    let claim = acquire(base.path().to_path_buf(), "demo")
+        .await
+        .expect("acquire");
     let origin = origin_for_port(claim.wrapper_port);
 
     for id in ["../demo", "nope", "Evil"] {
@@ -815,7 +845,9 @@ async fn html_is_locked_down_over_the_wire_and_other_types_are_untouched() {
         ("app.js", b"// RTCPeerConnection stays a word in JS source"),
         ("data.json", b"{}"),
     ]);
-    let claim = acquire(base.path().to_path_buf()).await.expect("acquire");
+    let claim = acquire(base.path().to_path_buf(), "demo")
+        .await
+        .expect("acquire");
     let origin = origin_for_port(claim.extension_port);
 
     let html = reqwest::get(format!("{origin}/{EXTENSION_ROUTE_PREFIX}/demo/index.html"))
@@ -904,7 +936,9 @@ async fn a_post_install_non_utf8_html_asset_is_refused() {
     broken.push(0xff);
     fs::write(base.path().join("demo").join("broken.html"), &broken).expect("broken");
 
-    let claim = acquire(base.path().to_path_buf()).await.expect("acquire");
+    let claim = acquire(base.path().to_path_buf(), "demo")
+        .await
+        .expect("acquire");
     let origin = origin_for_port(claim.extension_port);
     let response = reqwest::get(format!(
         "{origin}/{EXTENSION_ROUTE_PREFIX}/demo/broken.html"
@@ -977,7 +1011,9 @@ async fn an_svg_asset_is_served_renderable_but_inert() {
             b"<svg xmlns=\"http://www.w3.org/2000/svg\"></svg>",
         ),
     ]);
-    let claim = acquire(base.path().to_path_buf()).await.expect("acquire");
+    let claim = acquire(base.path().to_path_buf(), "demo")
+        .await
+        .expect("acquire");
     let origin = origin_for_port(claim.extension_port);
 
     let response = reqwest::get(format!("{origin}/{EXTENSION_ROUTE_PREFIX}/demo/asset.svg"))

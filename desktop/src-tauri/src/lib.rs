@@ -126,6 +126,13 @@ pub fn run() {
         .plugin(tauri_plugin_deep_link::init())
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_opener::init())
+        // The extension bridge. Registering it does NOT expose it: plugin
+        // commands are always ACL-checked, and no capability grants
+        // `extension-bridge:allow-resolve-identity` yet, so it is denied from
+        // every origin including Buzz's own. That fail-closed default is
+        // deliberate — the capability's final shape is held pending the
+        // owner-run Windows wrapper-origin classification row.
+        .plugin(extensions::bridge::init())
         .plugin(
             tauri_plugin_window_state::Builder::default()
                 // Visibility is excluded: the native reveal plugin below
