@@ -447,35 +447,64 @@ pub(crate) async fn publish_event<R: tauri::Runtime>(
     };
     let identity_pubkey = keys.public_key().to_hex();
 
-    // Fail closed: a store we cannot open has granted nothing, so the closure
-    // below answers `false` for every (kind, channel) rather than erroring.
-    let grant_db = super::dispatch::grant_db_path(app)
-        .ok()
-        .and_then(|path| super::grants::open_grant_db(&path).ok());
+    // Fail closed: a store we cannot open has granted nothing, so the lookup
+    // answers `false` for every (kind, channel) rather than erroring.
+    //
+    // Scoped, and re-opened per check rather than held: a `rusqlite`
+    // `Connection` is not `Sync`, so keeping one alive across the submit await
+    // would make this command's future non-`Send`. Re-opening also means the
+    // revalidation below reads the grant store *as it is then*, which is the
+    // point of revalidating at all.
+    let has_grant = |kind_value: u32, channel: &str, pubkey: &str| -> bool {
+        super::dispatch::grant_db_path(app)
+            .ok()
+            .and_then(|path| super::grants::open_grant_db(&path).ok())
+            .is_some_and(|conn| {
+                super::grants::has_sign_scope(&conn, pubkey, extension_id, kind_value, channel)
+            })
+    };
 
     if let Err(refusal) = authorise(&event, |kind_value, channel| {
-        grant_db.as_ref().is_some_and(|conn| {
-            super::grants::has_sign_scope(conn, &identity_pubkey, extension_id, kind_value, channel)
-        })
+        has_grant(kind_value, channel, &identity_pubkey)
     }) {
         return refusal.into();
     }
 
-    // A cheap complement, explicitly **not** load-bearing: if the frame has
-    // already gone there is no one to answer, so skip the work. Correctness
-    // rests on the event id being deterministic, not on winning this race —
-    // the frame can still vanish between this check and the relay accepting,
-    // and that case is safe because the retry rebuilds the same id.
-    //
-    // Signing has already happened and is harmless on its own: with egress
-    // default-deny a signed-but-unpublished event has nowhere to go, which is
-    // §4's own reason for cutting `sign.event`. The irreversible step is the
-    // submit below, so this is the last useful moment to check.
-    if super::frame_host::extension_for_lease(lease).is_none() {
-        return BridgeReply::err(code::DENIED, "no live extension frame for this lease");
-    }
+    // Authority is re-checked at the last moment before the POST, inside
+    // `sign_and_publish`. It is deliberately **not** described as liveness or
+    // cancellation: budget exhaustion closes the port without releasing the
+    // lease, so a live lease does not mean a live port, and nothing here
+    // recalls a request already on the wire. Correctness rests on the event id
+    // being deterministic; this only avoids publishing under authority that
+    // has since been withdrawn.
+    let identity_at_entry = identity_pubkey.clone();
+    let event_ref = &event;
+    let state_ref = &*state;
+    let revalidate = || -> Result<(), String> {
+        // The lease must still resolve to *this* extension — not merely to
+        // something. A reissued lease pointing elsewhere is a different caller.
+        match super::frame_host::extension_for_lease(lease) {
+            Some(current) if current == extension_id => {}
+            _ => return Err("frame lease is no longer this extension".to_string()),
+        }
+        // The signing identity must still be available and unchanged. Recovery
+        // swaps in an ephemeral key, so "available" is not enough on its own.
+        let now_pubkey = super::dispatch::resolve_identity_pubkey(state_ref)
+            .ok_or_else(|| "identity is no longer available".to_string())?;
+        if now_pubkey != identity_at_entry {
+            return Err("identity changed while the request was queued".to_string());
+        }
+        // And the exact (kind, channel) grant must still exist.
+        let channel = event_ref
+            .channel()
+            .ok_or_else(|| "event lost its channel tag".to_string())?;
+        if !has_grant(event_ref.kind, channel, &now_pubkey) {
+            return Err("the grant was revoked while the request was queued".to_string());
+        }
+        Ok(())
+    };
 
-    match sign_and_publish(&event, &keys, &state).await {
+    match sign_and_publish(&event, &keys, &state, revalidate).await {
         Ok(signed) => BridgeReply::ok(signed),
         Err(reply) => reply,
     }
@@ -491,6 +520,7 @@ async fn sign_and_publish(
     event: &CanonicalEvent,
     keys: &nostr::Keys,
     state: &crate::AppState,
+    revalidate: impl Fn() -> Result<(), String>,
 ) -> Result<Value, super::dispatch::BridgeReply> {
     use super::dispatch::{code, BridgeReply};
 
@@ -527,9 +557,22 @@ async fn sign_and_publish(
     // returns the same success on retry. The relay's `message` is not forwarded,
     // so "you already did this" is not even observable: the caller is told
     // "committed", which is the only fact that matters to it.
-    let accepted = crate::relay::submit_signed_event_with_keys(&signed, state, keys, None)
-        .await
-        .map_err(|_| BridgeReply::err(code::RELAY_ERROR, "the relay did not accept the event"))?;
+    let accepted =
+        crate::relay::submit_signed_event_revalidated(&signed, state, keys, None, revalidate)
+            .await
+            .map_err(|_| {
+                BridgeReply::err(code::RELAY_ERROR, "the relay did not accept the event")
+            })?;
+
+    // The relay must be talking about the event we signed. A mismatch means
+    // something between here and the store substituted an id, and reporting it
+    // as success would tell the caller a different event had committed.
+    if accepted.event_id != signed.id.to_hex() {
+        return Err(BridgeReply::err(
+            code::RELAY_ERROR,
+            "the relay acknowledged a different event",
+        ));
+    }
 
     Ok(serde_json::json!({
         "event": {

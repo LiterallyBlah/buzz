@@ -561,6 +561,28 @@ pub async fn submit_signed_event_with_keys(
     keys: &Keys,
     auth_tag: Option<&str>,
 ) -> Result<SubmitEventResponse, String> {
+    submit_signed_event_revalidated(event, state, keys, auth_tag, || Ok(())).await
+}
+
+/// As [`submit_signed_event_with_keys`], but re-checks the caller's authority
+/// after the shared rate-limit wait and immediately before the POST.
+///
+/// The wait is unbounded from the caller's point of view — it is a global gate
+/// another request may have closed — so authority checked before it is
+/// authority checked at the wrong time. A grant can be revoked, an identity can
+/// go into recovery, and a frame can be released while a request sits in that
+/// queue. `revalidate` runs at the last moment where refusing still costs
+/// nothing, which is the instant before the request is put on the wire.
+///
+/// This is **not** cancellation: a POST already in flight is not recalled, and
+/// nothing here recovers an effect that has already committed.
+pub async fn submit_signed_event_revalidated(
+    event: &nostr::Event,
+    state: &AppState,
+    keys: &Keys,
+    auth_tag: Option<&str>,
+    revalidate: impl Fn() -> Result<(), String>,
+) -> Result<SubmitEventResponse, String> {
     if event.pubkey != keys.public_key() {
         return Err("signed event does not match the publishing identity".to_string());
     }
@@ -578,6 +600,9 @@ pub async fn submit_signed_event_with_keys(
     if let Some(tag) = auth_tag {
         request = request.header("x-auth-tag", tag);
     }
+
+    // Last check before the irreversible step.
+    revalidate()?;
 
     let response = request
         .body(body_bytes)

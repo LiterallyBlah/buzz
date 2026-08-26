@@ -400,6 +400,17 @@ fn a_non_integer_created_at_is_rejected() {
 
 // ── the real signing + submission path ───────────────────────────────────────
 
+/// Pull the `"id"` field out of a submitted nostr event body.
+///
+/// The fake relays echo it, because a real relay does — and the host now
+/// verifies the acknowledgement names the event it actually signed.
+fn submitted_event_id(body: &str) -> String {
+    let marker = "\"id\":\"";
+    body.find(marker)
+        .map(|at| body[at + marker.len()..].chars().take(64).collect())
+        .unwrap_or_default()
+}
+
 /// Serve one `POST /events`, hand back the request body it received.
 ///
 /// `std::net` on a `std::thread`, matching the pattern `relay.rs` documents:
@@ -441,7 +452,8 @@ fn one_shot_relay() -> (String, std::sync::mpsc::Receiver<String>) {
                     }
                 }
             }
-            let body = r#"{"event_id":"served","accepted":true,"message":""}"#;
+            let echoed = submitted_event_id(&String::from_utf8_lossy(&raw));
+            let body = format!(r#"{{"event_id":"{echoed}","accepted":true,"message":""}}"#);
             let response = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                 body.len()
@@ -476,7 +488,7 @@ async fn the_signed_event_on_the_wire_is_the_canonical_event() {
         created_at: 1_700_000_000,
     };
 
-    let result = sign_and_publish(&event, &keys, &state)
+    let result = sign_and_publish(&event, &keys, &state, || Ok(()))
         .await
         .expect("the publish path must succeed against an accepting relay");
 
@@ -529,8 +541,10 @@ async fn a_suppressed_duplicate_is_reported_as_success() {
     std::thread::spawn(move || {
         if let Ok((mut stream, _)) = listener.accept() {
             let mut buf = [0u8; 8192];
-            let _ = stream.read(&mut buf);
-            let body = r#"{"event_id":"served","accepted":true,"message":"duplicate:"}"#;
+            let read = stream.read(&mut buf).unwrap_or(0);
+            let echoed = submitted_event_id(&String::from_utf8_lossy(&buf[..read]));
+            let body =
+                format!(r#"{{"event_id":"{echoed}","accepted":true,"message":"duplicate:"}}"#);
             let response = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                 body.len()
@@ -546,7 +560,7 @@ async fn a_suppressed_duplicate_is_reported_as_success() {
     *state.relay_url_override.lock().unwrap() = Some(format!("http://{addr}"));
 
     let event = message(vec![tag(&["h", CHANNEL])], "a retry of an earlier publish");
-    let result = sign_and_publish(&event, &keys, &state)
+    let result = sign_and_publish(&event, &keys, &state, || Ok(()))
         .await
         .expect("a suppressed duplicate must not be an error");
 
@@ -559,6 +573,203 @@ async fn a_suppressed_duplicate_is_reported_as_success() {
     assert!(
         !rendered.contains("duplicate"),
         "the relay's duplicate marker must not reach the caller: {rendered}"
+    );
+}
+
+/// Sign a canonical event and return its id, the way `sign_and_publish` does.
+fn event_id_of(event: &CanonicalEvent, keys: &nostr::Keys) -> String {
+    let mut tags = Vec::new();
+    for parts in &event.tags {
+        tags.push(nostr::Tag::parse(parts.clone()).expect("tag"));
+    }
+    nostr::EventBuilder::new(
+        nostr::Kind::Custom(u16::try_from(event.kind).expect("kind")),
+        event.content.clone(),
+    )
+    .tags(tags)
+    .custom_created_at(nostr::Timestamp::from(
+        u64::try_from(event.created_at).expect("created_at"),
+    ))
+    .sign_with_keys(keys)
+    .expect("sign")
+    .id
+    .to_hex()
+}
+
+#[test]
+fn a_retry_at_a_different_now_produces_the_same_event_id() {
+    // Proof 1, carried all the way to the id rather than stopping at the
+    // canonical struct: the id is what the relay deduplicates on, so equality
+    // of the intermediate value is not the property that matters.
+    let keys = nostr::Keys::generate();
+    let now = 1_700_000_000i64;
+    let params = template_params(Some(now - 5));
+
+    let first = canonicalise(&parse_template(Some(params.clone()), now).expect("first"));
+    let retry = canonicalise(&parse_template(Some(params), now + 240).expect("retry"));
+
+    assert_eq!(first, retry, "the canonical event must be reproduced");
+    assert_eq!(
+        event_id_of(&first, &keys),
+        event_id_of(&retry, &keys),
+        "and so must the id the relay deduplicates on"
+    );
+}
+
+#[test]
+fn changing_any_canonical_field_changes_the_event_id() {
+    // Proof 7, and a check on the proof above: if the id were constant for
+    // some unrelated reason, the retry test would pass while proving nothing.
+    // Every field that goes into the canonical event must move the id.
+    let keys = nostr::Keys::generate();
+    let base = CanonicalEvent {
+        kind: kind::KIND_STREAM_MESSAGE,
+        content: "hello".to_string(),
+        tags: vec![tag(&["h", CHANNEL])],
+        created_at: 1_700_000_000,
+    };
+    let baseline = event_id_of(&base, &keys);
+
+    let variants = [
+        (
+            "kind",
+            CanonicalEvent {
+                kind: kind::KIND_FORUM_POST,
+                ..base.clone()
+            },
+        ),
+        (
+            "content",
+            CanonicalEvent {
+                content: "hello.".to_string(),
+                ..base.clone()
+            },
+        ),
+        (
+            "created_at",
+            CanonicalEvent {
+                created_at: base.created_at + 1,
+                ..base.clone()
+            },
+        ),
+        (
+            "tag value",
+            CanonicalEvent {
+                tags: vec![tag(&["h", OTHER_CHANNEL])],
+                ..base.clone()
+            },
+        ),
+        (
+            "tag count",
+            CanonicalEvent {
+                tags: vec![tag(&["h", CHANNEL]), tag(&["t", "topic"])],
+                ..base.clone()
+            },
+        ),
+    ];
+    for (field, variant) in variants {
+        assert_ne!(
+            event_id_of(&variant, &keys),
+            baseline,
+            "changing {field} must change the event id"
+        );
+    }
+
+    // Tag *order* is part of the canonical event too, so reordering is a
+    // different operation rather than the same one.
+    let reordered = CanonicalEvent {
+        tags: vec![tag(&["t", "topic"]), tag(&["h", CHANNEL])],
+        ..base.clone()
+    };
+    let ordered = CanonicalEvent {
+        tags: vec![tag(&["h", CHANNEL]), tag(&["t", "topic"])],
+        ..base
+    };
+    assert_ne!(
+        event_id_of(&reordered, &keys),
+        event_id_of(&ordered, &keys),
+        "tag order is part of the operation identity"
+    );
+}
+
+#[tokio::test]
+async fn an_acknowledgement_naming_a_different_event_is_a_relay_error() {
+    // The relay must be talking about the event we signed. Reporting a
+    // mismatch as success would tell the caller some *other* event had
+    // committed — and under an idempotent contract they would then stop
+    // retrying the one that never landed.
+    use std::io::{Read as _, Write as _};
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    std::thread::spawn(move || {
+        if let Ok((mut stream, _)) = listener.accept() {
+            let mut buf = [0u8; 8192];
+            let _ = stream.read(&mut buf);
+            // Well-formed, accepted — and about a different event entirely.
+            let body = format!(
+                r#"{{"event_id":"{}","accepted":true,"message":""}}"#,
+                "f".repeat(64)
+            );
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(response.as_bytes());
+            let _ = stream.flush();
+        }
+    });
+
+    let keys = nostr::Keys::generate();
+    let state = crate::app_state::build_app_state();
+    *state.keys.lock().unwrap() = keys.clone();
+    *state.relay_url_override.lock().unwrap() = Some(format!("http://{addr}"));
+
+    let event = message(vec![tag(&["h", CHANNEL])], "hello");
+    let reply = sign_and_publish(&event, &keys, &state, || Ok(()))
+        .await
+        .expect_err("a mismatched acknowledgement must not read as success");
+    assert_eq!(reply.error.expect("error").code, code::RELAY_ERROR);
+}
+
+#[tokio::test]
+async fn revoked_authority_during_the_wait_produces_no_post() {
+    // Proof 9. The rate-limit gate is global and unbounded from the caller's
+    // point of view, so authority checked before it is checked at the wrong
+    // time. The revalidation runs after that wait and immediately before the
+    // POST; a refusal there must mean the request never reaches the socket.
+    //
+    // The listener counts connections, so "no POST" is observed rather than
+    // inferred from a return value.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let connections = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = connections.clone();
+    std::thread::spawn(move || {
+        for _ in listener.incoming() {
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    });
+
+    let keys = nostr::Keys::generate();
+    let state = crate::app_state::build_app_state();
+    *state.keys.lock().unwrap() = keys.clone();
+    *state.relay_url_override.lock().unwrap() = Some(format!("http://{addr}"));
+
+    let event = message(vec![tag(&["h", CHANNEL])], "hello");
+    let reply = sign_and_publish(&event, &keys, &state, || {
+        Err("the grant was revoked while the request was queued".to_string())
+    })
+    .await
+    .expect_err("a revoked grant must not publish");
+    assert_eq!(reply.error.expect("error").code, code::RELAY_ERROR);
+
+    // The decisive assertion: nothing was sent.
+    std::thread::sleep(std::time::Duration::from_millis(80));
+    assert_eq!(
+        connections.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "revalidation refused, so no request may have reached the relay"
     );
 }
 
@@ -592,7 +803,7 @@ async fn a_relay_refusal_is_normalised_and_leaks_nothing() {
     *state.relay_url_override.lock().unwrap() = Some(format!("http://{addr}"));
 
     let event = message(vec![tag(&["h", CHANNEL])], "hello");
-    let reply = sign_and_publish(&event, &keys, &state)
+    let reply = sign_and_publish(&event, &keys, &state, || Ok(()))
         .await
         .expect_err("a 403 must not be reported as success");
 
