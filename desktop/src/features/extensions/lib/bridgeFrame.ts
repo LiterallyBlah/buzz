@@ -162,13 +162,19 @@ function checkValue(root: unknown, budget: Budget): string | null {
    */
   const enqueue = (value: unknown, depth: number): boolean => {
     budget.nodes += 1;
-    // Defence in depth, and honestly unreachable at the current constants: an
-    // array long enough to matter is refused on its declared length below, and
-    // an object entry costs at least nine encoded bytes against a budget of
-    // ~6.5 bytes per node, so the byte cap always arrives first. No fixture can
-    // isolate this branch, which is why the mutation battery does not claim
-    // one. It is kept because it is the bound that stays correct if MAX_NODES,
-    // MAX_FRAME_BYTES or the per-entry costs are ever retuned.
+    // The **node budget fires** — but through the array capacity precheck
+    // below, not through this branch. A depth-13 binary tree encoding to
+    // 41 051 bytes, well inside the byte cap, is refused with "too many
+    // values" by that precheck.
+    //
+    // *This overflow branch* is what is unreachable at the current constants:
+    // an array long enough to matter is refused on declared length before any
+    // element is enqueued, and an object entry costs at least nine encoded
+    // bytes against a budget of ~6.5 per node, so the byte cap arrives first.
+    // No fixture can isolate the branch, which is why the mutation battery
+    // does not claim one. It is kept because it is the bound that stays
+    // correct if MAX_NODES, MAX_FRAME_BYTES or the per-entry costs are
+    // retuned.
     if (budget.nodes > MAX_NODES) {
       return false;
     }

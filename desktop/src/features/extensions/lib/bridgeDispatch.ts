@@ -174,10 +174,21 @@ export function startBridgeDispatch(options: StartOptions): DispatchHandle {
     for (const id of outstanding) {
       // Written directly: `closeAndDrain` already marked these terminal, so
       // `reply` would find nothing to settle and write nothing. The caller
-      // must hear about them before the port closes.
+      // must hear about them before the channel goes.
       write(id, { ok: false, error: { ...TEARDOWN_ERROR } });
     }
     disposed = true;
+    // Then actually close it.
+    //
+    // Removing the listener alone leaves an **open but unserved** channel: a
+    // later request is posted successfully and simply never answered, which is
+    // the hang the terminal contract exists to remove — it would merely arrive
+    // after a warning. The replies above are queued before this runs, and the
+    // close is what makes the end of the port observable rather than silent.
+    //
+    // `MessagePort.close()` is idempotent, so the handshake owner closing the
+    // same port again on unmount is harmless.
+    port.close();
   };
 
   port.addEventListener("message", onMessage);

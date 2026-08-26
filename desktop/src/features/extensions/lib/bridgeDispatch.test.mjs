@@ -31,6 +31,13 @@ function harness(t, options = {}) {
     calls.push({ lease, v, method });
     return call ? call(lease, v, method) : Promise.resolve(reply);
   };
+  let closeCount = 0;
+  const realClose = channel.port1.close.bind(channel.port1);
+  channel.port1.close = () => {
+    closeCount += 1;
+    realClose();
+  };
+
   const handle = startBridgeDispatch({
     port: channel.port1,
     lease: LEASE,
@@ -42,7 +49,7 @@ function harness(t, options = {}) {
     channel.port1.close();
     channel.port2.close();
   });
-  return { channel, calls, handle };
+  return { channel, calls, handle, closeCount: () => closeCount };
 }
 
 async function waitFor(predicate, what, timeoutMs = 2000) {
@@ -394,4 +401,98 @@ test("exhausting the budget tears the port down and settles what is in flight", 
   );
   assert.equal(after, null, "an exhausted port must not serve again");
   assert.equal(calls.length, 1);
+});
+
+test("terminal exhaustion closes the host port, exactly once", async (t) => {
+  // Removing the listener is not the same as closing. An open but unserved
+  // channel accepts a later request and never answers it — the hang the
+  // terminal contract exists to remove, merely arriving after a warning.
+  const registry = createRegistry();
+  const spent = (n) => `3f2504e0-4f89-41d3-9a0c-${String(n).padStart(12, "b")}`;
+  for (let n = 0; n < MAX_REQUESTS_PER_PORT - 1; n += 1) {
+    registry.admit(spent(n));
+    registry.settle(spent(n));
+  }
+
+  let release;
+  const { channel, calls, handle, closeCount } = harness(t, {
+    registry,
+    call: () =>
+      new Promise((resolve) => {
+        release = resolve;
+      }),
+  });
+  const seen = collect(channel);
+
+  // Takes the last budget slot and stays outstanding.
+  channel.port2.postMessage({
+    id: uuid(1),
+    v: 1,
+    method: "identity.getPublicKey",
+  });
+  await waitFor(() => calls.length === 1, "the in-flight request");
+  assert.equal(closeCount(), 0, "nothing is closed before exhaustion");
+
+  // Exhausts the budget.
+  channel.port2.postMessage({
+    id: uuid(2),
+    v: 1,
+    method: "identity.getPublicKey",
+  });
+  await waitFor(() => seen.length === 2, "the refusal and the settlement");
+
+  // 1. The port is closed, exactly once.
+  assert.equal(closeCount(), 1, "terminal exhaustion must close the port");
+
+  // 2. The quota reply and the outstanding settlement are still delivered.
+  const byId = new Map(seen.map((r) => [r.id, r]));
+  assert.equal(byId.get(uuid(2)).error.code, "quota_exceeded");
+  assert.equal(
+    byId.get(uuid(1)).error.code,
+    "internal",
+    "the in-flight request is settled, not abandoned",
+  );
+
+  // 3. A later request receives nothing at all.
+  channel.port2.postMessage({
+    id: uuid(3),
+    v: 1,
+    method: "identity.getPublicKey",
+  });
+  await new Promise((resolve) => setTimeout(resolve, 60));
+  assert.equal(seen.length, 2, "a closed port answers nothing further");
+  assert.equal(calls.length, 1, "and dispatches nothing further");
+
+  // 4. A late completion from before the close cannot emit.
+  release({ ok: true, result: { pubkey: "a".repeat(64) } });
+  await new Promise((resolve) => setTimeout(resolve, 60));
+  assert.equal(
+    seen.length,
+    2,
+    "a late completion must not emit a second result",
+  );
+
+  // 5. Ordinary cleanup stays idempotent — no second close.
+  handle.dispose();
+  handle.dispose();
+  assert.equal(
+    closeCount(),
+    1,
+    "dispose after exhaustion must not close again",
+  );
+});
+
+test("ordinary teardown closes the port once", async (t) => {
+  const { channel, handle, closeCount } = harness(t);
+  await roundTrip(channel, {
+    id: uuid(1),
+    v: 1,
+    method: "identity.getPublicKey",
+  });
+  assert.equal(closeCount(), 0);
+
+  handle.dispose();
+  assert.equal(closeCount(), 1, "teardown closes the channel it served");
+  handle.dispose();
+  assert.equal(closeCount(), 1, "and is idempotent");
 });
