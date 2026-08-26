@@ -1,5 +1,9 @@
 import * as React from "react";
 
+import {
+  type DispatchHandle,
+  startBridgeDispatch,
+} from "@/features/extensions/lib/bridgeDispatch";
 import { startHostHandshake } from "@/features/extensions/lib/bridgeHandshake";
 import {
   type ExtensionFrameTarget,
@@ -102,8 +106,20 @@ export function ExtensionFrame({ extensionId }: ExtensionFrameProps) {
     if (!target || !frame) {
       return;
     }
-    const handshake = startHostHandshake({ frame });
+    // The dispatcher is attached to the port the handshake produced, and only
+    // then: before that there is no channel, and the lease it will carry is
+    // this component's own — never anything the frame supplies.
+    let dispatch: DispatchHandle | null = null;
+    const handshake = startHostHandshake({
+      frame,
+      onEstablished: (port) => {
+        dispatch = startBridgeDispatch({ port, lease: target.lease });
+      },
+    });
     return () => {
+      // Stop serving before the port closes, so a request in flight cannot try
+      // to answer on a closed channel.
+      dispatch?.dispose();
       handshake.dispose();
     };
   }, [target]);
