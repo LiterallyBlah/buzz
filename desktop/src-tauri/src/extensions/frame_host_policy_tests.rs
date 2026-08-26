@@ -1,8 +1,12 @@
 //! Frame-host tests over the *documents and policies* the host emits.
 //!
 //! Split from `frame_host_tests.rs` at the 1000-line ceiling. These assert the
-//! shape of what is served — the wrapper's relay contract and the CSP strings —
-//! without binding a socket.
+//! shape of what is served — the wrapper's relay contract and the CSP strings.
+//!
+//! Most need no listener. `a_post_install_non_utf8_html_asset_is_refused` does,
+//! since refusing an asset is something only the serving path can do, and it
+//! takes `lifecycle_guard()` accordingly — as every test that starts the
+//! process-global host must.
 
 use std::fs;
 

@@ -1,9 +1,14 @@
 //! Frame-host tests over pure functions: path resolution, header shape and
 //! URL construction.
 //!
-//! Nothing here binds a socket. Document and policy shape live in
-//! `frame_host_policy_tests`; anything driving a live listener lives in
-//! `frame_host_wire_tests`, which is why the lifecycle guard is not used here.
+//! Document and policy shape live in `frame_host_policy_tests`; the live-wire
+//! behaviour lives in `frame_host_wire_tests`.
+//!
+//! One test here is not pure: `every_served_document_carries_the_egress_policy`
+//! serves real requests, because decision 004 is a property of the host rather
+//! than of any HTML it emits. It takes `lifecycle_guard()` for that reason —
+//! every test that starts the process-global host must, or concurrent tests
+//! tear down each other's listener.
 
 use std::fs;
 
