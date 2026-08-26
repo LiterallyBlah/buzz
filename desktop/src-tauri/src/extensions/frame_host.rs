@@ -878,6 +878,28 @@ pub(crate) fn extension_for_lease(lease: &str) -> Option<String> {
     host_state().leases.get(lease).cloned()
 }
 
+/// Serialises every test that touches the **process-wide** frame host.
+///
+/// `acquire`/`release`/`shutdown_now` all mutate one global. Any test that
+/// calls them races every other one, and the failure is remote from the cause:
+/// a `shutdown_now()` in an unrelated module drops the running host's shutdown
+/// senders, its axum servers stop, and a *different* test's next probe gets
+/// `ECONNREFUSED` — measured at ~14% of parallel runs before this was shared.
+///
+/// It lives here, not in a test module, precisely so it is reachable from
+/// every module that touches the host. A private per-module lock is the bug.
+#[cfg(test)]
+pub(crate) static LIFECYCLE_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Take the lifecycle lock and reset the global to a known state.
+#[cfg(test)]
+pub(crate) async fn lifecycle_guard() -> tokio::sync::MutexGuard<'static, ()> {
+    let guard = LIFECYCLE_TEST_LOCK.lock().await;
+    // Whatever a previous test left behind is not this test's starting state.
+    shutdown_now();
+    guard
+}
+
 /// The running extension-content port, if any. Test and diagnostic use.
 #[cfg(test)]
 pub(crate) fn running_port() -> Option<u16> {

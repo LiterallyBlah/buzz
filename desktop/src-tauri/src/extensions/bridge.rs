@@ -105,7 +105,10 @@ mod tests {
         .expect("manifest");
         std::fs::write(root.join("index.html"), b"<!doctype html>").expect("entry");
 
-        frame_host::shutdown_now();
+        // The frame host is process-wide. Without this guard, this test's
+        // `shutdown_now()` tore down the host a lifecycle test was mid-way
+        // through using — the cause of a ~14% flake in `frame_host_tests`.
+        let _guard = frame_host::lifecycle_guard().await;
         let claim = frame_host::acquire(base.path().to_path_buf(), "demo")
             .await
             .expect("acquire");

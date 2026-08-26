@@ -14,19 +14,8 @@ use std::io::Write;
 
 use super::*;
 
-/// Serialises tests that touch the process-wide frame-host state.
-///
-/// Async-aware on purpose: these tests hold the guard across `await`, and a
-/// `std::sync::Mutex` held across an await point is a real deadlock hazard on a
-/// multi-threaded runtime (and `clippy::await_holding_lock` says so).
-static TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
-async fn lifecycle_guard() -> tokio::sync::MutexGuard<'static, ()> {
-    let guard = TEST_LOCK.lock().await;
-    // Whatever a previous test left behind is not this test's starting state.
-    shutdown_now();
-    guard
-}
+// The lifecycle lock lives in `frame_host` so every module that touches the
+// process-wide host shares one — see `frame_host::lifecycle_guard`.
 
 /// An installed package containing `files`, under a fresh extensions base dir.
 fn installed(files: &[(&str, &[u8])]) -> tempfile::TempDir {
