@@ -131,6 +131,157 @@ fn an_unknown_or_released_lease_is_denied() {
     }
 }
 
+// ── wire bounds ──────────────────────────────────────────────────────────────
+
+#[test]
+fn an_oversized_method_is_refused_without_being_looked_up() {
+    let method = "a".repeat(MAX_METHOD_LEN + 1);
+    let decision = route(resolver(LIVE), "lease-a", 1, &method);
+    match decision {
+        Route::Refuse { code, message } => {
+            assert_eq!(code, code::INVALID_PARAMS);
+            assert!(
+                !message.contains(&method),
+                "the refusal must not echo the oversized input back: {message}"
+            );
+        }
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_method_at_the_limit_is_still_dispatched() {
+    // The boundary is a limit, not an off-by-one: a method of exactly
+    // MAX_METHOD_LEN is legal and must reach the method table (where it is
+    // simply unknown), rather than being refused as oversized.
+    let method = "a".repeat(MAX_METHOD_LEN);
+    match route(resolver(LIVE), "lease-a", 1, &method) {
+        Route::Refuse { code, .. } => assert_eq!(
+            code,
+            code::UNKNOWN_METHOD,
+            "a method at exactly the limit must be looked up, not rejected as oversized"
+        ),
+        other => panic!("expected unknown_method, got {other:?}"),
+    }
+}
+
+#[test]
+fn an_oversized_lease_is_refused_before_it_is_resolved() {
+    // A lease this long cannot be one the host minted. Refusing before the
+    // lookup means an absurd input costs nothing to reject.
+    let lease = "b".repeat(MAX_LEASE_LEN + 1);
+    let decision = route(resolver(LIVE), &lease, 1, "identity.getPublicKey");
+    match decision {
+        Route::Refuse { code, message } => {
+            assert_eq!(code, code::INVALID_PARAMS);
+            assert!(!message.contains(&lease), "must not echo the lease back");
+        }
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_version_refusal_still_outranks_a_bounds_refusal() {
+    // Ordering stays observable and stable: an unsupported version is reported
+    // even when the frame is also oversized, so a client cannot use an
+    // oversized field to discover anything about lease or method handling.
+    let decision = route(
+        resolver(LIVE),
+        "lease-a",
+        99,
+        &"a".repeat(MAX_METHOD_LEN + 1),
+    );
+    match decision {
+        Route::Refuse { code, .. } => assert_eq!(code, code::UNSUPPORTED_VERSION),
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+}
+
+// ── error normalisation (§8) ─────────────────────────────────────────────────
+
+/// Every `error.code` §8 defines. A code outside this set is not a code an
+/// extension's client library can be expected to handle.
+const SPEC_CODES: &[&str] = &[
+    "unsupported_version",
+    "unknown_method",
+    "invalid_params",
+    "denied",
+    "quota_exceeded",
+    "rate_limited",
+    "relay_error",
+    "identity_unavailable",
+    "internal",
+];
+
+/// Substrings that would mean host internals reached the wire.
+const INTERNAL_MARKERS: &[&str] = &[
+    "rusqlite",
+    "sqlite",
+    "os error",
+    "panicked",
+    "/opt/",
+    "/home/",
+    "unwrap",
+    "Error {",
+    "extension-grants",
+];
+
+#[test]
+fn every_refusal_this_module_can_produce_is_normalised() {
+    // §8: a stable code from the defined set, and a message that carries no
+    // host internals — no rust error text, no filesystem path, no panic
+    // string. The grant store's own errors are deliberately discarded rather
+    // than wrapped, so there is no path by which one reaches a reply.
+    let long = "z".repeat(MAX_METHOD_LEN + 10);
+    let mut replies = Vec::new();
+
+    for (lease, version, method) in [
+        ("lease-a", 1u32, "identity.getPublicKey"),
+        ("lease-a", 99, "identity.getPublicKey"),
+        ("lease-a", 1, "publish.event"),
+        ("lease-a", 1, ""),
+        ("dead-lease", 1, "identity.getPublicKey"),
+        ("lease-a", 1, long.as_str()),
+        (long.as_str(), 1, "identity.getPublicKey"),
+    ] {
+        if let Route::Refuse { code, message } = route(resolver(LIVE), lease, version, method) {
+            replies.push(BridgeReply::err(code, message));
+        }
+    }
+    replies.push(identity_get_public_key(&"a".repeat(64), false, "demo"));
+    replies.push(identity_get_public_key("", true, "demo"));
+    replies.push(BridgeReply::err(code::INTERNAL, "identity is not readable"));
+
+    assert!(
+        replies.len() >= 8,
+        "expected the full refusal matrix, got {}",
+        replies.len()
+    );
+
+    for reply in replies {
+        let error = reply.error.as_ref().expect("a refusal carries an error");
+        assert!(
+            SPEC_CODES.contains(&error.code.as_str()),
+            "code {:?} is not one §8 defines",
+            error.code
+        );
+        assert!(
+            !error.message.is_empty(),
+            "code {:?} carried an empty message",
+            error.code
+        );
+        let lowered = error.message.to_lowercase();
+        for marker in INTERNAL_MARKERS {
+            assert!(
+                !lowered.contains(&marker.to_lowercase()),
+                "message for {:?} leaked {marker:?}: {}",
+                error.code,
+                error.message
+            );
+        }
+    }
+}
+
 // ── identity.getPublicKey (§3) ───────────────────────────────────────────────
 
 #[test]

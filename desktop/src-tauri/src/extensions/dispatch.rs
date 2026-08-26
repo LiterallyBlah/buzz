@@ -37,10 +37,27 @@ use super::grants;
 /// The wire version this host speaks (§2).
 const SUPPORTED_VERSION: u32 = 1;
 
+/// Longest `method` this host will look at, in bytes.
+///
+/// §2 methods are `<area>.<name>`; the longest plausible one is a fraction of
+/// this. The spec sets no number, so this is ours: far above any legitimate
+/// caller, far below anything that makes the host do unbounded work. The
+/// bound also makes the `unknown_method` message — which echoes the caller's
+/// own method back for debuggability — a bounded string.
+const MAX_METHOD_LEN: usize = 64;
+
+/// Longest `lease` this host will look up, in bytes.
+///
+/// The lease is host-minted, so a longer one cannot be legitimate. Checked
+/// anyway: the frontend is our code, but it is the layer an extension is
+/// adjacent to, and this module does not assume its caller validated anything.
+const MAX_LEASE_LEN: usize = 128;
+
 /// `error.code` values from §8 — only those this increment can produce.
 pub(crate) mod code {
     pub(crate) const UNSUPPORTED_VERSION: &str = "unsupported_version";
     pub(crate) const UNKNOWN_METHOD: &str = "unknown_method";
+    pub(crate) const INVALID_PARAMS: &str = "invalid_params";
     pub(crate) const DENIED: &str = "denied";
     pub(crate) const IDENTITY_UNAVAILABLE: &str = "identity_unavailable";
     pub(crate) const INTERNAL: &str = "internal";
@@ -113,6 +130,16 @@ pub(crate) fn route(
         return Route::Refuse {
             code: code::UNSUPPORTED_VERSION,
             message: format!("this host speaks bridge version {SUPPORTED_VERSION}"),
+        };
+    }
+
+    // Bounds before any lookup or echo. A frame this far outside the wire
+    // shape gets a §8 code and no further work — in particular the message
+    // does not repeat the oversized input back.
+    if method.len() > MAX_METHOD_LEN || lease.len() > MAX_LEASE_LEN {
+        return Route::Refuse {
+            code: code::INVALID_PARAMS,
+            message: "request exceeds the wire limits".to_string(),
         };
     }
 
