@@ -561,32 +561,39 @@ pub async fn submit_signed_event_with_keys(
     keys: &Keys,
     auth_tag: Option<&str>,
 ) -> Result<SubmitEventResponse, String> {
-    submit_signed_event_revalidated(event, state, keys, auth_tag, || Ok(())).await
+    submit_prepared_event(state, keys, auth_tag, || Ok(event.clone())).await
 }
 
-/// As [`submit_signed_event_with_keys`], but re-checks the caller's authority
-/// after the shared rate-limit wait and immediately before the POST.
+/// Wait for the shared rate-limit gate, then build and submit the event.
+///
+/// `prepare` runs **after** the wait and is where an effectful caller
+/// revalidates its authority and signs. Splitting it this way is what makes
+/// "checked immediately before the POST" true rather than aspirational.
 ///
 /// The wait is unbounded from the caller's point of view — it is a global gate
-/// another request may have closed — so authority checked before it is
-/// authority checked at the wrong time. A grant can be revoked, an identity can
-/// go into recovery, and a frame can be released while a request sits in that
-/// queue. `revalidate` runs at the last moment where refusing still costs
-/// nothing, which is the instant before the request is put on the wire.
+/// another request may have closed — so a grant can be revoked, an identity can
+/// enter recovery, and a frame can be released while a request sits in that
+/// queue. `prepare` runs at the last moment where refusing still costs nothing.
 ///
 /// This is **not** cancellation: a POST already in flight is not recalled, and
 /// nothing here recovers an effect that has already committed.
-pub async fn submit_signed_event_revalidated(
-    event: &nostr::Event,
+pub async fn submit_prepared_event(
     state: &AppState,
     keys: &Keys,
     auth_tag: Option<&str>,
-    revalidate: impl Fn() -> Result<(), String>,
+    prepare: impl FnOnce() -> Result<nostr::Event, String>,
 ) -> Result<SubmitEventResponse, String> {
+    // The wait comes first, and `prepare` runs *after* it. That ordering is the
+    // point: the gate is global and unbounded from this caller's view, so an
+    // authority check made before it is a check made at the wrong time, and an
+    // event signed before it is signed under an identity that may since have
+    // changed. Everything between `prepare` and `.send()` below is local work
+    // with no await, so nothing can intervene.
+    crate::relay_admission::wait_for_rate_limit().await;
+    let event = prepare()?;
     if event.pubkey != keys.public_key() {
         return Err("signed event does not match the publishing identity".to_string());
     }
-    crate::relay_admission::wait_for_rate_limit().await;
     let url = format!("{}/events", relay_api_base_url_with_override(state));
     let body_bytes = event.as_json().into_bytes();
     crate::egress_guard::assert_no_key_backup_bytes(&body_bytes, "signed event submit (keys)")?;
@@ -600,9 +607,6 @@ pub async fn submit_signed_event_revalidated(
     if let Some(tag) = auth_tag {
         request = request.header("x-auth-tag", tag);
     }
-
-    // Last check before the irreversible step.
-    revalidate()?;
 
     let response = request
         .body(body_bytes)

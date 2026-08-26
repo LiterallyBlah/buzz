@@ -140,8 +140,21 @@ pub(crate) struct EventTemplate {
     ///
     /// Not an `Option`: there is no default-to-now path, because a caller who
     /// omits it gets a different id on every retry and double-publishes the
-    /// first time anything goes wrong. The client shim sets it once per logical
-    /// publish and reuses it, which is what makes a retry idempotent.
+    /// first time anything goes wrong.
+    ///
+    /// **The v1 contract is that the caller retains and resubmits the exact
+    /// template.** There is no client shim on this branch — `window.buzz` is
+    /// injected nowhere — so nothing else is holding this value on the
+    /// extension's behalf. A §11 shim may later offer same-frame convenience,
+    /// but it cannot be relied on across a frame reopen: the terminal port
+    /// lifecycle can retire a frame, and identity held only in that frame's
+    /// JavaScript goes with it.
+    ///
+    /// The horizon is bounded and worth stating plainly: the host accepts a
+    /// five-minute window and the relay retains for fifteen. Past the host
+    /// window a reused template is **rejected**, which is safe — it will not
+    /// duplicate — but `publish.event` alone can no longer confirm the earlier
+    /// commit. That is bounded idempotency, not indefinite result retrieval.
     pub(crate) created_at: i64,
 }
 
@@ -176,9 +189,12 @@ impl CanonicalEvent {
 
 /// Build the event the host will sign, from the template it was handed.
 ///
-/// Drops nothing and interprets nothing: the only transformation is resolving
-/// and clamping `created_at`. Tags are carried across verbatim so that what the
-/// checks inspect is exactly what gets signed.
+/// Drops nothing, interprets nothing, and transforms nothing. `created_at` is
+/// required and window-checked during parsing, so by the time a template exists
+/// there is no resolving or clamping left to do — this is a projection, and it
+/// has to be, because any adjustment here would change the event id the caller
+/// will retry with. Tags are carried across verbatim so that what the checks
+/// inspect is exactly what gets signed.
 pub(crate) fn canonicalise(template: &EventTemplate) -> CanonicalEvent {
     CanonicalEvent {
         kind: template.kind,
@@ -441,9 +457,23 @@ pub(crate) async fn publish_event<R: tauri::Runtime>(
     let event = canonicalise(&template);
 
     let state = app.state::<crate::AppState>();
-    let keys = match state.keys.lock() {
-        Ok(keys) => keys.clone(),
-        Err(_) => return BridgeReply::err(code::INTERNAL, "identity is not readable"),
+
+    // Through the authority gate, never `state.keys` directly.
+    //
+    // This is increment 2's blocker 3, and it was reintroduced here because the
+    // re-apply fixed the identity handler's key read and missed this parallel
+    // one in the signer. `identity_lost` and `keyring_locked` both boot with a
+    // real-looking **ephemeral** key, so locking `state.keys` yields 64 valid
+    // hex characters that are not the user's — and signing under it would
+    // publish, with a real signature, as an identity the user does not control.
+    //
+    // Grant-before-protected-state is preserved: §7 grants are keyed by
+    // identity, so with no usable identity there is nothing to key a lookup by,
+    // nothing can be granted, and the caller is `denied` exactly as an
+    // ungranted one is. Recovery stays invisible.
+    let keys = match state.signing_keys() {
+        Ok(keys) => keys,
+        Err(_) => return BridgeReply::err(code::DENIED, "missing scope: sign"),
     };
     let identity_pubkey = keys.public_key().to_hex();
 
@@ -480,26 +510,34 @@ pub(crate) async fn publish_event<R: tauri::Runtime>(
     let identity_at_entry = identity_pubkey.clone();
     let event_ref = &event;
     let state_ref = &*state;
-    let revalidate = || -> Result<(), String> {
+    let revalidate = || -> Result<(), &'static str> {
         // The lease must still resolve to *this* extension — not merely to
         // something. A reissued lease pointing elsewhere is a different caller.
         match super::frame_host::extension_for_lease(lease) {
             Some(current) if current == extension_id => {}
-            _ => return Err("frame lease is no longer this extension".to_string()),
+            _ => return Err(code::DENIED),
         }
         // The signing identity must still be available and unchanged. Recovery
         // swaps in an ephemeral key, so "available" is not enough on its own.
-        let now_pubkey = super::dispatch::resolve_identity_pubkey(state_ref)
-            .ok_or_else(|| "identity is no longer available".to_string())?;
+        let now_pubkey = super::dispatch::resolve_identity_pubkey(state_ref).ok_or(code::DENIED)?;
         if now_pubkey != identity_at_entry {
-            return Err("identity changed while the request was queued".to_string());
+            return Err(code::DENIED);
         }
-        // And the exact (kind, channel) grant must still exist.
-        let channel = event_ref
-            .channel()
-            .ok_or_else(|| "event lost its channel tag".to_string())?;
-        if !has_grant(event_ref.kind, channel, &now_pubkey) {
-            return Err("the grant was revoked while the request was queued".to_string());
+        // The whole authority decision, re-run against the exact canonical
+        // event — not just the grant row. Re-running `authorise` means a
+        // revocation, a denylist change or a tag that no longer passes is
+        // caught by the same code that admitted it, rather than by a
+        // hand-copied subset of it that could drift.
+        authorise(event_ref, |kind_value, channel| {
+            has_grant(kind_value, channel, &now_pubkey)
+        })
+        .map_err(Refusal::code)?;
+
+        // The wait is unbounded, so a template that was inside the window when
+        // it arrived may not be now. Signing it anyway would put an event on
+        // the relay that the host would refuse if asked again.
+        if !timestamp_in_window(event_ref.created_at, now_unix()) {
+            return Err(code::INVALID_PARAMS);
         }
         Ok(())
     };
@@ -507,6 +545,23 @@ pub(crate) async fn publish_event<R: tauri::Runtime>(
     match sign_and_publish(&event, &keys, &state, revalidate).await {
         Ok(signed) => BridgeReply::ok(signed),
         Err(reply) => reply,
+    }
+}
+
+/// A §8 code and the message that goes with it.
+///
+/// Kept as one mapping so a refusal raised deep in `prepare` cannot arrive at
+/// the caller wearing the wrong code — collapsing them all into `relay_error`
+/// would have told a caller whose grant was revoked that the relay was at
+/// fault, and a caller whose timestamp expired that it should retry.
+fn message_for(code: &str) -> &'static str {
+    match code {
+        c if c == super::dispatch::code::DENIED => "publishing is no longer permitted",
+        c if c == super::dispatch::code::INVALID_PARAMS => {
+            "created_at is outside the acceptable window"
+        }
+        c if c == super::dispatch::code::INTERNAL => "the event could not be signed",
+        _ => "the relay did not accept the event",
     }
 }
 
@@ -520,7 +575,7 @@ async fn sign_and_publish(
     event: &CanonicalEvent,
     keys: &nostr::Keys,
     state: &crate::AppState,
-    revalidate: impl Fn() -> Result<(), String>,
+    revalidate: impl Fn() -> Result<(), &'static str>,
 ) -> Result<Value, super::dispatch::BridgeReply> {
     use super::dispatch::{code, BridgeReply};
 
@@ -542,9 +597,35 @@ async fn sign_and_publish(
         .tags(tags)
         .custom_created_at(nostr::Timestamp::from(created_at));
 
-    let signed = builder
-        .sign_with_keys(keys)
-        .map_err(|_| BridgeReply::err(code::INTERNAL, "the event could not be signed"))?;
+    // The id is computed from the *unsigned* event, before anything is signed.
+    //
+    // That is the whole idempotency claim in one line: an event id is a hash of
+    // the canonical event and the author's pubkey, and carries nothing from the
+    // signature — so a re-sign of the same template yields the same id even
+    // though Schnorr signatures need not be byte-identical. It also gives us
+    // something to check the relay's acknowledgement against without holding
+    // the signed event across the await.
+    let expected_id = builder.clone().build(keys.public_key()).id();
+
+    // Signing is deferred into `prepare`, which runs after the rate-limit wait
+    // and after revalidation — so the signature is made under an identity and
+    // an authority that were both confirmed a moment earlier, with no await
+    // between that confirmation and the POST.
+    let signing_keys = keys.clone();
+    // The refusal reason has to survive out through a submit path that only
+    // speaks `String`, so `prepare` records the §8 code here on its way out.
+    let refusal: std::sync::Mutex<Option<&'static str>> = std::sync::Mutex::new(None);
+    let refusal_ref = &refusal;
+    let prepare = move || -> Result<nostr::Event, String> {
+        if let Err(code) = revalidate() {
+            *refusal_ref.lock().expect("refusal cell") = Some(code);
+            return Err("refused before submission".to_string());
+        }
+        builder.sign_with_keys(&signing_keys).map_err(|_| {
+            *refusal_ref.lock().expect("refusal cell") = Some(super::dispatch::code::INTERNAL);
+            "the event could not be signed".to_string()
+        })
+    };
 
     // Every relay failure collapses to one §8 code with a fixed message. The
     // relay's own text is discarded rather than wrapped — it is written for an
@@ -557,17 +638,25 @@ async fn sign_and_publish(
     // returns the same success on retry. The relay's `message` is not forwarded,
     // so "you already did this" is not even observable: the caller is told
     // "committed", which is the only fact that matters to it.
-    let accepted =
-        crate::relay::submit_signed_event_revalidated(&signed, state, keys, None, revalidate)
-            .await
-            .map_err(|_| {
-                BridgeReply::err(code::RELAY_ERROR, "the relay did not accept the event")
-            })?;
+    let accepted = crate::relay::submit_prepared_event(state, keys, None, prepare)
+        .await
+        .map_err(|_| {
+            // A refusal recorded by `prepare` outranks the generic relay error:
+            // the request never reached the relay, so blaming it would be
+            // false.
+            let recorded = refusal.lock().expect("refusal cell").take();
+            let code = recorded.unwrap_or(code::RELAY_ERROR);
+            BridgeReply::err(code, message_for(code))
+        })?;
 
-    // The relay must be talking about the event we signed. A mismatch means
-    // something between here and the store substituted an id, and reporting it
-    // as success would tell the caller a different event had committed.
-    if accepted.event_id != signed.id.to_hex() {
+    // The relay must be talking about the event we signed, and it must say so
+    // for a duplicate exactly as for a fresh insert. A mismatch means something
+    // between here and the store substituted an id, and reporting that as
+    // success would tell the caller a *different* event had committed — under
+    // an idempotent contract they would then stop retrying the one that never
+    // landed.
+    let signed_id = expected_id.to_hex();
+    if !accepted.accepted || accepted.event_id != signed_id {
         return Err(BridgeReply::err(
             code::RELAY_ERROR,
             "the relay acknowledged a different event",
@@ -576,10 +665,10 @@ async fn sign_and_publish(
 
     Ok(serde_json::json!({
         "event": {
-            "id": signed.id.to_hex(),
-            "pubkey": signed.pubkey.to_hex(),
+            "id": signed_id,
+            "pubkey": keys.public_key().to_hex(),
             "kind": event.kind,
-            "content": signed.content,
+            "content": event.content,
             "created_at": event.created_at,
             "tags": event.tags,
         },
@@ -588,5 +677,17 @@ async fn sign_and_publish(
 }
 
 #[cfg(test)]
+#[path = "publish_test_support.rs"]
+mod publish_test_support;
+
+#[cfg(test)]
 #[path = "publish_tests.rs"]
 mod publish_tests;
+
+#[cfg(test)]
+#[path = "publish_wire_tests.rs"]
+mod publish_wire_tests;
+
+#[cfg(test)]
+#[path = "publish_denylist_tests.rs"]
+mod publish_denylist_tests;
