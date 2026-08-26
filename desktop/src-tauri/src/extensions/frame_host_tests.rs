@@ -694,16 +694,78 @@ async fn package_content_is_not_served_from_the_wrapper_origin() {
     release(&claim.lease);
 }
 
+/// Origin the committed E2E fixture is generated for. Any literal works; it
+/// only has to match on both sides.
+#[cfg(test)]
+const WRAPPER_CSP_FIXTURE_ORIGIN: &str = "http://127.0.0.1:51234";
+
 #[test]
-fn the_wrapper_policy_refuses_being_embedded() {
-    // The confused-deputy wall: a hostile extension embedding a wrapper would
-    // obtain a trusted instance with itself as parent. `frame-ancestors` is
-    // enforced by the embedded document against its embedder, which is the
-    // direction needed here.
+fn the_e2e_wrapper_csp_fixture_matches_production() {
+    // Closes the drift that let 27 E2E specs stay green over a blank surface:
+    // the browser-side regression hand-wrote its own policy, so it could never
+    // notice production growing a header that refuses framing.
+    //
+    // The fixture below is the string the E2E spec serves. This test is what
+    // makes it the REAL one. If you changed the wrapper policy, regenerate:
+    //
+    //   cargo test -p buzz-desktop the_e2e_wrapper_csp_fixture -- --nocapture
+    //
+    // and paste the printed value into the fixture file. Then run the E2E
+    // regression, because a policy that refuses embedding will turn it red —
+    // which is the entire point.
+    let fixture_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../tests/e2e/fixtures/wrapper-csp.txt");
+    let produced = wrapper_content_security_policy(WRAPPER_CSP_FIXTURE_ORIGIN);
+    // Printed BEFORE the read, so a missing fixture still tells you what to
+    // write into it rather than only that it is missing.
+    println!("PRODUCTION WRAPPER CSP:\n{produced}");
+    let committed = std::fs::read_to_string(&fixture_path)
+        .unwrap_or_else(|error| panic!("cannot read {}: {error}", fixture_path.display()));
+
+    assert_eq!(
+        produced.trim(),
+        committed.trim(),
+        "the E2E wrapper-CSP fixture has drifted from production. Regenerate it \
+         from the value printed above, then rerun the E2E regression."
+    );
+}
+
+#[test]
+fn the_wrapper_policy_does_not_yet_refuse_being_embedded() {
+    // Deliberately inverted, and this test is the tripwire.
+    //
+    // `frame-ancestors 'none'` is the confused-deputy wall and it belongs here
+    // EVENTUALLY. It cannot ship yet: Buzz frames this document itself
+    // (`ExtensionFrame.tsx` renders `<iframe src={target.url}>` and that url is
+    // now the wrapper's), so the header refuses the composition that ships and
+    // blanks the extension surface. Measured in Chromium: framed → 0 markers,
+    // top-level → 1.
+    //
+    // If you are here because this assertion failed, you added the header. Add
+    // it only together with the migration that makes the wrapper the TOP-LEVEL
+    // document of the dedicated native webview — otherwise you have just
+    // broken extensions.
     let policy = wrapper_content_security_policy("http://127.0.0.1:4321");
     assert!(
-        policy.contains("frame-ancestors 'none'"),
-        "the wrapper must refuse all embedding; got: {policy}"
+        !policy.contains("frame-ancestors"),
+        "frame-ancestors cannot ship while Buzz still frames the wrapper; got: {policy}"
+    );
+}
+
+#[test]
+fn deferring_frame_ancestors_leaves_no_hole_in_todays_composition() {
+    // Why the deferral above is sequencing rather than an accepted hole: a
+    // hostile package cannot frame anything at all, so it cannot embed a
+    // wrapper to become a confused deputy in the first place.
+    let extension_policy = content_security_policy("http://127.0.0.1:4321");
+    assert!(
+        extension_policy.contains("default-src 'none'"),
+        "the extension document must default-deny; got: {extension_policy}"
+    );
+    assert!(
+        !extension_policy.contains("frame-src"),
+        "the extension document must not be able to frame anything, which is \
+         what makes deferring frame-ancestors safe today; got: {extension_policy}"
     );
 }
 

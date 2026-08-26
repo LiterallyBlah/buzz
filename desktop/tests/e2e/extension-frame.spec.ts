@@ -14,6 +14,8 @@
  * remote-class rather than a registered custom scheme. Both are asserted below
  * against the DOM the app really renders.
  */
+import { readFileSync } from "node:fs";
+
 import { expect, test } from "@playwright/test";
 
 import { installMockBridge } from "../helpers/bridge";
@@ -187,6 +189,93 @@ test("a sandboxed document under the served policy can still reach its parent", 
   // frame's origin is the string "null". Pin that so a future change that
   // starts trusting `event.origin` is caught here.
   expect(outcome.origin).toBe("null");
+});
+
+/**
+ * Drive the real `ExtensionFrame` against a wrapper served with a chosen CSP,
+ * and report whether the document actually ran.
+ *
+ * This exists because header-only tests missed a real regression: the Rust
+ * suite proved `frame-ancestors 'none'` was present, and the route tests proved
+ * the origins were split, but nothing composed that header with the `<iframe>`
+ * this component renders. The wrapper was refused and the extension surface
+ * went blank with every Rust test green.
+ */
+async function wrapperLoadsWhenFramed(
+  page: import("@playwright/test").Page,
+  options: { frameAncestorsNone: boolean },
+) {
+  const origin = "http://127.0.0.1:51234";
+  // The REAL policy the Rust frame host serves, not a hand-written lookalike.
+  // A Rust test (`the_e2e_wrapper_csp_fixture_matches_production`) asserts this
+  // file is byte-identical to `wrapper_content_security_policy()`, so it cannot
+  // drift. That drift is exactly why 27 specs stayed green over a blank
+  // surface: this fixture used to invent its own policy and could never notice
+  // production growing a header that refuses framing.
+  const production = readFileSync(
+    new URL("./fixtures/wrapper-csp.txt", import.meta.url),
+    "utf8",
+  ).trim();
+  const policy = options.frameAncestorsNone
+    ? `${production}; frame-ancestors 'none'`
+    : production;
+
+  await page.route(`${origin}/**`, async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: "text/html; charset=utf-8",
+      headers: { "Content-Security-Policy": policy },
+      body: `<!doctype html><title>wrapper</title><script>parent.postMessage({ buzz: "wrapper-ran" }, "*");</script>`,
+    });
+  });
+
+  await installMockBridge(page, {
+    extensionPickPath: "/tmp/equation-explorer",
+    extensionPreviewManifest: MANIFEST,
+    extensionFrameOrigin: origin,
+  });
+  await installOne(page);
+
+  const ran = page.evaluate(
+    () =>
+      new Promise<boolean>((resolve) => {
+        const timer = window.setTimeout(() => resolve(false), 4000);
+        window.addEventListener("message", function onMessage(event) {
+          const data = event.data as { buzz?: string };
+          if (data?.buzz === "wrapper-ran") {
+            window.clearTimeout(timer);
+            window.removeEventListener("message", onMessage);
+            resolve(true);
+          }
+        });
+      }),
+  );
+
+  await page.getByTestId("open-extension-equation-explorer").click();
+  return await ran;
+}
+
+test("REGRESSION: the wrapper still loads inside the iframe Buzz renders", async ({
+  page,
+}) => {
+  // Buzz frames the wrapper today — `open_extension_frame` returns the wrapper
+  // URL and this component renders `<iframe src={target.url}>`. Any wrapper
+  // header that refuses embedding blanks the extension surface.
+  expect(
+    await wrapperLoadsWhenFramed(page, { frameAncestorsNone: false }),
+  ).toBe(true);
+});
+
+test("CONTROL: frame-ancestors 'none' really would blank the surface", async ({
+  page,
+}) => {
+  // Without this row the regression above could pass for the uninteresting
+  // reason that nothing was ever capable of blocking the frame. This proves the
+  // harness observes the failure — and documents exactly what re-adding the
+  // header before the native top-level webview migration would cost.
+  expect(await wrapperLoadsWhenFramed(page, { frameAncestorsNone: true })).toBe(
+    false,
+  );
 });
 
 test("the app really does load a frame from a remote-class localhost origin", async ({

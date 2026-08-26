@@ -264,16 +264,37 @@ fn content_security_policy(origin: &str) -> String {
 /// `extension_origin` is the origin the wrapper is allowed to frame — a
 /// *different* origin from the one serving this document.
 ///
-/// `frame-ancestors 'none'` is the confused-deputy wall: it stops any document
-/// from embedding the wrapper, which is what a hostile extension would do to
-/// obtain a trusted wrapper instance with itself as parent. It is enforced by
-/// the embedded document against its embedder, so unlike `frame-src` it binds
-/// even when the embedder's policy is permissive.
+/// # Why `frame-ancestors 'none'` is NOT here yet
+///
+/// It belongs here eventually: it is the confused-deputy wall, stopping a
+/// hostile extension from embedding a wrapper to obtain a trusted instance with
+/// itself as parent. Unlike `frame-src` it is enforced by the embedded document
+/// against its embedder, so it binds even when the embedder is permissive.
+///
+/// **But Buzz currently frames this document itself.** `open_extension_frame`
+/// returns the wrapper URL and `ExtensionFrame.tsx` renders it as
+/// `<iframe src={target.url}>`, so `frame-ancestors 'none'` refuses the very
+/// composition that ships — the extension surface goes blank. That was measured
+/// in Chromium, not reasoned about: framed → 0 markers, top-level → 1.
+///
+/// **Reinstate it when, and only when, the wrapper becomes the top-level
+/// document of the dedicated native webview.** Adding it before that migration
+/// breaks the product.
+///
+/// Deferring is safe in the composition that ships today, for two independent
+/// reasons — this is a sequencing decision, not an accepted hole:
+///
+/// 1. the extension document's own policy is `default-src 'none'` with **no**
+///    `frame-src`, so a hostile package cannot frame anything at all, let alone
+///    a wrapper;
+/// 2. **no capability grants the bridge**, so a wrapper instance obtained by a
+///    confused deputy would hold no authority worth stealing.
+///
+/// Both of those change at the same migration that makes the header safe to add.
 fn wrapper_content_security_policy(extension_origin: &str) -> String {
     format!(
         "default-src 'none'; \
          frame-src {extension_origin}; \
-         frame-ancestors 'none'; \
          script-src 'unsafe-inline'; \
          style-src 'unsafe-inline'; \
          connect-src 'none'; \

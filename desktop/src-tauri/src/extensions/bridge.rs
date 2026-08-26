@@ -4,11 +4,12 @@
 //!
 //! Tauri checks the ACL when the command is a plugin command, when the app
 //! declares an ACL manifest, or when the origin is remote
-//! (`tauri-2.11.5/src/webview/mod.rs:1823`). Buzz has **no `__app__` manifest**
+//! (`tauri-2.11.5/src/webview/mod.rs:1823`). Buzz has **no `__app-acl__` manifest**
 //! — the generated `acl-manifests.json` reports `has_app: false` — so an *app*
 //! command cannot be granted narrowly to one origin. Measured: adding a
 //! capability that grants an app command fails outright with
-//! `UnknownManifest { key: "app manifest" }`.
+//! `UnknownManifest { key: "app manifest" }` (the key Tauri 2.11.5 looks for is
+//! `__app-acl__`).
 //!
 //! A **plugin** command is always ACL-checked and resolves against the manifest
 //! `tauri_build::InlinedPlugin` generates, so it can be granted to exactly one
