@@ -2,7 +2,11 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { startBridgeDispatch } from "./bridgeDispatch.ts";
-import { MAX_IN_FLIGHT } from "./bridgeRegistry.ts";
+import {
+  createRegistry,
+  MAX_IN_FLIGHT,
+  MAX_REQUESTS_PER_PORT,
+} from "./bridgeRegistry.ts";
 
 const LEASE = "9f1c2d3e-4a5b-4c6d-8e7f-0a1b2c3d4e5f";
 const uuid = (n) => `3f2504e0-4f89-41d3-9a0c-${String(n).padStart(12, "0")}`;
@@ -16,8 +20,11 @@ const uuid = (n) => `3f2504e0-4f89-41d3-9a0c-${String(n).padStart(12, "0")}`;
  * hangs instead of reporting.
  */
 function harness(t, options = {}) {
-  const { reply = { ok: true, result: { pubkey: "a".repeat(64) } }, call } =
-    options;
+  const {
+    reply = { ok: true, result: { pubkey: "a".repeat(64) } },
+    call,
+    registry,
+  } = options;
   const channel = new MessageChannel();
   const calls = [];
   const record = (lease, v, method) => {
@@ -28,6 +35,7 @@ function harness(t, options = {}) {
     port: channel.port1,
     lease: LEASE,
     call: record,
+    registry,
   });
   t.after(() => {
     handle.dispose();
@@ -335,4 +343,55 @@ test("an uncorrelatable frame is dropped and a malformed one is answered", async
     "a numeric v that is not 1 is unsupported, whatever u32 can carry",
   );
   assert.equal(calls.length, 0);
+});
+
+test("exhausting the budget tears the port down and settles what is in flight", async (t) => {
+  // The refusal is not the end of it: the port can never serve again, so
+  // leaving it open would mean the extension talks to a channel that will
+  // never answer. Everything outstanding is settled and the dispatcher stops.
+  const registry = createRegistry();
+  const spent = (n) => `3f2504e0-4f89-41d3-9a0c-${String(n).padStart(12, "b")}`;
+  for (let n = 0; n < MAX_REQUESTS_PER_PORT - 1; n += 1) {
+    registry.admit(spent(n));
+    registry.settle(spent(n));
+  }
+
+  const { channel, calls } = harness(t, {
+    registry,
+    call: () => new Promise(() => {}), // never resolves
+  });
+  const seen = collect(channel);
+
+  // Takes the last slot in the budget, and stays outstanding.
+  channel.port2.postMessage({
+    id: uuid(1),
+    v: 1,
+    method: "identity.getPublicKey",
+  });
+  await waitFor(() => calls.length === 1, "the in-flight request");
+
+  // Exhausts it.
+  channel.port2.postMessage({
+    id: uuid(2),
+    v: 1,
+    method: "identity.getPublicKey",
+  });
+  await waitFor(() => seen.length === 2, "the refusal and the settlement");
+
+  const byId = new Map(seen.map((r) => [r.id, r]));
+  assert.equal(byId.get(uuid(2)).error.code, "quota_exceeded");
+  assert.equal(
+    byId.get(uuid(1)).error.code,
+    "internal",
+    "the in-flight request must be settled, not abandoned",
+  );
+
+  // And the port is done: nothing further is served.
+  const after = await roundTrip(
+    channel,
+    { id: uuid(3), v: 1, method: "identity.getPublicKey" },
+    100,
+  );
+  assert.equal(after, null, "an exhausted port must not serve again");
+  assert.equal(calls.length, 1);
 });

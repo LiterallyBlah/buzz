@@ -33,7 +33,11 @@
 import { invoke as tauriInvoke } from "@tauri-apps/api/core";
 
 import { checkFrame, isUuid, WIRE_VERSION } from "./bridgeFrame";
-import { createRegistry, TEARDOWN_ERROR } from "./bridgeRegistry";
+import {
+  createRegistry,
+  type Registry,
+  TEARDOWN_ERROR,
+} from "./bridgeRegistry";
 
 type BridgeReply = {
   ok: boolean;
@@ -53,6 +57,11 @@ type StartOptions = {
   lease: string;
   /** Injected for tests; defaults to Tauri's `invoke`. */
   call?: (lease: string, v: number, method: string) => Promise<BridgeReply>;
+  /**
+   * Injected for tests, so budget exhaustion is reachable without driving
+   * twenty thousand real round trips through the port.
+   */
+  registry?: Registry;
 };
 
 /**
@@ -79,7 +88,7 @@ export function startBridgeDispatch(options: StartOptions): DispatchHandle {
         method,
       }));
 
-  const registry = createRegistry();
+  const registry = options.registry ?? createRegistry();
   let disposed = false;
 
   /** The single write path to the port. */
@@ -129,6 +138,14 @@ export function startBridgeDispatch(options: StartOptions): DispatchHandle {
           error: { code: admission.code, message: admission.message },
         });
       }
+      if (admission.terminal) {
+        // The port has spent its budget. §2 admits one `ready` per frame, so
+        // no successor port can be negotiated here — the honest end is to tear
+        // this one down, settling anything outstanding, and let re-opening the
+        // frame mint a fresh lease and port. Refusing forever instead would
+        // leave the extension talking to a channel that will never answer.
+        dispose();
+      }
       return;
     }
 
@@ -145,28 +162,28 @@ export function startBridgeDispatch(options: StartOptions): DispatchHandle {
       });
   };
 
+  const dispose = () => {
+    if (disposed) {
+      return;
+    }
+    // Stop listening first, then close admission and settle. Requests already
+    // dispatched are answered below; anything arriving after this point has no
+    // listener to reach.
+    port.removeEventListener("message", onMessage);
+    const outstanding = registry.closeAndDrain();
+    for (const id of outstanding) {
+      // Written directly: `closeAndDrain` already marked these terminal, so
+      // `reply` would find nothing to settle and write nothing. The caller
+      // must hear about them before the port closes.
+      write(id, { ok: false, error: { ...TEARDOWN_ERROR } });
+    }
+    disposed = true;
+  };
+
   port.addEventListener("message", onMessage);
   port.start();
 
-  return {
-    dispose: () => {
-      if (disposed) {
-        return;
-      }
-      // Stop listening first, then close admission and settle. Requests
-      // already dispatched are answered below; anything arriving after this
-      // point has no listener to reach.
-      port.removeEventListener("message", onMessage);
-      const outstanding = registry.closeAndDrain();
-      for (const id of outstanding) {
-        // Written directly: `closeAndDrain` already marked these terminal, so
-        // `reply` would find nothing to settle and write nothing. The caller
-        // must hear about them before the port closes.
-        write(id, { ok: false, error: { ...TEARDOWN_ERROR } });
-      }
-      disposed = true;
-    },
-  };
+  return { dispose };
 }
 
 export { WIRE_VERSION as BRIDGE_WIRE_VERSION };

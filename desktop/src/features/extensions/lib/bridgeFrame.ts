@@ -137,6 +137,10 @@ type Budget = {
   nodes: number;
 };
 
+const TOO_MANY_VALUES = "request frame has too many values";
+const EXCEEDS_LIMITS = "request frame exceeds the wire limits";
+const NOT_ALLOWED = "request frame carries a value the protocol does not allow";
+
 /**
  * Walk a value, admitting only JSON-compatible types and charging it against
  * the budget. Returns an error string, or null if the value is acceptable.
@@ -146,7 +150,35 @@ type Budget = {
  */
 function checkValue(root: unknown, budget: Budget): string | null {
   const seen = new WeakSet<object>();
-  const stack: Array<[unknown, number]> = [[root, 0]];
+  const stack: Array<[unknown, number]> = [];
+
+  /**
+   * Charge a value when it is **enqueued**, not when it is visited.
+   *
+   * Charging on visit lets a container push all of its children before the
+   * ceiling is next consulted, so a million-element array allocates a
+   * million stack entries and *then* gets refused. Charging on enqueue makes
+   * the node budget bound the stack itself.
+   */
+  const enqueue = (value: unknown, depth: number): boolean => {
+    budget.nodes += 1;
+    // Defence in depth, and honestly unreachable at the current constants: an
+    // array long enough to matter is refused on its declared length below, and
+    // an object entry costs at least nine encoded bytes against a budget of
+    // ~6.5 bytes per node, so the byte cap always arrives first. No fixture can
+    // isolate this branch, which is why the mutation battery does not claim
+    // one. It is kept because it is the bound that stays correct if MAX_NODES,
+    // MAX_FRAME_BYTES or the per-entry costs are ever retuned.
+    if (budget.nodes > MAX_NODES) {
+      return false;
+    }
+    stack.push([value, depth]);
+    return true;
+  };
+
+  if (!enqueue(root, 0)) {
+    return TOO_MANY_VALUES;
+  }
 
   while (stack.length > 0) {
     const entry = stack.pop();
@@ -155,10 +187,6 @@ function checkValue(root: unknown, budget: Budget): string | null {
     }
     const [value, depth] = entry;
 
-    budget.nodes += 1;
-    if (budget.nodes > MAX_NODES) {
-      return "request frame has too many values";
-    }
     if (depth > MAX_DEPTH) {
       return "request frame is nested too deeply";
     }
@@ -188,34 +216,56 @@ function checkValue(root: unknown, budget: Budget): string | null {
       seen.add(container);
 
       if (Array.isArray(container)) {
+        // Refuse on the declared length before touching a single element: an
+        // enormous array must cost one comparison, not one push per element.
+        if (budget.nodes + container.length > MAX_NODES) {
+          return TOO_MANY_VALUES;
+        }
         budget.bytes += 2 + Math.max(0, container.length - 1); // [] + commas
         for (const item of container) {
-          stack.push([item, depth + 1]);
+          if (!enqueue(item, depth + 1)) {
+            return TOO_MANY_VALUES;
+          }
         }
       } else if (isPlainObject(container)) {
-        const keys = Object.keys(container);
-        budget.bytes += 2 + Math.max(0, keys.length - 1);
-        for (const key of keys) {
+        // `for...in` rather than `Object.keys`, which would materialise an
+        // array of every key before any budget could refuse them. The
+        // prototype is already known to be `Object.prototype` or null, so an
+        // own-property filter is all the guard this needs.
+        budget.bytes += 2; // {}
+        let keys = 0;
+        for (const key in container) {
+          if (!Object.hasOwn(container, key)) {
+            continue;
+          }
+          keys += 1;
           const size = utf8Length(key);
           if (size > MAX_STRING_BYTES) {
             return "request frame carries an oversized key";
           }
-          budget.bytes += size + 3; // quotes and colon
-          stack.push([(container as Record<string, unknown>)[key], depth + 1]);
+          budget.bytes += size + 3 + (keys > 1 ? 1 : 0); // quotes, colon, comma
+          if (budget.bytes > MAX_FRAME_BYTES) {
+            return EXCEEDS_LIMITS;
+          }
+          if (
+            !enqueue((container as Record<string, unknown>)[key], depth + 1)
+          ) {
+            return TOO_MANY_VALUES;
+          }
         }
       } else {
         // Everything structured clone carries that JSON cannot represent:
         // ArrayBuffer, typed arrays, DataView, Map, Set, Blob, File, Date,
         // RegExp, Error, MessagePort and any other exotic object.
-        return "request frame carries a value the protocol does not allow";
+        return NOT_ALLOWED;
       }
     } else {
       // undefined, bigint, function, symbol.
-      return "request frame carries a value the protocol does not allow";
+      return NOT_ALLOWED;
     }
 
     if (budget.bytes > MAX_FRAME_BYTES) {
-      return "request frame exceeds the wire limits";
+      return EXCEEDS_LIMITS;
     }
   }
 
@@ -251,8 +301,16 @@ export function checkFrame(data: unknown): FrameCheck {
   const refuse = (message: string): FrameCheck =>
     refuseWith(INVALID_PARAMS, message);
 
-  for (const key of Object.keys(data)) {
-    if (!FRAME_FIELDS.has(key)) {
+  // `for...in` with a running count, not `Object.keys`: a frame carrying a
+  // million top-level keys would otherwise materialise a million-element array
+  // before anything could refuse it. This refuses on the fifth key.
+  let fields = 0;
+  for (const key in data) {
+    if (!Object.hasOwn(data, key)) {
+      continue;
+    }
+    fields += 1;
+    if (fields > FRAME_FIELDS.size || !FRAME_FIELDS.has(key)) {
       return refuse("request frame carries an unrecognised field");
     }
   }
@@ -291,6 +349,30 @@ export function checkFrame(data: unknown): FrameCheck {
   const problem = checkValue(data, budget);
   if (problem !== null) {
     return refuse(problem);
+  }
+
+  // The walk charges **raw** UTF-8 bytes, but JSON escapes: a NUL is one raw
+  // byte and six encoded ones (`\u0000`), and quotes and backslashes double.
+  // So the running estimate can sit under the cap while the real encoding is
+  // over it — 11 000 NULs measured 11 000 raw and 66 085 encoded against a
+  // 65 536 limit. Only measuring the actual encoding is exact.
+  //
+  // Affordable precisely because the walk ran first: nodes, depth, per-string
+  // size and raw bytes are all bounded by then, so what reaches `stringify`
+  // is at most the frame budget plus one string's overshoot, and escaping
+  // expands that by at most six. Doing this before the walk would be the DoS
+  // the walk exists to prevent.
+  let encoded: number;
+  try {
+    encoded = new TextEncoder().encode(JSON.stringify(data)).byteLength;
+  } catch {
+    // Unreachable for a value the walk admitted, which is why it refuses
+    // rather than rethrowing: an exception here would mean the walk let
+    // something through, and failing closed is the safer answer.
+    return refuse(EXCEEDS_LIMITS);
+  }
+  if (encoded > MAX_FRAME_BYTES) {
+    return refuse(EXCEEDS_LIMITS);
   }
 
   return {

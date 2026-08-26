@@ -180,11 +180,20 @@ test("a frame at the depth limit is accepted", () => {
   assert.equal(checkFrame(frameWith(root)).kind, "ok");
 });
 
-test("a very wide frame is rejected on node count", () => {
-  // Many values, few bytes: an array of nulls encodes to about 50 KiB, inside
-  // the frame budget, so the node budget is the only bound that can refuse it.
-  // Keyed objects would blow the byte budget first and leave this untested.
-  const wide = new Array(MAX_NODES + 10).fill(null);
+test("nested growth is refused as the node budget is spent", () => {
+  // A binary tree: no single container is large, so this exercises the
+  // pre-check as it applies to *incremental* growth — `nodes + length` trips
+  // on the way up rather than on one oversized array.
+  //
+  // Sized so nodes run out before bytes do — each node costs about three
+  // encoded bytes, and the walk enqueues roughly two children per pop, so the
+  // ceiling is reached well inside the frame budget. Depth 13 is 16 383 nodes
+  // encoding to about 41 KiB, so even a *complete* traversal would stay under
+  // the byte cap — the node ceiling is the only thing that can refuse it, which
+  // is what makes this fixture test that ceiling rather than the byte one.
+  const tree = (depth) =>
+    depth === 0 ? [] : [tree(depth - 1), tree(depth - 1)];
+  const wide = tree(13);
   refusalFor(wide);
 });
 
@@ -337,4 +346,104 @@ test("an ordinary frame with a plain params tree is accepted", () => {
   assert.equal(checked.frame.id, ID);
   assert.equal(checked.frame.method, "some.method");
   assert.equal(checked.frame.params.kind, 9);
+});
+
+// ── the encoded size, not the raw size ───────────────────────────────────────
+
+test("json escaping is charged: control characters cannot smuggle bytes past the cap", () => {
+  // A NUL is one raw UTF-8 byte and six encoded ones. Charging raw bytes let
+  // 11 000 of them measure 11 000 against a 65 536 cap while the real encoding
+  // was 66 085 — over the limit and admitted.
+  const nul = String.fromCharCode(0);
+  const text = nul.repeat(11_000);
+
+  assert.ok(
+    utf8Length(text) < MAX_STRING_BYTES,
+    "precondition: the raw string is inside the per-string cap",
+  );
+  const encoded = new TextEncoder().encode(
+    JSON.stringify(frameWith({ text })),
+  ).byteLength;
+  assert.ok(
+    encoded > MAX_FRAME_BYTES,
+    `precondition: the encoded frame must exceed the cap (got ${encoded})`,
+  );
+
+  refusalFor({ text });
+});
+
+test("quotes and backslashes are charged too", () => {
+  // Same mechanism, two encoded bytes per character instead of six. Split
+  // across several strings so each stays inside the per-string cap — a single
+  // long one would be refused by that cap and never reach the size question.
+  const chunk = '"'.repeat(10_000);
+  const params = { a: chunk, b: chunk, c: chunk, d: chunk, e: chunk, f: chunk };
+
+  for (const value of Object.values(params)) {
+    assert.ok(
+      utf8Length(value) < MAX_STRING_BYTES,
+      "precondition: no single string trips the per-string cap",
+    );
+  }
+  const raw = Object.values(params).reduce((n, v) => n + utf8Length(v), 0);
+  assert.ok(raw < MAX_FRAME_BYTES, "precondition: raw total is inside the cap");
+  const encoded = new TextEncoder().encode(
+    JSON.stringify(frameWith(params)),
+  ).byteLength;
+  assert.ok(
+    encoded > MAX_FRAME_BYTES,
+    `precondition: encoded is over (${encoded})`,
+  );
+
+  refusalFor(params);
+});
+
+// ── bounded work, not merely eventual refusal ────────────────────────────────
+
+test("an oversized array is refused without reading its elements", () => {
+  // The bound must cost a comparison, not one push per element. Indexed
+  // getters count reads: pushing children before consulting the ceiling would
+  // read every one of them.
+  const arr = new Array(50_000);
+  let reads = 0;
+  for (let i = 0; i < 50_000; i += 1) {
+    Object.defineProperty(arr, i, {
+      enumerable: true,
+      configurable: true,
+      get() {
+        reads += 1;
+        return 1;
+      },
+    });
+  }
+
+  refusalFor(arr);
+  assert.equal(
+    reads,
+    0,
+    "the declared length must refuse the array before any element is touched",
+  );
+});
+
+test("a wide object stops reading values once the budget is spent", () => {
+  // `Object.keys` plus push-everything would read all 50 000; enqueue-time
+  // charging stops at the ceiling.
+  const wide = {};
+  let reads = 0;
+  for (let i = 0; i < 50_000; i += 1) {
+    Object.defineProperty(wide, `k${i}`, {
+      enumerable: true,
+      configurable: true,
+      get() {
+        reads += 1;
+        return 1;
+      },
+    });
+  }
+
+  refusalFor(wide);
+  assert.ok(
+    reads <= MAX_NODES + 1,
+    `must stop at the node ceiling, read ${reads} of 50000`,
+  );
 });

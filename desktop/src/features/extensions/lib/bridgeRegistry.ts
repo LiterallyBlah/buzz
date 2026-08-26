@@ -22,8 +22,22 @@
  *
  * Memory is bounded by a **finite per-port request budget**, not by eviction.
  * An LRU would evict old ids back into validity, which is precisely the
- * property being defended. When the budget is spent the port is done and the
- * frame must renew it.
+ * property being defended.
+ *
+ * # Exhausting the budget ends the port, it does not throttle it
+ *
+ * An earlier revision returned `quota_exceeded` forever and claimed the frame
+ * would "renew the port". No such path existed: §2 admits exactly one `ready`
+ * per frame, so a successor port cannot be negotiated on a live frame, and the
+ * handshake latches after the first one. That comment described code that was
+ * never written.
+ *
+ * Rather than relax a §2 rule inside a hardening increment, exhaustion is now
+ * **terminal**: the exhausting request is refused `quota_exceeded`, no further
+ * request is admitted, and the owner tears the port down — settling anything
+ * outstanding. Recovery is re-opening the extension frame, which mints a fresh
+ * lease and a fresh port through the ordinary path. That is a deliberate
+ * lifecycle contract, not silent permanent exhaustion.
  */
 
 /** §8 codes this module produces. */
@@ -35,9 +49,10 @@ const INTERNAL = "internal";
 /**
  * Most requests one port may ever admit.
  *
- * Bounds the retained id set. Generous for a UI surface — an extension issuing
- * one request a second would take five hours to reach it — and reaching it is
- * not fatal: the frame renews the port.
+ * Bounds the retained id set, at roughly 80 bytes an id. Generous for a UI
+ * surface — an extension issuing one request a second would take five and a
+ * half hours to reach it — and reaching it ends the port rather than wedging
+ * it, so the failure is observable instead of an endless refusal.
  */
 export const MAX_REQUESTS_PER_PORT = 20_000;
 
@@ -52,7 +67,13 @@ export const MAX_IN_FLIGHT = 32;
 
 export type Admission =
   | { kind: "admitted" }
-  | { kind: "refused"; code: string; message: string };
+  | {
+      kind: "refused";
+      code: string;
+      message: string;
+      /** The port cannot serve again; the owner must tear it down. */
+      terminal?: boolean;
+    };
 
 export type Registry = {
   /** Reserve an id, or explain why not. */
@@ -69,6 +90,8 @@ export type Registry = {
   readonly closeAndDrain: () => string[];
   /** Test/introspection: how many requests are outstanding. */
   readonly inFlight: () => number;
+  /** Has the port spent its budget and become unusable? */
+  readonly isExhausted: () => boolean;
 };
 
 export const TEARDOWN_ERROR = {
@@ -82,9 +105,22 @@ export function createRegistry(): Registry {
   /** Ids admitted and not yet terminal. */
   const outstanding = new Set<string>();
   let admitting = true;
+  let exhausted = false;
+
+  const spent = (): Admission => ({
+    kind: "refused",
+    code: QUOTA_EXCEEDED,
+    message: "this connection has reached its request budget",
+    terminal: true,
+  });
 
   return {
     admit(id: string): Admission {
+      // Reported before the teardown arm so the reason stays accurate for any
+      // request that races the teardown this very refusal triggers.
+      if (exhausted) {
+        return spent();
+      }
       if (!admitting) {
         // Closed ports admit nothing. Reached only if a frame arrives between
         // teardown and the listener being removed.
@@ -99,11 +135,8 @@ export function createRegistry(): Registry {
         };
       }
       if (used.size >= MAX_REQUESTS_PER_PORT) {
-        return {
-          kind: "refused",
-          code: QUOTA_EXCEEDED,
-          message: "this connection has reached its request budget",
-        };
+        exhausted = true;
+        return spent();
       }
       if (outstanding.size >= MAX_IN_FLIGHT) {
         return {
@@ -133,6 +166,10 @@ export function createRegistry(): Registry {
 
     inFlight(): number {
       return outstanding.size;
+    },
+
+    isExhausted(): boolean {
+      return exhausted;
     },
   };
 }

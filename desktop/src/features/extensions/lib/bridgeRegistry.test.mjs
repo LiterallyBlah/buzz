@@ -61,20 +61,19 @@ test("the in-flight ceiling refuses excess with rate_limited", () => {
   assert.equal(registry.admit(id(MAX_IN_FLIGHT)).kind, "admitted");
 });
 
-test("the per-port budget refuses with quota_exceeded and never evicts", () => {
+test("the per-port budget never evicts an id back into validity", () => {
   // Bounded memory without an LRU. An LRU would evict old ids back into
-  // validity, which is exactly the replay this defends against — so the port
-  // is finite instead, and the frame renews it.
+  // validity, which is exactly the replay this defends against.
+  //
+  // Observed one below the budget, deliberately: once the budget is spent the
+  // port is terminal and every answer is `quota_exceeded`, so "is the oldest
+  // id still known?" is only observable while the port still admits.
   const registry = createRegistry();
-  for (let n = 0; n < MAX_REQUESTS_PER_PORT; n += 1) {
+  for (let n = 0; n < MAX_REQUESTS_PER_PORT - 1; n += 1) {
     assert.equal(registry.admit(id(n)).kind, "admitted", `request ${n}`);
     registry.settle(id(n));
   }
-  const spent = registry.admit(id(MAX_REQUESTS_PER_PORT));
-  assert.equal(spent.kind, "refused");
-  assert.equal(spent.code, "quota_exceeded");
 
-  // The very first id must still be refused as used, not forgotten.
   const earliest = registry.admit(id(0));
   assert.equal(earliest.kind, "refused");
   assert.equal(
@@ -82,6 +81,34 @@ test("the per-port budget refuses with quota_exceeded and never evicts", () => {
     "invalid_params",
     "the oldest id must still read as used, not evicted back into validity",
   );
+  assert.equal(
+    registry.isExhausted(),
+    false,
+    "a refusal must not spend budget",
+  );
+});
+
+test("exhausting the budget ends the port rather than throttling it", () => {
+  // The earlier revision answered `quota_exceeded` forever and claimed the
+  // frame would renew the port. No such path exists — §2 admits one `ready`
+  // per frame — so exhaustion is terminal and the owner tears the port down.
+  const registry = createRegistry();
+  for (let n = 0; n < MAX_REQUESTS_PER_PORT; n += 1) {
+    registry.admit(id(n));
+    registry.settle(id(n));
+  }
+
+  const spent = registry.admit(id(MAX_REQUESTS_PER_PORT));
+  assert.equal(spent.kind, "refused");
+  assert.equal(spent.code, "quota_exceeded");
+  assert.equal(spent.terminal, true, "the owner must be told to tear down");
+  assert.equal(registry.isExhausted(), true);
+
+  // And it stays terminal, with the reason intact rather than decaying into a
+  // generic teardown error.
+  const next = registry.admit(id(MAX_REQUESTS_PER_PORT + 1));
+  assert.equal(next.code, "quota_exceeded");
+  assert.equal(next.terminal, true);
 });
 
 test("closing stops admission and hands back everything outstanding", () => {
