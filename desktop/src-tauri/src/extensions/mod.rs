@@ -26,6 +26,7 @@ mod install;
 // `manifest::EXTENSION_SIGNABLE_KINDS` rather than re-declare the allowlist.
 // One writer, two consumers.
 pub(crate) mod bridge;
+pub(crate) mod grants;
 pub(crate) mod manifest;
 mod package_path;
 mod preview;
