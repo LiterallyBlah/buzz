@@ -1634,6 +1634,7 @@ mod tests {
             false,
             crate::config::DEFAULT_MAX_FRAME_BYTES,
             None,
+            None,
         )
         .limitation
         .expect("limitation")

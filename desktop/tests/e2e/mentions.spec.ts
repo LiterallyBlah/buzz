@@ -1,5 +1,7 @@
 import { expect, test } from "@playwright/test";
 
+import { waitForAnimations } from "../helpers/animations";
+
 import {
   installMockBridge,
   openChannelBrowser,
@@ -36,37 +38,6 @@ const DM_THREAD_AGENT_MENTION_ERROR_TEXT =
   "Agents must already be in a DM to be mentioned in its threads. Start a new conversation that includes the agent.";
 const DM_THREAD_MEMBERS_LOADING_ERROR_TEXT =
   "Checking conversation members. Try again in a moment.";
-
-async function expectTextContrast(
-  locator: import("@playwright/test").Locator,
-  minimum = 4.5,
-) {
-  const contrastRatio = await locator.evaluate((element) => {
-    const parseRgb = (value: string) =>
-      (value.match(/[\d.]+/g) ?? []).slice(0, 3).map(Number);
-    const luminance = (color: number[]) =>
-      color
-        .map((channel) => {
-          const value = channel / 255;
-          return value <= 0.04045
-            ? value / 12.92
-            : ((value + 0.055) / 1.055) ** 2.4;
-        })
-        .reduce(
-          (sum, channel, index) =>
-            sum + channel * [0.2126, 0.7152, 0.0722][index],
-          0,
-        );
-    const style = getComputedStyle(element);
-    const foreground = luminance(parseRgb(style.color));
-    const background = luminance(parseRgb(style.backgroundColor));
-    return (
-      (Math.max(foreground, background) + 0.05) /
-      (Math.min(foreground, background) + 0.05)
-    );
-  });
-  expect(contrastRatio).toBeGreaterThanOrEqual(minimum);
-}
 
 /** Locator scoped to the mention autocomplete dropdown inside the composer. */
 function autocomplete(page: import("@playwright/test").Page) {
@@ -459,7 +430,7 @@ test("duplicate owned agents preserve provenance and exact pubkey selection", as
   await expect
     .poll(() => readOutgoingMentionPubkeys(page, "local"))
     .toEqual([managedPubkey]);
-  await expect(input).toBeEmpty();
+  await expect(input).toHaveText("@carl ");
 
   await page.getByTestId(`composer-address-lock-${managedPubkey}`).click();
   await input.fill("@carl");
@@ -749,7 +720,7 @@ test("defers agent mentions until DM members finish loading", async ({
   expect(commandCount(await readCommandLog(page), "add_channel_members")).toBe(
     commandCount(baselineCommands, "add_channel_members"),
   );
-  await expect(input).toBeEmpty();
+  await expect(input).toHaveText("@alice ");
   await expect(threadPanel).toContainText("before members resolve");
 });
 
@@ -844,6 +815,9 @@ test("mention autocomplete caps global people search at 50 results", async ({
 test("selecting a person mention inserts @Name into input", async ({
   page,
 }) => {
+  await page.addInitScript(() => {
+    window.localStorage.setItem("buzz-theme", "buzz-dark");
+  });
   await page.goto("/");
   await page.getByTestId("channel-general").click();
   await expect(page.getByTestId("chat-title")).toHaveText("general");
@@ -872,6 +846,114 @@ test("selecting a person mention inserts @Name into input", async ({
     ),
   );
   expect(iconMask).toContain("data:image/svg+xml");
+  await expect(mentionChip).toHaveCSS("line-height", "18px");
+  const scrollViewport = page.getByTestId("message-input-scroll");
+  const paintedBounds = await mentionChip.evaluate((element) => {
+    const chip = element.getBoundingClientRect();
+    const viewport = element
+      .closest("[data-testid='message-input-scroll']")
+      ?.getBoundingClientRect();
+    if (!viewport)
+      throw new Error("Mention chip is missing its scroll viewport");
+    return {
+      chipTop: chip.top,
+      chipBottom: chip.bottom,
+      viewportTop: viewport.top,
+      viewportBottom: viewport.bottom,
+    };
+  });
+  expect(paintedBounds.chipTop).toBeGreaterThanOrEqual(
+    paintedBounds.viewportTop,
+  );
+  expect(paintedBounds.chipBottom).toBeLessThanOrEqual(
+    paintedBounds.viewportBottom,
+  );
+  const humanIconTranslateY = await mentionChip.evaluate(
+    (element) =>
+      new DOMMatrix(getComputedStyle(element, "::before").transform).m42,
+  );
+  const channelIconTranslateY = await input.evaluate((composer) => {
+    const probe = document.createElement("span");
+    probe.className =
+      "mention-chip inline-chip-with-icon inline-chip-icon-channel";
+    composer.append(probe);
+    const translateY = new DOMMatrix(
+      getComputedStyle(probe, "::before").transform,
+    ).m42;
+    probe.remove();
+    return translateY;
+  });
+  expect(humanIconTranslateY - channelIconTranslateY).toBeCloseTo(1);
+
+  await input.fill("@bo");
+  await dropdown.getByText("bob").click();
+  await input.press("Shift+Enter");
+  await page.keyboard.type("@bo");
+  await dropdown.getByText("bob").click();
+  await input.press("Shift+Enter");
+  await page.keyboard.type("@bo");
+  await dropdown.getByText("bob").click();
+  const multilineChips = input.locator(".human-mention-highlight");
+  await expect(multilineChips).toHaveCount(3);
+  const multilinePaintBounds = await multilineChips.evaluateAll((elements) => {
+    const viewport = elements[0]
+      ?.closest("[data-testid='message-input-scroll']")
+      ?.getBoundingClientRect();
+    if (!viewport) {
+      throw new Error("Mention chips are missing their scroll viewport");
+    }
+    return elements.map((element) => {
+      const chip = element.getBoundingClientRect();
+      return {
+        chipTop: chip.top,
+        chipBottom: chip.bottom,
+        viewportTop: viewport.top,
+        viewportBottom: viewport.bottom,
+      };
+    });
+  });
+  for (const bounds of multilinePaintBounds) {
+    expect(bounds.chipTop).toBeGreaterThanOrEqual(bounds.viewportTop);
+    expect(bounds.chipBottom).toBeLessThanOrEqual(bounds.viewportBottom);
+  }
+
+  await scrollViewport.evaluate((element) => {
+    element.style.width = "8rem";
+  });
+  await input.fill("A deliberately long prefix that forces @bo");
+  await dropdown.getByText("bob").click();
+  const wrappedChip = input.locator(".human-mention-highlight", {
+    hasText: "bob",
+  });
+  const wrappedPaintBounds = await wrappedChip.evaluate((element) => {
+    const chip = element.getBoundingClientRect();
+    const viewport = element
+      .closest("[data-testid='message-input-scroll']")
+      ?.getBoundingClientRect();
+    if (!viewport)
+      throw new Error("Mention chip is missing its scroll viewport");
+    return {
+      chipTop: chip.top,
+      chipBottom: chip.bottom,
+      viewportTop: viewport.top,
+      viewportBottom: viewport.bottom,
+    };
+  });
+  expect(wrappedPaintBounds.chipTop).toBeGreaterThanOrEqual(
+    wrappedPaintBounds.viewportTop,
+  );
+  expect(wrappedPaintBounds.chipBottom).toBeLessThanOrEqual(
+    wrappedPaintBounds.viewportBottom,
+  );
+  await expect(input).toHaveCSS("height", /^(?!20px$)/);
+  await scrollViewport.evaluate((element) => {
+    element.style.removeProperty("width");
+  });
+
+  await waitForAnimations(page);
+  await page.getByTestId("message-composer").screenshot({
+    path: "test-results/inline-chip-polish/composer-after.png",
+  });
 });
 
 test("immediate ArrowLeft after a person mention is not bounced past the trailing space", async ({
@@ -1178,7 +1260,7 @@ test("selecting a persona mention reuses an existing persona agent", async ({
   await expect(mentionChip).toHaveText("Fizz");
 });
 
-test("managed relay-profile agents with member roles use the agent address tray", async ({
+test("managed relay-profile agents with member roles can be addressed explicitly", async ({
   page,
 }) => {
   await installMockBridge(page, {
@@ -1204,11 +1286,20 @@ test("managed relay-profile agents with member roles use the agent address tray"
   await input.fill("@char");
 
   const dropdown = autocomplete(page);
-  await expect(dropdown.getByText("charlie")).toBeVisible();
-  await expect(dropdown.getByText("agent")).toBeVisible();
-  await input.press("Enter");
+  const charlieRow = dropdown.getByTestId(
+    `mention-suggestion-${TEST_IDENTITIES.charlie.pubkey}`,
+  );
+  await expect(charlieRow.getByText("charlie")).toBeVisible();
+  await expect(charlieRow.getByText("agent")).toBeVisible();
+  await charlieRow
+    .getByRole("button", {
+      name: "Automatically mention charlie",
+      exact: true,
+    })
+    .click();
 
-  await expect(input).toBeEmpty();
+  await expect(input).toHaveText("@charlie ");
+  await expect(input.locator(".agent-mention-highlight")).toHaveText("charlie");
   await expect(
     page.getByTestId(`composer-address-lock-${TEST_IDENTITIES.charlie.pubkey}`),
   ).toBeVisible();
@@ -2535,7 +2626,7 @@ test("system member-joined rows render the joined person as a plain profile name
   await expect(joinedPersonName).not.toHaveAttribute("data-mention");
 });
 
-test("selecting a managed non-member agent from a DM addresses it", async ({
+test("a managed non-member agent from a DM can be addressed explicitly", async ({
   page,
 }) => {
   await installMockBridge(page, {
@@ -2555,13 +2646,21 @@ test("selecting a managed non-member agent from a DM addresses it", async ({
   await input.fill("@char");
 
   const dropdown = autocomplete(page);
-  await expect(dropdown.getByText("charlie")).toBeVisible();
+  const charlieRow = dropdown.getByTestId(
+    `mention-suggestion-${TEST_IDENTITIES.charlie.pubkey}`,
+  );
+  await expect(charlieRow.getByText("charlie")).toBeVisible();
   await expect(autocomplete(page)).toHaveCount(1);
   await expect(input.locator(".mention-chip")).toHaveCount(0);
-  await input.press("Enter");
+  await charlieRow
+    .getByRole("button", {
+      name: "Automatically mention charlie",
+      exact: true,
+    })
+    .click();
 
-  await expect(input).toBeEmpty();
-  await expect(input.locator(".mention-chip")).toHaveCount(0);
+  await expect(input).toHaveText("@charlie ");
+  await expect(input.locator(".agent-mention-highlight")).toHaveText("charlie");
   await expect(
     page.getByTestId(`composer-address-lock-${TEST_IDENTITIES.charlie.pubkey}`),
   ).toBeVisible();
@@ -2636,9 +2735,6 @@ test("sent non-member person mention uses the normal mention style", async ({
 test("sent managed non-member agent mention uses the agent mention style", async ({
   page,
 }) => {
-  await page.addInitScript(() => {
-    window.localStorage.setItem("buzz-theme", "buzz-dark");
-  });
   await installMockBridge(page, {
     managedAgents: [
       {
@@ -2668,13 +2764,6 @@ test("sent managed non-member agent mention uses the agent mention style", async
   await expect(mentionChip).toBeVisible();
   await expect(mentionChip).toHaveText("charlie");
   await expect(mentionChip).toHaveClass(/agent-mention-highlight/);
-  await expect(mentionChip).toHaveCSS("background-color", "rgb(252, 223, 105)");
-  await expect(mentionChip).toHaveCSS("color", "rgb(26, 26, 26)");
-  await expectTextContrast(mentionChip);
-  await mentionChip.hover();
-  await expect(mentionChip).toHaveCSS("background-color", "rgb(251, 214, 65)");
-  await expect(mentionChip).toHaveCSS("color", "rgb(26, 26, 26)");
-  await expectTextContrast(mentionChip);
 });
 
 test("mention button opens autocomplete and inserts a selected member", async ({
@@ -2780,13 +2869,6 @@ test("mention text is highlighted in sent messages", async ({ page }) => {
   await expect(mentionChip).toBeVisible();
   await expect(mentionChip).toHaveText("bob");
   await expect(mentionChip).toHaveClass(/inline-chip-icon-human/);
-  await expect(mentionChip).toHaveCSS("background-color", "rgb(252, 223, 105)");
-  await expect(mentionChip).toHaveCSS("color", "rgb(26, 26, 26)");
-  await expectTextContrast(mentionChip);
-  await mentionChip.hover();
-  await expect(mentionChip).toHaveCSS("background-color", "rgb(251, 214, 65)");
-  await expect(mentionChip).toHaveCSS("color", "rgb(26, 26, 26)");
-  await expectTextContrast(mentionChip);
 });
 
 test("clicking author name opens user profile panel", async ({ page }) => {

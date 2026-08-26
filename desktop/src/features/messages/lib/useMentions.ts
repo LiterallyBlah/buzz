@@ -38,6 +38,8 @@ import { detectPrefixQuery } from "@/shared/lib/detectPrefixQuery";
 import { normalizePubkey } from "@/shared/lib/pubkey";
 import { channelMemberPubkeySet } from "@/shared/lib/rosterDerivations";
 import { trimMapToSize } from "@/shared/lib/trimMapToSize";
+import { useActiveAgentPubkeys } from "./useActiveAgentPubkeys";
+import { useDefaultAgentSuggestion } from "./useDefaultAgentSuggestion";
 import { flushMentionDebounce } from "./flushMentionDebounce";
 import { useAgentMentionRevalidation } from "./agentMentionRevalidation";
 import { extractMentionPubkeys } from "./extractMentionPubkeys";
@@ -67,6 +69,7 @@ const MENTION_SUGGESTION_LIMIT = 50;
 type UseMentionsOptions = {
   agentEligibilityScope?: AgentEligibilityScope;
   channelType?: ChannelType | null;
+  recentMentionPubkeys?: readonly string[];
 };
 // Keep managed-agent identity normalisation in one place. Channel-member sets
 // use the shared identity cache below so the timeline and composer reuse them.
@@ -177,6 +180,10 @@ export function useMentions(
         ]),
       ),
     [relayAgentsQuery.data],
+  );
+  const activeAgentPubkeys = useActiveAgentPubkeys(
+    managedAgentsQuery.data,
+    relayAgentsQuery.data,
   );
   const sharedChannelIds = React.useMemo(
     () => getSharedChannelIds(channelsQuery.data),
@@ -295,6 +302,7 @@ export function useMentions(
               ? (candidate.displayName ?? current.displayName)
               : (current.displayName ?? candidate.displayName),
         isAgent: current.isAgent || candidate.isAgent,
+        isActiveAgent: current.isActiveAgent || candidate.isActiveAgent,
         isMember: current.isMember || candidate.isMember,
         personaId: current.personaId ?? candidate.personaId,
         personaName: current.personaName ?? candidate.personaName ?? null,
@@ -340,6 +348,7 @@ export function useMentions(
           member.role === "bot" ||
           managedAgentNamesByPubkey.has(pubkey) ||
           relayAgentNamesByPubkey.has(pubkey),
+        isActiveAgent: activeAgentPubkeys.has(pubkey),
         ownerPubkey: profile?.ownerPubkey ?? null,
         personaName: personaNameByPubkey.get(pubkey) ?? null,
         role: member.role,
@@ -361,6 +370,7 @@ export function useMentions(
           (activePersonaById.has(pubkey) ? pubkey : undefined),
         ownerPubkey: agent.ownerPubkey,
         isAgent: true,
+        isActiveAgent: agent.status !== "offline",
       });
     }
     for (const agent of managedAgentsQuery.data ?? []) {
@@ -370,6 +380,8 @@ export function useMentions(
         displayName: agent.name,
         isMember: false,
         isAgent: true,
+        isActiveAgent:
+          agent.status === "running" || agent.status === "deployed",
         isManagedAgent: true,
         personaId: agent.personaId ?? undefined,
         personaName:
@@ -425,6 +437,7 @@ export function useMentions(
     );
   }, [
     activePersonaById,
+    activeAgentPubkeys,
     activePersonas,
     userSearchResults,
     canSearchGlobalUsers,
@@ -553,6 +566,16 @@ export function useMentions(
     ownerProfilesQuery.data?.profiles,
     profiles,
   ]);
+  const getDefaultAgentSuggestion = useDefaultAgentSuggestion({
+    activePersonaIds,
+    agentProvenanceReady: agentDirectoriesReady,
+    candidates: mentionCandidates,
+    channelType: options?.channelType,
+    currentPubkey,
+    ownerProfiles: ownerProfilesQuery.data?.profiles,
+    profiles,
+    recentMentionPubkeys: options?.recentMentionPubkeys,
+  });
   const fetchMoreSuggestions = React.useCallback(() => {
     if (userSearchQuery.hasNextPage && !userSearchQuery.isFetchingNextPage) {
       void userSearchQuery.fetchNextPage();
@@ -960,6 +983,7 @@ export function useMentions(
   return {
     cancelMentionAutocomplete,
     clearMentions,
+    getDefaultAgentSuggestion,
     extractMentionPersonas,
     extractMentionPubkeys: extractMentionPubkeysForCurrentMentions,
     revalidateMentionPubkeys,
