@@ -45,16 +45,38 @@
 //! viable **only after** extensions move to a dedicated webview; until then the
 //! wall must bind this frame, not the webview.
 //!
+//! # Two origins
+//!
+//! There are **two** listeners, on two ports, and the separation is a security
+//! boundary rather than tidiness:
+//!
+//! - the **extension origin** serves package content (`/ext/<id>/…`) and the
+//!   realm lockdown — the lockdown lives here because it is injected into the
+//!   extension document, which must be same-origin with it under `script-src`;
+//!
+//! - the **wrapper origin** serves the trusted wrapper and nothing else.
+//!
+//! A hostile package therefore cannot reach the privileged document by
+//! same-origin navigation: the wrapper route does not exist on its origin. That
+//! matters because a pathname-scoped Tauri capability admits *any document at
+//! that path*, so the defence has to be that the extension cannot arrive there
+//! at all.
+//!
+//! Distinct **ports**, not a distinct hostname: `<name>.localhost` does not
+//! resolve through an ordinary `files dns` resolver, so a listener there would
+//! be unreachable. A different port is a different origin by definition.
+//!
 //! # Lifecycle
 //!
-//! The listener is reference-counted by live frames, not started at boot:
+//! Both listeners are reference-counted together by live frames, not started at
+//! boot:
 //!
-//! - [`acquire`] starts it on the first frame and hands out the port.
-//! - [`release`] stops it when the last frame goes away — a closed tab, a
+//! - [`acquire`] starts both on the first frame and hands out both ports.
+//! - [`release`] stops both when the last frame goes away — a closed tab, a
 //!   navigation, or the preview flag being switched off (the frame unmounts in
 //!   every one of those cases).
-//! - [`shutdown_now`] stops it unconditionally on app exit, so a leaked holder
-//!   count cannot outlive the process.
+//! - [`shutdown_now`] stops both unconditionally on app exit, so a leaked
+//!   holder count cannot outlive the process.
 //!
 //! Nothing listens when no extension frame is open, which is the state the app
 //! is in almost all the time.
@@ -239,10 +261,19 @@ fn content_security_policy(origin: &str) -> String {
 /// and carry its own layout style — but nothing else: no network, no images,
 /// no fonts, no media. Its `style-src` exists because its inline rules are what
 /// make the extension fill the surface instead of a 300x150 default box.
-fn wrapper_content_security_policy(origin: &str) -> String {
+/// `extension_origin` is the origin the wrapper is allowed to frame — a
+/// *different* origin from the one serving this document.
+///
+/// `frame-ancestors 'none'` is the confused-deputy wall: it stops any document
+/// from embedding the wrapper, which is what a hostile extension would do to
+/// obtain a trusted wrapper instance with itself as parent. It is enforced by
+/// the embedded document against its embedder, so unlike `frame-src` it binds
+/// even when the embedder's policy is permissive.
+fn wrapper_content_security_policy(extension_origin: &str) -> String {
     format!(
         "default-src 'none'; \
-         frame-src {origin}; \
+         frame-src {extension_origin}; \
+         frame-ancestors 'none'; \
          script-src 'unsafe-inline'; \
          style-src 'unsafe-inline'; \
          connect-src 'none'; \
@@ -450,21 +481,40 @@ fn asset_content_security_policy(origin: &str, content_type: &str) -> String {
 #[derive(Clone)]
 struct HostState {
     base_dir: PathBuf,
-    origin: String,
+    /// Where package content lives. The wrapper needs this to build the
+    /// `src` it frames and the `frame-src` that bounds it.
+    extension_origin: String,
 }
 
-fn build_router(base_dir: PathBuf, port: u16) -> Router {
+/// The package-content origin: assets and the realm lockdown.
+///
+/// **The wrapper route is deliberately absent here.** If the wrapper were also
+/// served from this origin, the extension could reach the privileged document's
+/// path by ordinary same-origin navigation, and a pathname-scoped capability
+/// would then match a document the extension controls the arrival of.
+fn build_extension_router(base_dir: PathBuf, extension_port: u16) -> Router {
     let state = HostState {
         base_dir,
-        origin: origin_for_port(port),
+        extension_origin: origin_for_port(extension_port),
     };
     Router::new()
         .route(&format!("/{LOCKDOWN_ROUTE}"), get(serve_lockdown))
-        .route(&format!("/{FRAME_ROUTE_PREFIX}/{{id}}"), get(serve_wrapper))
         .route(
             &format!("/{EXTENSION_ROUTE_PREFIX}/{{id}}/{{*asset}}"),
             get(serve_asset),
         )
+        .with_state(state)
+}
+
+/// The trusted-wrapper origin. Serves exactly one route and nothing
+/// package-authored, ever.
+fn build_wrapper_router(base_dir: PathBuf, extension_port: u16) -> Router {
+    let state = HostState {
+        base_dir,
+        extension_origin: origin_for_port(extension_port),
+    };
+    Router::new()
+        .route(&format!("/{FRAME_ROUTE_PREFIX}/{{id}}"), get(serve_wrapper))
         .with_state(state)
 }
 
@@ -528,7 +578,7 @@ async fn serve_lockdown(State(state): State<HostState>) -> Response {
     insert(
         headers,
         header::CONTENT_SECURITY_POLICY,
-        &content_security_policy(&state.origin),
+        &content_security_policy(&state.extension_origin),
     );
     insert(headers, header::X_CONTENT_TYPE_OPTIONS, "nosniff");
     insert(headers, header::CACHE_CONTROL, "no-store");
@@ -545,7 +595,7 @@ async fn serve_wrapper(
         Ok(manifest) => manifest,
         Err(_) => return empty(StatusCode::NOT_FOUND),
     };
-    let entry_url = frame_url(&state.origin, &manifest.id, &manifest.entry);
+    let entry_url = frame_url(&state.extension_origin, &manifest.id, &manifest.entry);
 
     let mut response = Response::new(Body::from(wrapper_document(&entry_url)));
     let headers = response.headers_mut();
@@ -553,7 +603,7 @@ async fn serve_wrapper(
     insert(
         headers,
         header::CONTENT_SECURITY_POLICY,
-        &wrapper_content_security_policy(&state.origin),
+        &wrapper_content_security_policy(&state.extension_origin),
     );
     insert(headers, header::X_CONTENT_TYPE_OPTIONS, "nosniff");
     insert(headers, header::CACHE_CONTROL, "no-store");
@@ -575,7 +625,7 @@ async fn serve_asset(
     let content_type = content_type_for(&path);
     let bytes = if content_type.starts_with("text/html") {
         match std::str::from_utf8(&bytes) {
-            Ok(html) => document_with_lockdown(html, &state.origin).into_bytes(),
+            Ok(html) => document_with_lockdown(html, &state.extension_origin).into_bytes(),
             // Install-time validation rejects non-UTF-8 entry documents, so
             // reaching here means the tree changed under us. Refuse rather than
             // serve an active document the lockdown could not be written into —
@@ -593,7 +643,7 @@ async fn serve_asset(
     insert(
         headers,
         header::CONTENT_SECURITY_POLICY,
-        &asset_content_security_policy(&state.origin, content_type),
+        &asset_content_security_policy(&state.extension_origin, content_type),
     );
     // The package's own naming decides the type; never let a browser re-guess.
     insert(headers, header::X_CONTENT_TYPE_OPTIONS, "nosniff");
@@ -615,9 +665,21 @@ fn empty(status: StatusCode) -> Response {
 
 // ── Lifecycle ────────────────────────────────────────────────────────────────
 
+/// Two listeners, deliberately: the trusted wrapper and package content are
+/// served from **different origins** so the extension cannot reach the
+/// privileged one at all.
+///
+/// Distinct **ports** rather than a distinct hostname. `<name>.localhost` does
+/// not resolve through an ordinary `files dns` resolver (verified on this host:
+/// `getaddrinfo("buzz-extension-wrapper.localhost")` fails), so a real HTTP
+/// listener there would be unreachable. A different port is a different origin
+/// by definition, needs no name resolution, and behaves identically on every
+/// platform.
 struct RunningHost {
-    port: u16,
-    shutdown: oneshot::Sender<()>,
+    extension_port: u16,
+    wrapper_port: u16,
+    shutdown_extension: oneshot::Sender<()>,
+    shutdown_wrapper: oneshot::Sender<()>,
 }
 
 #[derive(Default)]
@@ -650,7 +712,13 @@ fn host_state() -> MutexGuard<'static, FrameHostState> {
 /// A live frame's claim on the host. Opaque to the caller by design.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct FrameLease {
-    pub port: u16,
+    /// Serves package content (`/ext/<id>/…`) and the realm lockdown. The
+    /// lockdown stays here because it is injected into the *extension*
+    /// document, which must be same-origin with it under `script-src`.
+    pub extension_port: u16,
+    /// Serves the trusted wrapper only. Nothing package-authored is ever
+    /// served from this origin.
+    pub wrapper_port: u16,
     pub lease: String,
 }
 
@@ -663,28 +731,50 @@ pub(crate) async fn acquire(base_dir: PathBuf) -> Result<FrameLease, String> {
     {
         let mut state = host_state();
         if let Some(running) = &state.running {
-            let port = running.port;
+            let (extension_port, wrapper_port) = (running.extension_port, running.wrapper_port);
             state.leases.insert(lease.clone());
-            return Ok(FrameLease { port, lease });
+            return Ok(FrameLease {
+                extension_port,
+                wrapper_port,
+                lease,
+            });
         }
     }
 
-    // Bind outside the lock: this is the only await in the path, and holding a
-    // std Mutex across it would be a deadlock waiting to happen.
-    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+    // Bind outside the lock: these are the only awaits in the path, and holding
+    // a std Mutex across them would be a deadlock waiting to happen.
+    let extension_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
         .await
         .map_err(|error| format!("could not start the extension frame host: {error}"))?;
-    let port = listener
+    let extension_port = extension_listener
         .local_addr()
         .map_err(|error| format!("could not read the frame host address: {error}"))?
         .port();
 
-    let (shutdown, shutdown_rx) = oneshot::channel();
-    let router = build_router(base_dir, port);
+    let wrapper_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .map_err(|error| format!("could not start the extension wrapper host: {error}"))?;
+    let wrapper_port = wrapper_listener
+        .local_addr()
+        .map_err(|error| format!("could not read the wrapper host address: {error}"))?
+        .port();
+
+    let (shutdown_extension, extension_rx) = oneshot::channel();
+    let (shutdown_wrapper, wrapper_rx) = oneshot::channel();
+    let extension_router = build_extension_router(base_dir.clone(), extension_port);
+    let wrapper_router = build_wrapper_router(base_dir, extension_port);
     tokio::spawn(async move {
-        axum::serve(listener, router)
+        axum::serve(extension_listener, extension_router)
             .with_graceful_shutdown(async move {
-                shutdown_rx.await.ok();
+                extension_rx.await.ok();
+            })
+            .await
+            .ok();
+    });
+    tokio::spawn(async move {
+        axum::serve(wrapper_listener, wrapper_router)
+            .with_graceful_shutdown(async move {
+                wrapper_rx.await.ok();
             })
             .await
             .ok();
@@ -693,15 +783,29 @@ pub(crate) async fn acquire(base_dir: PathBuf) -> Result<FrameLease, String> {
     let mut state = host_state();
     if let Some(running) = &state.running {
         // Another frame won the race while we were binding. Keep theirs and
-        // retire the listener we just created rather than leaking it.
-        let port = running.port;
-        let _ = shutdown.send(());
+        // retire BOTH listeners we just created rather than leaking them.
+        let (extension_port, wrapper_port) = (running.extension_port, running.wrapper_port);
+        let _ = shutdown_extension.send(());
+        let _ = shutdown_wrapper.send(());
         state.leases.insert(lease.clone());
-        return Ok(FrameLease { port, lease });
+        return Ok(FrameLease {
+            extension_port,
+            wrapper_port,
+            lease,
+        });
     }
-    state.running = Some(RunningHost { port, shutdown });
+    state.running = Some(RunningHost {
+        extension_port,
+        wrapper_port,
+        shutdown_extension,
+        shutdown_wrapper,
+    });
     state.leases.insert(lease.clone());
-    Ok(FrameLease { port, lease })
+    Ok(FrameLease {
+        extension_port,
+        wrapper_port,
+        lease,
+    })
 }
 
 /// Release one lease, stopping the host when the last one goes.
@@ -716,7 +820,9 @@ pub(crate) fn release(lease: &str) {
     }
     if state.leases.is_empty() {
         if let Some(running) = state.running.take() {
-            let _ = running.shutdown.send(());
+            // Both listeners, or the wrapper origin outlives the frames.
+            let _ = running.shutdown_extension.send(());
+            let _ = running.shutdown_wrapper.send(());
         }
     }
 }
@@ -729,14 +835,27 @@ pub(crate) fn shutdown_now() {
     let mut state = host_state();
     state.leases.clear();
     if let Some(running) = state.running.take() {
-        let _ = running.shutdown.send(());
+        let _ = running.shutdown_extension.send(());
+        let _ = running.shutdown_wrapper.send(());
     }
 }
 
-/// The running port, if any. Test and diagnostic use.
+/// The running extension-content port, if any. Test and diagnostic use.
 #[cfg(test)]
 pub(crate) fn running_port() -> Option<u16> {
-    host_state().running.as_ref().map(|running| running.port)
+    host_state()
+        .running
+        .as_ref()
+        .map(|running| running.extension_port)
+}
+
+/// The running trusted-wrapper port, if any. Test and diagnostic use.
+#[cfg(test)]
+pub(crate) fn running_wrapper_port() -> Option<u16> {
+    host_state()
+        .running
+        .as_ref()
+        .map(|running| running.wrapper_port)
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────

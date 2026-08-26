@@ -223,7 +223,7 @@ async fn the_host_starts_serves_and_leaves_no_listener_behind() {
     let claim = acquire(base.path().to_path_buf())
         .await
         .expect("host should start");
-    let port = claim.port;
+    let port = claim.extension_port;
     assert!(is_listening(port).await, "nothing is listening on {port}");
     assert_eq!(running_port(), Some(port));
 
@@ -271,7 +271,7 @@ async fn a_second_frame_keeps_the_host_up_until_both_release() {
     let first = acquire(base.path().to_path_buf()).await.expect("first");
     let second = acquire(base.path().to_path_buf()).await.expect("second");
     assert_eq!(
-        first.port, second.port,
+        first.extension_port, second.extension_port,
         "a second frame must reuse the one listener"
     );
     assert_ne!(
@@ -281,13 +281,13 @@ async fn a_second_frame_keeps_the_host_up_until_both_release() {
 
     release(&first.lease);
     assert!(
-        is_listening(first.port).await,
+        is_listening(first.extension_port).await,
         "the host stopped while a frame was still open"
     );
 
     release(&second.lease);
     assert!(
-        wait_until_closed(first.port).await,
+        wait_until_closed(first.extension_port).await,
         "the last release must stop it"
     );
 }
@@ -300,7 +300,7 @@ async fn shutdown_stops_the_host_even_with_holders_outstanding() {
     let base = installed(&[("index.html", b"x")]);
 
     let claim = acquire(base.path().to_path_buf()).await.expect("acquire");
-    let port = claim.port;
+    let port = claim.extension_port;
     let second = acquire(base.path().to_path_buf()).await.expect("acquire");
     assert!(is_listening(port).await);
 
@@ -325,15 +325,15 @@ async fn a_restarted_host_serves_again_on_a_fresh_port() {
 
     let first = acquire(base.path().to_path_buf()).await.expect("first");
     release(&first.lease);
-    assert!(wait_until_closed(first.port).await);
+    assert!(wait_until_closed(first.extension_port).await);
 
     let second = acquire(base.path().to_path_buf()).await.expect("second");
     assert!(
-        is_listening(second.port).await,
+        is_listening(second.extension_port).await,
         "the host did not come back"
     );
     release(&second.lease);
-    assert!(wait_until_closed(second.port).await);
+    assert!(wait_until_closed(second.extension_port).await);
 }
 
 #[tokio::test]
@@ -343,7 +343,7 @@ async fn traversal_is_refused_over_the_wire_too() {
     fs::write(base.path().join("secret.txt"), b"top secret").expect("secret");
 
     let claim = acquire(base.path().to_path_buf()).await.expect("acquire");
-    let port = claim.port;
+    let port = claim.extension_port;
     let origin = origin_for_port(port);
 
     // Sent raw so the client cannot normalise the traversal away before it
@@ -421,7 +421,7 @@ async fn every_served_document_carries_the_egress_policy() {
     ]);
 
     let claim = acquire(base.path().to_path_buf()).await.expect("acquire");
-    let port = claim.port;
+    let port = claim.extension_port;
     let origin = origin_for_port(port);
 
     for asset in ["index.html", "app.js", "app.css", "icon.png", "data.json"] {
@@ -494,7 +494,7 @@ async fn a_failed_open_cannot_stop_a_healthy_frame() {
     let base = installed(&[("index.html", b"x")]);
 
     let healthy = acquire(base.path().to_path_buf()).await.expect("frame A");
-    assert!(is_listening(healthy.port).await);
+    assert!(is_listening(healthy.extension_port).await);
 
     // Frame B never got a lease — its open failed. Cleanup still runs.
     release("");
@@ -502,13 +502,13 @@ async fn a_failed_open_cannot_stop_a_healthy_frame() {
     release(&uuid::Uuid::new_v4().to_string());
 
     assert!(
-        is_listening(healthy.port).await,
+        is_listening(healthy.extension_port).await,
         "a failed frame's cleanup stopped the host still serving a healthy one"
     );
-    assert_eq!(running_port(), Some(healthy.port));
+    assert_eq!(running_port(), Some(healthy.extension_port));
 
     release(&healthy.lease);
-    assert!(wait_until_closed(healthy.port).await);
+    assert!(wait_until_closed(healthy.extension_port).await);
 }
 
 #[tokio::test]
@@ -526,12 +526,12 @@ async fn releasing_the_same_lease_twice_does_not_close_another_frame() {
     release(&first.lease);
 
     assert!(
-        is_listening(second.port).await,
+        is_listening(second.extension_port).await,
         "a repeated release consumed a different frame's lease"
     );
 
     release(&second.lease);
-    assert!(wait_until_closed(second.port).await);
+    assert!(wait_until_closed(second.extension_port).await);
 }
 
 // ── Blocker 1: the wrapper is the navigation container ───────────────────────
@@ -550,9 +550,14 @@ async fn the_wrapper_document_carries_the_navigation_wall() {
     fs::write(root.join("index.html"), b"<!doctype html>hello").expect("entry");
 
     let claim = acquire(base.path().to_path_buf()).await.expect("acquire");
-    let origin = origin_for_port(claim.port);
+    let origin = origin_for_port(claim.extension_port);
+    let wrapper_origin = origin_for_port(claim.wrapper_port);
+    assert_ne!(
+        origin, wrapper_origin,
+        "wrapper and package content must not share an origin"
+    );
 
-    let response = reqwest::get(wrapper_url(&origin, "demo"))
+    let response = reqwest::get(wrapper_url(&wrapper_origin, "demo"))
         .await
         .expect("request");
     assert_eq!(response.status(), 200);
@@ -586,7 +591,104 @@ async fn the_wrapper_document_carries_the_navigation_wall() {
     );
 
     release(&claim.lease);
-    assert!(wait_until_closed(claim.port).await);
+    assert!(wait_until_closed(claim.extension_port).await);
+}
+
+// ── Distinct origins (P4 scaffolding) ────────────────────────────────────────
+//
+// The wrapper and package content are served from separate origins so a hostile
+// extension cannot reach the privileged document by same-origin navigation.
+// Each direction is asserted, because a split that leaks either way is not a
+// split.
+
+#[tokio::test]
+async fn the_wrapper_is_not_served_from_the_extension_origin() {
+    let _guard = lifecycle_guard().await;
+    let base = tempfile::tempdir().expect("tempdir");
+    let root = base.path().join("demo");
+    fs::create_dir_all(&root).expect("root");
+    fs::write(
+        root.join("extension.json"),
+        br#"{ "id": "demo", "name": "Demo", "version": "1", "entry": "index.html" }"#,
+    )
+    .expect("manifest");
+    fs::write(root.join("index.html"), b"<!doctype html>hello").expect("entry");
+
+    let claim = acquire(base.path().to_path_buf()).await.expect("acquire");
+    let extension_origin = origin_for_port(claim.extension_port);
+    let wrapper_origin = origin_for_port(claim.wrapper_port);
+
+    // CONTROL: the wrapper really is reachable on its own origin, so the 404
+    // below is the split working rather than a broken package or dead host.
+    let ok = reqwest::get(wrapper_url(&wrapper_origin, "demo"))
+        .await
+        .expect("wrapper request");
+    assert_eq!(ok.status(), 200, "wrapper must serve on the wrapper origin");
+
+    // The property: the extension's own origin has no wrapper route at all, so
+    // package content cannot navigate to the privileged document.
+    let denied = reqwest::get(wrapper_url(&extension_origin, "demo"))
+        .await
+        .expect("request");
+    assert_eq!(
+        denied.status(),
+        404,
+        "the wrapper must NOT be reachable from the package-content origin"
+    );
+
+    release(&claim.lease);
+}
+
+#[tokio::test]
+async fn package_content_is_not_served_from_the_wrapper_origin() {
+    let _guard = lifecycle_guard().await;
+    let base = installed(&[("index.html", b"<!doctype html>hello")]);
+    let claim = acquire(base.path().to_path_buf()).await.expect("acquire");
+    let extension_origin = origin_for_port(claim.extension_port);
+    let wrapper_origin = origin_for_port(claim.wrapper_port);
+
+    // CONTROL: the asset is genuinely servable, on its own origin.
+    let ok = reqwest::get(frame_url(&extension_origin, "demo", "index.html"))
+        .await
+        .expect("asset request");
+    assert_eq!(ok.status(), 200);
+
+    // Nothing package-authored is ever served from the privileged origin.
+    let denied = reqwest::get(frame_url(&wrapper_origin, "demo", "index.html"))
+        .await
+        .expect("request");
+    assert_eq!(
+        denied.status(),
+        404,
+        "package bytes must never come from the wrapper origin"
+    );
+
+    release(&claim.lease);
+}
+
+#[test]
+fn the_wrapper_policy_refuses_being_embedded() {
+    // The confused-deputy wall: a hostile extension embedding a wrapper would
+    // obtain a trusted instance with itself as parent. `frame-ancestors` is
+    // enforced by the embedded document against its embedder, which is the
+    // direction needed here.
+    let policy = wrapper_content_security_policy("http://127.0.0.1:4321");
+    assert!(
+        policy.contains("frame-ancestors 'none'"),
+        "the wrapper must refuse all embedding; got: {policy}"
+    );
+}
+
+#[test]
+fn the_wrapper_frames_the_extension_origin_not_its_own() {
+    // If `frame-src` named the wrapper's own origin the split would be
+    // decorative: the wrapper could only frame documents from the privileged
+    // origin, and the extension would have to live there.
+    let policy = wrapper_content_security_policy("http://127.0.0.1:4321");
+    assert!(
+        policy.contains("frame-src http://127.0.0.1:4321"),
+        "the wrapper must frame the extension origin; got: {policy}"
+    );
 }
 
 #[tokio::test]
@@ -594,7 +696,7 @@ async fn the_wrapper_refuses_an_unknown_or_invalid_extension() {
     let _guard = lifecycle_guard().await;
     let base = installed(&[("index.html", b"x")]);
     let claim = acquire(base.path().to_path_buf()).await.expect("acquire");
-    let origin = origin_for_port(claim.port);
+    let origin = origin_for_port(claim.wrapper_port);
 
     for id in ["../demo", "nope", "Evil"] {
         let response = reqwest::get(format!("{origin}/{FRAME_ROUTE_PREFIX}/{id}"))
@@ -604,7 +706,7 @@ async fn the_wrapper_refuses_an_unknown_or_invalid_extension() {
     }
 
     release(&claim.lease);
-    assert!(wait_until_closed(claim.port).await);
+    assert!(wait_until_closed(claim.extension_port).await);
 }
 
 // ── Blocker 1 (round 3): the WebRTC wall ─────────────────────────────────────
@@ -714,7 +816,7 @@ async fn html_is_locked_down_over_the_wire_and_other_types_are_untouched() {
         ("data.json", b"{}"),
     ]);
     let claim = acquire(base.path().to_path_buf()).await.expect("acquire");
-    let origin = origin_for_port(claim.port);
+    let origin = origin_for_port(claim.extension_port);
 
     let html = reqwest::get(format!("{origin}/{EXTENSION_ROUTE_PREFIX}/demo/index.html"))
         .await
@@ -747,7 +849,7 @@ async fn html_is_locked_down_over_the_wire_and_other_types_are_untouched() {
     assert_eq!(js, "// RTCPeerConnection stays a word in JS source");
 
     release(&claim.lease);
-    assert!(wait_until_closed(claim.port).await);
+    assert!(wait_until_closed(claim.extension_port).await);
 }
 
 // ── Blocker 2 (round 3): the wrapper's own style must not be blocked ─────────
@@ -803,7 +905,7 @@ async fn a_post_install_non_utf8_html_asset_is_refused() {
     fs::write(base.path().join("demo").join("broken.html"), &broken).expect("broken");
 
     let claim = acquire(base.path().to_path_buf()).await.expect("acquire");
-    let origin = origin_for_port(claim.port);
+    let origin = origin_for_port(claim.extension_port);
     let response = reqwest::get(format!(
         "{origin}/{EXTENSION_ROUTE_PREFIX}/demo/broken.html"
     ))
@@ -816,7 +918,7 @@ async fn a_post_install_non_utf8_html_asset_is_refused() {
     );
 
     release(&claim.lease);
-    assert!(wait_until_closed(claim.port).await);
+    assert!(wait_until_closed(claim.extension_port).await);
 }
 
 // ── Route 2: non-HTML active documents cannot execute ───────────────────────
@@ -876,7 +978,7 @@ async fn an_svg_asset_is_served_renderable_but_inert() {
         ),
     ]);
     let claim = acquire(base.path().to_path_buf()).await.expect("acquire");
-    let origin = origin_for_port(claim.port);
+    let origin = origin_for_port(claim.extension_port);
 
     let response = reqwest::get(format!("{origin}/{EXTENSION_ROUTE_PREFIX}/demo/asset.svg"))
         .await
@@ -899,5 +1001,5 @@ async fn an_svg_asset_is_served_renderable_but_inert() {
     assert!(policy.contains("script-src 'none'"), "got: {policy}");
 
     release(&claim.lease);
-    assert!(wait_until_closed(claim.port).await);
+    assert!(wait_until_closed(claim.extension_port).await);
 }

@@ -170,7 +170,10 @@ pub async fn open_extension_frame(
     };
 
     let claim = frame_host::acquire(base_dir).await?;
-    let origin = frame_host::origin_for_port(claim.port);
+    // Buzz frames the *wrapper*, so the origin the caller asserts against is
+    // the wrapper origin — a different origin from the one serving package
+    // content, which is the point of the split.
+    let origin = frame_host::origin_for_port(claim.wrapper_port);
     Ok(ExtensionFrameTarget {
         url: frame_host::wrapper_url(&origin, &manifest.id),
         origin,
