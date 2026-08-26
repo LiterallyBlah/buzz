@@ -31,6 +31,7 @@ pub(crate) mod grants;
 pub(crate) mod manifest;
 mod package_path;
 mod preview;
+pub(crate) mod publish;
 
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;

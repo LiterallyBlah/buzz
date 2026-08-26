@@ -60,11 +60,16 @@ pub(crate) mod code {
     pub(crate) const INVALID_PARAMS: &str = "invalid_params";
     pub(crate) const DENIED: &str = "denied";
     pub(crate) const IDENTITY_UNAVAILABLE: &str = "identity_unavailable";
-    // §8 also defines `internal`, `quota_exceeded`, `rate_limited` and
-    // `relay_error`. Those are produced by the frontend spine — IPC failure,
-    // teardown settlement, admission limits — so they are not declared here.
-    // Nothing in Rust emits them yet, and a constant nothing emits is a
-    // vocabulary entry pretending to be a code path.
+    /// The signer could not complete a step that is the host's fault, not the
+    /// caller's — an unreadable identity, an event that would not sign.
+    pub(crate) const INTERNAL: &str = "internal";
+    /// The relay refused the event. Its own text is discarded: it is written
+    /// for an operator and can name hosts and internal reasons.
+    pub(crate) const RELAY_ERROR: &str = "relay_error";
+    // §8 also defines `quota_exceeded` and `rate_limited`. Those remain
+    // frontend-only — they are admission decisions the spine makes before a
+    // request reaches Rust — so they are not declared here. A constant nothing
+    // emits is a vocabulary entry pretending to be a code path.
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -114,6 +119,12 @@ impl BridgeReply {
 pub(crate) enum Route {
     /// Run `identity.getPublicKey` for this extension (§3).
     IdentityGetPublicKey { extension_id: String },
+    /// Run `publish.event` for this extension (§4).
+    ///
+    /// Carries only the identity. The template travels separately, so the
+    /// value that decides *who the caller is* is still produced by a function
+    /// that never sees the payload.
+    PublishEvent { extension_id: String },
     /// Refuse, with this §8 code and message.
     Refuse { code: &'static str, message: String },
 }
@@ -158,6 +169,7 @@ pub(crate) fn route(
 
     match method {
         "identity.getPublicKey" => Route::IdentityGetPublicKey { extension_id },
+        "publish.event" => Route::PublishEvent { extension_id },
         _ => Route::Refuse {
             code: code::UNKNOWN_METHOD,
             message: format!("unknown method: {method}"),
@@ -226,11 +238,16 @@ pub(crate) fn grant_db_path<R: tauri::Runtime>(
 }
 
 /// Wire [`route`] to the real lease map, identity and grant store.
-pub(crate) fn dispatch<R: tauri::Runtime>(
+///
+/// `params` is threaded to the handlers but never to [`route`] — attribution
+/// is decided before the payload is looked at, and the signature keeps it that
+/// way.
+pub(crate) async fn dispatch<R: tauri::Runtime>(
     app: &AppHandle<R>,
     lease: &str,
     version: u32,
     method: &str,
+    params: Option<Value>,
 ) -> BridgeReply {
     match route(
         super::frame_host::extension_for_lease,
@@ -239,6 +256,9 @@ pub(crate) fn dispatch<R: tauri::Runtime>(
         method,
     ) {
         Route::Refuse { code, message } => BridgeReply::err(code, message),
+        Route::PublishEvent { extension_id } => {
+            super::publish::publish_event(app, &extension_id, params).await
+        }
         Route::IdentityGetPublicKey { extension_id } => {
             let state = app.state::<crate::AppState>();
 

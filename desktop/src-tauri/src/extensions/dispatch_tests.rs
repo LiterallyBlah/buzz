@@ -101,9 +101,11 @@ fn an_unsupported_version_outranks_an_unknown_lease() {
 fn an_unknown_method_is_refused() {
     for method in [
         "identity.getSecretKey",
-        "publish.event",
+        "publish.sign", // the cut `sign.event` shape — never exposed (§4)
+        "storage.set",  // a later increment's surface, not reachable yet
         "",
-        "identity.getPublicKey ",
+        "identity.getPublicKey ", // trailing space: no trimming, no near-miss
+        "Publish.Event",          // case is significant
     ] {
         let decision = route(resolver(LIVE), "lease-a", 1, method);
         match decision {
@@ -115,6 +117,20 @@ fn an_unknown_method_is_refused() {
             other => panic!("method {method:?} resolved to {other:?}"),
         }
     }
+}
+
+#[test]
+fn publish_event_routes_to_the_signer_for_the_leased_extension() {
+    // §4's method is reachable, and carries the lease-derived identity — the
+    // same attribution path `identity.getPublicKey` uses. The template is not
+    // a parameter of `route` at all, so no payload can influence which
+    // extension the signer will act as.
+    assert_eq!(
+        route(resolver(LIVE), "lease-b", 1, "publish.event"),
+        Route::PublishEvent {
+            extension_id: "other".to_string()
+        }
+    );
 }
 
 #[test]
@@ -238,7 +254,7 @@ fn every_refusal_this_module_can_produce_is_normalised() {
     for (lease, version, method) in [
         ("lease-a", 1u32, "identity.getPublicKey"),
         ("lease-a", 99, "identity.getPublicKey"),
-        ("lease-a", 1, "publish.event"),
+        ("lease-a", 1, "publish.sign"),
         ("lease-a", 1, ""),
         ("dead-lease", 1, "identity.getPublicKey"),
         ("lease-a", 1, long.as_str()),

@@ -109,6 +109,70 @@ pub(crate) fn has_scope(
     matches!(found, Ok(count) if count > 0)
 }
 
+/// Scope gating `publish.event` (§4). Qualified by `(kind, channel)`.
+pub(crate) const SCOPE_SIGN: &str = "sign";
+
+/// Record a `(kind, channel)` sign grant (§7).
+///
+/// `channel` is one concrete channel id. §7 forbids an "all channels"
+/// sentinel, so granting two channels means two rows — there is no value of
+/// `channel` that means "any", and [`has_sign_scope`] matches literally.
+#[allow(dead_code)] // Called by the grants UX; the store capability lands first.
+pub(crate) fn grant_sign_scope(
+    conn: &Connection,
+    identity_pubkey: &str,
+    extension_id: &str,
+    kind: u32,
+    channel: &str,
+) -> Result<(), String> {
+    conn.execute(
+        "INSERT OR REPLACE INTO extension_grants
+             (identity_pubkey, extension_id, scope, kind, channel, granted_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![
+            identity_pubkey,
+            extension_id,
+            SCOPE_SIGN,
+            i64::from(kind),
+            channel,
+            now_unix()
+        ],
+    )
+    .map_err(|error| format!("could not record the sign grant: {error}"))?;
+    Ok(())
+}
+
+/// May this extension sign this kind in this channel, for this identity?
+///
+/// Fail-closed on every arm, including a database error: a store we cannot
+/// read has granted nothing. An empty `channel` can never match, because a
+/// boolean row stores `channel = ''` and must not be readable as a sign grant.
+pub(crate) fn has_sign_scope(
+    conn: &Connection,
+    identity_pubkey: &str,
+    extension_id: &str,
+    kind: u32,
+    channel: &str,
+) -> bool {
+    if channel.is_empty() {
+        return false;
+    }
+    let found: Result<i64, _> = conn.query_row(
+        "SELECT COUNT(*) FROM extension_grants
+          WHERE identity_pubkey = ?1 AND extension_id = ?2 AND scope = ?3
+            AND kind = ?4 AND channel = ?5",
+        params![
+            identity_pubkey,
+            extension_id,
+            SCOPE_SIGN,
+            i64::from(kind),
+            channel
+        ],
+        |row| row.get(0),
+    );
+    matches!(found, Ok(count) if count > 0)
+}
+
 /// Drop every grant for one extension under one identity.
 ///
 /// Revocation takes effect on the next request (§9): there is no cached copy

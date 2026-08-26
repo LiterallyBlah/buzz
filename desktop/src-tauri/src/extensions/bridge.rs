@@ -82,8 +82,9 @@ pub(crate) async fn invoke<R: Runtime>(
     lease: String,
     v: u32,
     method: String,
+    params: Option<serde_json::Value>,
 ) -> super::dispatch::BridgeReply {
-    super::dispatch::dispatch(&app, &lease, v, &method)
+    super::dispatch::dispatch(&app, &lease, v, &method, params).await
 }
 
 /// Plugin name. Must match the `tauri_build::InlinedPlugin` entry in `build.rs`
