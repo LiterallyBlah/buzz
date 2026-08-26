@@ -911,6 +911,18 @@ pub(crate) fn running_port() -> Option<u16> {
 
 // ── Tests ────────────────────────────────────────────────────────────────────
 
+// `frame_host_tests.rs` outgrew the 1000-line ceiling, so it is split by what
+// each group needs: pure functions, emitted documents/policies, and tests that
+// drive a live listener. `frame_host_test_support` holds what they share.
+#[cfg(test)]
+#[path = "frame_host_policy_tests.rs"]
+mod frame_host_policy_tests;
+#[cfg(test)]
+#[path = "frame_host_test_support.rs"]
+mod frame_host_test_support;
 #[cfg(test)]
 #[path = "frame_host_tests.rs"]
 mod frame_host_tests;
+#[cfg(test)]
+#[path = "frame_host_wire_tests.rs"]
+mod frame_host_wire_tests;
