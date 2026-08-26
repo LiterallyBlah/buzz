@@ -51,8 +51,16 @@ const MAX_EXTENSION_ID_LEN: usize = 64;
 /// the set. The frontend deliberately does not mirror it — zod validates shape
 /// and unknown fields, this side owns the semantics, so there is no second copy
 /// to drift.
+///
+/// **Kind 7 (reaction) was removed** (design-repo §4, `d640883`). A reaction is
+/// not `h`-scoped: the relay derives its channel from the event its `e` tag
+/// points at (`derive_reaction_channel`, `ingest.rs`), so the target *is* the
+/// channel selector. An extension granted channel A could therefore react to an
+/// event in channel B and have the relay scope it to B — acting outside its
+/// grant — and the host cannot tell without resolving the target, which is not
+/// locally decidable. Restoring it needs either lookup-free scoping or a
+/// reviewed target-resolution policy, not a one-line edit here.
 pub(crate) const EXTENSION_SIGNABLE_KINDS: &[u32] = &[
-    kind::KIND_REACTION,            // 7     — reaction
     kind::KIND_STREAM_MESSAGE,      // 9     — channel message
     kind::KIND_EXTENSION_DATA,      // 30800 — extension data (decision 009)
     kind::KIND_STREAM_MESSAGE_EDIT, // 40003 — edit of the user's own event

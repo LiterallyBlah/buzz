@@ -93,13 +93,54 @@ fn a_non_allowlisted_kind_is_denied() {
 
 #[test]
 fn an_allowlisted_kind_without_a_grant_is_denied() {
-    // Granted-but-out-of-scope in the *kind* direction: 7 is allowlisted and
-    // this extension holds no grant for it.
+    // Granted-but-out-of-scope in the *kind* direction: 45001 is allowlisted
+    // and this extension holds no grant for it.
     let event = CanonicalEvent {
-        kind: kind::KIND_REACTION,
-        ..message(vec![tag(&["h", CHANNEL])], "+")
+        kind: kind::KIND_FORUM_POST,
+        ..message(vec![tag(&["h", CHANNEL])], "a post")
     };
     assert_eq!(refusal(&event), Some(Refusal::ChannelNotGranted));
+}
+
+#[test]
+fn a_reaction_is_refused_like_any_other_non_signable_kind() {
+    // Kind 7 is out of the v1 allowlist (design-repo §4, `d640883`) because a
+    // reaction's channel comes from its `e` target, not from `h` — so a grant
+    // for channel A could reach channel B and the host could not tell without
+    // resolving the target.
+    //
+    // It is refused as an ordinary non-allowlisted kind: no reaction-specific
+    // code, and no `e`-target resolution. The three targets below — one in the
+    // granted channel, one elsewhere, one that does not resolve — are refused
+    // identically, so a refused extension learns nothing about whether the
+    // target exists or where it lives.
+    let targets = [
+        tag(&["e", &"a".repeat(64)]),
+        tag(&["e", &"b".repeat(64)]),
+        tag(&["e", &"c".repeat(64)]),
+    ];
+    let mut rendered = Vec::new();
+    for target in targets {
+        let event = CanonicalEvent {
+            kind: kind::KIND_REACTION,
+            ..message(vec![tag(&["h", CHANNEL]), target], "+")
+        };
+        assert_eq!(
+            refusal_with_everything_granted(&event),
+            Some(Refusal::NotAllowlisted),
+            "a reaction must be refused by the allowlist, whatever it points at"
+        );
+        let refused = refusal_with_everything_granted(&event).expect("refused");
+        rendered.push(format!("{}|{}", refused.code(), refused.message()));
+    }
+    assert_eq!(
+        rendered
+            .iter()
+            .collect::<std::collections::HashSet<_>>()
+            .len(),
+        1,
+        "every reaction refusal must be byte-identical, whatever the target"
+    );
 }
 
 #[test]

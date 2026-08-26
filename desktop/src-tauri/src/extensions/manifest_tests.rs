@@ -252,8 +252,15 @@ fn traversal_id_is_rejected_by_the_manifest_validator() {
 fn every_allowlisted_sign_kind_is_accepted() {
     assert_eq!(
         EXTENSION_SIGNABLE_KINDS,
-        &[7, 9, 30800, 40003, 45001, 45002, 45003],
+        &[9, 30800, 40003, 45001, 45002, 45003],
         "the v1 signable allowlist is BRIDGE_SPEC.md §4; changing it is a spec change"
+    );
+    assert!(
+        !EXTENSION_SIGNABLE_KINDS.contains(&7),
+        "kind 7 was removed from the v1 allowlist (design-repo §4, d640883): a \
+         reaction's channel comes from its `e` target rather than an `h` tag, so \
+         a grant for one channel could reach another and the host cannot tell \
+         without resolving the target"
     );
     for kind_value in EXTENSION_SIGNABLE_KINDS {
         let scopes =
