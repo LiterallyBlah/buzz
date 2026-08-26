@@ -248,9 +248,12 @@ fn every_refusal_this_module_can_produce_is_normalised() {
             replies.push(BridgeReply::err(code, message));
         }
     }
-    replies.push(identity_get_public_key(&"a".repeat(64), false, "demo"));
-    replies.push(identity_get_public_key("", true, "demo"));
-    replies.push(BridgeReply::err(code::INTERNAL, "identity is not readable"));
+    replies.push(identity_get_public_key(
+        Some(&"a".repeat(64)),
+        false,
+        "demo",
+    ));
+    replies.push(identity_get_public_key(None, true, "demo"));
 
     assert!(
         replies.len() >= 8,
@@ -287,7 +290,7 @@ fn every_refusal_this_module_can_produce_is_normalised() {
 #[test]
 fn the_pubkey_is_returned_when_the_scope_is_granted() {
     let pubkey = "a".repeat(64);
-    let reply = identity_get_public_key(&pubkey, true, "demo");
+    let reply = identity_get_public_key(Some(&pubkey), true, "demo");
     assert!(reply.ok);
     assert_eq!(
         reply.result,
@@ -298,7 +301,7 @@ fn the_pubkey_is_returned_when_the_scope_is_granted() {
 
 #[test]
 fn without_the_grant_it_is_denied_fail_closed() {
-    let reply = identity_get_public_key(&"a".repeat(64), false, "demo");
+    let reply = identity_get_public_key(Some(&"a".repeat(64)), false, "demo");
     assert!(!reply.ok);
     assert_eq!(reply.error_code(), Some(code::DENIED));
     assert_eq!(
@@ -312,7 +315,7 @@ fn without_the_grant_it_is_denied_fail_closed() {
 fn a_denial_carries_no_pubkey() {
     // The denial path must not leak the value it refused to hand over.
     let pubkey = "abcdef0123456789".repeat(4);
-    let reply = identity_get_public_key(&pubkey, false, "demo");
+    let reply = identity_get_public_key(Some(&pubkey), false, "demo");
     let rendered = serde_json::to_string(&reply).expect("serialise");
     assert!(
         !rendered.contains(&pubkey),
@@ -320,12 +323,129 @@ fn a_denial_carries_no_pubkey() {
     );
 }
 
+/// The three identity controls, as named in review.
+///
+/// Stated over the pure function, where "identity absent" is `None` — the
+/// shape recovery produces once `signing_keys()` has refused. The composed
+/// behaviour, where a missing identity also means no grant can be keyed, is
+/// pinned separately by `recovery_is_invisible_to_every_caller`.
 #[test]
-fn no_identity_reports_identity_unavailable_not_denied() {
-    // §8 distinguishes "keyring locked / identity lost" from a scope refusal;
-    // collapsing them would tell a granted extension it had been un-granted.
-    let reply = identity_get_public_key("", true, "demo");
-    assert_eq!(reply.error_code(), Some(code::IDENTITY_UNAVAILABLE));
+fn the_three_identity_controls_hold() {
+    // ungranted + identity present → denied
+    assert_eq!(
+        identity_get_public_key(Some(&"a".repeat(64)), false, "demo").error_code(),
+        Some(code::DENIED)
+    );
+    // ungranted + identity absent → denied
+    assert_eq!(
+        identity_get_public_key(None, false, "demo").error_code(),
+        Some(code::DENIED)
+    );
+    // granted + identity absent → identity_unavailable
+    assert_eq!(
+        identity_get_public_key(None, true, "demo").error_code(),
+        Some(code::IDENTITY_UNAVAILABLE)
+    );
+}
+
+#[test]
+fn an_ungranted_caller_cannot_tell_whether_an_identity_is_loaded() {
+    // The refusal code must not be an oracle. An extension without the scope
+    // sees exactly one answer whether or not an identity is available; only a
+    // *granted* caller may distinguish "unavailable" from "refused".
+    //
+    // This is the row the original suite lacked: it pinned ("", true) only, so
+    // reordering these two checks broke nothing and the leak was invisible.
+    let with_identity = identity_get_public_key(Some(&"a".repeat(64)), false, "demo");
+    let without_identity = identity_get_public_key(None, false, "demo");
+
+    assert_eq!(with_identity.error_code(), Some(code::DENIED));
+    assert_eq!(without_identity.error_code(), Some(code::DENIED));
+    assert_eq!(
+        serde_json::to_string(&with_identity).expect("serialise"),
+        serde_json::to_string(&without_identity).expect("serialise"),
+        "the two refusals must be byte-identical, or the difference is the oracle"
+    );
+}
+
+// ── recovery, in the shape production actually produces ──────────────────────
+
+/// An `AppState` in the recovery shape: a **real ephemeral key** plus the
+/// recovery flag. This is what `resolve_persisted_identity` leaves behind —
+/// `app_state.rs`: "Both states boot with an ephemeral key."
+fn recovery_state(lost: bool) -> crate::AppState {
+    use std::sync::atomic::Ordering;
+    let state = crate::app_state::build_app_state();
+    *state.keys.lock().unwrap() = nostr::Keys::generate();
+    if lost {
+        state.identity_lost.store(true, Ordering::Release);
+    } else {
+        state.keyring_locked.store(true, Ordering::Release);
+    }
+    state
+}
+
+#[test]
+fn recovery_holds_a_real_pubkey_that_must_not_be_served() {
+    // The reason the empty-string surrogate never reproduced this: recovery
+    // does not zero the identity, it substitutes one. Reading `state.keys`
+    // directly returns 64 hex characters that look entirely healthy.
+    for lost in [true, false] {
+        let state = recovery_state(lost);
+        let ephemeral = state.keys.lock().unwrap().public_key().to_hex();
+        assert_eq!(ephemeral.len(), 64, "recovery carries a real-looking key");
+        assert!(!ephemeral.is_empty());
+
+        assert_eq!(
+            resolve_identity_pubkey(&state),
+            None,
+            "the authority gate must refuse in recovery, whatever state.keys holds"
+        );
+    }
+}
+
+#[test]
+fn recovery_is_invisible_to_every_caller() {
+    // Composed behaviour. §7 grants are per identity, so with no identity there
+    // is nothing to key a lookup by and nothing can be granted — recovery is
+    // therefore indistinguishable from being ungranted, which is what stops the
+    // code being an oracle.
+    let state = recovery_state(true);
+    let identity = resolve_identity_pubkey(&state);
+    assert!(identity.is_none());
+
+    let in_recovery = identity_get_public_key(identity.as_deref(), false, "demo");
+    let healthy_but_ungranted = identity_get_public_key(Some(&"a".repeat(64)), false, "demo");
+    assert_eq!(
+        serde_json::to_string(&in_recovery).expect("serialise"),
+        serde_json::to_string(&healthy_but_ungranted).expect("serialise"),
+        "recovery must be byte-identical to an ordinary refusal"
+    );
+}
+
+#[test]
+fn a_healthy_state_resolves_its_identity() {
+    // The positive control: without it, `resolve_identity_pubkey` returning
+    // `None` unconditionally would pass every test above.
+    let state = crate::app_state::build_app_state();
+    let keys = nostr::Keys::generate();
+    *state.keys.lock().unwrap() = keys.clone();
+    assert_eq!(
+        resolve_identity_pubkey(&state),
+        Some(keys.public_key().to_hex()),
+        "a healthy identity must resolve"
+    );
+}
+
+#[test]
+fn an_empty_pubkey_is_treated_as_no_identity() {
+    // The retired surrogate. Production recovery never produces `""` — it
+    // produces a real ephemeral key — but an empty string must not read as a
+    // usable identity if one ever reaches here.
+    assert_eq!(
+        identity_get_public_key(Some(""), true, "demo").error_code(),
+        Some(code::IDENTITY_UNAVAILABLE)
+    );
 }
 
 #[test]
@@ -334,9 +454,9 @@ fn no_reply_on_any_path_mentions_secret_key_material() {
     // reply this module can produce.
     let pubkey = "a".repeat(64);
     for reply in [
-        identity_get_public_key(&pubkey, true, "demo"),
-        identity_get_public_key(&pubkey, false, "demo"),
-        identity_get_public_key("", true, "demo"),
+        identity_get_public_key(Some(&pubkey), true, "demo"),
+        identity_get_public_key(Some(&pubkey), false, "demo"),
+        identity_get_public_key(None, true, "demo"),
     ] {
         let rendered = serde_json::to_string(&reply).expect("serialise");
         for forbidden in ["nsec", "secret", "privkey", "private_key", "seckey"] {

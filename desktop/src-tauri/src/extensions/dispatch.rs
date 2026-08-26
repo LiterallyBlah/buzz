@@ -60,7 +60,11 @@ pub(crate) mod code {
     pub(crate) const INVALID_PARAMS: &str = "invalid_params";
     pub(crate) const DENIED: &str = "denied";
     pub(crate) const IDENTITY_UNAVAILABLE: &str = "identity_unavailable";
-    pub(crate) const INTERNAL: &str = "internal";
+    // §8 also defines `internal`, `quota_exceeded`, `rate_limited` and
+    // `relay_error`. Those are produced by the frontend spine — IPC failure,
+    // teardown settlement, admission limits — so they are not declared here.
+    // Nothing in Rust emits them yet, and a constant nothing emits is a
+    // vocabulary entry pretending to be a code path.
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -166,21 +170,48 @@ pub(crate) fn route(
 /// The only value this reads from the identity is `public_key()`. There is no
 /// branch that reads, derives or reports secret-key material — §3 is explicit
 /// that no method returns the nsec and none will be added.
+/// `pubkey` is `None` when no usable identity exists — recovery mode, where
+/// `signing_keys()` refuses and `state.keys` holds only an ephemeral boot key.
 pub(crate) fn identity_get_public_key(
-    pubkey: &str,
+    pubkey: Option<&str>,
     granted: bool,
     extension_id: &str,
 ) -> BridgeReply {
     let _ = extension_id;
-    if pubkey.is_empty() {
-        return BridgeReply::err(code::IDENTITY_UNAVAILABLE, "no identity is loaded");
-    }
+    // Authority first. Testing identity availability before the grant would
+    // make the *choice of error code* an oracle: an ungranted extension would
+    // get one code when an identity is loaded and another when it is not, and
+    // could poll the difference. Two refusals that are usefully distinct to a
+    // granted caller must be indistinguishable to one that was refused.
     if !granted {
         // §8: name the missing scope so the client can prompt, without
         // revealing anything the extension was not granted.
         return BridgeReply::err(code::DENIED, "missing scope: identity");
     }
-    BridgeReply::ok(serde_json::json!({ "pubkey": pubkey }))
+    // Reachable only once the scope is held, so it discloses nothing to a
+    // caller without it. Kept distinct from `denied` because collapsing them
+    // would tell a *granted* extension it had been un-granted when the identity
+    // is merely unavailable.
+    match pubkey {
+        Some(pubkey) if !pubkey.is_empty() => {
+            BridgeReply::ok(serde_json::json!({ "pubkey": pubkey }))
+        }
+        _ => BridgeReply::err(code::IDENTITY_UNAVAILABLE, "no identity is loaded"),
+    }
+}
+
+/// The identity a bridge call may act under, or `None` in recovery.
+///
+/// Goes through [`crate::AppState::signing_keys`] rather than locking
+/// `state.keys`, because the two disagree in exactly the case that matters:
+/// `identity_lost` and `keyring_locked` both boot with an **ephemeral key**
+/// (`app_state.rs`), so `state.keys` yields a real 64-character pubkey that is
+/// not the user's and reads as a healthy identity.
+///
+/// Extracted so the recovery path is testable against a production-shaped
+/// `AppState` — the seam itself, not a re-derivation of it in a test.
+pub(crate) fn resolve_identity_pubkey(state: &crate::AppState) -> Option<String> {
+    state.signing_keys().ok().map(|k| k.public_key().to_hex())
 }
 
 /// Where the grant store lives: beside the installed packages, under a name
@@ -210,24 +241,34 @@ pub(crate) fn dispatch<R: tauri::Runtime>(
         Route::Refuse { code, message } => BridgeReply::err(code, message),
         Route::IdentityGetPublicKey { extension_id } => {
             let state = app.state::<crate::AppState>();
-            let pubkey = match state.keys.lock() {
-                Ok(keys) => keys.public_key().to_hex(),
-                Err(_) => {
-                    return BridgeReply::err(code::INTERNAL, "identity is not readable");
-                }
-            };
 
+            // `signing_keys()` is the established authority gate: it refuses
+            // while `identity_lost` or `keyring_locked` is set. Locking
+            // `state.keys` directly would bypass it and hand back the
+            // **ephemeral boot key** those states carry — a real 64-char pubkey
+            // that is not the user's, which reads as a perfectly healthy
+            // identity (`app_state.rs`: "Both states boot with an ephemeral
+            // key").
+            let identity = resolve_identity_pubkey(&state);
+
+            // §7 grants are per identity. With no identity there is nothing to
+            // key a lookup by, so nothing can be granted — the extension is
+            // genuinely ungranted right now, not merely unreadable. Recovery is
+            // therefore invisible here: every caller sees `denied`, which is
+            // what keeps the code from being an oracle.
+            //
             // Fail closed at every step: a path we cannot resolve or a store we
-            // cannot open has granted nothing.
-            let granted = grant_db_path(app)
-                .ok()
-                .and_then(|path| grants::open_grant_db(&path).ok())
-                .map(|conn| {
-                    grants::has_scope(&conn, &pubkey, &extension_id, grants::SCOPE_IDENTITY)
-                })
-                .unwrap_or(false);
+            // cannot open has granted nothing either.
+            let granted = identity.as_deref().is_some_and(|pubkey| {
+                grant_db_path(app)
+                    .ok()
+                    .and_then(|path| grants::open_grant_db(&path).ok())
+                    .is_some_and(|conn| {
+                        grants::has_scope(&conn, pubkey, &extension_id, grants::SCOPE_IDENTITY)
+                    })
+            });
 
-            identity_get_public_key(&pubkey, granted, &extension_id)
+            identity_get_public_key(identity.as_deref(), granted, &extension_id)
         }
     }
 }
