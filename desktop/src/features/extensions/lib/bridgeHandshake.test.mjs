@@ -39,12 +39,18 @@ test("completes the handshake for the frame it created", () => {
   const { view, frame, contentWindow, sent } = harness();
   const handshake = startHostHandshake({ frame, view });
 
-  view.dispatchEvent(new FakeMessageEvent({ data: ready(), source: contentWindow }));
+  view.dispatchEvent(
+    new FakeMessageEvent({ data: ready(), source: contentWindow }),
+  );
 
   assert.equal(sent.length, 1, "exactly one port message");
   assert.deepEqual(sent[0].data, { buzz: "port", v: 1 });
   assert.equal(sent[0].targetOrigin, "*");
-  assert.equal(sent[0].transfer.length, 1, "port2 travels in the transfer list");
+  assert.equal(
+    sent[0].transfer.length,
+    1,
+    "port2 travels in the transfer list",
+  );
   assert.ok(handshake.port(), "the host retains port1");
   // The transferred port is the *other* end, never the one the host kept.
   assert.notEqual(sent[0].transfer[0], handshake.port());
@@ -61,7 +67,11 @@ test("ignores a ready from any source that is not the host's own frame", () => {
   const impostor = { postMessage: () => {} };
   view.dispatchEvent(new FakeMessageEvent({ data: ready(), source: impostor }));
 
-  assert.equal(sent.length, 0, "no port may be issued to an unattributed source");
+  assert.equal(
+    sent.length,
+    0,
+    "no port may be issued to an unattributed source",
+  );
   assert.equal(handshake.port(), null);
 
   handshake.dispose();
@@ -92,10 +102,16 @@ test("accepts exactly one ready per frame", () => {
   const { view, frame, contentWindow, sent } = harness();
   const handshake = startHostHandshake({ frame, view });
 
-  view.dispatchEvent(new FakeMessageEvent({ data: ready(), source: contentWindow }));
+  view.dispatchEvent(
+    new FakeMessageEvent({ data: ready(), source: contentWindow }),
+  );
   const first = handshake.port();
-  view.dispatchEvent(new FakeMessageEvent({ data: ready(), source: contentWindow }));
-  view.dispatchEvent(new FakeMessageEvent({ data: ready(), source: contentWindow }));
+  view.dispatchEvent(
+    new FakeMessageEvent({ data: ready(), source: contentWindow }),
+  );
+  view.dispatchEvent(
+    new FakeMessageEvent({ data: ready(), source: contentWindow }),
+  );
 
   assert.equal(sent.length, 1, "a repeat ready must not mint a second channel");
   assert.equal(handshake.port(), first, "the retained port is unchanged");
@@ -141,7 +157,9 @@ test("dispose stops listening and is idempotent", () => {
   handshake.dispose();
   handshake.dispose();
 
-  view.dispatchEvent(new FakeMessageEvent({ data: ready(), source: contentWindow }));
+  view.dispatchEvent(
+    new FakeMessageEvent({ data: ready(), source: contentWindow }),
+  );
 
   assert.equal(sent.length, 0, "a disposed handshake must not answer");
   assert.equal(handshake.port(), null);
