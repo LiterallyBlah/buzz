@@ -545,6 +545,10 @@ pub(crate) async fn extension_data_get<R: tauri::Runtime>(
 mod extension_data_test_support;
 
 #[cfg(test)]
+#[path = "extension_data_fake_relay.rs"]
+mod extension_data_fake_relay;
+
+#[cfg(test)]
 #[path = "extension_data_tests.rs"]
 mod extension_data_tests;
 
