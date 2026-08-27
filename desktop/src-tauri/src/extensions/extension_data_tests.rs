@@ -1524,3 +1524,122 @@ async fn proof_7c_grant_revoked_after_send_denies_and_exposes_nothing() {
     assert!(denied(&reply), "got {:?}", reply.error);
     assert!(reply.result.is_none());
 }
+
+// ── against a real relay ─────────────────────────────────────────────────────
+
+/// Both extension-data methods, end to end against a relay built from this
+/// checkout with real PostgreSQL and Redis behind it.
+///
+/// Ignored by default; pointed at a relay with `BUZZ_B1_REAL_RELAY`. It adds
+/// the one thing every fake listener above cannot: the NIP-98 header this path
+/// emits is *accepted* by a real auth pipeline, on the submission and on the
+/// confirmation query. The fakes admit anything, so they can prove which key
+/// signed but never that the signature is one a relay would take.
+///
+/// The read is the point. `head_for_coordinate` signs with keys captured at
+/// entry and carried across the admission wait, through the extracted
+/// [`crate::relay::query_relay_at_with_keys_no_wait`] — so a live
+/// `current: true` is that whole sequence working against something that
+/// answers 401 when it does not.
+#[tokio::test]
+#[ignore = "needs a live relay: BUZZ_B1_REAL_RELAY=http://127.0.0.1:PORT"]
+async fn against_a_live_relay_both_extension_data_methods_authenticate() {
+    use tauri::Manager as _;
+    let url = std::env::var("BUZZ_B1_REAL_RELAY").expect("BUZZ_B1_REAL_RELAY must be set");
+
+    let _gate = crate::relay_admission::gate_guard().await;
+    let _host = super::super::frame_host::lifecycle_guard().await;
+
+    let keys = nostr::Keys::generate();
+    let identity = keys.public_key().to_hex();
+    // A fresh coordinate per run: the relay's replacement key is
+    // (community, kind, pubkey, d), and a reused one would let an earlier
+    // run's head answer this run's confirmation.
+    let key = format!("live.{}", &identity[..16]);
+    let coordinate = build_coordinate(EXTID, &key).expect("coordinate");
+    // Printed so the transcript can match this run against the relay's own
+    // request log rather than taking the test's word for which key signed.
+    println!("LIVE identity={identity}");
+    println!("LIVE coordinate={coordinate}");
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("grants").join("extension-grants.db");
+    {
+        let conn = super::super::grants::open_grant_db(&db_path).expect("open");
+        super::super::grants::grant_boolean_scope(&conn, &identity, EXTID, SCOPE_EXTENSION_DATA)
+            .expect("grant");
+    }
+
+    let state = crate::app_state::build_app_state();
+    *state.keys.lock().unwrap() = keys;
+    *state.relay_url_override.lock().unwrap() = Some(url);
+
+    let app = tauri::test::mock_app();
+    app.manage(state);
+    if let Ok(prod) = super::super::dispatch::grant_db_path(app.handle()) {
+        if let Some(parent) = prod.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::copy(&db_path, &prod);
+    }
+
+    super::super::frame_host::insert_lease_for_test(LEASE, EXTID);
+
+    let written = publish_extension_data(
+        app.handle(),
+        EXTID,
+        LEASE,
+        Some(serde_json::json!({
+            "key": key,
+            "content": "{\"v\":\"live\"}",
+            "created_at": super::super::publish::now_unix(),
+        })),
+    )
+    .await;
+    assert!(
+        written.ok,
+        "the live write must be accepted: {:?}",
+        written.error
+    );
+    let written = written.result.expect("result");
+    // `current: true` means the confirmation query authenticated and the relay
+    // answered with the event just submitted. A rejected NIP-98 would have
+    // surfaced as a relay error instead.
+    assert_eq!(
+        written["current"],
+        serde_json::json!(true),
+        "the live read-back must confirm the submitted event"
+    );
+    let submitted_id = written["event"]["id"].as_str().expect("id").to_string();
+    println!("LIVE submitted_id={submitted_id}");
+
+    let read = extension_data_get(
+        app.handle(),
+        EXTID,
+        LEASE,
+        Some(serde_json::json!({ "key": key })),
+    )
+    .await;
+    assert!(read.ok, "the live read must succeed: {:?}", read.error);
+    let event = read.result.expect("result")["event"].clone();
+    assert_eq!(
+        event["id"].as_str(),
+        Some(submitted_id.as_str()),
+        "the live read must return the event this test wrote"
+    );
+    assert_eq!(
+        event["pubkey"].as_str(),
+        Some(identity.as_str()),
+        "and it must be authored by the admitted identity"
+    );
+    // The host-derived coordinate survived the round trip, so the relay stored
+    // the event under the namespace the host built rather than under anything
+    // the caller could name.
+    let d = event["tags"]
+        .as_array()
+        .expect("tags")
+        .iter()
+        .find(|t| t[0] == "d")
+        .expect("a d tag");
+    assert_eq!(d[1].as_str(), Some(coordinate.as_str()));
+}
