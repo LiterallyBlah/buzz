@@ -434,3 +434,203 @@ async fn one_extension_cannot_name_or_read_another_extensions_namespace() {
         "and must not satisfy a read for A's coordinate"
     );
 }
+
+// ── `current` — the truthful-reporting mechanism ─────────────────────────────
+//
+// `current` is the whole answer to the relay's ambiguous acknowledgement, and
+// until these tests existed nothing defended it: the only test driving the real
+// `publish_extension_data` used a listener that could count connections but not
+// *serve* a write, so both its users were refusals. A mutant hardcoding
+// `current: true`, inverting the id compare, or breaking the head read survived
+// the entire suite.
+//
+// This fake serves both endpoints the write path uses — `POST /events` to
+// accept the submission and `POST /query` for the head read-back — which is the
+// minimum needed to reach the compare at all.
+
+/// What the fake relay should return from the head query.
+enum HeadReply {
+    /// Echo the event that was just submitted — the fresh-write case.
+    EchoSubmitted,
+    /// Serve a different event — the superseded-before-read-back case.
+    ServeOther(String),
+    /// Fail the query — the read-back-unavailable case.
+    Fail,
+}
+
+fn fake_relay(mode: HeadReply) -> String {
+    use std::io::{Read as _, Write as _};
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("addr");
+
+    std::thread::spawn(move || {
+        let mut submitted: Option<String> = None;
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { break };
+            let mut raw = Vec::new();
+            let mut buf = [0u8; 8192];
+            // Read headers plus the declared body.
+            while let Ok(n) = stream.read(&mut buf) {
+                if n == 0 {
+                    break;
+                }
+                raw.extend_from_slice(&buf[..n]);
+                let text = String::from_utf8_lossy(&raw).to_string();
+                if let Some((head, body)) = text.split_once("\r\n\r\n") {
+                    let want = head
+                        .lines()
+                        .find_map(|l| {
+                            l.strip_prefix("Content-Length: ")
+                                .or_else(|| l.strip_prefix("content-length: "))
+                        })
+                        .and_then(|v| v.trim().parse::<usize>().ok())
+                        .unwrap_or(0);
+                    if body.len() >= want {
+                        break;
+                    }
+                }
+            }
+            let text = String::from_utf8_lossy(&raw).to_string();
+            let (head, body) = text.split_once("\r\n\r\n").unwrap_or(("", ""));
+            let is_query = head.starts_with("POST /query");
+
+            let (status, payload) = if is_query {
+                match &mode {
+                    HeadReply::Fail => ("500 Internal Server Error", "{}".to_string()),
+                    HeadReply::ServeOther(other) => ("200 OK", format!("[{other}]")),
+                    HeadReply::EchoSubmitted => match &submitted {
+                        Some(event) => ("200 OK", format!("[{event}]")),
+                        None => ("200 OK", "[]".to_string()),
+                    },
+                }
+            } else {
+                // A submission: remember it so the head query can echo it back.
+                submitted = Some(body.to_string());
+                let id = body
+                    .split_once("\"id\":\"")
+                    .and_then(|(_, rest)| rest.get(..64))
+                    .unwrap_or_default()
+                    .to_string();
+                (
+                    "200 OK",
+                    format!(r#"{{"event_id":"{id}","accepted":true,"message":""}}"#),
+                )
+            };
+
+            let response = format!(
+                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+                payload.len()
+            );
+            let _ = stream.write_all(response.as_bytes());
+            let _ = stream.flush();
+        }
+    });
+
+    format!("http://{addr}")
+}
+
+/// Drive the real `publish_extension_data` against a relay that can serve a
+/// write, with the grant and lease in place so it reaches the submission.
+async fn successful_write(mode: HeadReply) -> BridgeReply {
+    use tauri::Manager as _;
+
+    let keys = nostr::Keys::generate();
+    let identity = keys.public_key().to_hex();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("grants").join("extension-grants.db");
+    {
+        let conn = super::super::grants::open_grant_db(&db_path).expect("open");
+        super::super::grants::grant_boolean_scope(&conn, &identity, EXTID, SCOPE_EXTENSION_DATA)
+            .expect("grant");
+    }
+
+    let state = crate::app_state::build_app_state();
+    *state.keys.lock().unwrap() = keys;
+    *state.relay_url_override.lock().unwrap() = Some(fake_relay(mode));
+
+    let app = tauri::test::mock_app();
+    app.manage(state);
+    // The grant store the production path reads is derived from the app, so
+    // point the test's grants at it by copying into place.
+    if let Ok(prod) = super::super::dispatch::grant_db_path(app.handle()) {
+        if let Some(parent) = prod.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::copy(&db_path, &prod);
+    }
+
+    publish_extension_data(
+        app.handle(),
+        EXTID,
+        LEASE,
+        Some(serde_json::json!({
+            "key": KEY,
+            "content": "{\"v\":1}",
+            "created_at": super::super::publish::now_unix(),
+        })),
+    )
+    .await
+}
+
+#[tokio::test]
+async fn a_fresh_write_reports_current_true() {
+    let _gate = crate::relay_admission::gate_guard().await;
+    let _host = super::super::frame_host::lifecycle_guard().await;
+    super::super::frame_host::insert_lease_for_test(LEASE, EXTID);
+
+    let reply = successful_write(HeadReply::EchoSubmitted).await;
+    assert!(reply.ok, "the write must succeed: {:?}", reply.error);
+    let result = reply.result.expect("result");
+    assert_eq!(
+        result["current"],
+        serde_json::json!(true),
+        "the head read returned the submitted event, so it is current"
+    );
+    assert!(
+        result["event"]["sig"].is_string(),
+        "the signed event is returned"
+    );
+}
+
+#[tokio::test]
+async fn a_write_already_superseded_at_read_back_reports_current_false() {
+    let _gate = crate::relay_admission::gate_guard().await;
+    let _host = super::super::frame_host::lifecycle_guard().await;
+    super::super::frame_host::insert_lease_for_test(LEASE, EXTID);
+
+    // The head query answers with a *different* event at the same coordinate —
+    // someone else's write landed first, or ours was superseded between the
+    // POST and the read. Either way ours is not the head, and saying otherwise
+    // would be the false "your value is live" the ambiguous ack invites.
+    let keys = nostr::Keys::generate();
+    let coordinate = build_coordinate(EXTID, KEY).expect("coordinate");
+    let other = signed(&keys, 30800, vec![d_tag(&coordinate)]);
+    use nostr::JsonUtil as _;
+
+    let reply = successful_write(HeadReply::ServeOther(other.as_json())).await;
+    assert!(reply.ok, "the submission itself still succeeded");
+    assert_eq!(
+        reply.result.expect("result")["current"],
+        serde_json::json!(false),
+        "a head that is not ours must report current: false"
+    );
+}
+
+#[tokio::test]
+async fn a_failed_read_back_is_a_normalised_failure_not_a_guess() {
+    let _gate = crate::relay_admission::gate_guard().await;
+    let _host = super::super::frame_host::lifecycle_guard().await;
+    super::super::frame_host::insert_lease_for_test(LEASE, EXTID);
+
+    // The relay's acknowledgement cannot distinguish an exact retry from a
+    // rejected stale write, so with the read-back unavailable there is nothing
+    // honest to derive `current` from. Guessing either way is worse than
+    // refusing: the caller can safely retry the exact request.
+    let reply = successful_write(HeadReply::Fail).await;
+    assert!(!reply.ok, "an unconfirmable write must not report success");
+    assert_eq!(
+        reply.error.as_ref().map(|e| e.code.as_str()),
+        Some(code::RELAY_ERROR)
+    );
+}
