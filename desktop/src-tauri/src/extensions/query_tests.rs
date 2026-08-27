@@ -423,7 +423,21 @@ fn a_global_kind_carrying_a_stray_h_naming_a_granted_channel_is_refused() {
 fn an_event_carrying_two_h_tags_is_refused_rather_than_resolved() {
     // Ambiguous placement is refused, not resolved by picking one — picking is
     // how an event carrying both a granted and a foreign channel gets in.
-    let (_dir, conn, filters, id) = granted_a();
+    //
+    // **Both channels are granted on purpose.** With only A granted, the last
+    // `h` resolves to B, the grant lookup refuses it, and this test passes
+    // whether or not the exactly-one-`h` rule exists — it would be a test of
+    // the grant lookup wearing this name. Granting both leaves ambiguity as
+    // the only thing that can reject the event.
+    let (_dir, conn) = temp_db();
+    let id = identity();
+    super::super::grants::grant_read_scope(&conn, &id, EXTID, 9, CHAN_A).expect("grant");
+    super::super::grants::grant_read_scope(&conn, &id, EXTID, 9, CHAN_B).expect("grant");
+    let filters = construct_filters(
+        &[(9u32, CHAN_A.to_string()), (9u32, CHAN_B.to_string())],
+        &ok_request(serde_json::json!({})),
+    )
+    .expect("build");
     let keys = nostr::Keys::generate();
     let event = signed_event(&keys, 9, vec![h(CHAN_A), h(CHAN_B)]);
     assert!(!verify_event(&event, &filters, &conn, &id, EXTID));
@@ -450,7 +464,21 @@ fn an_event_with_no_h_is_refused() {
 
 #[test]
 fn an_h_that_is_not_a_channel_uuid_is_refused() {
-    let (_dir, conn, filters, id) = granted_a();
+    // The store is the trust boundary at query time, not the manifest: this
+    // grants the non-canonical channel itself, so the grant lookup *passes* and
+    // the emitted filter carries that literal value. Only the canonical-UUID
+    // check can reject the event, which is the point of asserting it here.
+    //
+    // Without granting it, the grant lookup refuses first and this test passes
+    // with the UUID check deleted.
+    let (_dir, conn) = temp_db();
+    let id = identity();
+    super::super::grants::grant_read_scope(&conn, &id, EXTID, 9, "nonsense").expect("grant");
+    let filters = construct_filters(
+        &[(9u32, "nonsense".to_string())],
+        &ok_request(serde_json::json!({})),
+    )
+    .expect("build");
     let keys = nostr::Keys::generate();
     let event = signed_event(
         &keys,
@@ -475,21 +503,34 @@ fn a_revocation_between_construction_and_verification_drops_the_event() {
 
 #[test]
 fn a_misdelivered_event_matching_no_constructed_filter_is_dropped() {
-    // The relay is untrusted. Grant 9@A and 45001@B, ask only for A, and have
-    // the relay answer with a 45001 carrying `h = A`. Its (kind, channel) is
-    // *not* a granted pair, and no emitted filter asked for it.
+    // The relay is untrusted. Grant 9 in **both** A and B, ask only for A, and
+    // have the relay answer with a 9 carrying `h = B`.
+    //
+    // The pair `(9, B)` *is* granted, so the live grant lookup accepts it and
+    // cannot be what rejects this event — only "matches a complete constructed
+    // filter" can, because the emitted filter carries `#h: [A]`. An earlier
+    // version used an ungranted pair and passed with filter-matching deleted,
+    // which made it a second test of the grant lookup.
     let (_dir, conn) = temp_db();
     let id = identity();
     super::super::grants::grant_read_scope(&conn, &id, EXTID, 9, CHAN_A).expect("grant");
-    super::super::grants::grant_read_scope(&conn, &id, EXTID, 45001, CHAN_B).expect("grant");
+    super::super::grants::grant_read_scope(&conn, &id, EXTID, 9, CHAN_B).expect("grant");
     let filters = construct_filters(
-        &[(9u32, CHAN_A.to_string()), (45001u32, CHAN_B.to_string())],
+        &[(9u32, CHAN_A.to_string()), (9u32, CHAN_B.to_string())],
         &ok_request(serde_json::json!({ "#h": [CHAN_A] })),
     )
     .expect("build");
+    assert_eq!(
+        filters.as_filters().len(),
+        1,
+        "only channel A was requested"
+    );
 
     let keys = nostr::Keys::generate();
-    let misdelivered = signed_event(&keys, 45001, vec![h(CHAN_A)]);
+    let misdelivered = signed_event(&keys, 9, vec![h(CHAN_B)]);
+    assert!(super::super::grants::has_read_scope(
+        &conn, &id, EXTID, 9, CHAN_B
+    ));
     assert!(!verify_event(&misdelivered, &filters, &conn, &id, EXTID));
 }
 
@@ -517,15 +558,17 @@ fn an_event_outside_the_requested_window_is_dropped() {
 fn a_boolean_row_never_becomes_a_read_pair() {
     // A boolean grant stores `kind = -1, channel = ''`. Neither is a pair, and
     // a sentinel that reads as "any" is exactly the shape §7 forbids.
+    //
+    // **The sentinel row is written under the `read` scope itself.** A boolean
+    // row under some *other* scope is excluded by the `scope = 'read'` clause,
+    // so using one would test that clause instead — and the sentinel guard
+    // could be deleted with every test still green. The realistic hazard is a
+    // grants UX that writes a boolean `read` row; that must not read as an
+    // unscoped read grant.
     let (_dir, conn) = temp_db();
     let id = identity();
-    super::super::grants::grant_boolean_scope(
-        &conn,
-        &id,
-        EXTID,
-        super::super::grants::SCOPE_IDENTITY,
-    )
-    .expect("grant");
+    super::super::grants::grant_boolean_scope(&conn, &id, EXTID, super::super::grants::SCOPE_READ)
+        .expect("grant");
     assert!(super::super::grants::list_read_pairs(&conn, &id, EXTID).is_empty());
     assert!(!super::super::grants::has_read_scope(
         &conn, &id, EXTID, 9, ""
