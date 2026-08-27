@@ -236,8 +236,13 @@ enum HeadReadError {
 /// key from `state` — which, after an unbounded wait, can be the ephemeral
 /// recovery key rather than the identity whose grant admitted the request. So
 /// the sequence is explicit here: wait, revalidate, then send with the *exact*
-/// keys captured at entry, and revalidate again before the answer is
-/// classified — so a relay failure can never outrank a refusal.
+/// keys captured at entry.
+///
+/// The answer is then **matched, not classified in one line**, because the two
+/// outcomes need the post-response recheck at different points: a relay failure
+/// is revalidated *before* it is reported, so a failure can never outrank a
+/// refusal; a relay success is verified *first* and revalidated immediately
+/// before exposure, so nothing is returned on authority that has since lapsed.
 ///
 /// `revalidate` is the caller's read revalidator — timestamp-free, because a
 /// window check belongs before signing, not around a read.
@@ -271,25 +276,37 @@ async fn head_for_coordinate(
     )
     .await;
 
-    // Authority can also have been withdrawn while the relay was answering, and
-    // it is rechecked **before the response is classified at all**.
+    // Authority can also have been withdrawn while the relay was answering. The
+    // answer is matched rather than classified in one line, because the recheck
+    // belongs at a different point on each branch.
     //
-    // Classifying first is the bug this ordering exists to prevent: an
-    // I/O, status or parse failure and a lost lease can happen in the same
-    // window, and `map_err(…Relay)?` would return `relay_error` for a caller
-    // who is in fact no longer entitled to ask. The requirement is
-    // unconditional — authority changed after the send means `denied` — not
-    // "denied whenever the relay also happened to answer well-formed JSON".
+    // On **failure**, the recheck comes first. An I/O, status or parse failure
+    // and a lost lease can happen in the same window, and classifying first
+    // would return `relay_error` to a caller who is in fact no longer entitled
+    // to ask. The requirement is unconditional — authority changed after the
+    // send means `denied` — not "denied whenever the relay also happened to
+    // answer well-formed JSON".
+    let events = match answered {
+        Ok(events) => events,
+        Err(_) => {
+            revalidate().map_err(|_| HeadReadError::AuthorityLost)?;
+            return Err(HeadReadError::Relay);
+        }
+    };
+
+    // On **success**, the recheck comes last — after every returned event has
+    // been re-verified, immediately before the value is exposed.
     //
-    // There is no `await` between this recheck and the return, so it remains
-    // the last suspension-free step before anything is exposed.
-    revalidate().map_err(|_| HeadReadError::AuthorityLost)?;
-
-    // Only now, with authority known current, is a relay failure the caller's
-    // answer. This case is unchanged: authority current + relay failed is
-    // still `relay_error`.
-    let events = answered.map_err(|_| HeadReadError::Relay)?;
-
+    // It is not enough that no `await` separates a recheck from the return.
+    // This is a multithreaded Tokio runtime over a WAL-mode grant database
+    // built for a concurrent writer, so "no await" only means *this task* does
+    // not cooperatively suspend; another worker thread, or another process
+    // committing a revocation, can release the lease, swap the identity or
+    // revoke the grant while synchronous work runs. And this loop is not short:
+    // `limit: 1` is a request to an **untrusted** relay that need not honour
+    // it, so `event_matches_coordinate` can run signature verification over as
+    // many events as the relay chose to hand back. Verify first, then check
+    // that the authority to see the result still holds.
     let mut head = None;
     for event in events {
         if event_matches_coordinate(&event, identity_pubkey, coordinate) {
@@ -297,6 +314,8 @@ async fn head_for_coordinate(
             break;
         }
     }
+
+    revalidate().map_err(|_| HeadReadError::AuthorityLost)?;
     Ok(head)
 }
 
