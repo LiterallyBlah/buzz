@@ -60,6 +60,7 @@ import {
 import { ProjectWorkItemGroup } from "./ProjectWorkItemGroup";
 import { ProjectWorkItemRow } from "./ProjectWorkItemRow";
 import { ProjectRootAgentsSection } from "./ProjectRootAgentsSection";
+import { ProjectPanelState } from "./ProjectPanelState";
 
 export function issueStatusClassName(status: ProjectIssue["status"]) {
   if (status === "Triage" || status === "In Progress") return "text-amber-500";
@@ -118,6 +119,11 @@ const ISSUE_STATUS_ORDER: readonly ProjectIssue["status"][] = [
   "Done",
   "Closed",
 ];
+
+export type ProjectIssuePanelItem = {
+  issue: ProjectIssue;
+  project: Project;
+};
 
 function issueMembers(
   project: Project,
@@ -448,52 +454,71 @@ export function ProjectIssueDetail({
 
 export function ProjectIssuesPanel({
   fillHeight = false,
+  error,
+  isLoading,
+  issueItems,
   onSelectedIssueIdChange,
   profiles,
   project,
   selectedIssueId,
 }: {
   fillHeight?: boolean;
+  error?: unknown;
+  isLoading?: boolean;
+  issueItems?: ProjectIssuePanelItem[];
   onSelectedIssueIdChange: (id: string | null) => void;
   profiles?: UserProfileLookup;
   project: Project;
   selectedIssueId: string | null;
 }) {
-  const issuesQuery = useProjectIssuesQuery(project);
-  const issues = issuesQuery.data ?? [];
-  const selectedIssue =
-    issues.find((issue) => issue.id === selectedIssueId) ?? null;
+  const issuesQuery = useProjectIssuesQuery(
+    issueItems === undefined ? project : null,
+  );
+  const resolvedItems =
+    issueItems ?? (issuesQuery.data ?? []).map((issue) => ({ issue, project }));
+  const selectedItem =
+    resolvedItems.find(({ issue }) => issue.id === selectedIssueId) ?? null;
+  const loading = isLoading ?? issuesQuery.isLoading;
+  const loadError = error ?? issuesQuery.error;
 
-  if (issuesQuery.isLoading) {
+  if (loading) {
     return <BuzzLoadingState label="Loading tasks" />;
   }
 
-  if (issues.length === 0) {
+  if (resolvedItems.length === 0) {
     return (
-      <p className="p-4 text-sm text-muted-foreground">
-        {issuesQuery.error
-          ? "Could not load tasks for this repository."
-          : "No tasks yet."}
-      </p>
+      <ProjectPanelState
+        description={
+          loadError
+            ? "Refresh the project and try again."
+            : issueItems
+              ? "Tasks created for this project's repositories will appear here."
+              : "Tasks created for this repository will appear here."
+        }
+        error={Boolean(loadError)}
+        title={loadError ? "Could not load tasks" : "No tasks yet"}
+      />
     );
   }
 
-  if (selectedIssue) {
+  if (selectedItem) {
     return (
       <ProjectIssueDetail
         fillHeight={fillHeight}
-        issue={selectedIssue}
+        issue={selectedItem.issue}
         profiles={profiles}
-        project={project}
+        project={selectedItem.project}
       />
     );
   }
 
   const groups = ISSUE_STATUS_ORDER.map((status) => ({
-    items: issues.filter((issue) => issue.status === status),
+    items: resolvedItems.filter(({ issue }) => issue.status === status),
     status,
   })).filter((group) => group.items.length > 0);
-  const rangeItems = issues.map((issue) => issueSelectionItem(project, issue));
+  const rangeItems = resolvedItems.map(({ issue, project: itemProject }) =>
+    issueSelectionItem(itemProject, issue),
+  );
 
   return (
     <div>
@@ -508,17 +533,19 @@ export function ProjectIssuesPanel({
                 state={visual.progress}
               />
             }
-            items={items.map((issue) => issueSelectionItem(project, issue))}
+            items={items.map(({ issue, project: itemProject }) =>
+              issueSelectionItem(itemProject, issue),
+            )}
             key={status}
             label={status}
           >
-            {items.map((issue) => (
+            {items.map(({ issue, project: itemProject }) => (
               <IssueRow
                 issue={issue}
                 key={issue.id}
                 onOpen={() => onSelectedIssueIdChange(issue.id)}
                 profiles={profiles}
-                project={project}
+                project={itemProject}
                 rangeItems={rangeItems}
               />
             ))}
