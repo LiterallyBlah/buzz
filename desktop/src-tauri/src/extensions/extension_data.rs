@@ -194,31 +194,47 @@ async fn head_for_coordinate(
     let events = crate::relay::query_relay(state, &[filter]).await?;
 
     for event in events {
-        // Fail closed on anything that does not match exactly. A relay that
-        // answers with a different author's row, a different kind, or a
-        // different coordinate is not trusted to have honoured the filter.
-        if event.verify().is_err() {
-            continue;
-        }
-        if u32::from(event.kind.as_u16()) != buzz_core_pkg::kind::KIND_EXTENSION_DATA {
-            continue;
-        }
-        if event.pubkey.to_hex() != identity_pubkey {
-            continue;
-        }
-        let mut d_values = event.tags.iter().filter_map(|tag| {
-            let parts = tag.clone().to_vec();
-            (parts.len() >= 2 && parts[0] == "d").then(|| parts[1].clone())
-        });
-        // Exactly one `d`, equal to the coordinate asked for. A second `d`
-        // makes the addressable identity ambiguous, so it is refused rather
-        // than resolved by picking one.
-        match (d_values.next(), d_values.next()) {
-            (Some(only), None) if only == coordinate => return Ok(Some(event)),
-            _ => continue,
+        if event_matches_coordinate(&event, identity_pubkey, coordinate) {
+            return Ok(Some(event));
         }
     }
     Ok(None)
+}
+
+/// Is this event exactly what was asked for, on its own evidence?
+///
+/// **Extracted so it can be defended.** These four checks are the host's
+/// willingness to believe a relay honoured a filter; inside the async query
+/// they were unreachable from any test, and an unreachable check is one that
+/// can be deleted without a single test noticing.
+///
+/// Fail closed on every mismatch. A relay answering with another author's row,
+/// another kind, or another coordinate is not trusted — the constrained filter
+/// is what was requested, this is what is accepted.
+fn event_matches_coordinate(event: &nostr::Event, identity_pubkey: &str, coordinate: &str) -> bool {
+    // The signature covers these bytes. Everything below is only meaningful
+    // once the event is known to be authentic.
+    if event.verify().is_err() {
+        return false;
+    }
+    if u32::from(event.kind.as_u16()) != buzz_core_pkg::kind::KIND_EXTENSION_DATA {
+        return false;
+    }
+    if event.pubkey.to_hex() != identity_pubkey {
+        return false;
+    }
+    let mut d_values = event.tags.iter().filter_map(|tag| {
+        let parts = tag.clone().to_vec();
+        (parts.len() >= 2 && parts[0] == "d").then(|| parts[1].clone())
+    });
+    // Exactly one `d`, equal to the coordinate asked for. A second `d` makes
+    // the addressable identity ambiguous, so it is refused rather than resolved
+    // by picking one — picking would let a crafted event carry both a granted
+    // coordinate and a foreign one.
+    matches!(
+        (d_values.next(), d_values.next()),
+        (Some(only), None) if only == coordinate
+    )
 }
 
 /// §4 `publish.extensionData({ key, content, created_at }) → { event, current }`.

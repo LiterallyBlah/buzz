@@ -308,3 +308,85 @@ async fn an_out_of_window_created_at_is_rejected_not_clamped() {
     );
     assert_eq!(connections, 0, "nothing may reach the socket");
 }
+
+// ── the read path's four verifications ───────────────────────────────────────
+//
+// The host's willingness to believe a relay honoured its filter. Each test
+// starts from an event that *does* match, then breaks exactly one property.
+
+fn signed(keys: &nostr::Keys, kind: u16, tags: Vec<Vec<String>>) -> nostr::Event {
+    let mut builder = nostr::EventBuilder::new(nostr::Kind::from(kind), "{}");
+    for tag in tags {
+        builder = builder.tag(nostr::Tag::parse(tag).expect("tag"));
+    }
+    builder.sign_with_keys(keys).expect("sign")
+}
+
+fn d_tag(coordinate: &str) -> Vec<String> {
+    vec!["d".to_string(), coordinate.to_string()]
+}
+
+#[test]
+fn a_matching_event_is_accepted_and_each_broken_property_is_not() {
+    let keys = nostr::Keys::generate();
+    let me = keys.public_key().to_hex();
+    let coordinate = build_coordinate(EXTID, KEY).expect("coordinate");
+
+    // Control: everything matches.
+    let good = signed(&keys, 30800, vec![d_tag(&coordinate)]);
+    assert!(
+        event_matches_coordinate(&good, &me, &coordinate),
+        "the control must match, or the refusals below prove nothing"
+    );
+
+    // Wrong kind — a different addressable kind at the same coordinate.
+    let wrong_kind = signed(&keys, 30801, vec![d_tag(&coordinate)]);
+    assert!(!event_matches_coordinate(&wrong_kind, &me, &coordinate));
+
+    // Wrong author — another user's row for the same coordinate.
+    let stranger = nostr::Keys::generate();
+    let foreign = signed(&stranger, 30800, vec![d_tag(&coordinate)]);
+    assert!(!event_matches_coordinate(&foreign, &me, &coordinate));
+
+    // Wrong coordinate — another extension's namespace.
+    let other = build_coordinate("other-extension", KEY).expect("coordinate");
+    let elsewhere = signed(&keys, 30800, vec![d_tag(&other)]);
+    assert!(!event_matches_coordinate(&elsewhere, &me, &coordinate));
+}
+
+#[test]
+fn an_event_carrying_two_d_tags_is_refused_rather_than_resolved() {
+    // Ambiguous addressable identity. Picking one would let a crafted event
+    // carry both a granted coordinate and a foreign one and be accepted for
+    // whichever the host happened to read first.
+    let keys = nostr::Keys::generate();
+    let me = keys.public_key().to_hex();
+    let mine = build_coordinate(EXTID, KEY).expect("coordinate");
+    let theirs = build_coordinate("other-extension", KEY).expect("coordinate");
+
+    let two = signed(&keys, 30800, vec![d_tag(&mine), d_tag(&theirs)]);
+    assert!(!event_matches_coordinate(&two, &me, &mine));
+    assert!(!event_matches_coordinate(&two, &me, &theirs));
+
+    let none = signed(&keys, 30800, vec![]);
+    assert!(!event_matches_coordinate(&none, &me, &mine));
+}
+
+#[test]
+fn an_event_whose_signature_does_not_cover_it_is_refused() {
+    // Tampering after signing: the id and sig no longer match the content.
+    let keys = nostr::Keys::generate();
+    let me = keys.public_key().to_hex();
+    let coordinate = build_coordinate(EXTID, KEY).expect("coordinate");
+    let good = signed(&keys, 30800, vec![d_tag(&coordinate)]);
+    assert!(event_matches_coordinate(&good, &me, &coordinate));
+
+    use nostr::JsonUtil as _;
+    let mut raw: serde_json::Value = serde_json::from_str(&good.as_json()).expect("event json");
+    raw["content"] = serde_json::json!("{\"tampered\":true}");
+    let tampered = nostr::Event::from_json(raw.to_string()).expect("still parses");
+    assert!(
+        !event_matches_coordinate(&tampered, &me, &coordinate),
+        "a tampered event must not be exposed"
+    );
+}
