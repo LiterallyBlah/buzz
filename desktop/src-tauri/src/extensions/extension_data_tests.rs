@@ -569,14 +569,28 @@ enum HeadReply {
 }
 
 fn fake_relay(mode: HeadReply) -> String {
-    fake_relay_with(mode, None)
+    fake_relay_with(mode, Disturb::default())
 }
 
-/// As [`fake_relay`], but able to disturb host authority in the window between
-/// accepting the submission and answering the confirmation query — the one
-/// place where a write has already committed but its `current` is not yet read.
-fn fake_relay_with(mode: HeadReply, after_submit: Option<Box<dyn Fn() + Send>>) -> String {
+/// Where a fake relay should disturb host authority during a publish.
+///
+/// The two windows are different production branches, and only the relay can
+/// tell them apart: `after_submit` fires once the write has committed but
+/// before the confirmation query goes out, so the read-back's **pre-send**
+/// recheck sees it; `before_head_reply` fires with the query already on the
+/// wire, which only the **post-response** recheck can catch.
+#[derive(Default)]
+struct Disturb {
+    after_submit: Option<Box<dyn Fn() + Send>>,
+    before_head_reply: Option<Box<dyn Fn() + Send>>,
+}
+
+fn fake_relay_with(mode: HeadReply, disturb: Disturb) -> String {
     use std::io::{Read as _, Write as _};
+    let Disturb {
+        after_submit,
+        before_head_reply,
+    } = disturb;
 
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
     let addr = listener.local_addr().expect("addr");
@@ -613,6 +627,11 @@ fn fake_relay_with(mode: HeadReply, after_submit: Option<Box<dyn Fn() + Send>>) 
             let is_query = head.starts_with("POST /query");
 
             let (status, payload) = if is_query {
+                // The query is already on the wire; anything from here can only
+                // be caught after the response.
+                if let Some(hook) = &before_head_reply {
+                    hook();
+                }
                 match &mode {
                     HeadReply::Fail => ("500 Internal Server Error", "{}".to_string()),
                     HeadReply::ServeOther(other) => ("200 OK", format!("[{other}]")),
@@ -712,11 +731,10 @@ async fn successful_write_with(
     .await
 }
 
-#[tokio::test]
-async fn a_write_whose_authority_dies_before_the_read_back_denies_without_inventing_current() {
-    let _gate = crate::relay_admission::gate_guard().await;
-    let _host = super::super::frame_host::lifecycle_guard().await;
-    super::super::frame_host::insert_lease_for_test(LEASE, EXTID);
+/// Publish a value against a relay that revokes the grant in a chosen window,
+/// and return the reply. `window` picks which of the two production rechecks is
+/// the only one that can still catch it.
+async fn write_with_grant_revoked(window: fn(Box<dyn Fn() + Send>) -> Disturb) -> BridgeReply {
     use tauri::Manager as _;
 
     let keys = nostr::Keys::generate();
@@ -738,19 +756,15 @@ async fn a_write_whose_authority_dies_before_the_read_back_denies_without_invent
     }
     let _ = std::fs::copy(&db_path, &prod_db);
 
-    // Revoked once the submission is in — the write has committed, the
-    // confirmation has not run.
     let revoked_identity = identity.clone();
     let revoked_db = prod_db.clone();
-    let url = fake_relay_with(
-        HeadReply::EchoSubmitted,
-        Some(Box::new(move || {
-            let conn = super::super::grants::open_grant_db(&revoked_db).expect("reopen");
-            let removed =
-                super::super::grants::revoke_all(&conn, &revoked_identity, EXTID).expect("revoke");
-            assert_eq!(removed, 1, "the grant must have existed to be revoked");
-        })),
-    );
+    let revoke: Box<dyn Fn() + Send> = Box::new(move || {
+        let conn = super::super::grants::open_grant_db(&revoked_db).expect("reopen");
+        let removed =
+            super::super::grants::revoke_all(&conn, &revoked_identity, EXTID).expect("revoke");
+        assert_eq!(removed, 1, "the grant must have existed to be revoked");
+    });
+    let url = fake_relay_with(HeadReply::EchoSubmitted, window(revoke));
     *state.relay_url_override.lock().unwrap() = Some(url);
     app.manage(state);
 
@@ -765,19 +779,59 @@ async fn a_write_whose_authority_dies_before_the_read_back_denies_without_invent
         })),
     )
     .await;
+    reply
+}
 
-    // `denied`, not `invalid_params`: nothing about the parameters was wrong,
-    // and the event may well be stored. The caller can retry the exact request.
+/// `denied`, not `invalid_params`: nothing about the parameters was wrong, and
+/// the event may well be stored. `current` is not guessed either way — no
+/// result is returned at all, so the caller retries the exact request rather
+/// than acting on a fabricated answer.
+fn assert_confirmation_refused(reply: &BridgeReply) {
     assert!(
-        denied(&reply),
+        denied(reply),
         "authority lost around the confirmation must deny, got {:?}",
         reply.error
     );
-    // And `current` is not guessed either way — no result is returned at all.
     assert!(
         reply.result.is_none(),
         "a refused confirmation must not invent `current`"
     );
+}
+
+#[tokio::test]
+async fn a_write_whose_authority_dies_before_the_read_back_denies_without_inventing_current() {
+    let _gate = crate::relay_admission::gate_guard().await;
+    let _host = super::super::frame_host::lifecycle_guard().await;
+    super::super::frame_host::insert_lease_for_test(LEASE, EXTID);
+
+    // Revoked once the submission is in: the write has committed and the
+    // confirmation has not gone out, so the read-back's pre-send recheck owns
+    // this one.
+    let reply = write_with_grant_revoked(|revoke| Disturb {
+        after_submit: Some(revoke),
+        ..Default::default()
+    })
+    .await;
+    assert_confirmation_refused(&reply);
+}
+
+#[tokio::test]
+async fn a_write_whose_authority_dies_after_the_read_back_is_sent_denies_without_inventing_current()
+{
+    let _gate = crate::relay_admission::gate_guard().await;
+    let _host = super::super::frame_host::lifecycle_guard().await;
+    super::super::frame_host::insert_lease_for_test(LEASE, EXTID);
+
+    // The same outcome one branch further along: the confirmation query is
+    // already on the wire when the grant dies, so only the post-response
+    // recheck can refuse. Its twin above passes with that recheck deleted —
+    // the pre-send one answers first — which is why both windows are named.
+    let reply = write_with_grant_revoked(|revoke| Disturb {
+        before_head_reply: Some(revoke),
+        ..Default::default()
+    })
+    .await;
+    assert_confirmation_refused(&reply);
 }
 
 #[tokio::test]
@@ -1042,8 +1096,22 @@ async fn an_identity_change_during_the_gate_wait_denies_with_no_request() {
     let _host = super::super::frame_host::lifecycle_guard().await;
     // A *different valid* identity — not recovery. The request was admitted for
     // one user; it must not go out authenticated as another.
-    let (reply, connections) = read_parked_at_the_gate(|state, _, _| {
-        *state.keys.lock().unwrap() = nostr::Keys::generate();
+    //
+    // The incoming identity is granted the same scope on the way in. Without
+    // that, the grant lookup refuses first — it is keyed by pubkey — and this
+    // probe passes with the identity-equality check deleted, proving only that
+    // *something* refused.
+    let (reply, connections) = read_parked_at_the_gate(|state, _, db| {
+        let other = nostr::Keys::generate();
+        let conn = super::super::grants::open_grant_db(db).expect("reopen");
+        super::super::grants::grant_boolean_scope(
+            &conn,
+            &other.public_key().to_hex(),
+            EXTID,
+            SCOPE_EXTENSION_DATA,
+        )
+        .expect("grant the incoming identity");
+        *state.keys.lock().unwrap() = other;
     })
     .await;
     assert!(denied(&reply));
@@ -1074,6 +1142,83 @@ async fn a_lease_released_during_the_gate_wait_denies_with_no_request() {
     .await;
     assert!(denied(&reply));
     assert_eq!(connections, 0);
+}
+
+#[tokio::test]
+async fn the_connection_counter_sees_a_request_that_is_actually_made() {
+    let _gate = crate::relay_admission::gate_guard().await;
+    let _host = super::super::frame_host::lifecycle_guard().await;
+
+    // The instrument's own control. Five probes above read `connections == 0`,
+    // and that number means nothing until the same listener, on the same port,
+    // is shown reporting 1 when a request *is* made — otherwise a counter that
+    // never increments passes all five for no reason at all.
+    let (reply, connections) = read_parked_at_the_gate(|_, _, _| {}).await;
+
+    assert_eq!(
+        connections, 1,
+        "an undisturbed read must reach the relay, or the zero-counts prove nothing"
+    );
+    // The listener accepts and drops without answering, so the read fails at
+    // the relay rather than at authority — which is also the assertion that it
+    // got past revalidation instead of being refused for some other reason.
+    assert_eq!(
+        reply.error.as_ref().map(|e| e.code.as_str()),
+        Some(code::RELAY_ERROR),
+        "an undisturbed read must not be denied: {:?}",
+        reply.error
+    );
+}
+
+#[tokio::test]
+async fn the_waiting_wrapper_waits_and_the_extracted_seam_does_not() {
+    let _gate = crate::relay_admission::gate_guard().await;
+
+    // The one behavioural risk the extraction creates. `query_relay_at_with_keys`
+    // is now a two-line wrapper, so the wait it owes its three existing callers
+    // can be deleted without touching anything those callers can see. Stated as
+    // a contrast, because "it was slow" is not evidence on its own.
+    let keys = nostr::Keys::generate();
+    let state = crate::app_state::build_app_state();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    std::thread::spawn(move || for _ in listener.incoming() {});
+    let url = format!("http://{addr}");
+    let filter = serde_json::json!({ "kinds": [30800], "limit": 1 });
+
+    crate::relay_admission::activate_rate_limit(Some(1));
+    let seam_at = std::time::Instant::now();
+    let _ = crate::relay::query_relay_at_with_keys_no_wait(
+        &state,
+        &url,
+        std::slice::from_ref(&filter),
+        &keys,
+        None,
+    )
+    .await;
+    let seam = seam_at.elapsed();
+
+    crate::relay_admission::activate_rate_limit(Some(1));
+    let wrapper_at = std::time::Instant::now();
+    let _ = crate::relay::query_relay_at_with_keys(
+        &state,
+        &url,
+        std::slice::from_ref(&filter),
+        &keys,
+        None,
+    )
+    .await;
+    let wrapper = wrapper_at.elapsed();
+    crate::relay_admission::reset_rate_limit_gate();
+
+    assert!(
+        seam < std::time::Duration::from_millis(500),
+        "the extracted seam must not wait — the caller owns the gate: {seam:?}"
+    );
+    assert!(
+        wrapper >= std::time::Duration::from_millis(900),
+        "the wrapper must still park its callers on the armed gate: {wrapper:?}"
+    );
 }
 
 /// A fake relay that records the `Authorization` header it was given, and can
@@ -1344,10 +1489,22 @@ async fn proof_7a_lease_released_after_send_denies_and_exposes_nothing() {
 async fn proof_7b_identity_changed_after_send_denies_and_exposes_nothing() {
     let _gate = crate::relay_admission::gate_guard().await;
     let _host = super::super::frame_host::lifecycle_guard().await;
-    let reply = read_disturbed_after_send(|app, _, _| {
+    // As in the held-gate identity probe: the incoming identity is granted the
+    // same scope, so the grant lookup cannot be what refuses. Only the
+    // identity-equality branch is left to catch this.
+    let reply = read_disturbed_after_send(|app, _, db| {
         use tauri::Manager as _;
+        let other = nostr::Keys::generate();
+        let conn = super::super::grants::open_grant_db(db).expect("reopen");
+        super::super::grants::grant_boolean_scope(
+            &conn,
+            &other.public_key().to_hex(),
+            EXTID,
+            SCOPE_EXTENSION_DATA,
+        )
+        .expect("grant the incoming identity");
         let state = app.state::<crate::AppState>();
-        *state.keys.lock().unwrap() = nostr::Keys::generate();
+        *state.keys.lock().unwrap() = other;
     })
     .await;
     assert!(denied(&reply), "got {:?}", reply.error);
