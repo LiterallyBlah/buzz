@@ -223,18 +223,30 @@ fn event_matches_coordinate(event: &nostr::Event, identity_pubkey: &str, coordin
     if event.pubkey.to_hex() != identity_pubkey {
         return false;
     }
-    let mut d_values = event.tags.iter().filter_map(|tag| {
+    // Count occurrences by tag **name**, independently of whether a value is
+    // present, then classify once.
+    //
+    // Filtering to values first — `filter_map(|t| … then(|| t[1]))` — silently
+    // drops a valueless `["d"]` *before* the count, so a crafted
+    // `[["d"], ["d", coordinate]]` carries two `d` occurrences and reads as
+    // one. This is `publish.rs`'s valueless-`["h"]` bypass in a second place:
+    // `channel()` already counts occurrences separately from extracting the
+    // value, and this counter did not inherit that shape.
+    let mut seen = 0usize;
+    let mut value: Option<String> = None;
+    for tag in event.tags.iter() {
         let parts = tag.clone().to_vec();
-        (parts.len() >= 2 && parts[0] == "d").then(|| parts[1].clone())
-    });
-    // Exactly one `d`, equal to the coordinate asked for. A second `d` makes
-    // the addressable identity ambiguous, so it is refused rather than resolved
-    // by picking one — picking would let a crafted event carry both a granted
-    // coordinate and a foreign one.
-    matches!(
-        (d_values.next(), d_values.next()),
-        (Some(only), None) if only == coordinate
-    )
+        if parts.first().map(String::as_str) == Some("d") {
+            seen += 1;
+            value = parts.get(1).cloned();
+        }
+    }
+    // Exactly one `d`, carrying exactly the coordinate asked for. A second `d`
+    // makes the addressable identity ambiguous, so it is refused rather than
+    // resolved by picking one — picking would let a crafted event carry both a
+    // granted coordinate and a foreign one. A lone valueless `["d"]` is an
+    // occurrence with no usable value, so it fails the same way.
+    matches!((seen, value.as_deref()), (1, Some(only)) if only == coordinate)
 }
 
 /// §4 `publish.extensionData({ key, content, created_at }) → { event, current }`.

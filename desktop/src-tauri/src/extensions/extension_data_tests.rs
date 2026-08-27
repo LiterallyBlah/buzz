@@ -634,3 +634,40 @@ async fn a_failed_read_back_is_a_normalised_failure_not_a_guess() {
         Some(code::RELAY_ERROR)
     );
 }
+
+#[test]
+fn a_valueless_d_plus_the_coordinate_is_refused_as_two_d_tags() {
+    // Increment 3's valueless-`["h"]` bypass, in a second place. Counting by
+    // *value* drops the empty occurrence before the multiplicity check, so this
+    // correctly-signed event reads as carrying exactly one `d` and is accepted
+    // at a coordinate whose addressable identity is in fact ambiguous.
+    let keys = nostr::Keys::generate();
+    let me = keys.public_key().to_hex();
+    let coordinate = build_coordinate(EXTID, KEY).expect("coordinate");
+
+    let crafted = signed(
+        &keys,
+        30800,
+        vec![vec!["d".to_string()], d_tag(&coordinate)],
+    );
+    assert!(
+        !event_matches_coordinate(&crafted, &me, &coordinate),
+        "every d-tag occurrence must count, including a valueless one"
+    );
+
+    // The reverse order too — a counter that looks at the first or the last
+    // occurrence would pass one of these and fail the other.
+    let reversed = signed(
+        &keys,
+        30800,
+        vec![d_tag(&coordinate), vec!["d".to_string()]],
+    );
+    assert!(
+        !event_matches_coordinate(&reversed, &me, &coordinate),
+        "order must not decide it"
+    );
+
+    // And a lone valueless `["d"]` is an occurrence with no usable value.
+    let lone = signed(&keys, 30800, vec![vec!["d".to_string()]]);
+    assert!(!event_matches_coordinate(&lone, &me, &coordinate));
+}
