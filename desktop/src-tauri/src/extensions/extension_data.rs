@@ -236,7 +236,8 @@ enum HeadReadError {
 /// key from `state` — which, after an unbounded wait, can be the ephemeral
 /// recovery key rather than the identity whose grant admitted the request. So
 /// the sequence is explicit here: wait, revalidate, then send with the *exact*
-/// keys captured at entry, and revalidate again before exposing anything.
+/// keys captured at entry, and revalidate again before the answer is
+/// classified — so a relay failure can never outrank a refusal.
 ///
 /// `revalidate` is the caller's read revalidator — timestamp-free, because a
 /// window check belongs before signing, not around a read.
@@ -261,15 +262,33 @@ async fn head_for_coordinate(
 
     // No await between the recheck above and the send. The keys are the ones
     // admitted at entry — nothing here consults `state` for identity.
-    let events = crate::relay::query_relay_at_with_keys_no_wait(
+    let answered = crate::relay::query_relay_at_with_keys_no_wait(
         state,
         &crate::relay::relay_api_base_url_with_override(state),
         &[filter],
         keys,
         None,
     )
-    .await
-    .map_err(|_| HeadReadError::Relay)?;
+    .await;
+
+    // Authority can also have been withdrawn while the relay was answering, and
+    // it is rechecked **before the response is classified at all**.
+    //
+    // Classifying first is the bug this ordering exists to prevent: an
+    // I/O, status or parse failure and a lost lease can happen in the same
+    // window, and `map_err(…Relay)?` would return `relay_error` for a caller
+    // who is in fact no longer entitled to ask. The requirement is
+    // unconditional — authority changed after the send means `denied` — not
+    // "denied whenever the relay also happened to answer well-formed JSON".
+    //
+    // There is no `await` between this recheck and the return, so it remains
+    // the last suspension-free step before anything is exposed.
+    revalidate().map_err(|_| HeadReadError::AuthorityLost)?;
+
+    // Only now, with authority known current, is a relay failure the caller's
+    // answer. This case is unchanged: authority current + relay failed is
+    // still `relay_error`.
+    let events = answered.map_err(|_| HeadReadError::Relay)?;
 
     let mut head = None;
     for event in events {
@@ -278,11 +297,6 @@ async fn head_for_coordinate(
             break;
         }
     }
-
-    // Authority can also have been withdrawn while the relay was answering.
-    // Rechecked before anything is exposed, so a revoked caller receives a
-    // refusal rather than data it is no longer entitled to.
-    revalidate().map_err(|_| HeadReadError::AuthorityLost)?;
     Ok(head)
 }
 

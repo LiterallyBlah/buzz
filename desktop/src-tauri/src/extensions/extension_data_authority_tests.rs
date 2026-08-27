@@ -426,12 +426,35 @@ async fn proof_6_2_the_query_signs_with_its_explicit_keys_not_with_state() {
     assert_ne!(auth["pubkey"].as_str().expect("pubkey"), b);
 }
 
+/// What the released relay answers, once the disturbance has landed.
+///
+/// The two are different production branches, not two flavours of the same one.
+/// `Empty` leaves the response classifiable, so `denied` can only come from the
+/// post-response recheck; `Failure` makes the response *unclassifiable*, which
+/// is the case where a relay error and a lost authority arrive in the same
+/// window and something has to win.
+#[derive(Clone, Copy)]
+enum AfterSendAnswer {
+    /// A well-formed empty head.
+    Empty,
+    /// An unusable answer — an I/O, status or parse failure to the host.
+    Failure,
+}
+
 /// Drive a read whose authority is withdrawn *after* the relay has the request.
 ///
 /// The relay signals when it has received the request and waits; the test
 /// disturbs authority with full access to the app, then releases the relay to
 /// answer. So the post-response recheck is the only thing that can catch it.
 async fn read_disturbed_after_send(
+    disturb: impl FnOnce(&tauri::AppHandle<tauri::test::MockRuntime>, &str, &std::path::Path),
+) -> BridgeReply {
+    read_disturbed_after_send_answering(AfterSendAnswer::Empty, disturb).await
+}
+
+/// [`read_disturbed_after_send`], choosing what the relay answers on release.
+async fn read_disturbed_after_send_answering(
+    answer: AfterSendAnswer,
     disturb: impl FnOnce(&tauri::AppHandle<tauri::test::MockRuntime>, &str, &std::path::Path),
 ) -> BridgeReply {
     use std::io::{Read as _, Write as _};
@@ -460,9 +483,12 @@ async fn read_disturbed_after_send(
             let _ = stream.read(&mut buf);
             let _ = arrived_tx.send(());
             let _ = release_rx.recv();
-            let payload = "[]";
+            let (status, payload) = match answer {
+                AfterSendAnswer::Empty => ("200 OK", "[]"),
+                AfterSendAnswer::Failure => ("500 Internal Server Error", "{}"),
+            };
             let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
                 payload.len()
             );
             let _ = stream.write_all(response.as_bytes());
@@ -565,6 +591,56 @@ async fn proof_7c_grant_revoked_after_send_denies_and_exposes_nothing() {
     .await;
     assert!(denied(&reply), "got {:?}", reply.error);
     assert!(reply.result.is_none());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_relay_failure_alone_after_send_is_still_a_relay_error() {
+    let _gate = crate::relay_admission::gate_guard().await;
+    let _host = super::super::frame_host::lifecycle_guard().await;
+
+    // The control for the probe below, and it is not optional. That probe
+    // disturbs authority *and* fails the relay; if the failure arm did not
+    // actually make the answer unusable it would be proof 7a wearing a
+    // different name — the post-response recheck would produce `denied` from
+    // the lease release alone and the probe would pass with the precedence bug
+    // fully present. This shows the same arm, undisturbed, reaching
+    // `relay_error`: the failure is real, and authority-current still maps it
+    // the way it always did.
+    let reply = read_disturbed_after_send_answering(AfterSendAnswer::Failure, |_, _, _| {}).await;
+    assert_eq!(
+        code_of(&reply),
+        Some(code::RELAY_ERROR),
+        "an undisturbed read whose relay fails is a relay error: {:?}",
+        reply.error
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn authority_lost_after_send_denies_even_when_the_relay_also_fails() {
+    let _gate = crate::relay_admission::gate_guard().await;
+    let _host = super::super::frame_host::lifecycle_guard().await;
+
+    // Proof 7a's exact window, with the relay answering unusably instead of
+    // well. Both conditions are true at once, so the two classifications race
+    // and the order they are applied in decides the answer: classifying the
+    // response first returns `relay_error` and the post-response recheck is
+    // never reached.
+    //
+    // The frozen requirement is unconditional — authority changed after the
+    // send but before the result is exposed is `denied` — and it does not
+    // become conditional because the relay happened to fail in the same
+    // window. A caller told `relay_error` would retry; a caller told `denied`
+    // knows it no longer holds the lease.
+    let reply = read_disturbed_after_send_answering(AfterSendAnswer::Failure, |_, _, _| {
+        super::super::frame_host::release(LEASE);
+    })
+    .await;
+    assert!(
+        denied(&reply),
+        "authority loss outranks the relay failure: {:?}",
+        reply.error
+    );
+    assert!(reply.result.is_none(), "no event bytes may be exposed");
 }
 
 // ── against a real relay ─────────────────────────────────────────────────────

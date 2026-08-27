@@ -618,8 +618,13 @@ async fn successful_write_with(
 
 /// Publish a value against a relay that revokes the grant in a chosen window,
 /// and return the reply. `window` picks which of the two production rechecks is
-/// the only one that can still catch it.
-async fn write_with_grant_revoked(window: fn(Box<dyn Fn() + Send>) -> Disturb) -> BridgeReply {
+/// the only one that can still catch it, and `mode` is what the confirmation
+/// query answers — `Fail` puts a relay failure in the same window as the
+/// revocation, so the two classifications have to be ordered.
+async fn write_with_grant_revoked(
+    mode: HeadReply,
+    window: fn(Box<dyn Fn() + Send>) -> Disturb,
+) -> BridgeReply {
     use tauri::Manager as _;
 
     let keys = nostr::Keys::generate();
@@ -649,7 +654,7 @@ async fn write_with_grant_revoked(window: fn(Box<dyn Fn() + Send>) -> Disturb) -
             super::super::grants::revoke_all(&conn, &revoked_identity, EXTID).expect("revoke");
         assert_eq!(removed, 1, "the grant must have existed to be revoked");
     });
-    let url = fake_relay_with(HeadReply::EchoSubmitted, window(revoke));
+    let url = fake_relay_with(mode, window(revoke));
     *state.relay_url_override.lock().unwrap() = Some(url);
     app.manage(state);
 
@@ -692,7 +697,7 @@ async fn a_write_whose_authority_dies_before_the_read_back_denies_without_invent
     // Revoked once the submission is in: the write has committed and the
     // confirmation has not gone out, so the read-back's pre-send recheck owns
     // this one.
-    let reply = write_with_grant_revoked(|revoke| Disturb {
+    let reply = write_with_grant_revoked(HeadReply::EchoSubmitted, |revoke| Disturb {
         after_submit: Some(revoke),
         ..Default::default()
     })
@@ -711,7 +716,30 @@ async fn a_write_whose_authority_dies_after_the_read_back_is_sent_denies_without
     // already on the wire when the grant dies, so only the post-response
     // recheck can refuse. Its twin above passes with that recheck deleted —
     // the pre-send one answers first — which is why both windows are named.
-    let reply = write_with_grant_revoked(|revoke| Disturb {
+    let reply = write_with_grant_revoked(HeadReply::EchoSubmitted, |revoke| Disturb {
+        before_head_reply: Some(revoke),
+        ..Default::default()
+    })
+    .await;
+    assert_confirmation_refused(&reply);
+}
+
+#[tokio::test]
+async fn a_read_back_that_fails_does_not_outrank_authority_lost_in_the_same_window() {
+    let _gate = crate::relay_admission::gate_guard().await;
+    let _host = super::super::frame_host::lifecycle_guard().await;
+    super::super::frame_host::insert_lease_for_test(LEASE, EXTID);
+
+    // The twin above, with the confirmation query *also* failing. Both are true
+    // at once, so whichever is classified first wins: reading the relay result
+    // before the post-response recheck returns `relay_error` for a caller who
+    // no longer holds the grant, and the recheck is never reached. The frozen
+    // requirement is unconditional, so `denied` outranks it.
+    //
+    // `a_failed_read_back_is_a_normalised_failure_not_a_guess` is the control:
+    // the same `HeadReply::Fail` arm, undisturbed, still reaches `relay_error`
+    // — so the failure here is real and `denied` is the revocation winning.
+    let reply = write_with_grant_revoked(HeadReply::Fail, |revoke| Disturb {
         before_head_reply: Some(revoke),
         ..Default::default()
     })
