@@ -27,6 +27,7 @@ mod install;
 // One writer, two consumers.
 pub(crate) mod bridge;
 pub(crate) mod dispatch;
+pub(crate) mod extension_data;
 pub(crate) mod grants;
 pub(crate) mod manifest;
 mod package_path;

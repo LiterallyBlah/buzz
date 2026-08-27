@@ -457,7 +457,7 @@ fn parse_template(
     })
 }
 
-fn now_unix() -> i64 {
+pub(crate) fn now_unix() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
@@ -727,7 +727,10 @@ fn message_for(code: &str) -> &'static str {
 /// wire, and does not: §8 requires a normalised `{ code, message }`, and a
 /// relay string can carry internals a refused extension has no business
 /// reading.
-async fn sign_and_publish(
+/// Shared with [`super::extension_data`]: the submission machinery is common to
+/// both publish methods. What is *not* shared is authority — each method owns
+/// its own revalidator, because `authorise` here refuses kind 30800 by design.
+pub(crate) async fn sign_and_publish(
     event: &CanonicalEvent,
     keys: &nostr::Keys,
     state: &crate::AppState,

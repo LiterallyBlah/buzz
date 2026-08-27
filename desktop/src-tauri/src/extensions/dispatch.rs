@@ -125,6 +125,14 @@ pub(crate) enum Route {
     /// value that decides *who the caller is* is still produced by a function
     /// that never sees the payload.
     PublishEvent { extension_id: String },
+    /// Run `publish.extensionData` for this extension (§4).
+    ///
+    /// A distinct route from [`Route::PublishEvent`], not a flag on it: kind
+    /// 30800 is refused outright by the generic signer, and the two methods
+    /// keep separate authority owners all the way down.
+    PublishExtensionData { extension_id: String },
+    /// Run `extensionData.get` for this extension (§4).
+    ExtensionDataGet { extension_id: String },
     /// Refuse, with this §8 code and message.
     Refuse { code: &'static str, message: String },
 }
@@ -170,6 +178,8 @@ pub(crate) fn route(
     match method {
         "identity.getPublicKey" => Route::IdentityGetPublicKey { extension_id },
         "publish.event" => Route::PublishEvent { extension_id },
+        "publish.extensionData" => Route::PublishExtensionData { extension_id },
+        "extensionData.get" => Route::ExtensionDataGet { extension_id },
         _ => Route::Refuse {
             code: code::UNKNOWN_METHOD,
             message: format!("unknown method: {method}"),
@@ -264,6 +274,12 @@ pub(crate) async fn dispatch<R: tauri::Runtime>(
             // port. Attribution already came from `route`, which resolved it
             // without seeing `params`.
             super::publish::publish_event(app, &extension_id, lease, params).await
+        }
+        Route::PublishExtensionData { extension_id } => {
+            super::extension_data::publish_extension_data(app, &extension_id, lease, params).await
+        }
+        Route::ExtensionDataGet { extension_id } => {
+            super::extension_data::extension_data_get(app, &extension_id, params).await
         }
         Route::IdentityGetPublicKey { extension_id } => {
             let state = app.state::<crate::AppState>();
