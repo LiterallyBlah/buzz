@@ -100,6 +100,13 @@ async fn identity_lost_during_the_gate_wait_denies_with_no_request() {
     let _gate = crate::relay_admission::gate_guard().await;
     let _host = super::super::frame_host::lifecycle_guard().await;
     let (reply, connections) = read_parked_at_the_gate(|state, _, _| {
+        // Production's recovery boot, in production's order: `resolve_persisted_identity`
+        // writes an **ephemeral key** into `state.keys` and *then* stores the flag with
+        // Release. The key swap is the half that makes this adversarial — with the flag
+        // alone, `state.keys` still holds the admitted identity, so an implementation
+        // that re-read `state` after the wait would sign correctly anyway and the
+        // zero-connection result would not distinguish a fix from the defect.
+        *state.keys.lock().unwrap() = nostr::Keys::generate();
         state
             .identity_lost
             .store(true, std::sync::atomic::Ordering::Release);
@@ -113,7 +120,9 @@ async fn identity_lost_during_the_gate_wait_denies_with_no_request() {
 async fn keyring_locked_during_the_gate_wait_denies_with_no_request() {
     let _gate = crate::relay_admission::gate_guard().await;
     let _host = super::super::frame_host::lifecycle_guard().await;
+    // The sibling recovery state, same shape: ephemeral key first, then the flag.
     let (reply, connections) = read_parked_at_the_gate(|state, _, _| {
+        *state.keys.lock().unwrap() = nostr::Keys::generate();
         state
             .keyring_locked
             .store(true, std::sync::atomic::Ordering::Release);
