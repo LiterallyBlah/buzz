@@ -725,3 +725,341 @@ fn a_valueless_d_plus_the_coordinate_is_refused_as_two_d_tags() {
     let lone = signed(&keys, 30800, vec![vec!["d".to_string()]]);
     assert!(!event_matches_coordinate(&lone, &me, &coordinate));
 }
+
+// ── query-authority hardening: authority transitions across the real gate ────
+//
+// The defect these defend: the generic query path re-derives its NIP-98 key
+// from `state` *after* the unbounded admission wait, so a transition into
+// recovery during that wait could sign with the ephemeral boot key. Entry
+// gating does not cover it — the key used is fetched later than the gate.
+//
+// Every probe below arms the *real* process-global gate rather than injecting a
+// refusal: the point is the production transition that creates a stale
+// authority, not that a refusal suppresses a request.
+
+/// A parked read: real armed gate, real grant store, real lease, counting
+/// listener. The closure runs while the read is parked in the gate.
+async fn read_parked_at_the_gate(
+    disturb: impl FnOnce(&crate::AppState, &str, &std::path::Path) + Send + 'static,
+) -> (BridgeReply, usize) {
+    use tauri::Manager as _;
+
+    let keys = nostr::Keys::generate();
+    let identity = keys.public_key().to_hex();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("grants").join("extension-grants.db");
+    {
+        let conn = super::super::grants::open_grant_db(&db_path).expect("open");
+        super::super::grants::grant_boolean_scope(&conn, &identity, EXTID, SCOPE_EXTENSION_DATA)
+            .expect("grant");
+    }
+
+    // A listener that accepts and counts, so "no request" is observed rather
+    // than asserted. Nothing answers: a parked read must never reach it.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let connections = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = connections.clone();
+    std::thread::spawn(move || {
+        for _ in listener.incoming() {
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    });
+
+    let state = crate::app_state::build_app_state();
+    *state.keys.lock().unwrap() = keys;
+    *state.relay_url_override.lock().unwrap() = Some(format!("http://{addr}"));
+
+    let app = tauri::test::mock_app();
+    app.manage(state);
+    if let Ok(prod) = super::super::dispatch::grant_db_path(app.handle()) {
+        if let Some(parent) = prod.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::copy(&db_path, &prod);
+    }
+
+    super::super::frame_host::insert_lease_for_test(LEASE, EXTID);
+
+    // Arm a real bounded wait, then disturb authority while the read sits in it.
+    crate::relay_admission::activate_rate_limit(Some(1));
+    let armed_at = std::time::Instant::now();
+
+    let handle = app.handle().clone();
+    let read = extension_data_get(
+        &handle,
+        EXTID,
+        LEASE,
+        Some(serde_json::json!({ "key": KEY })),
+    );
+
+    let state_ref = app.state::<crate::AppState>();
+    let prod_db = super::super::dispatch::grant_db_path(app.handle()).unwrap_or(db_path.clone());
+    let identity_for_disturb = identity.clone();
+    let disturb_task = async {
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        disturb(&state_ref, &identity_for_disturb, &prod_db);
+    };
+
+    let (reply, ()) = tokio::join!(read, disturb_task);
+    crate::relay_admission::reset_rate_limit_gate();
+
+    // Without a real armed wait the disturbance would land after the read had
+    // already finished, and the probe would prove nothing.
+    assert!(
+        armed_at.elapsed() >= std::time::Duration::from_millis(300),
+        "the read must actually have parked in the gate"
+    );
+    (reply, connections.load(std::sync::atomic::Ordering::SeqCst))
+}
+
+fn denied(reply: &BridgeReply) -> bool {
+    reply.error.as_ref().map(|e| e.code.as_str()) == Some(code::DENIED)
+}
+
+#[tokio::test]
+async fn identity_lost_during_the_gate_wait_denies_with_no_request() {
+    let _gate = crate::relay_admission::gate_guard().await;
+    let _host = super::super::frame_host::lifecycle_guard().await;
+    let (reply, connections) = read_parked_at_the_gate(|state, _, _| {
+        state
+            .identity_lost
+            .store(true, std::sync::atomic::Ordering::Release);
+    })
+    .await;
+    assert!(denied(&reply), "recovery must refuse: {:?}", reply.error);
+    assert_eq!(connections, 0, "no request may reach the relay");
+}
+
+#[tokio::test]
+async fn keyring_locked_during_the_gate_wait_denies_with_no_request() {
+    let _gate = crate::relay_admission::gate_guard().await;
+    let _host = super::super::frame_host::lifecycle_guard().await;
+    let (reply, connections) = read_parked_at_the_gate(|state, _, _| {
+        state
+            .keyring_locked
+            .store(true, std::sync::atomic::Ordering::Release);
+    })
+    .await;
+    assert!(denied(&reply));
+    assert_eq!(connections, 0);
+}
+
+#[tokio::test]
+async fn an_identity_change_during_the_gate_wait_denies_with_no_request() {
+    let _gate = crate::relay_admission::gate_guard().await;
+    let _host = super::super::frame_host::lifecycle_guard().await;
+    // A *different valid* identity — not recovery. The request was admitted for
+    // one user; it must not go out authenticated as another.
+    let (reply, connections) = read_parked_at_the_gate(|state, _, _| {
+        *state.keys.lock().unwrap() = nostr::Keys::generate();
+    })
+    .await;
+    assert!(denied(&reply));
+    assert_eq!(connections, 0);
+}
+
+#[tokio::test]
+async fn a_grant_revoked_during_the_gate_wait_denies_with_no_request() {
+    let _gate = crate::relay_admission::gate_guard().await;
+    let _host = super::super::frame_host::lifecycle_guard().await;
+    let (reply, connections) = read_parked_at_the_gate(|_, identity, db| {
+        let conn = super::super::grants::open_grant_db(db).expect("reopen");
+        let removed = super::super::grants::revoke_all(&conn, identity, EXTID).expect("revoke");
+        assert_eq!(removed, 1, "the grant must have existed to be revoked");
+    })
+    .await;
+    assert!(denied(&reply));
+    assert_eq!(connections, 0);
+}
+
+#[tokio::test]
+async fn a_lease_released_during_the_gate_wait_denies_with_no_request() {
+    let _gate = crate::relay_admission::gate_guard().await;
+    let _host = super::super::frame_host::lifecycle_guard().await;
+    let (reply, connections) = read_parked_at_the_gate(|_, _, _| {
+        super::super::frame_host::release(LEASE);
+    })
+    .await;
+    assert!(denied(&reply));
+    assert_eq!(connections, 0);
+}
+
+/// A fake relay that records the `Authorization` header it was given, and can
+/// disturb authority *after* receiving the request but before answering.
+fn capturing_relay(
+    seen_auth: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+    on_request: Option<Box<dyn Fn() + Send>>,
+) -> String {
+    use std::io::{Read as _, Write as _};
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("addr");
+
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { break };
+            let mut raw = Vec::new();
+            let mut buf = [0u8; 8192];
+            while let Ok(n) = stream.read(&mut buf) {
+                if n == 0 {
+                    break;
+                }
+                raw.extend_from_slice(&buf[..n]);
+                let text = String::from_utf8_lossy(&raw).to_string();
+                if let Some((head, body)) = text.split_once("\r\n\r\n") {
+                    let want = head
+                        .lines()
+                        .find_map(|l| {
+                            l.strip_prefix("Content-Length: ")
+                                .or_else(|| l.strip_prefix("content-length: "))
+                        })
+                        .and_then(|v| v.trim().parse::<usize>().ok())
+                        .unwrap_or(0);
+                    if body.len() >= want {
+                        break;
+                    }
+                }
+            }
+            let text = String::from_utf8_lossy(&raw).to_string();
+            if let Some(line) = text
+                .lines()
+                .find(|l| l.to_ascii_lowercase().starts_with("authorization:"))
+            {
+                *seen_auth.lock().unwrap() =
+                    Some(line.splitn(2, ':').nth(1).unwrap_or("").trim().to_string());
+            }
+            // The request has been received; authority may now be withdrawn
+            // before the host sees the answer.
+            if let Some(hook) = &on_request {
+                hook();
+            }
+            let payload = "[]";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+                payload.len()
+            );
+            let _ = stream.write_all(response.as_bytes());
+            let _ = stream.flush();
+        }
+    });
+    format!("http://{addr}")
+}
+
+#[tokio::test]
+async fn the_query_is_authenticated_by_the_admitted_identity_not_a_later_state_key() {
+    // The positive wire control. Everything above proves a refusal; this proves
+    // the request that *does* go out carries the identity whose grant admitted
+    // it — decoded from the actual NIP-98 header on the wire, not asserted.
+    let _gate = crate::relay_admission::gate_guard().await;
+    let _host = super::super::frame_host::lifecycle_guard().await;
+    use base64::Engine as _;
+    use tauri::Manager as _;
+
+    let keys = nostr::Keys::generate();
+    let admitted = keys.public_key().to_hex();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("grants").join("extension-grants.db");
+    {
+        let conn = super::super::grants::open_grant_db(&db_path).expect("open");
+        super::super::grants::grant_boolean_scope(&conn, &admitted, EXTID, SCOPE_EXTENSION_DATA)
+            .expect("grant");
+    }
+
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let url = capturing_relay(seen.clone(), None);
+
+    let state = crate::app_state::build_app_state();
+    *state.keys.lock().unwrap() = keys;
+    *state.relay_url_override.lock().unwrap() = Some(url);
+
+    let app = tauri::test::mock_app();
+    app.manage(state);
+    if let Ok(prod) = super::super::dispatch::grant_db_path(app.handle()) {
+        if let Some(parent) = prod.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::copy(&db_path, &prod);
+    }
+    super::super::frame_host::insert_lease_for_test(LEASE, EXTID);
+
+    let reply = extension_data_get(
+        app.handle(),
+        EXTID,
+        LEASE,
+        Some(serde_json::json!({ "key": KEY })),
+    )
+    .await;
+    assert!(reply.ok, "the read must succeed: {:?}", reply.error);
+
+    let header = seen.lock().unwrap().clone().expect("a request was made");
+    let token = header.strip_prefix("Nostr ").expect("NIP-98 scheme");
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(token)
+        .expect("base64");
+    let auth_event: serde_json::Value = serde_json::from_slice(&decoded).expect("auth event json");
+
+    assert_eq!(
+        auth_event["pubkey"].as_str().expect("pubkey"),
+        admitted,
+        "NIP-98 must be signed by the identity whose grant admitted the request"
+    );
+}
+
+#[tokio::test]
+async fn authority_lost_after_the_request_denies_and_exposes_no_event() {
+    // Proof 7: the request is already on the wire when authority disappears.
+    // The relay answers, but nothing may be handed to the extension — and the
+    // refusal is `denied`, not `invalid_params`: for the publish confirmation
+    // this can occur after the event committed, and nothing about the caller's
+    // parameters was wrong.
+    let _gate = crate::relay_admission::gate_guard().await;
+    let _host = super::super::frame_host::lifecycle_guard().await;
+    use tauri::Manager as _;
+
+    let keys = nostr::Keys::generate();
+    let identity = keys.public_key().to_hex();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("grants").join("extension-grants.db");
+    {
+        let conn = super::super::grants::open_grant_db(&db_path).expect("open");
+        super::super::grants::grant_boolean_scope(&conn, &identity, EXTID, SCOPE_EXTENSION_DATA)
+            .expect("grant");
+    }
+
+    let state = crate::app_state::build_app_state();
+    *state.keys.lock().unwrap() = keys;
+    let app = tauri::test::mock_app();
+
+    // The lease is released the moment the relay receives the request, so the
+    // post-response recheck is the only thing that can catch it.
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let url = capturing_relay(
+        seen,
+        Some(Box::new(|| super::super::frame_host::release(LEASE))),
+    );
+    *state.relay_url_override.lock().unwrap() = Some(url);
+    app.manage(state);
+    if let Ok(prod) = super::super::dispatch::grant_db_path(app.handle()) {
+        if let Some(parent) = prod.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::copy(&db_path, &prod);
+    }
+    super::super::frame_host::insert_lease_for_test(LEASE, EXTID);
+
+    let reply = extension_data_get(
+        app.handle(),
+        EXTID,
+        LEASE,
+        Some(serde_json::json!({ "key": KEY })),
+    )
+    .await;
+
+    assert!(
+        denied(&reply),
+        "authority lost in flight must deny, got {:?}",
+        reply.error
+    );
+    assert!(reply.result.is_none(), "no event bytes may be exposed");
+}

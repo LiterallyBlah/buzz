@@ -348,6 +348,28 @@ pub async fn query_relay_at_with_keys(
     auth_tag: Option<&str>,
 ) -> Result<Vec<nostr::Event>, String> {
     crate::relay_admission::wait_for_rate_limit().await;
+    query_relay_at_with_keys_no_wait(state, api_base_url, filters, keys, auth_tag).await
+}
+
+/// [`query_relay_at_with_keys`] without the admission wait.
+///
+/// **The caller must already have waited on the admission gate and revalidated
+/// its authority afterwards.** That is the entire reason this exists: the gate
+/// wait is unbounded, so authority checked before it can be stale by the time
+/// the request goes out, and a caller that needs to recheck in between has
+/// nowhere to stand if the wait is buried inside the send.
+///
+/// Keys are taken explicitly and are the ones used to sign NIP-98 — nothing
+/// here re-reads `state` for identity. A caller that resolved its identity
+/// through the authority gate therefore signs with *that* identity, not with
+/// whatever `state.keys` holds by the time the request is built.
+pub async fn query_relay_at_with_keys_no_wait(
+    state: &AppState,
+    api_base_url: &str,
+    filters: &[serde_json::Value],
+    keys: &Keys,
+    auth_tag: Option<&str>,
+) -> Result<Vec<nostr::Event>, String> {
     let url = format!("{}/query", api_base_url);
     let body_bytes =
         serde_json::to_vec(filters).map_err(|e| format!("filter serialization failed: {e}"))?;

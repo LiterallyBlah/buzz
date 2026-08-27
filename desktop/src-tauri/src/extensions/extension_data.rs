@@ -99,6 +99,56 @@ pub(crate) fn build_coordinate(extension_id: &str, key: &str) -> Result<String, 
     Ok(coordinate)
 }
 
+/// The authority recheck for an extension-data **read**.
+///
+/// Deliberately **timestamp-free**. `created_at` is a pre-signing concern: it
+/// decides whether an event may be *created*. Re-applying it around a read
+/// would fail a confirmation for an event that is already stored, merely
+/// because the template aged out while the relay was answering — reporting a
+/// parameter error for something that already succeeded.
+///
+/// [`ExtensionDataRevalidation`] is defined as *this plus* the window check, so
+/// the four shared decisions cannot drift apart into two copies.
+pub(crate) struct ReadRevalidation<'a> {
+    pub(crate) lease: &'a str,
+    pub(crate) extension_id: &'a str,
+    pub(crate) key: &'a str,
+    pub(crate) identity_at_entry: &'a str,
+    pub(crate) coordinate_at_entry: &'a str,
+    pub(crate) state: &'a crate::AppState,
+    pub(crate) grant_db: Option<std::path::PathBuf>,
+}
+
+impl ReadRevalidation<'_> {
+    pub(crate) fn check(&self) -> Result<(), &'static str> {
+        // The lease must still resolve to *this* extension.
+        match super::frame_host::extension_for_lease(self.lease) {
+            Some(current) if current == self.extension_id => {}
+            _ => return Err(code::DENIED),
+        }
+
+        // Identity still available and unchanged. Recovery swaps in an
+        // ephemeral key, so "available" is not enough on its own.
+        let now_pubkey =
+            super::dispatch::resolve_identity_pubkey(self.state).ok_or(code::DENIED)?;
+        if now_pubkey != self.identity_at_entry {
+            return Err(code::DENIED);
+        }
+
+        // Grant still held, read from the store as it is now.
+        if !grant_lookup(self.grant_db.as_deref(), self.extension_id, &now_pubkey) {
+            return Err(code::DENIED);
+        }
+
+        // The namespace wall, re-derived rather than trusted.
+        match build_coordinate(self.extension_id, self.key) {
+            Ok(now) if now == self.coordinate_at_entry => {}
+            _ => return Err(code::DENIED),
+        }
+        Ok(())
+    }
+}
+
 /// The authority recheck run at the last moment before an extension-data POST.
 ///
 /// **A separate owner from [`super::publish::Revalidation`], deliberately.**
@@ -120,38 +170,26 @@ pub(crate) struct ExtensionDataRevalidation<'a> {
 
 impl ExtensionDataRevalidation<'_> {
     /// Re-run every authority decision against the exact event being signed.
+    ///
+    /// **The write recheck is the read recheck plus the acceptance window.**
+    /// Expressed by delegation rather than by a second copy of the four shared
+    /// decisions: two hand-maintained lists of the same checks is how one of
+    /// them silently loses a check.
     pub(crate) fn check(&self) -> Result<(), &'static str> {
-        // The lease must still resolve to *this* extension. A reissued lease
-        // pointing elsewhere is a different caller.
-        match super::frame_host::extension_for_lease(self.lease) {
-            Some(current) if current == self.extension_id => {}
-            _ => return Err(code::DENIED),
+        ReadRevalidation {
+            lease: self.lease,
+            extension_id: self.extension_id,
+            key: self.key,
+            identity_at_entry: self.identity_at_entry,
+            coordinate_at_entry: self.coordinate_at_entry,
+            state: self.state,
+            grant_db: self.grant_db.clone(),
         }
+        .check()?;
 
-        // The signing identity must still be available and unchanged. Recovery
-        // swaps in an ephemeral key, so "available" is not enough alone.
-        let now_pubkey =
-            super::dispatch::resolve_identity_pubkey(self.state).ok_or(code::DENIED)?;
-        if now_pubkey != self.identity_at_entry {
-            return Err(code::DENIED);
-        }
-
-        // The grant must still be held, read from the store *as it is now*.
-        if !grant_lookup(self.grant_db.as_deref(), self.extension_id, &now_pubkey) {
-            return Err(code::DENIED);
-        }
-
-        // The namespace wall, re-derived rather than trusted. The coordinate
-        // about to be signed must still be the one the host builds from live
-        // state for this extension and key — not a value carried since entry.
-        match build_coordinate(self.extension_id, self.key) {
-            Ok(now) if now == self.coordinate_at_entry => {}
-            _ => return Err(code::DENIED),
-        }
-
-        // The wait is unbounded, so a template inside the window on arrival may
-        // not be now. Signing anyway would publish an event the host would
-        // refuse if asked again.
+        // The one check that is write-only. The wait is unbounded, so a
+        // template inside the window on arrival may not be now; signing it
+        // anyway would publish an event the host would refuse if asked again.
         if !super::publish::timestamp_in_window(self.created_at, super::publish::now_unix()) {
             return Err(code::INVALID_PARAMS);
         }
@@ -180,25 +218,73 @@ fn grant_lookup(grant_db: Option<&std::path::Path>, extension_id: &str, pubkey: 
 /// Every returned event is independently re-verified before it is exposed:
 /// signature, kind, author and the exact coordinate. The constrained filter is
 /// what the relay was asked for; this is what the host is willing to believe.
+/// Why a head read produced no usable value.
+///
+/// Separated because the two answers are not interchangeable to a caller:
+/// losing authority mid-flight is a refusal that must expose nothing, while a
+/// relay failure is a normalised error the caller may retry.
+enum HeadReadError {
+    /// Lease, identity or grant changed around the read.
+    AuthorityLost,
+    /// The relay was unreachable or answered unusably.
+    Relay,
+}
+
+/// The one fixed-filter head read, shared by `current` and `extensionData.get`.
+///
+/// **This function owns the admission wait and the revalidation around it.**
+/// The generic `query_relay` waits internally and then re-derives the signing
+/// key from `state` — which, after an unbounded wait, can be the ephemeral
+/// recovery key rather than the identity whose grant admitted the request. So
+/// the sequence is explicit here: wait, revalidate, then send with the *exact*
+/// keys captured at entry, and revalidate again before exposing anything.
+///
+/// `revalidate` is the caller's read revalidator — timestamp-free, because a
+/// window check belongs before signing, not around a read.
 async fn head_for_coordinate(
     state: &crate::AppState,
+    keys: &nostr::Keys,
     identity_pubkey: &str,
     coordinate: &str,
-) -> Result<Option<nostr::Event>, String> {
+    revalidate: impl Fn() -> Result<(), &'static str>,
+) -> Result<Option<nostr::Event>, HeadReadError> {
     let filter = serde_json::json!({
         "kinds":   [buzz_core_pkg::kind::KIND_EXTENSION_DATA],
         "authors": [identity_pubkey],
         "#d":      [coordinate],
         "limit":   1,
     });
-    let events = crate::relay::query_relay(state, &[filter]).await?;
 
+    // The gate is process-global and unbounded from this caller's view, so
+    // authority checked before it proves nothing about authority now.
+    crate::relay_admission::wait_for_rate_limit().await;
+    revalidate().map_err(|_| HeadReadError::AuthorityLost)?;
+
+    // No await between the recheck above and the send. The keys are the ones
+    // admitted at entry — nothing here consults `state` for identity.
+    let events = crate::relay::query_relay_at_with_keys_no_wait(
+        state,
+        &crate::relay::relay_api_base_url_with_override(state),
+        &[filter],
+        keys,
+        None,
+    )
+    .await
+    .map_err(|_| HeadReadError::Relay)?;
+
+    let mut head = None;
     for event in events {
         if event_matches_coordinate(&event, identity_pubkey, coordinate) {
-            return Ok(Some(event));
+            head = Some(event);
+            break;
         }
     }
-    Ok(None)
+
+    // Authority can also have been withdrawn while the relay was answering.
+    // Rechecked before anything is exposed, so a revoked caller receives a
+    // refusal rather than data it is no longer entitled to.
+    revalidate().map_err(|_| HeadReadError::AuthorityLost)?;
+    Ok(head)
 }
 
 /// Is this event exactly what was asked for, on its own evidence?
@@ -335,7 +421,7 @@ pub(crate) async fn publish_extension_data<R: tauri::Runtime>(
         coordinate_at_entry: &coordinate,
         created_at,
         state: &state,
-        grant_db,
+        grant_db: grant_db.clone(),
     };
 
     // wait → revalidate → sign → pre-POST id check → send, all inside.
@@ -353,12 +439,37 @@ pub(crate) async fn publish_extension_data<R: tauri::Runtime>(
         .as_str()
         .unwrap_or_default()
         .to_string();
-    let current = match head_for_coordinate(&state, &identity_pubkey, &coordinate).await {
+    // Timestamp-free: the event is already on the relay, so failing the
+    // confirmation because the template aged out would report a parameter
+    // error for something that has already succeeded.
+    let read_revalidation = ReadRevalidation {
+        lease,
+        extension_id,
+        key,
+        identity_at_entry: &identity_pubkey,
+        coordinate_at_entry: &coordinate,
+        state: &state,
+        grant_db,
+    };
+    let current = match head_for_coordinate(&state, &keys, &identity_pubkey, &coordinate, || {
+        read_revalidation.check()
+    })
+    .await
+    {
         Ok(head) => head.is_some_and(|head| head.id.to_hex() == submitted_id),
+        // Authority went away around the read. The write itself may already
+        // have committed, so this is `denied` rather than `invalid_params` —
+        // nothing about the *parameters* was wrong — and `current` is not
+        // invented. The caller can retry the exact deterministic request.
+        Err(HeadReadError::AuthorityLost) => {
+            return BridgeReply::err(code::DENIED, "missing scope: extensionData")
+        }
         // Never guess from the ambiguous acknowledgement. The caller can safely
         // retry the exact request; reporting a fabricated `current` cannot be
         // undone by them.
-        Err(_) => return BridgeReply::err(code::RELAY_ERROR, "could not confirm the stored value"),
+        Err(HeadReadError::Relay) => {
+            return BridgeReply::err(code::RELAY_ERROR, "could not confirm the stored value")
+        }
     };
 
     BridgeReply::ok(serde_json::json!({
@@ -371,6 +482,7 @@ pub(crate) async fn publish_extension_data<R: tauri::Runtime>(
 pub(crate) async fn extension_data_get<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
     extension_id: &str,
+    lease: &str,
     params: Option<serde_json::Value>,
 ) -> BridgeReply {
     use tauri::Manager as _;
@@ -397,7 +509,20 @@ pub(crate) async fn extension_data_get<R: tauri::Runtime>(
         return BridgeReply::err(code::DENIED, "missing scope: extensionData");
     }
 
-    match head_for_coordinate(&state, &identity_pubkey, &coordinate).await {
+    let read_revalidation = ReadRevalidation {
+        lease,
+        extension_id,
+        key,
+        identity_at_entry: &identity_pubkey,
+        coordinate_at_entry: &coordinate,
+        state: &state,
+        grant_db,
+    };
+    match head_for_coordinate(&state, &keys, &identity_pubkey, &coordinate, || {
+        read_revalidation.check()
+    })
+    .await
+    {
         Ok(Some(event)) => {
             use nostr::JsonUtil as _;
             match serde_json::from_str::<serde_json::Value>(&event.as_json()) {
@@ -406,7 +531,13 @@ pub(crate) async fn extension_data_get<R: tauri::Runtime>(
             }
         }
         Ok(None) => BridgeReply::ok(serde_json::json!({ "event": serde_json::Value::Null })),
-        Err(_) => BridgeReply::err(code::RELAY_ERROR, "could not read the stored value"),
+        // Authority withdrawn around the read — refuse, exposing no bytes.
+        Err(HeadReadError::AuthorityLost) => {
+            BridgeReply::err(code::DENIED, "missing scope: extensionData")
+        }
+        Err(HeadReadError::Relay) => {
+            BridgeReply::err(code::RELAY_ERROR, "could not read the stored value")
+        }
     }
 }
 

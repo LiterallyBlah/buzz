@@ -279,7 +279,7 @@ pub(crate) async fn dispatch<R: tauri::Runtime>(
             super::extension_data::publish_extension_data(app, &extension_id, lease, params).await
         }
         Route::ExtensionDataGet { extension_id } => {
-            super::extension_data::extension_data_get(app, &extension_id, params).await
+            super::extension_data::extension_data_get(app, &extension_id, lease, params).await
         }
         Route::IdentityGetPublicKey { extension_id } => {
             let state = app.state::<crate::AppState>();
