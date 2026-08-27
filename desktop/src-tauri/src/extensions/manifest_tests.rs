@@ -406,12 +406,18 @@ fn every_kind_on_the_spec_floor_is_rejected_at_install() {
 }
 
 #[test]
-fn relay_only_kinds_are_readable_but_never_signable() {
-    // BRIDGE_SPEC §5 does not put relay-only kinds on the read floor: "relay
-    // only" means a client may not AUTHOR the kind. Reads are channel-scoped,
-    // so a relay-authored event in a granted channel is channel-public to the
-    // user granting it — denying it costs capability (thread summaries, system
-    // messages) for no threat-model gain.
+fn relay_only_kinds_are_off_the_floor_yet_not_read_grantable_and_never_signable() {
+    // **Amended by design-repo `5a55036`.** This test previously asserted that
+    // a relay-only kind off the floor was read-grantable, because §5 then
+    // defined the read-allowed set as the floor's complement. §5 now requires
+    // membership in the audited `EXTENSION_CHANNEL_READABLE_KINDS`, and
+    // relay-authored kinds are deliberately excluded for v1 pending a trusted
+    // relay-identity witness. Being off the floor is no longer sufficient.
+    //
+    // The floor itself is unchanged, and that half still matters: "relay only"
+    // means a client may not AUTHOR the kind, which is why these are absent
+    // from a floor about what may never be READ. The two questions stayed
+    // separate; only the answer to "what may be read" moved.
     let relay_only: Vec<u32> = (0..=50_000u32)
         .filter(|k| kind::is_relay_only_kind(*k) && !spec_read_deny_floor(*k))
         .collect();
@@ -423,13 +429,27 @@ fn relay_only_kinds_are_readable_but_never_signable() {
     for kind_value in &relay_only {
         assert!(
             !is_read_denied_kind(*kind_value),
-            "relay-only kind {kind_value} must stay readable"
+            "the floor is unchanged and must not have grown: {kind_value}"
         );
         let scopes = format!(
             r#"{{ "read": [ {{ "kinds": [{kind_value}], "channels": ["{CHANNEL_A}"] }} ] }}"#
         );
-        parse_and_validate(&manifest_with_scopes(&scopes))
-            .unwrap_or_else(|error| panic!("read on relay-only {kind_value} rejected: {error}"));
+        let result = parse_and_validate(&manifest_with_scopes(&scopes));
+        if is_channel_readable_kind(*kind_value) {
+            // A relay-only kind that the audit did admit stays grantable —
+            // the allowlist decides, so this arm is not hypothetical guarding.
+            result.unwrap_or_else(|error| {
+                panic!("allowlisted kind {kind_value} rejected for read: {error}")
+            });
+        } else {
+            let Err(error) = result else {
+                panic!("read on non-allowlisted relay-only {kind_value} must be refused");
+            };
+            assert!(
+                error.contains("is not channel-readable"),
+                "expected the allowlist refusal, got: {error}"
+            );
+        }
 
         // The sign side still refuses them — §4's allowlist admits only the
         // seven content kinds, so a relay-only kind is non-signable by

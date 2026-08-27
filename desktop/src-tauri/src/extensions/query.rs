@@ -59,6 +59,11 @@ const MAX_REQUEST_BYTES: usize = 16 * 1024;
 const ALLOWED_TAG_FILTERS: &[&str] = &["#e", "#p", "#q", "#t", "#d"];
 
 /// Why a read produced no value.
+///
+/// `Debug` is for test assertions only. It is never reached from
+/// [`QueryError::into_reply`], so no Rust error text can ride out to an
+/// extension on it.
+#[derive(Debug)]
 pub(crate) enum QueryError {
     /// The request was not well-formed. Never used for an authority failure.
     InvalidParams(String),
@@ -770,3 +775,7 @@ pub(crate) async fn query_events<R: tauri::Runtime>(
     }
     BridgeReply::ok(serde_json::json!({ "events": out }))
 }
+
+#[cfg(test)]
+#[path = "query_tests.rs"]
+mod query_tests;
