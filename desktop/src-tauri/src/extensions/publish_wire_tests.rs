@@ -813,3 +813,137 @@ async fn a_refused_template_reaches_neither_key_nor_socket_on_the_production_pat
         "the refused template must not have produced a second connection"
     );
 }
+
+// ── the revalidator's remaining branches ─────────────────────────────────────
+//
+// Proof 9 drives one of `Revalidation::check`'s four branches: the grant. The
+// other three — lease, identity equality, timestamp — are load-bearing
+// production lines, so each gets a test that isolates it and a mutant that
+// deletes it. Each test first asserts the fixture otherwise passes, because a
+// test that only observes a refusal cannot tell which check produced it.
+
+/// A `Revalidation` input set with every check satisfied.
+fn passing_revalidation() -> (
+    tempfile::TempDir,
+    std::path::PathBuf,
+    crate::AppState,
+    String,
+    CanonicalEvent,
+) {
+    let keys = nostr::Keys::generate();
+    let identity = keys.public_key().to_hex();
+    let state = crate::app_state::build_app_state();
+    *state.keys.lock().unwrap() = keys;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("grants").join("extension-grants.db");
+    {
+        let conn = crate::extensions::grants::open_grant_db(&db_path).expect("open");
+        crate::extensions::grants::grant_sign_scope(
+            &conn,
+            &identity,
+            "demo",
+            kind::KIND_STREAM_MESSAGE,
+            CHANNEL,
+        )
+        .expect("grant");
+    }
+
+    let event = CanonicalEvent {
+        created_at: now_unix(),
+        ..message(vec![tag(&["h", CHANNEL])], "hello")
+    };
+    (dir, db_path, state, identity, event)
+}
+
+#[tokio::test]
+async fn a_released_lease_refuses_the_revalidation() {
+    let _host = crate::extensions::frame_host::lifecycle_guard().await;
+    let (_dir, db_path, state, identity, event) = passing_revalidation();
+    let revalidation = Revalidation {
+        lease: LEASE,
+        extension_id: "demo",
+        identity_at_entry: &identity,
+        event: &event,
+        state: &state,
+        grant_db: Some(db_path),
+    };
+
+    crate::extensions::frame_host::insert_lease_for_test(LEASE, "demo");
+    revalidation
+        .check()
+        .expect("the fixture must otherwise pass, or the refusal below proves nothing");
+
+    // Release is terminal: budget exhaustion or a closed frame drops the
+    // lease, and a released lease is not a caller.
+    crate::extensions::frame_host::release(LEASE);
+    assert_eq!(revalidation.check(), Err(code::DENIED));
+}
+
+#[tokio::test]
+async fn an_identity_that_changed_under_the_request_refuses_the_revalidation() {
+    let _host = crate::extensions::frame_host::lifecycle_guard().await;
+    let (_dir, db_path, state, identity, event) = passing_revalidation();
+    crate::extensions::frame_host::insert_lease_for_test(LEASE, "demo");
+
+    let held = Revalidation {
+        lease: LEASE,
+        extension_id: "demo",
+        identity_at_entry: &identity,
+        event: &event,
+        state: &state,
+        grant_db: Some(db_path.clone()),
+    };
+    held.check()
+        .expect("the fixture must otherwise pass, or the refusal below proves nothing");
+
+    // The identity that entered is not the one that would sign now. The grant
+    // still resolves for the *current* pubkey, so only the equality check can
+    // produce this refusal.
+    let entered_as = nostr::Keys::generate().public_key().to_hex();
+    let swapped = Revalidation {
+        lease: LEASE,
+        extension_id: "demo",
+        identity_at_entry: &entered_as,
+        event: &event,
+        state: &state,
+        grant_db: Some(db_path),
+    };
+    assert_eq!(swapped.check(), Err(code::DENIED));
+}
+
+#[tokio::test]
+async fn a_template_that_left_the_window_during_the_wait_is_refused() {
+    let _host = crate::extensions::frame_host::lifecycle_guard().await;
+    let (_dir, db_path, state, identity, event) = passing_revalidation();
+    crate::extensions::frame_host::insert_lease_for_test(LEASE, "demo");
+
+    let fresh = Revalidation {
+        lease: LEASE,
+        extension_id: "demo",
+        identity_at_entry: &identity,
+        event: &event,
+        state: &state,
+        grant_db: Some(db_path.clone()),
+    };
+    fresh
+        .check()
+        .expect("the fixture must otherwise pass, or the refusal below proves nothing");
+
+    // The wait is unbounded, so a template can age out of the window while it
+    // is parked in the gate. Signing it then would publish an event the host
+    // would refuse if asked again.
+    let stale = CanonicalEvent {
+        created_at: now_unix() - (CREATED_AT_SKEW_SECONDS * 4),
+        ..message(vec![tag(&["h", CHANNEL])], "hello")
+    };
+    let aged = Revalidation {
+        lease: LEASE,
+        extension_id: "demo",
+        identity_at_entry: &identity,
+        event: &stale,
+        state: &state,
+        grant_db: Some(db_path),
+    };
+    assert_eq!(aged.check(), Err(code::INVALID_PARAMS));
+}
