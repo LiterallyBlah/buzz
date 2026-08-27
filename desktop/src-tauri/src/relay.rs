@@ -297,101 +297,10 @@ pub async fn relay_error_message(response: reqwest::Response) -> String {
 
 // ── HTTP bridge: POST /query ────────────────────────────────────────────────
 
-/// Execute a one-shot query via the relay's HTTP bridge (`POST /query`).
-///
-/// Filters are serialized as a JSON array. The request is authenticated with
-/// a NIP-98 event signed by the user's keys. Returns the deserialized array of
-/// events.
-pub async fn query_relay(
-    state: &AppState,
-    filters: &[serde_json::Value],
-) -> Result<Vec<nostr::Event>, String> {
-    query_relay_at(state, &relay_api_base_url_with_override(state), filters).await
-}
-
-/// Like [`query_relay`] but targets an explicit HTTP API base URL instead of
-/// the workspace override. Used when a query must hit a specific relay (e.g.
-/// reconciling an agent's profile on the relay where it was published).
-pub async fn query_relay_at(
-    state: &AppState,
-    api_base_url: &str,
-    filters: &[serde_json::Value],
-) -> Result<Vec<nostr::Event>, String> {
-    crate::relay_admission::wait_for_rate_limit().await;
-    let url = format!("{}/query", api_base_url);
-    let body_bytes =
-        serde_json::to_vec(filters).map_err(|e| format!("filter serialization failed: {e}"))?;
-    let auth = build_nip98_auth_header(&Method::POST, &url, &body_bytes, state)?;
-
-    let response = state
-        .http_client
-        .post(&url)
-        .header("Authorization", auth)
-        .header("Content-Type", "application/json")
-        .body(body_bytes)
-        .send()
-        .await
-        .map_err(|e| classify_request_error(&e))?;
-
-    if !response.status().is_success() {
-        return Err(relay_error_message(response).await);
-    }
-
-    parse_json_response(response).await
-}
-
-pub async fn query_relay_at_with_keys(
-    state: &AppState,
-    api_base_url: &str,
-    filters: &[serde_json::Value],
-    keys: &Keys,
-    auth_tag: Option<&str>,
-) -> Result<Vec<nostr::Event>, String> {
-    crate::relay_admission::wait_for_rate_limit().await;
-    query_relay_at_with_keys_no_wait(state, api_base_url, filters, keys, auth_tag).await
-}
-
-/// [`query_relay_at_with_keys`] without the admission wait.
-///
-/// **The caller must already have waited on the admission gate and revalidated
-/// its authority afterwards.** That is the entire reason this exists: the gate
-/// wait is unbounded, so authority checked before it can be stale by the time
-/// the request goes out, and a caller that needs to recheck in between has
-/// nowhere to stand if the wait is buried inside the send.
-///
-/// Keys are taken explicitly and are the ones used to sign NIP-98 — nothing
-/// here re-reads `state` for identity. A caller that resolved its identity
-/// through the authority gate therefore signs with *that* identity, not with
-/// whatever `state.keys` holds by the time the request is built.
-pub async fn query_relay_at_with_keys_no_wait(
-    state: &AppState,
-    api_base_url: &str,
-    filters: &[serde_json::Value],
-    keys: &Keys,
-    auth_tag: Option<&str>,
-) -> Result<Vec<nostr::Event>, String> {
-    let url = format!("{}/query", api_base_url);
-    let body_bytes =
-        serde_json::to_vec(filters).map_err(|e| format!("filter serialization failed: {e}"))?;
-    let auth = build_nip98_auth_header_for_keys(keys, &Method::POST, &url, &body_bytes)?;
-    let mut request = state
-        .http_client
-        .post(&url)
-        .header("Authorization", auth)
-        .header("Content-Type", "application/json");
-    if let Some(tag) = auth_tag {
-        request = request.header("x-auth-tag", tag);
-    }
-    let response = request
-        .body(body_bytes)
-        .send()
-        .await
-        .map_err(|e| classify_request_error(&e))?;
-    if !response.status().is_success() {
-        return Err(relay_error_message(response).await);
-    }
-    parse_json_response(response).await
-}
+mod query;
+pub use query::{
+    query_relay, query_relay_at, query_relay_at_with_keys, query_relay_at_with_keys_no_wait,
+};
 
 // ── Command response parsing ────────────────────────────────────────────────
 
