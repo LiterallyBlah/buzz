@@ -533,10 +533,26 @@ fn fake_relay(mode: HeadReply) -> String {
 /// Drive the real `publish_extension_data` against a relay that can serve a
 /// write, with the grant and lease in place so it reaches the submission.
 async fn successful_write(mode: HeadReply) -> BridgeReply {
+    successful_write_with(|_, _| mode).await
+}
+
+/// As [`successful_write`], but the head is built **from the identity that is
+/// actually installed**.
+///
+/// The distinction is the whole point of the superseded case: a head signed by
+/// a different keypair is rejected at the author check, so `current` comes back
+/// false without the ID comparison ever running. The closure receives the real
+/// signing keys and the host-derived coordinate so the served head can differ
+/// from the submitted event in **exactly one** respect — its id.
+async fn successful_write_with(
+    make_mode: impl FnOnce(&nostr::Keys, &str) -> HeadReply,
+) -> BridgeReply {
     use tauri::Manager as _;
 
     let keys = nostr::Keys::generate();
     let identity = keys.public_key().to_hex();
+    let coordinate = build_coordinate(EXTID, KEY).expect("coordinate");
+    let mode = make_mode(&keys, &coordinate);
     let dir = tempfile::tempdir().expect("tempdir");
     let db_path = dir.path().join("grants").join("extension-grants.db");
     {
@@ -599,21 +615,59 @@ async fn a_write_already_superseded_at_read_back_reports_current_false() {
     let _host = super::super::frame_host::lifecycle_guard().await;
     super::super::frame_host::insert_lease_for_test(LEASE, EXTID);
 
-    // The head query answers with a *different* event at the same coordinate —
-    // someone else's write landed first, or ours was superseded between the
-    // POST and the read. Either way ours is not the head, and saying otherwise
-    // would be the false "your value is live" the ambiguous ack invites.
-    let keys = nostr::Keys::generate();
-    let coordinate = build_coordinate(EXTID, KEY).expect("coordinate");
-    let other = signed(&keys, 30800, vec![d_tag(&coordinate)]);
-    use nostr::JsonUtil as _;
+    // The head query answers with a different event at the same coordinate,
+    // signed by the **same identity that is installed** — someone else's write
+    // landed first, or ours was superseded between the POST and the read.
+    //
+    // Signing it with a fresh keypair, as this test first did, is not the case
+    // it names: that head is rejected at the author check, so `current` comes
+    // back false without the id comparison ever running, and
+    // `Ok(head) => head.is_some()` survives. The whole point here is two
+    // *valid, same-author* heads distinguished only by id.
+    let observed = std::sync::Arc::new(std::sync::Mutex::new(None::<(String, String, String)>));
+    let seen = observed.clone();
 
-    let reply = successful_write(HeadReply::ServeOther(other.as_json())).await;
+    let reply = successful_write_with(move |keys, coordinate| {
+        use nostr::JsonUtil as _;
+        let other = nostr::EventBuilder::new(nostr::Kind::from(30800u16), "{\"other\":true}")
+            .tag(nostr::Tag::parse(d_tag(coordinate)).expect("d tag"))
+            .sign_with_keys(keys)
+            .expect("sign");
+        *seen.lock().unwrap() = Some((
+            keys.public_key().to_hex(),
+            coordinate.to_string(),
+            other.id.to_hex(),
+        ));
+        HeadReply::ServeOther(other.as_json())
+    })
+    .await;
+
     assert!(reply.ok, "the submission itself still succeeded");
+    let result = reply.result.expect("result");
     assert_eq!(
-        reply.result.expect("result")["current"],
+        result["current"],
         serde_json::json!(false),
-        "a head that is not ours must report current: false"
+        "a valid same-author head that is not ours must report current: false"
+    );
+
+    // Pin the preconditions, so this can never silently decay into the
+    // different-author case again.
+    let (head_author, head_coordinate, head_id) =
+        observed.lock().unwrap().clone().expect("head was built");
+    assert_eq!(
+        result["event"]["pubkey"].as_str().expect("pubkey"),
+        head_author,
+        "the served head must share the submitted event's author"
+    );
+    assert_eq!(
+        result["event"]["tags"][0][1].as_str().expect("d value"),
+        head_coordinate,
+        "and its coordinate"
+    );
+    assert_ne!(
+        result["event"]["id"].as_str().expect("id"),
+        head_id,
+        "and differ only by id — otherwise there is nothing for the compare to distinguish"
     );
 }
 
