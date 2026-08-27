@@ -173,6 +173,121 @@ pub(crate) fn has_sign_scope(
     matches!(found, Ok(count) if count > 0)
 }
 
+/// Scope gating `query.events` (§5). Qualified by `(kind, channel)`.
+pub(crate) const SCOPE_READ: &str = "read";
+
+/// Record a `(kind, channel)` read grant (§7).
+///
+/// One row per pair, exactly as the sign side. A manifest `read` scope listing
+/// three kinds across two channels flattens to six rows — §5 is explicit that
+/// there is no entry grouping to reconstruct, so none is stored.
+#[allow(dead_code)] // Called by the grants UX; the store capability lands first.
+pub(crate) fn grant_read_scope(
+    conn: &Connection,
+    identity_pubkey: &str,
+    extension_id: &str,
+    kind: u32,
+    channel: &str,
+) -> Result<(), String> {
+    conn.execute(
+        "INSERT OR REPLACE INTO extension_grants
+             (identity_pubkey, extension_id, scope, kind, channel, granted_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![
+            identity_pubkey,
+            extension_id,
+            SCOPE_READ,
+            i64::from(kind),
+            channel,
+            now_unix()
+        ],
+    )
+    .map_err(|error| format!("could not record the read grant: {error}"))?;
+    Ok(())
+}
+
+/// Every concrete `(kind, channel)` pair this extension may read.
+///
+/// This is the **construction** input: §5 builds the emitted relay filters from
+/// these pairs, so a pair that is not here cannot appear in a query. Returns an
+/// empty vector for any failure — an unreadable store has granted nothing, and
+/// zero pairs is `denied` at the call site rather than an unscoped read.
+///
+/// Sentinel rows are excluded at the SQL level: a boolean grant stores
+/// `kind = -1, channel = ''`, and neither is a pair. That is the same
+/// refuse-empty-channel discipline [`has_sign_scope`] applies, moved to
+/// enumeration so a boolean row can never *become* a pair on the way out.
+///
+/// Ordered so filter construction is deterministic for a given grant set.
+pub(crate) fn list_read_pairs(
+    conn: &Connection,
+    identity_pubkey: &str,
+    extension_id: &str,
+) -> Vec<(u32, String)> {
+    let mut statement = match conn.prepare(
+        "SELECT kind, channel FROM extension_grants
+          WHERE identity_pubkey = ?1 AND extension_id = ?2 AND scope = ?3
+            AND kind >= 0 AND channel <> ''
+          ORDER BY channel ASC, kind ASC",
+    ) {
+        Ok(statement) => statement,
+        Err(_) => return Vec::new(),
+    };
+    let rows = statement.query_map(params![identity_pubkey, extension_id, SCOPE_READ], |row| {
+        let kind: i64 = row.get(0)?;
+        let channel: String = row.get(1)?;
+        Ok((kind, channel))
+    });
+    let Ok(rows) = rows else {
+        return Vec::new();
+    };
+    let mut pairs = Vec::new();
+    for row in rows {
+        // A row we cannot read is skipped rather than defaulted: there is no
+        // value of `kind` that should stand in for one the store lost.
+        let Ok((kind, channel)) = row else { continue };
+        let Ok(kind) = u32::try_from(kind) else {
+            continue;
+        };
+        if channel.is_empty() {
+            continue;
+        }
+        pairs.push((kind, channel));
+    }
+    pairs
+}
+
+/// May this extension read this kind in this channel, for this identity?
+///
+/// The **per-event admission** check, read live for every returned event, so a
+/// revocation between construction and exposure is caught. Fail-closed on every
+/// arm including a database error, and an empty `channel` can never match.
+pub(crate) fn has_read_scope(
+    conn: &Connection,
+    identity_pubkey: &str,
+    extension_id: &str,
+    kind: u32,
+    channel: &str,
+) -> bool {
+    if channel.is_empty() {
+        return false;
+    }
+    let found: Result<i64, _> = conn.query_row(
+        "SELECT COUNT(*) FROM extension_grants
+          WHERE identity_pubkey = ?1 AND extension_id = ?2 AND scope = ?3
+            AND kind = ?4 AND channel = ?5",
+        params![
+            identity_pubkey,
+            extension_id,
+            SCOPE_READ,
+            i64::from(kind),
+            channel
+        ],
+        |row| row.get(0),
+    );
+    matches!(found, Ok(count) if count > 0)
+}
+
 /// Drop every grant for one extension under one identity.
 ///
 /// Revocation takes effect on the next request (§9): there is no cached copy

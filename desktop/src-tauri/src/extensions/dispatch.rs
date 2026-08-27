@@ -66,10 +66,16 @@ pub(crate) mod code {
     /// The relay refused the event. Its own text is discarded: it is written
     /// for an operator and can name hosts and internal reasons.
     pub(crate) const RELAY_ERROR: &str = "relay_error";
-    // §8 also defines `quota_exceeded` and `rate_limited`. Those remain
-    // frontend-only — they are admission decisions the spine makes before a
-    // request reaches Rust — so they are not declared here. A constant nothing
-    // emits is a vocabulary entry pretending to be a code path.
+    /// The request is well-formed but asks for more work than the host allows
+    /// — too large a `limit`, too many channels, too big a rewritten query.
+    ///
+    /// Declared here as of §5's read path, which emits it *before* any network
+    /// work. It was previously withheld on the rule below, which it now meets.
+    pub(crate) const QUOTA_EXCEEDED: &str = "quota_exceeded";
+    // §8 also defines `rate_limited`. That remains frontend-only — it is an
+    // admission decision the spine makes before a request reaches Rust — so it
+    // is not declared here. A constant nothing emits is a vocabulary entry
+    // pretending to be a code path.
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -133,6 +139,8 @@ pub(crate) enum Route {
     PublishExtensionData { extension_id: String },
     /// Run `extensionData.get` for this extension (§4).
     ExtensionDataGet { extension_id: String },
+    /// §5 `query.events` — a one-shot channel-scoped read.
+    QueryEvents { extension_id: String },
     /// Refuse, with this §8 code and message.
     Refuse { code: &'static str, message: String },
 }
@@ -180,6 +188,7 @@ pub(crate) fn route(
         "publish.event" => Route::PublishEvent { extension_id },
         "publish.extensionData" => Route::PublishExtensionData { extension_id },
         "extensionData.get" => Route::ExtensionDataGet { extension_id },
+        "query.events" => Route::QueryEvents { extension_id },
         _ => Route::Refuse {
             code: code::UNKNOWN_METHOD,
             message: format!("unknown method: {method}"),
@@ -280,6 +289,9 @@ pub(crate) async fn dispatch<R: tauri::Runtime>(
         }
         Route::ExtensionDataGet { extension_id } => {
             super::extension_data::extension_data_get(app, &extension_id, lease, params).await
+        }
+        Route::QueryEvents { extension_id } => {
+            super::query::query_events(app, &extension_id, lease, params).await
         }
         Route::IdentityGetPublicKey { extension_id } => {
             let state = app.state::<crate::AppState>();

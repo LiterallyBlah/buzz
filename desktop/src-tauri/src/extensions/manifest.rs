@@ -7,8 +7,11 @@
 //!   traversal-blocking rule from `managed_agents::custom_harnesses`.
 //! - `docs/BRIDGE_SPEC.md` §7 — the concrete field layout implemented here.
 //! - `docs/BRIDGE_SPEC.md` §4 — the v1 signable-kind allowlist.
-//! - `docs/BRIDGE_SPEC.md` §5 — the read denylist floor, whose complement is
-//!   the "read-allowed set" §7 refers to; v1 has no enumerated read allowlist.
+//! - `docs/BRIDGE_SPEC.md` §5 — the read denylist floor **and** the audited
+//!   `EXTENSION_CHANNEL_READABLE_KINDS` allowlist, checked independently of
+//!   each other. The floor's complement is *not* the read-allowed set; §5 was
+//!   amended (design-repo `5a55036`) precisely because it admits global kinds
+//!   whose stray signed `h` still matches an `#h` filter.
 //! - decision 004 — egress is default-deny, widened only per declared origin.
 //!
 //! Everything in this module is pure validation over an already-staged package
@@ -68,6 +71,61 @@ pub(crate) const EXTENSION_SIGNABLE_KINDS: &[u32] = &[
     kind::KIND_FORUM_VOTE,          // 45002 — forum vote
     kind::KIND_FORUM_COMMENT,       // 45003 — forum comment
 ];
+
+/// Kinds an extension may be granted to **read** in a granted channel (§5).
+///
+/// **An explicit audited allowlist, not the floor's complement.** The
+/// complement is the wrong set: it contains global kinds, whose stray *signed*
+/// `h` tag still matches an `#h` filter; derived-channel kinds such as
+/// reactions, whose channel comes from the `e`-target rather than an `h`; and
+/// kinds where a raw `h` is not authoritative placement. Membership here means
+/// something stronger — one canonical `h` is authoritative **and** the relay
+/// ingest-verified the channel placement.
+///
+/// These 24 are the v1 set from `docs/READ_KIND_AUDIT.md`, which walks all 134
+/// kinds with per-row citations. Deliberately excluded, with reasons in the
+/// audit: `9007` (`h` optional, which would break the exactly-one-`h`
+/// verifier); relay-authored `40099`/`39005` (deferred pending a trusted
+/// relay-identity witness); `39000`–`39002` (relay-placed but `h`-less);
+/// `30620` (verified only via the command bypass, which skips the ban/timeout
+/// gate); `43001`/`43004` (bimodal channel/project routing); and ephemeral
+/// `20002`/`24810` (never stored, so `query` and `subscribe` would diverge for
+/// one grant).
+pub(crate) const EXTENSION_CHANNEL_READABLE_KINDS: &[u32] = &[
+    kind::KIND_STREAM_MESSAGE,            // 9
+    kind::KIND_NIP29_PUT_USER,            // 9000
+    kind::KIND_NIP29_REMOVE_USER,         // 9001
+    kind::KIND_NIP29_EDIT_METADATA,       // 9002
+    kind::KIND_NIP29_DELETE_EVENT,        // 9005
+    kind::KIND_NIP29_DELETE_GROUP,        // 9008
+    kind::KIND_NIP29_JOIN_REQUEST,        // 9021
+    kind::KIND_NIP29_LEAVE_REQUEST,       // 9022
+    kind::KIND_STREAM_MESSAGE_V2,         // 40002
+    kind::KIND_STREAM_MESSAGE_EDIT,       // 40003
+    kind::KIND_STREAM_MESSAGE_PINNED,     // 40004
+    kind::KIND_STREAM_MESSAGE_BOOKMARKED, // 40005
+    kind::KIND_STREAM_MESSAGE_SCHEDULED,  // 40006
+    kind::KIND_STREAM_REMINDER,           // 40007
+    kind::KIND_STREAM_MESSAGE_DIFF,       // 40008
+    kind::KIND_CANVAS,                    // 40100
+    kind::KIND_FORUM_POST,                // 45001
+    kind::KIND_FORUM_VOTE,                // 45002
+    kind::KIND_FORUM_COMMENT,             // 45003
+    kind::KIND_HUDDLE_STARTED,            // 48100
+    kind::KIND_HUDDLE_PARTICIPANT_JOINED, // 48101
+    kind::KIND_HUDDLE_PARTICIPANT_LEFT,   // 48102
+    kind::KIND_HUDDLE_ENDED,              // 48103
+    kind::KIND_HUDDLE_GUIDELINES,         // 48106
+];
+
+/// Is this kind readable by an extension in a granted channel?
+///
+/// Independent of [`is_read_denied_kind`] on purpose: §5 requires the floor to
+/// be checked *apart from* the allowlist, so neither is derived from the other
+/// and deleting one cannot be masked by the other still answering.
+pub(crate) fn is_channel_readable_kind(kind_value: u32) -> bool {
+    EXTENSION_CHANNEL_READABLE_KINDS.contains(&kind_value)
+}
 
 /// The `41xxx` DM kinds named by `docs/BRIDGE_SPEC.md` §5.
 ///
@@ -209,10 +267,15 @@ pub(crate) fn is_valid_extension_id(id: &str) -> bool {
 /// capability (thread summaries, system messages) for no threat-model gain. The
 /// sign side still refuses relay-only kinds, which is §4's separate rule.
 ///
-/// The **read-allowed set** §7 refers to is this predicate's complement — v1
-/// has no separately enumerated read allowlist (§5). Reach is then bounded
-/// twice more at query time, by the user's channel grants and the granted-kind
-/// intersection.
+/// **This predicate's complement is NOT the read-allowed set.** An earlier
+/// draft said it was; §5 was amended (design-repo `5a55036`) to require
+/// membership in the audited [`EXTENSION_CHANNEL_READABLE_KINDS`] instead,
+/// because the complement admits global kinds whose stray *signed* `h` tag
+/// still matches an `#h` filter, derived-channel kinds, and kinds where a raw
+/// `h` is not authoritative placement. The two are checked independently, so
+/// this floor remains a belt under the allowlist's braces rather than being
+/// derived from it. Reach is then bounded twice more at query time, by the
+/// user's channel grants and the granted-pair intersection.
 ///
 /// Kind 30800 is included because extension data is never served through
 /// `query.events`/`subscribe` (§5); its only read path is `extensionData.get`.
@@ -282,6 +345,15 @@ pub(crate) fn validate_manifest(manifest: &ExtensionManifest) -> Result<(), Stri
             if is_read_denied_kind(*kind_value) {
                 return Err(format!(
                     "{MANIFEST_FILE_NAME}: scopes.read requests kind {kind_value}, which extensions may never read"
+                ));
+            }
+            // Checked separately from the floor, not as its complement (§5).
+            // A manifest must not request a capability the host could only
+            // implement by guessing where the event's channel came from.
+            if !is_channel_readable_kind(*kind_value) {
+                return Err(format!(
+                    "{MANIFEST_FILE_NAME}: scopes.read requests kind {kind_value}, which is not channel-readable; an extension may only read kinds whose channel placement the relay verified (v1 readable kinds: {})",
+                    format_kind_list(EXTENSION_CHANNEL_READABLE_KINDS)
                 ));
             }
         }
@@ -446,7 +518,12 @@ fn validate_channels(channels: &[String], field: &str) -> Result<(), String> {
 }
 
 /// A channel id in the lowercase hyphenated form Buzz publishes.
-fn is_canonical_channel_uuid(value: &str) -> bool {
+///
+/// Shared with §5's read path, which needs the same canonical form in two
+/// places: the `#h` value grammar, and the per-event check that the event's one
+/// `h` occurrence carries a channel UUID. Re-deriving it there would be a
+/// second definition of "is a channel id" to keep in step with this one.
+pub(crate) fn is_canonical_channel_uuid(value: &str) -> bool {
     match uuid::Uuid::parse_str(value) {
         Ok(parsed) => value == parsed.hyphenated().to_string(),
         Err(_) => false,
