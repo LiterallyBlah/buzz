@@ -390,3 +390,47 @@ fn an_event_whose_signature_does_not_cover_it_is_refused() {
         "a tampered event must not be exposed"
     );
 }
+
+// ── the two host walls, demonstrated positively ──────────────────────────────
+//
+// The negative rows above show a mismatched coordinate is refused. These show
+// *why* one extension cannot reach another's namespace in the first place:
+// the extension id comes from host state, and the read filter is built from
+// the same derivation as the write.
+
+#[tokio::test]
+async fn one_extension_cannot_name_or_read_another_extensions_namespace() {
+    let _host = super::super::frame_host::lifecycle_guard().await;
+
+    // Two extensions, same key. The coordinates are disjoint because the host
+    // supplies the extension id — no caller parameter contributes to it.
+    let mine = build_coordinate("extension-a", KEY).expect("coordinate");
+    let theirs = build_coordinate("extension-b", KEY).expect("coordinate");
+    assert_ne!(mine, theirs);
+    assert_eq!(mine, "ext:extension-a:graph.v1");
+    assert_eq!(theirs, "ext:extension-b:graph.v1");
+
+    // Write wall: the id is resolved from the lease, so holding A's lease can
+    // only ever derive A's coordinate. A caller cannot present B's id.
+    super::super::frame_host::insert_lease_for_test(LEASE, "extension-a");
+    assert_eq!(
+        super::super::frame_host::extension_for_lease(LEASE).as_deref(),
+        Some("extension-a"),
+        "the lease is the single producer of extension identity"
+    );
+
+    // Read wall: B's own signed event, stored at B's coordinate, is refused
+    // when A asks — the same user authored it, so authorship alone would not
+    // have separated them. Only the coordinate does.
+    let keys = nostr::Keys::generate();
+    let same_user = keys.public_key().to_hex();
+    let b_event = signed(&keys, 30800, vec![d_tag(&theirs)]);
+    assert!(
+        event_matches_coordinate(&b_event, &same_user, &theirs),
+        "B's event is valid at B's coordinate"
+    );
+    assert!(
+        !event_matches_coordinate(&b_event, &same_user, &mine),
+        "and must not satisfy a read for A's coordinate"
+    );
+}
