@@ -208,16 +208,6 @@ fn grant_lookup(grant_db: Option<&std::path::Path>, extension_id: &str, pubkey: 
         })
 }
 
-/// The one fixed-filter head read, shared by `current` and `extensionData.get`.
-///
-/// **A dedicated function, not a switch on the generic query authoriser.** §4's
-/// implementation note is explicit that a reusable "skip channel scope" flag
-/// "has a habit of becoming doors"; the filter here is constructed fresh from
-/// host state every call and cannot be widened by a caller.
-///
-/// Every returned event is independently re-verified before it is exposed:
-/// signature, kind, author and the exact coordinate. The constrained filter is
-/// what the relay was asked for; this is what the host is willing to believe.
 /// Why a head read produced no usable value.
 ///
 /// Separated because the two answers are not interchangeable to a caller:
@@ -231,6 +221,15 @@ enum HeadReadError {
 }
 
 /// The one fixed-filter head read, shared by `current` and `extensionData.get`.
+///
+/// **A dedicated function, not a switch on the generic query authoriser.** §4's
+/// implementation note is explicit that a reusable "skip channel scope" flag
+/// "has a habit of becoming doors"; the filter here is constructed fresh from
+/// host state every call and cannot be widened by a caller.
+///
+/// Every returned event is independently re-verified before it is exposed:
+/// signature, kind, author and the exact coordinate. The constrained filter is
+/// what the relay was asked for; this is what the host is willing to believe.
 ///
 /// **This function owns the admission wait and the revalidation around it.**
 /// The generic `query_relay` waits internally and then re-derives the signing

@@ -251,6 +251,116 @@ async fn a_timestamp_that_left_the_window_refuses_the_revalidation() {
     );
 }
 
+// ── the read revalidator's own branches ──────────────────────────────────────
+//
+// The write revalidator is defined as this one *plus* the acceptance window, so
+// every check below is also reachable through `ExtensionDataRevalidation`. These
+// exist anyway: the tests above are named for the write path, and a check that
+// moved out of the shared revalidator into the write-only wrapper would leave
+// every one of them green while the read path silently lost it.
+
+fn read_revalidation<'a>(
+    identity: &'a str,
+    coordinate: &'a str,
+    state: &'a crate::AppState,
+    db: Option<std::path::PathBuf>,
+) -> ReadRevalidation<'a> {
+    ReadRevalidation {
+        lease: LEASE,
+        extension_id: EXTID,
+        key: KEY,
+        identity_at_entry: identity,
+        coordinate_at_entry: coordinate,
+        state,
+        grant_db: db,
+    }
+}
+
+#[tokio::test]
+async fn a_released_lease_refuses_the_read_revalidation() {
+    let _host = super::super::frame_host::lifecycle_guard().await;
+    let (_dir, db, state, identity, coordinate) = passing();
+    let r = read_revalidation(&identity, &coordinate, &state, Some(db));
+
+    super::super::frame_host::insert_lease_for_test(LEASE, EXTID);
+    r.check().expect("the fixture must otherwise pass");
+
+    super::super::frame_host::release(LEASE);
+    assert_eq!(r.check(), Err(code::DENIED));
+}
+
+#[tokio::test]
+async fn an_identity_that_changed_refuses_the_read_revalidation() {
+    let _host = super::super::frame_host::lifecycle_guard().await;
+    let (_dir, db, state, identity, coordinate) = passing();
+    super::super::frame_host::insert_lease_for_test(LEASE, EXTID);
+
+    read_revalidation(&identity, &coordinate, &state, Some(db.clone()))
+        .check()
+        .expect("the fixture must otherwise pass");
+
+    let entered_as = nostr::Keys::generate().public_key().to_hex();
+    assert_eq!(
+        read_revalidation(&entered_as, &coordinate, &state, Some(db)).check(),
+        Err(code::DENIED)
+    );
+}
+
+#[tokio::test]
+async fn a_revoked_grant_refuses_the_read_revalidation() {
+    let _host = super::super::frame_host::lifecycle_guard().await;
+    let (_dir, db, state, identity, coordinate) = passing();
+    super::super::frame_host::insert_lease_for_test(LEASE, EXTID);
+    let r = read_revalidation(&identity, &coordinate, &state, Some(db.clone()));
+    r.check().expect("the fixture must otherwise pass");
+
+    {
+        let conn = super::super::grants::open_grant_db(&db).expect("reopen");
+        let removed = super::super::grants::revoke_all(&conn, &identity, EXTID).expect("revoke");
+        assert_eq!(removed, 1, "the grant must have existed to be revoked");
+    }
+    assert_eq!(r.check(), Err(code::DENIED));
+}
+
+#[tokio::test]
+async fn a_coordinate_that_no_longer_derives_refuses_the_read_revalidation() {
+    let _host = super::super::frame_host::lifecycle_guard().await;
+    let (_dir, db, state, identity, coordinate) = passing();
+    super::super::frame_host::insert_lease_for_test(LEASE, EXTID);
+
+    read_revalidation(&identity, &coordinate, &state, Some(db.clone()))
+        .check()
+        .expect("the fixture must otherwise pass");
+
+    let foreign = build_coordinate("other-extension", KEY).expect("coordinate");
+    assert_eq!(
+        read_revalidation(&identity, &foreign, &state, Some(db)).check(),
+        Err(code::DENIED)
+    );
+}
+
+#[tokio::test]
+async fn the_read_revalidation_has_no_acceptance_window() {
+    let _host = super::super::frame_host::lifecycle_guard().await;
+    let (_dir, db, state, identity, coordinate) = passing();
+    super::super::frame_host::insert_lease_for_test(LEASE, EXTID);
+    let stale = super::super::publish::now_unix() - 3_600;
+
+    // The same authority state, told from both sides. A template this old may
+    // not be *signed* …
+    assert_eq!(
+        revalidation(&identity, &coordinate, &state, Some(db.clone()), stale).check(),
+        Err(code::INVALID_PARAMS)
+    );
+    // … but it must not stop a *read*. The event is already stored by the time
+    // the confirmation runs; refusing here would report a parameter error for
+    // something that has already succeeded. The paired assertion is the point:
+    // a window check added to the read revalidator reds this and nothing else.
+    read_revalidation(&identity, &coordinate, &state, Some(db))
+        .check()
+        .expect("a read must not be gated on the write acceptance window");
+}
+
 // ── the write path's own timestamp contract ──────────────────────────────────
 
 /// Drive the real `publish_extension_data` with a listener wired into state, so
@@ -459,6 +569,13 @@ enum HeadReply {
 }
 
 fn fake_relay(mode: HeadReply) -> String {
+    fake_relay_with(mode, None)
+}
+
+/// As [`fake_relay`], but able to disturb host authority in the window between
+/// accepting the submission and answering the confirmation query — the one
+/// place where a write has already committed but its `current` is not yet read.
+fn fake_relay_with(mode: HeadReply, after_submit: Option<Box<dyn Fn() + Send>>) -> String {
     use std::io::{Read as _, Write as _};
 
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
@@ -507,6 +624,12 @@ fn fake_relay(mode: HeadReply) -> String {
             } else {
                 // A submission: remember it so the head query can echo it back.
                 submitted = Some(body.to_string());
+                // The event is now committed as far as the host can tell. Any
+                // disturbance from here lands strictly between the write and
+                // its confirmation.
+                if let Some(hook) = &after_submit {
+                    hook();
+                }
                 let id = body
                     .split_once("\"id\":\"")
                     .and_then(|(_, rest)| rest.get(..64))
@@ -587,6 +710,74 @@ async fn successful_write_with(
         })),
     )
     .await
+}
+
+#[tokio::test]
+async fn a_write_whose_authority_dies_before_the_read_back_denies_without_inventing_current() {
+    let _gate = crate::relay_admission::gate_guard().await;
+    let _host = super::super::frame_host::lifecycle_guard().await;
+    super::super::frame_host::insert_lease_for_test(LEASE, EXTID);
+    use tauri::Manager as _;
+
+    let keys = nostr::Keys::generate();
+    let identity = keys.public_key().to_hex();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("grants").join("extension-grants.db");
+    {
+        let conn = super::super::grants::open_grant_db(&db_path).expect("open");
+        super::super::grants::grant_boolean_scope(&conn, &identity, EXTID, SCOPE_EXTENSION_DATA)
+            .expect("grant");
+    }
+
+    let state = crate::app_state::build_app_state();
+    *state.keys.lock().unwrap() = keys;
+    let app = tauri::test::mock_app();
+    let prod_db = super::super::dispatch::grant_db_path(app.handle()).unwrap_or(db_path.clone());
+    if let Some(parent) = prod_db.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::copy(&db_path, &prod_db);
+
+    // Revoked once the submission is in — the write has committed, the
+    // confirmation has not run.
+    let revoked_identity = identity.clone();
+    let revoked_db = prod_db.clone();
+    let url = fake_relay_with(
+        HeadReply::EchoSubmitted,
+        Some(Box::new(move || {
+            let conn = super::super::grants::open_grant_db(&revoked_db).expect("reopen");
+            let removed =
+                super::super::grants::revoke_all(&conn, &revoked_identity, EXTID).expect("revoke");
+            assert_eq!(removed, 1, "the grant must have existed to be revoked");
+        })),
+    );
+    *state.relay_url_override.lock().unwrap() = Some(url);
+    app.manage(state);
+
+    let reply = publish_extension_data(
+        app.handle(),
+        EXTID,
+        LEASE,
+        Some(serde_json::json!({
+            "key": KEY,
+            "content": "{\"v\":1}",
+            "created_at": super::super::publish::now_unix(),
+        })),
+    )
+    .await;
+
+    // `denied`, not `invalid_params`: nothing about the parameters was wrong,
+    // and the event may well be stored. The caller can retry the exact request.
+    assert!(
+        denied(&reply),
+        "authority lost around the confirmation must deny, got {:?}",
+        reply.error
+    );
+    // And `current` is not guessed either way — no result is returned at all.
+    assert!(
+        reply.result.is_none(),
+        "a refused confirmation must not invent `current`"
+    );
 }
 
 #[tokio::test]
@@ -947,10 +1138,12 @@ fn capturing_relay(
 }
 
 #[tokio::test]
-async fn the_query_is_authenticated_by_the_admitted_identity_not_a_later_state_key() {
-    // The positive wire control. Everything above proves a refusal; this proves
-    // the request that *does* go out carries the identity whose grant admitted
-    // it — decoded from the actual NIP-98 header on the wire, not asserted.
+async fn proof_6_1_the_full_route_emits_nip98_authored_by_the_admitted_identity() {
+    // The route positive. It deliberately does **not** try to prove
+    // "A rather than a later B": once revalidation asserts the identity is
+    // unchanged, `signing_keys()` and a raw `state.keys` read return the same
+    // key whenever the route succeeds, so no honest full-route fixture can
+    // separate them. That property is pinned one seam down, in 6.2.
     let _gate = crate::relay_admission::gate_guard().await;
     let _host = super::super::frame_host::lifecycle_guard().await;
     use base64::Engine as _;
@@ -997,24 +1190,64 @@ async fn the_query_is_authenticated_by_the_admitted_identity_not_a_later_state_k
     let decoded = base64::engine::general_purpose::STANDARD
         .decode(token)
         .expect("base64");
-    let auth_event: serde_json::Value = serde_json::from_slice(&decoded).expect("auth event json");
-
-    assert_eq!(
-        auth_event["pubkey"].as_str().expect("pubkey"),
-        admitted,
-        "NIP-98 must be signed by the identity whose grant admitted the request"
-    );
+    let auth: serde_json::Value = serde_json::from_slice(&decoded).expect("auth event");
+    assert_eq!(auth["pubkey"].as_str().expect("pubkey"), admitted);
 }
 
 #[tokio::test]
-async fn authority_lost_after_the_request_denies_and_exposes_no_event() {
-    // Proof 7: the request is already on the wire when authority disappears.
-    // The relay answers, but nothing may be handed to the extension — and the
-    // refusal is `denied`, not `invalid_params`: for the publish confirmation
-    // this can occur after the event committed, and nothing about the caller's
-    // parameters was wrong.
+async fn proof_6_2_the_query_signs_with_its_explicit_keys_not_with_state() {
+    // The key-source property, pinned at the seam that owns it. `state.keys`
+    // deliberately holds B while the caller passes A — a state the full route
+    // cannot reach, which is exactly why this is tested here and not there.
+    // Real wire bytes; no pretence of being a successful `extensionData.get`.
     let _gate = crate::relay_admission::gate_guard().await;
-    let _host = super::super::frame_host::lifecycle_guard().await;
+    use base64::Engine as _;
+
+    let admitted_keys = nostr::Keys::generate();
+    let a = admitted_keys.public_key().to_hex();
+    let other_keys = nostr::Keys::generate();
+    let b = other_keys.public_key().to_hex();
+    assert_ne!(a, b);
+
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let url = capturing_relay(seen.clone(), None);
+
+    let state = crate::app_state::build_app_state();
+    *state.keys.lock().unwrap() = other_keys; // B in state …
+
+    let filter = serde_json::json!({ "kinds": [30800], "limit": 1 });
+    let _ = crate::relay::query_relay_at_with_keys_no_wait(
+        &state,
+        &url,
+        &[filter],
+        &admitted_keys, // … A passed explicitly
+        None,
+    )
+    .await;
+
+    let header = seen.lock().unwrap().clone().expect("a request was made");
+    let token = header.strip_prefix("Nostr ").expect("NIP-98 scheme");
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(token)
+        .expect("base64");
+    let auth: serde_json::Value = serde_json::from_slice(&decoded).expect("auth event");
+    assert_eq!(
+        auth["pubkey"].as_str().expect("pubkey"),
+        a,
+        "the wire must carry the explicitly passed identity, never state's"
+    );
+    assert_ne!(auth["pubkey"].as_str().expect("pubkey"), b);
+}
+
+/// Drive a read whose authority is withdrawn *after* the relay has the request.
+///
+/// The relay signals when it has received the request and waits; the test
+/// disturbs authority with full access to the app, then releases the relay to
+/// answer. So the post-response recheck is the only thing that can catch it.
+async fn read_disturbed_after_send(
+    disturb: impl FnOnce(&tauri::AppHandle<tauri::test::MockRuntime>, &str, &std::path::Path),
+) -> BridgeReply {
+    use std::io::{Read as _, Write as _};
     use tauri::Manager as _;
 
     let keys = nostr::Keys::generate();
@@ -1027,39 +1260,110 @@ async fn authority_lost_after_the_request_denies_and_exposes_no_event() {
             .expect("grant");
     }
 
+    // Arrival is signalled on a *tokio* channel: the disturbance and the read
+    // run on one task, so a blocking wait here would stop the read being polled
+    // and the request it is waiting for could never be sent.
+    let (arrived_tx, arrived_rx) = tokio::sync::oneshot::channel::<()>();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    std::thread::spawn(move || {
+        if let Ok((mut stream, _)) = listener.accept() {
+            let mut buf = [0u8; 8192];
+            let _ = stream.read(&mut buf);
+            let _ = arrived_tx.send(());
+            let _ = release_rx.recv();
+            let payload = "[]";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+                payload.len()
+            );
+            let _ = stream.write_all(response.as_bytes());
+            let _ = stream.flush();
+        }
+    });
+
     let state = crate::app_state::build_app_state();
     *state.keys.lock().unwrap() = keys;
-    let app = tauri::test::mock_app();
+    *state.relay_url_override.lock().unwrap() = Some(format!("http://{addr}"));
 
-    // The lease is released the moment the relay receives the request, so the
-    // post-response recheck is the only thing that can catch it.
-    let seen = std::sync::Arc::new(std::sync::Mutex::new(None));
-    let url = capturing_relay(
-        seen,
-        Some(Box::new(|| super::super::frame_host::release(LEASE))),
-    );
-    *state.relay_url_override.lock().unwrap() = Some(url);
+    let app = tauri::test::mock_app();
     app.manage(state);
-    if let Ok(prod) = super::super::dispatch::grant_db_path(app.handle()) {
-        if let Some(parent) = prod.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        let _ = std::fs::copy(&db_path, &prod);
+    let prod_db = super::super::dispatch::grant_db_path(app.handle()).unwrap_or(db_path.clone());
+    if let Some(parent) = prod_db.parent() {
+        let _ = std::fs::create_dir_all(parent);
     }
+    let _ = std::fs::copy(&db_path, &prod_db);
     super::super::frame_host::insert_lease_for_test(LEASE, EXTID);
 
-    let reply = extension_data_get(
-        app.handle(),
+    let handle = app.handle().clone();
+    let read = extension_data_get(
+        &handle,
         EXTID,
         LEASE,
         Some(serde_json::json!({ "key": KEY })),
-    )
-    .await;
-
-    assert!(
-        denied(&reply),
-        "authority lost in flight must deny, got {:?}",
-        reply.error
     );
+
+    let disturber = async {
+        // Wait until the relay actually has the request in hand — bounded, so a
+        // request that never goes out fails this probe rather than hanging it.
+        let arrived = tokio::time::timeout(std::time::Duration::from_secs(10), arrived_rx)
+            .await
+            .is_ok_and(|r| r.is_ok());
+        if arrived {
+            disturb(app.handle(), &identity, &prod_db);
+        }
+        let _ = release_tx.send(());
+        arrived
+    };
+
+    let (reply, arrived) = tokio::join!(read, disturber);
+    // Without this the probe would silently degrade into "authority was already
+    // gone before the send", which the *pre*-send recheck catches — a different
+    // production line from the one these proofs name.
+    assert!(
+        arrived,
+        "the request must have reached the relay before authority was disturbed"
+    );
+    reply
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn proof_7a_lease_released_after_send_denies_and_exposes_nothing() {
+    let _gate = crate::relay_admission::gate_guard().await;
+    let _host = super::super::frame_host::lifecycle_guard().await;
+    let reply = read_disturbed_after_send(|_, _, _| {
+        super::super::frame_host::release(LEASE);
+    })
+    .await;
+    assert!(denied(&reply), "got {:?}", reply.error);
     assert!(reply.result.is_none(), "no event bytes may be exposed");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn proof_7b_identity_changed_after_send_denies_and_exposes_nothing() {
+    let _gate = crate::relay_admission::gate_guard().await;
+    let _host = super::super::frame_host::lifecycle_guard().await;
+    let reply = read_disturbed_after_send(|app, _, _| {
+        use tauri::Manager as _;
+        let state = app.state::<crate::AppState>();
+        *state.keys.lock().unwrap() = nostr::Keys::generate();
+    })
+    .await;
+    assert!(denied(&reply), "got {:?}", reply.error);
+    assert!(reply.result.is_none());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn proof_7c_grant_revoked_after_send_denies_and_exposes_nothing() {
+    let _gate = crate::relay_admission::gate_guard().await;
+    let _host = super::super::frame_host::lifecycle_guard().await;
+    let reply = read_disturbed_after_send(|_, identity, db| {
+        let conn = super::super::grants::open_grant_db(db).expect("reopen");
+        let removed = super::super::grants::revoke_all(&conn, identity, EXTID).expect("revoke");
+        assert_eq!(removed, 1, "the grant must have existed to be revoked");
+    })
+    .await;
+    assert!(denied(&reply), "got {:?}", reply.error);
+    assert!(reply.result.is_none());
 }
