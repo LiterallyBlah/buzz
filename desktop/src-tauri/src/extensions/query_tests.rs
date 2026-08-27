@@ -413,9 +413,29 @@ fn a_global_kind_carrying_a_stray_h_naming_a_granted_channel_is_refused() {
     // THE STRAY-`h` PROBE. Kind 1 is not channel-readable: the relay does not
     // assign its channel, so its `h` is whatever the author signed. Even
     // carrying a granted channel, it must not reach the extension.
-    let (_dir, conn, filters, id) = granted_a();
+    //
+    // **Kind 1 is granted in the store on purpose.** Manifest validation would
+    // never let such a row exist, which is exactly why the verifier must not
+    // lean on that: with kind 1 ungranted, the live grant lookup refuses the
+    // event and this test passes even with the allowlist clause deleted. This
+    // is the defence-in-depth case — a grant row for a kind that should never
+    // have been grantable — so the allowlist clause is the only thing left to
+    // reject it.
+    let (_dir, conn) = temp_db();
+    let id = identity();
+    super::super::grants::grant_read_scope(&conn, &id, EXTID, 9, CHAN_A).expect("grant");
+    super::super::grants::grant_read_scope(&conn, &id, EXTID, 1, CHAN_A).expect("grant");
+    let filters = construct_filters(
+        &[(9u32, CHAN_A.to_string())],
+        &ok_request(serde_json::json!({})),
+    )
+    .expect("build");
     let keys = nostr::Keys::generate();
     let event = signed_event(&keys, 1, vec![h(CHAN_A)]);
+    assert!(
+        super::super::grants::has_read_scope(&conn, &id, EXTID, 1, CHAN_A),
+        "the grant lookup must not be what rejects this event"
+    );
     assert!(!verify_event(&event, &filters, &conn, &id, EXTID));
 }
 
