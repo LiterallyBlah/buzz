@@ -758,3 +758,168 @@ fn the_deadline_does_not_close_an_already_closed_aggregate_twice() {
     agg.close(CloseReason::AuthorityLost);
     assert_eq!(on_initial_eose_deadline(&mut agg), Routed::default());
 }
+
+// ── admission order ────────────────────────────────────────────────────────
+//
+// reserve → gate → revalidate → REQ burst. Each step records that it ran, so
+// these assert *which steps happened*, not merely the returned value — the
+// ordering is the safety property and a result-only assertion cannot see it.
+
+#[derive(Default)]
+struct Steps {
+    gate: Cell<bool>,
+    revalidated: Cell<bool>,
+    reqs_sent: Cell<bool>,
+}
+
+#[test]
+fn a_successful_open_runs_every_step_and_holds_the_budget() {
+    // The positive control: the refusals below must not be satisfied by an
+    // implementation that never opens anything.
+    let quota = SubscriptionQuota::new();
+    let steps = Steps::default();
+    let opened = open_subscription(
+        &quota,
+        IDENTITY,
+        EXTID,
+        3,
+        || steps.gate.set(true),
+        || {
+            steps.revalidated.set(true);
+            Ok(())
+        },
+        || {
+            steps.reqs_sent.set(true);
+            Ok(vec!["b1".into(), "b2".into(), "b3".into()])
+        },
+    );
+    let (branches, _committed) = opened.expect("open");
+    assert_eq!(branches.len(), 3);
+    assert!(steps.gate.get() && steps.revalidated.get() && steps.reqs_sent.get());
+    assert_eq!(quota.held_by(IDENTITY, EXTID), 3, "committed, still held");
+}
+
+#[test]
+fn quota_is_reserved_before_any_network_side_effect() {
+    // With no budget, nothing may touch the network — not the gate, not a
+    // connect, not a REQ. Reserving after would let a subscription
+    // authenticate against budget it does not hold.
+    let quota = SubscriptionQuota::new();
+    let mut hold = Vec::new();
+    while let Some(r) = quota.reserve(IDENTITY, EXTID, MAX_BRANCHES_PER_SUB) {
+        hold.push(r);
+    }
+    let steps = Steps::default();
+    let result = open_subscription(
+        &quota,
+        IDENTITY,
+        EXTID,
+        1,
+        || steps.gate.set(true),
+        || {
+            steps.revalidated.set(true);
+            Ok(())
+        },
+        || {
+            steps.reqs_sent.set(true);
+            Ok(vec!["b1".into()])
+        },
+    );
+    assert_eq!(result.err(), Some(OpenFailure::QuotaExhausted));
+    assert!(!steps.gate.get(), "the gate must not be waited on");
+    assert!(!steps.revalidated.get());
+    assert!(!steps.reqs_sent.get(), "and no REQ may be sent");
+}
+
+#[test]
+fn authority_lost_during_the_gate_wait_sends_zero_reqs() {
+    // The contract's named hard negative. The gate wait is unbounded, so
+    // authority checked before it proves nothing after it — and the revalidation
+    // has to come between the wait and the burst.
+    let quota = SubscriptionQuota::new();
+    let steps = Steps::default();
+    let result = open_subscription(
+        &quota,
+        IDENTITY,
+        EXTID,
+        4,
+        || steps.gate.set(true),
+        || {
+            steps.revalidated.set(true);
+            Err(CloseReason::AuthorityLost)
+        },
+        || {
+            steps.reqs_sent.set(true);
+            Ok(vec!["b1".into()])
+        },
+    );
+    assert_eq!(
+        result.err(),
+        Some(OpenFailure::AuthorityLost(CloseReason::AuthorityLost))
+    );
+    assert!(steps.gate.get(), "the wait did happen");
+    assert!(
+        steps.revalidated.get(),
+        "and was followed by a revalidation"
+    );
+    assert!(!steps.reqs_sent.get(), "ZERO REQs after authority loss");
+    assert_eq!(
+        quota.held_by(IDENTITY, EXTID),
+        0,
+        "and the reservation rolled back"
+    );
+}
+
+#[test]
+fn a_failed_branch_open_rolls_the_whole_reservation_back() {
+    let quota = SubscriptionQuota::new();
+    let result = open_subscription(&quota, IDENTITY, EXTID, 6, || {}, || Ok(()), || Err(()));
+    assert_eq!(result.err(), Some(OpenFailure::BranchOpenFailed));
+    assert_eq!(
+        quota.held_by(IDENTITY, EXTID),
+        0,
+        "no partial reservation may leak"
+    );
+}
+
+// ── the sub-keyed stream envelope ──────────────────────────────────────────
+
+#[test]
+fn stream_frames_are_sub_keyed_and_carry_no_request_id() {
+    // A stream frame must never be mistakable for — or able to settle — a
+    // correlated request, which is what keeps it off the request-id budget.
+    let frames = [
+        StreamFrame::Event {
+            sub: "s1".into(),
+            event: Box::new(event()),
+        },
+        StreamFrame::Eose { sub: "s1".into() },
+        StreamFrame::Closed {
+            sub: "s1".into(),
+            reason: CloseReason::AuthorityLost,
+        },
+    ];
+    for frame in frames {
+        let wire = frame.to_wire();
+        assert_eq!(wire["sub"], "s1");
+        assert!(wire.get("id").is_none(), "no request id on a stream frame");
+        assert!(wire["kind"].is_string());
+    }
+}
+
+#[test]
+fn a_closed_frame_carries_only_a_normalised_reason() {
+    let wire = StreamFrame::Closed {
+        sub: "s1".into(),
+        reason: CloseReason::RelayClosed,
+    }
+    .to_wire();
+    assert_eq!(wire["kind"], "closed");
+    assert_eq!(wire["reason"], "relay_closed");
+}
+
+#[test]
+fn nothing_produces_no_frame() {
+    assert!(StreamFrame::from_emit("s1", Emit::Nothing).is_none());
+    assert!(StreamFrame::from_emit("s1", Emit::Eose).is_some());
+}

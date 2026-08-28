@@ -590,6 +590,123 @@ pub(super) fn on_initial_eose_deadline(aggregate: &mut Aggregate) -> Routed {
     }
 }
 
+/// A host→extension stream frame.
+///
+/// Keyed by `sub`, never by `id`: a stream is many frames for one subscription
+/// rather than one settle for one request, so these ride a parallel lifecycle
+/// table and consume none of the port's request-id budget.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum StreamFrame {
+    Event {
+        sub: String,
+        event: Box<nostr::Event>,
+    },
+    Eose {
+        sub: String,
+    },
+    Closed {
+        sub: String,
+        reason: CloseReason,
+    },
+}
+
+impl StreamFrame {
+    /// Build the frame from what the aggregate emitted, or `None` when there
+    /// was nothing to deliver.
+    pub(super) fn from_emit(sub: &str, emit: Emit) -> Option<Self> {
+        match emit {
+            Emit::Nothing => None,
+            Emit::Event(event) => Some(StreamFrame::Event {
+                sub: sub.to_string(),
+                event,
+            }),
+            Emit::Eose => Some(StreamFrame::Eose {
+                sub: sub.to_string(),
+            }),
+            Emit::Closed(reason) => Some(StreamFrame::Closed {
+                sub: sub.to_string(),
+                reason,
+            }),
+        }
+    }
+
+    /// The §2 wire shape. Carries no `id`, so a stream frame can never be
+    /// mistaken for — or settle — a correlated request.
+    pub(super) fn to_wire(&self) -> serde_json::Value {
+        use nostr::JsonUtil as _;
+        match self {
+            StreamFrame::Event { sub, event } => serde_json::json!({
+                "sub": sub,
+                "kind": "event",
+                "event": serde_json::from_str::<serde_json::Value>(&event.as_json())
+                    .unwrap_or(serde_json::Value::Null),
+            }),
+            StreamFrame::Eose { sub } => serde_json::json!({ "sub": sub, "kind": "eose" }),
+            StreamFrame::Closed { sub, reason } => serde_json::json!({
+                "sub": sub,
+                "kind": "closed",
+                "reason": reason.as_wire(),
+            }),
+        }
+    }
+}
+
+/// Why a `subscribe` could not be opened.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum OpenFailure {
+    /// The `(identity, extension)` branch budget had no room.
+    QuotaExhausted,
+    /// Authority changed between reservation and the REQ burst.
+    AuthorityLost(CloseReason),
+    /// The relay branches could not be opened.
+    BranchOpenFailed,
+}
+
+/// Open a subscription in the fixed admission order.
+///
+/// ```text
+/// reserve quota
+///   → wait on the process-global relay admission gate
+///   → revalidate lease + witness + every pair
+///   → send the bounded REQ burst
+/// ```
+///
+/// **The order is the contract, and each step is a closure so a probe can see
+/// which ones ran.** Two properties depend on it:
+///
+/// - reserving *before* any network side effect means a subscription cannot
+///   connect, authenticate or REQ against budget it does not hold;
+/// - revalidating *after* the gate means the unbounded wait cannot leave a
+///   stale authority behind — and if authority went away during it, **zero**
+///   REQs go out.
+///
+/// Rollback is structural: the `Reservation` is released by `Drop` on every
+/// early return here, so the four failure paths the contract enumerates do not
+/// each need remembering.
+pub(super) fn open_subscription(
+    quota: &Arc<SubscriptionQuota>,
+    identity_pubkey: &str,
+    extension_id: &str,
+    branches: usize,
+    wait_gate: impl FnOnce(),
+    revalidate: impl FnOnce() -> Result<(), CloseReason>,
+    send_reqs: impl FnOnce() -> Result<Vec<String>, ()>,
+) -> Result<(Vec<String>, CommittedReservation), OpenFailure> {
+    let reservation = quota
+        .reserve(identity_pubkey, extension_id, branches)
+        .ok_or(OpenFailure::QuotaExhausted)?;
+
+    wait_gate();
+
+    if let Err(reason) = revalidate() {
+        // `reservation` drops here, giving the branches back.
+        return Err(OpenFailure::AuthorityLost(reason));
+    }
+
+    let branch_ids = send_reqs().map_err(|()| OpenFailure::BranchOpenFailed)?;
+    Ok((branch_ids, reservation.commit()))
+}
+
 /// One live subscription and everything that must die with it.
 struct LiveSub {
     /// The Rust-side wall. Released when the tab closes or the extension is
