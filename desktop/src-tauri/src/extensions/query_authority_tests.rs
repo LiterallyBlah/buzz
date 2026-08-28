@@ -638,13 +638,30 @@ async fn an_oversized_response_without_a_content_length_is_still_refused() {
     // header check answers for it.
     let _host = super::super::frame_host::lifecycle_guard().await;
     super::super::frame_host::insert_lease_for_test(QLEASE, QEXTID);
-    let filler = "x".repeat(9 * 1024 * 1024);
-    let body = format!("[{{\"junk\":\"{filler}\"}}]");
+
+    // **The body must be one the host would otherwise accept.** Junk filler
+    // does not isolate this: with the ceiling deleted the deserialiser fails on
+    // it and returns the same `relay_error`, so the probe passes either way.
+    // This is a single genuinely signed, granted, verifiable event whose
+    // content pushes it past the ceiling — so without the ceiling the read
+    // *succeeds* and returns it, and the assertion below can actually fail.
+    let keys = nostr::Keys::generate();
+    let huge = nostr::EventBuilder::new(nostr::Kind::from(9u16), "x".repeat(9 * 1024 * 1024))
+        .tag(nostr::Tag::parse(vec!["h".to_string(), QCHAN.to_string()]).expect("tag"))
+        .sign_with_keys(&keys)
+        .expect("sign");
+    use nostr::JsonUtil as _;
+    let body = format!("[{}]", huge.as_json());
+    assert!(
+        body.len() > 8 * 1024 * 1024,
+        "the fixture must exceed the ceiling it probes"
+    );
+
     let reply = query_against_relay_body("", Some(body), || {}).await;
     assert!(
         relay_error(&reply),
         "an unbounded chunked body must be refused: {:?}",
-        reply.error
+        reply
     );
     assert!(reply.result.is_none(), "and expose nothing");
 }
