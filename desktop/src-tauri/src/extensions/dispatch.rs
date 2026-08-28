@@ -141,6 +141,8 @@ pub(crate) enum Route {
     ExtensionDataGet { extension_id: String },
     /// §5 `query.events` — a one-shot channel-scoped read.
     QueryEvents { extension_id: String },
+    /// §5 `subscribe` — open a live channel-scoped stream.
+    Subscribe { extension_id: String },
     /// §5 `unsubscribe` — ensure a subscription is not live on this lease.
     Unsubscribe { extension_id: String },
     /// Refuse, with this §8 code and message.
@@ -191,6 +193,7 @@ pub(crate) fn route(
         "publish.extensionData" => Route::PublishExtensionData { extension_id },
         "extensionData.get" => Route::ExtensionDataGet { extension_id },
         "query.events" => Route::QueryEvents { extension_id },
+        "subscribe" => Route::Subscribe { extension_id },
         "unsubscribe" => Route::Unsubscribe { extension_id },
         _ => Route::Refuse {
             code: code::UNKNOWN_METHOD,
@@ -295,6 +298,12 @@ pub(crate) async fn dispatch<R: tauri::Runtime>(
         }
         Route::QueryEvents { extension_id } => {
             super::query::query_events(app, &extension_id, lease, params).await
+        }
+        Route::Subscribe { extension_id } => {
+            // Same lease-carrying shape as the other authority-bearing routes:
+            // the stream revalidates against it for as long as it lives, not
+            // just at the moment it opens.
+            super::query::subscribe(app, &extension_id, lease, params).await
         }
         Route::Unsubscribe { extension_id } => {
             let _ = extension_id;

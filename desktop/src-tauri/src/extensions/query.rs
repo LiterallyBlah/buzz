@@ -742,12 +742,32 @@ pub(crate) async fn query_events<R: tauri::Runtime>(
 /// reach them through it.
 mod subscription;
 
+/// Who owns which live stream, and what dies with it.
+///
+/// A sibling of [`subscription`] rather than part of it only because the two
+/// together exceed the repo's 1000-line ratchet; both are private children of
+/// this module and the seal covers them identically.
+mod registry;
+
+/// The shared, authenticated relay socket the branches are opened on.
+mod connection;
+
 /// §5 `unsubscribe({ sub }) → { ok }` — the crate-visible bridge handler.
 ///
 /// Re-exported from the private child so `dispatch` can route to it without
 /// the sealed internals becoming reachable.
 pub(crate) fn unsubscribe(lease: &str, params: Option<Value>) -> BridgeReply {
-    subscription::unsubscribe(lease, params)
+    registry::unsubscribe(lease, params)
+}
+
+/// §5 `subscribe({ filter }) → { sub }` — the crate-visible bridge handler.
+pub(crate) async fn subscribe<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    extension_id: &str,
+    lease: &str,
+    params: Option<Value>,
+) -> BridgeReply {
+    connection::subscribe(app, extension_id, lease, params).await
 }
 
 #[cfg(test)]

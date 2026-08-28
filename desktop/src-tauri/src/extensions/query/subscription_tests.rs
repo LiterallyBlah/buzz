@@ -457,110 +457,6 @@ fn the_pre_reply_buffer_is_bounded() {
     assert_eq!(closed, Some(CloseReason::BoundExceeded));
 }
 
-// ── the lease wall ─────────────────────────────────────────────────────────
-//
-// The lease *is* the generation on this side: `frame_host::acquire` mints a
-// fresh UUID per frame mount, so a successor port carries a different one.
-
-const LEASE: &str = "lease-1";
-const SUCCESSOR_LEASE: &str = "lease-2";
-
-fn registered(
-    registry: &SubscriptionRegistry,
-    quota: &Arc<SubscriptionQuota>,
-    lease: &str,
-    sub: &str,
-) {
-    let reservation = quota.reserve(IDENTITY, EXTID, 2).expect("reserve").commit();
-    registry.insert(lease, sub, aggregate(&["b1"]), reservation);
-}
-
-#[test]
-fn a_frame_for_a_released_lease_is_dropped() {
-    // THE NO-MIGRATION RULE. Keying by (lease, sub) rather than sub alone means
-    // there is no code path that could hand a late completion to the frame that
-    // replaced the one which asked for it.
-    let quota = SubscriptionQuota::new();
-    let registry = SubscriptionRegistry::new();
-    registered(&registry, &quota, LEASE, "s1");
-
-    assert!(registry.with_aggregate(LEASE, "s1", |_| ()).is_some());
-    assert!(
-        registry
-            .with_aggregate(SUCCESSOR_LEASE, "s1", |_| ())
-            .is_none(),
-        "the same sub id under a successor lease must not resolve"
-    );
-}
-
-#[test]
-fn the_same_sub_id_on_two_leases_is_two_subscriptions() {
-    let quota = SubscriptionQuota::new();
-    let registry = SubscriptionRegistry::new();
-    registered(&registry, &quota, LEASE, "s1");
-    registered(&registry, &quota, SUCCESSOR_LEASE, "s1");
-    assert_eq!(registry.live_count(), 2);
-
-    registry.close_for_lease(LEASE, CloseReason::Unsubscribed);
-    assert_eq!(registry.live_count(), 1);
-    assert!(registry
-        .with_aggregate(SUCCESSOR_LEASE, "s1", |_| ())
-        .is_some());
-}
-
-#[test]
-fn the_lease_wall_closes_its_subs_and_releases_their_quota() {
-    let quota = SubscriptionQuota::new();
-    let registry = SubscriptionRegistry::new();
-    registered(&registry, &quota, LEASE, "s1");
-    registered(&registry, &quota, LEASE, "s2");
-    registered(&registry, &quota, SUCCESSOR_LEASE, "s3");
-    assert_eq!(quota.held_by(IDENTITY, EXTID), 6);
-
-    let closed = registry.close_for_lease(LEASE, CloseReason::AuthorityLost);
-    assert_eq!(closed.len(), 2);
-    assert_eq!(registry.live_count(), 1, "the other lease survives");
-    assert_eq!(
-        quota.held_by(IDENTITY, EXTID),
-        2,
-        "only the closed subs' branches came back"
-    );
-}
-
-#[test]
-fn tearing_down_the_same_lease_twice_releases_once() {
-    let quota = SubscriptionQuota::new();
-    let registry = SubscriptionRegistry::new();
-    registered(&registry, &quota, LEASE, "s1");
-    let _other = quota.reserve(IDENTITY, EXTID, 3).expect("reserve").commit();
-    assert_eq!(quota.held_by(IDENTITY, EXTID), 5);
-
-    registry.close_for_lease(LEASE, CloseReason::AuthorityLost);
-    registry.close_for_lease(LEASE, CloseReason::Unsubscribed);
-    assert_eq!(
-        quota.held_by(IDENTITY, EXTID),
-        3,
-        "the surviving reservation must not be refunded by a second teardown"
-    );
-}
-
-#[test]
-fn closing_one_sub_releases_only_its_own_branches() {
-    let quota = SubscriptionQuota::new();
-    let registry = SubscriptionRegistry::new();
-    registered(&registry, &quota, LEASE, "s1");
-    registered(&registry, &quota, LEASE, "s2");
-    assert_eq!(quota.held_by(IDENTITY, EXTID), 4);
-
-    let emit = registry.close_one(LEASE, "s1", CloseReason::Unsubscribed);
-    assert_eq!(emit, Some(Emit::Closed(CloseReason::Unsubscribed)));
-    assert_eq!(quota.held_by(IDENTITY, EXTID), 2);
-    assert!(registry
-        .close_one(LEASE, "s1", CloseReason::Unsubscribed)
-        .is_none());
-    assert_eq!(quota.held_by(IDENTITY, EXTID), 2, "still exactly once");
-}
-
 // ── the reader: multiplex raw frames from the start ────────────────────────
 
 use crate::relay::subscribe::RelayFrame;
@@ -668,33 +564,40 @@ fn a_rate_limit_signal_arms_the_admission_gate() {
     );
     assert!(routed.arm_gate);
 
-    let mut agg2 = aggregate(&["b1"]);
-    let noticed = route_frame(
-        &mut agg2,
+    // A `NOTICE` carries the same signal, but connection-scoped: it names no
+    // subscription, so it is decided by `on_notice` and never by an aggregate.
+    assert!(on_notice("NOTICE: rate limit reached"));
+}
+
+#[test]
+fn an_unremarkable_notice_does_not_arm_the_gate() {
+    // The positive control for the heuristic: it must not arm on everything.
+    assert!(!on_notice("server restarting shortly"));
+}
+
+#[test]
+fn a_notice_is_never_attributed_to_a_subscription() {
+    // The reason `on_notice` exists. A notice reaching `route_frame` would have
+    // to be handed some aggregate, and on a shared socket *every* live sub is
+    // an equally arbitrary choice — so one notice would arm the global gate
+    // once per subscription and could close or disturb a stream that the relay
+    // said nothing about. Routing one here must therefore be inert.
+    let mut agg = aggregate(&["b1"]);
+    let routed = route_frame(
+        &mut agg,
         RelayFrame::Notice {
             message: "NOTICE: rate limit reached".into(),
         },
         allow(),
         |_| true,
     );
-    assert!(noticed.arm_gate);
-    assert!(noticed.emits.is_empty(), "a notice delivers nothing");
-    assert!(!agg2.is_closed(), "and does not end the subscription");
-}
-
-#[test]
-fn an_unremarkable_notice_does_not_arm_the_gate() {
-    // The positive control for the heuristic: it must not arm on everything.
-    let mut agg = aggregate(&["b1"]);
-    let routed = route_frame(
-        &mut agg,
-        RelayFrame::Notice {
-            message: "server restarting shortly".into(),
-        },
-        allow(),
-        |_| true,
+    assert!(
+        !routed.arm_gate,
+        "the gate decision belongs to on_notice, not to an aggregate"
     );
-    assert!(!routed.arm_gate);
+    assert!(routed.emits.is_empty(), "a notice delivers nothing");
+    assert!(!routed.close_branches);
+    assert!(!agg.is_closed(), "and does not end the subscription");
 }
 
 #[test]
@@ -754,38 +657,52 @@ fn the_deadline_does_not_close_an_already_closed_aggregate_twice() {
 struct Steps {
     gate: Cell<bool>,
     revalidated: Cell<bool>,
+    registered: Cell<bool>,
     reqs_sent: Cell<bool>,
+    unregistered: Cell<bool>,
 }
 
-#[test]
-fn a_successful_open_runs_every_step_and_holds_the_budget() {
+#[tokio::test]
+async fn a_successful_open_runs_every_step_and_holds_the_budget() {
     // The positive control: the refusals below must not be satisfied by an
     // implementation that never opens anything.
     let quota = SubscriptionQuota::new();
     let steps = Steps::default();
+    // The fixture holds the committed reservation exactly as the registry does.
+    // Dropping it instead releases the budget through `Drop` — which is the
+    // right behaviour and the reason this is not `|_|`: "committed, still held"
+    // is a claim about whoever registers keeping the value alive.
+    let held: std::cell::RefCell<Option<CommittedReservation>> = std::cell::RefCell::new(None);
     let opened = open_subscription(
         &quota,
         IDENTITY,
         EXTID,
         3,
-        || steps.gate.set(true),
+        || async { steps.gate.set(true) },
         || {
             steps.revalidated.set(true);
             Ok(())
         },
+        |reservation| {
+            steps.registered.set(true);
+            *held.borrow_mut() = Some(reservation);
+        },
         || {
             steps.reqs_sent.set(true);
-            Ok(vec!["b1".into(), "b2".into(), "b3".into()])
+            async { Ok(()) }
         },
-    );
-    let (branches, _committed) = opened.expect("open");
-    assert_eq!(branches.len(), 3);
+        || steps.unregistered.set(true),
+    )
+    .await;
+    assert!(opened.is_ok(), "open");
     assert!(steps.gate.get() && steps.revalidated.get() && steps.reqs_sent.get());
+    assert!(steps.registered.get(), "and the sub was registered");
+    assert!(!steps.unregistered.get(), "and not rolled back");
     assert_eq!(quota.held_by(IDENTITY, EXTID), 3, "committed, still held");
 }
 
-#[test]
-fn quota_is_reserved_before_any_network_side_effect() {
+#[tokio::test]
+async fn quota_is_reserved_before_any_network_side_effect() {
     // With no budget, nothing may touch the network — not the gate, not a
     // connect, not a REQ. Reserving after would let a subscription
     // authenticate against budget it does not hold.
@@ -800,24 +717,28 @@ fn quota_is_reserved_before_any_network_side_effect() {
         IDENTITY,
         EXTID,
         1,
-        || steps.gate.set(true),
+        || async { steps.gate.set(true) },
         || {
             steps.revalidated.set(true);
             Ok(())
         },
+        |_| steps.registered.set(true),
         || {
             steps.reqs_sent.set(true);
-            Ok(vec!["b1".into()])
+            async { Ok(()) }
         },
-    );
+        || steps.unregistered.set(true),
+    )
+    .await;
     assert_eq!(result.err(), Some(OpenFailure::QuotaExhausted));
     assert!(!steps.gate.get(), "the gate must not be waited on");
     assert!(!steps.revalidated.get());
+    assert!(!steps.registered.get(), "and nothing may be registered");
     assert!(!steps.reqs_sent.get(), "and no REQ may be sent");
 }
 
-#[test]
-fn authority_lost_during_the_gate_wait_sends_zero_reqs() {
+#[tokio::test]
+async fn authority_lost_during_the_gate_wait_sends_zero_reqs() {
     // The contract's named hard negative. The gate wait is unbounded, so
     // authority checked before it proves nothing after it — and the revalidation
     // has to come between the wait and the burst.
@@ -828,16 +749,19 @@ fn authority_lost_during_the_gate_wait_sends_zero_reqs() {
         IDENTITY,
         EXTID,
         4,
-        || steps.gate.set(true),
+        || async { steps.gate.set(true) },
         || {
             steps.revalidated.set(true);
             Err(CloseReason::AuthorityLost)
         },
+        |_| steps.registered.set(true),
         || {
             steps.reqs_sent.set(true);
-            Ok(vec!["b1".into()])
+            async { Ok(()) }
         },
-    );
+        || steps.unregistered.set(true),
+    )
+    .await;
     assert_eq!(
         result.err(),
         Some(OpenFailure::AuthorityLost(CloseReason::AuthorityLost))
@@ -847,6 +771,7 @@ fn authority_lost_during_the_gate_wait_sends_zero_reqs() {
         steps.revalidated.get(),
         "and was followed by a revalidation"
     );
+    assert!(!steps.registered.get(), "nothing is registered");
     assert!(!steps.reqs_sent.get(), "ZERO REQs after authority loss");
     assert_eq!(
         quota.held_by(IDENTITY, EXTID),
@@ -855,16 +780,75 @@ fn authority_lost_during_the_gate_wait_sends_zero_reqs() {
     );
 }
 
-#[test]
-fn a_failed_branch_open_rolls_the_whole_reservation_back() {
+#[tokio::test]
+async fn a_failed_branch_open_rolls_the_whole_reservation_back() {
     let quota = SubscriptionQuota::new();
-    let result = open_subscription(&quota, IDENTITY, EXTID, 6, || {}, || Ok(()), || Err(()));
+    let steps = Steps::default();
+    let result = open_subscription(
+        &quota,
+        IDENTITY,
+        EXTID,
+        6,
+        || async {},
+        || Ok(()),
+        |_| steps.registered.set(true),
+        || {
+            steps.reqs_sent.set(true);
+            async { Err(()) }
+        },
+        || steps.unregistered.set(true),
+    )
+    .await;
     assert_eq!(result.err(), Some(OpenFailure::BranchOpenFailed));
+    assert!(
+        steps.unregistered.get(),
+        "the registered sub must be taken back out"
+    );
     assert_eq!(
         quota.held_by(IDENTITY, EXTID),
         0,
         "no partial reservation may leak"
     );
+}
+
+#[tokio::test]
+async fn a_subscription_is_registered_before_its_reqs_go_out() {
+    // Otherwise there is a window in which the relay's first answers resolve to
+    // no owner and are dropped — and those are the stored events §5 requires be
+    // delivered, so the extension would see a channel that looks empty.
+    //
+    // The order is observed, not assumed: `send_reqs` asserts on the flag that
+    // `register` sets, so reversing the two in `open_subscription` fails here
+    // rather than passing quietly.
+    let quota = SubscriptionQuota::new();
+    let steps = Steps::default();
+    let result = open_subscription(
+        &quota,
+        IDENTITY,
+        EXTID,
+        2,
+        || async {},
+        || Ok(()),
+        |_| steps.registered.set(true),
+        || {
+            let registered_first = steps.registered.get();
+            steps.reqs_sent.set(true);
+            async move {
+                if registered_first {
+                    Ok(())
+                } else {
+                    Err(())
+                }
+            }
+        },
+        || steps.unregistered.set(true),
+    )
+    .await;
+    assert!(
+        result.is_ok(),
+        "the REQ burst ran after registration, not before"
+    );
+    assert!(steps.reqs_sent.get(), "and it really ran");
 }
 
 // ── the sub-keyed stream envelope ──────────────────────────────────────────
@@ -907,88 +891,4 @@ fn a_closed_frame_carries_only_a_normalised_reason() {
 fn nothing_produces_no_frame() {
     assert!(StreamFrame::from_emit("s1", Emit::Nothing).is_none());
     assert!(StreamFrame::from_emit("s1", Emit::Eose).is_some());
-}
-
-// ── unsubscribe: idempotent, lease-scoped, no existence oracle ─────────────
-
-fn code_of_reply(reply: &BridgeReply) -> Option<&str> {
-    reply.error.as_ref().map(|e| e.code.as_str())
-}
-
-#[test]
-fn unsubscribe_reports_the_same_thing_whether_or_not_the_sub_was_live() {
-    // THE ORACLE PROBE. If the reply differed, an extension could enumerate
-    // which ids exist — including ones minted for somebody else's frame.
-    let quota = SubscriptionQuota::new();
-    let live_reservation = quota.reserve(IDENTITY, EXTID, 1).expect("reserve").commit();
-    registry().insert(
-        "oracle-lease",
-        "known-sub",
-        aggregate(&["b1"]),
-        live_reservation,
-    );
-
-    let hit = unsubscribe(
-        "oracle-lease",
-        Some(serde_json::json!({ "sub": "known-sub" })),
-    );
-    let miss = unsubscribe(
-        "oracle-lease",
-        Some(serde_json::json!({ "sub": "never-existed" })),
-    );
-    assert!(hit.error.is_none());
-    assert_eq!(
-        hit.result, miss.result,
-        "a live sub and an invented one must be indistinguishable"
-    );
-    assert_eq!(hit.error.is_none(), miss.error.is_none());
-}
-
-#[test]
-fn unsubscribe_is_idempotent() {
-    let quota = SubscriptionQuota::new();
-    let reservation = quota.reserve(IDENTITY, EXTID, 1).expect("reserve").commit();
-    registry().insert("idem-lease", "s1", aggregate(&["b1"]), reservation);
-
-    let first = unsubscribe("idem-lease", Some(serde_json::json!({ "sub": "s1" })));
-    let second = unsubscribe("idem-lease", Some(serde_json::json!({ "sub": "s1" })));
-    assert!(first.error.is_none() && second.error.is_none());
-    assert_eq!(first.result, second.result);
-}
-
-#[test]
-fn unsubscribe_cannot_reach_another_leases_subscription() {
-    // Scoped to the calling lease: one frame must not be able to cancel
-    // another's stream by guessing or replaying its id.
-    let quota = SubscriptionQuota::new();
-    let reservation = quota.reserve(IDENTITY, EXTID, 1).expect("reserve").commit();
-    registry().insert("owner-lease", "victim", aggregate(&["b1"]), reservation);
-
-    let reply = unsubscribe(
-        "attacker-lease",
-        Some(serde_json::json!({ "sub": "victim" })),
-    );
-    assert!(reply.error.is_none(), "still an indistinguishable success");
-    assert!(
-        registry().with_aggregate("owner-lease", "victim", |a| a.is_closed()) == Some(false),
-        "the other lease's subscription must be untouched"
-    );
-    registry().close_one("owner-lease", "victim", CloseReason::Unsubscribed);
-}
-
-#[test]
-fn a_malformed_sub_is_invalid_params() {
-    // The one distinguishable outcome, and it is a statement about the
-    // caller's own request rather than about the host's state.
-    for bad in [
-        None,
-        Some(serde_json::json!("not-an-object")),
-        Some(serde_json::json!({})),
-        Some(serde_json::json!({ "sub": 7 })),
-        Some(serde_json::json!({ "sub": "" })),
-        Some(serde_json::json!({ "sub": "x".repeat(MAX_SUB_ID_LEN + 1) })),
-    ] {
-        let reply = unsubscribe("some-lease", bad.clone());
-        assert_eq!(code_of_reply(&reply), Some("invalid_params"), "for {bad:?}");
-    }
 }

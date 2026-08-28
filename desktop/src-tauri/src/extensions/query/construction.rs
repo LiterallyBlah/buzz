@@ -32,6 +32,17 @@ impl ConstrainedFilters {
         &self.pairs
     }
 
+    /// How many filters were built.
+    ///
+    /// `subscribe` needs exactly this and nothing more: one relay branch is
+    /// opened per emitted filter, so the count *is* the branch count that the
+    /// quota reserves and the aggregate spans. Handing out the filters to count
+    /// them is what broke the seal once already — a number cannot be sent to a
+    /// relay.
+    pub(super) fn filter_count(&self) -> usize {
+        self.filters.len()
+    }
+
     /// Test-only view of the emitted filters.
     ///
     /// **Deliberately `cfg(test)`.** Handing these out in production is
@@ -53,6 +64,33 @@ impl ConstrainedFilters {
         self.filters
             .iter()
             .any(|filter| super::matches_constructed_filter(event, filter, channel, kind))
+    }
+
+    /// The `REQ` burst for these filters — one branch per filter.
+    ///
+    /// **Serialised in here, for the same reason [`Self::send`] is.** A caller
+    /// that wanted to build these itself would need the filters, and handing
+    /// them out is what broke the seal before: the relay would then accept any
+    /// `Vec<Value>` at all. What leaves is the finished wire text, which is
+    /// exactly what the socket was going to see.
+    ///
+    /// Returns `None` when the branch ids do not correspond one-to-one with the
+    /// filters. Zipping instead would silently open fewer branches than the
+    /// aggregate was built to span, and an aggregate waiting on a branch that
+    /// was never requested never reaches its public `eose` — it would hang
+    /// until the deadline and close, which reads to an extension as a relay
+    /// that never answered.
+    pub(super) fn req_frames(&self, branch_ids: &[String]) -> Option<Vec<String>> {
+        if branch_ids.len() != self.filters.len() {
+            return None;
+        }
+        branch_ids
+            .iter()
+            .zip(self.filters.iter())
+            .map(|(branch, filter)| {
+                serde_json::to_string(&serde_json::json!(["REQ", branch, filter])).ok()
+            })
+            .collect()
     }
 
     /// Send these filters, and read the answer under a hard ceiling.

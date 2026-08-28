@@ -17,14 +17,8 @@
 //! EOSE'd on a **raw** relay frame, dedups across branches, and closes as a
 //! whole rather than silently narrowing when one branch dies.
 
-// Consumed by the bridge handler and the reader task, which land next. Remove
-// this when they do — a permanent allow here would hide an orphaned module.
-#![allow(dead_code)]
-
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
-
-use super::super::dispatch::{code, BridgeReply};
 
 /// Most physical branches one public subscription may own.
 ///
@@ -155,10 +149,6 @@ pub(super) struct Reservation {
 }
 
 impl Reservation {
-    pub(super) fn branches(&self) -> usize {
-        self.branches
-    }
-
     /// The subscription is live; the budget stays spent until teardown.
     pub(super) fn commit(mut self) -> CommittedReservation {
         self.outstanding = false;
@@ -266,6 +256,7 @@ impl SubscriptionQuota {
     }
 
     /// Branches currently held by this pair. For assertions and teardown.
+    #[cfg(test)]
     pub(super) fn held_by(&self, identity_pubkey: &str, extension_id: &str) -> usize {
         self.held
             .lock()
@@ -367,6 +358,7 @@ impl Aggregate {
         out
     }
 
+    #[cfg(test)]
     pub(super) fn reply_written(&self) -> bool {
         self.reply_written
     }
@@ -380,8 +372,19 @@ impl Aggregate {
         self.eose_emitted
     }
 
-    pub(super) fn branch_count(&self) -> usize {
-        self.branches.len()
+    /// Every branch this aggregate owns.
+    ///
+    /// The `CLOSE` burst and the reader's owner lookup both read this rather
+    /// than a list kept beside it. One list, derived twice — a second copy is
+    /// how a branch comes to be closed while its aggregate still expects it,
+    /// or routed to an aggregate that has already let it go.
+    pub(super) fn branch_ids(&self) -> impl Iterator<Item = &str> {
+        self.branches.iter().map(String::as_str)
+    }
+
+    /// Does this aggregate own that branch?
+    pub(super) fn owns_branch(&self, branch_id: &str) -> bool {
+        self.branches.contains(branch_id)
     }
 
     /// Close terminally. Idempotent, and the **first** reason wins.
@@ -556,12 +559,23 @@ pub(super) fn route_frame(
                 arm_gate: indicates_rate_limit(&reason),
             }
         }
-        RelayFrame::Notice { message } => Routed {
-            arm_gate: indicates_rate_limit(&message),
-            ..Routed::default()
-        },
-        RelayFrame::Other => Routed::default(),
+        // Connection-scoped, so they resolve to no aggregate at all: a `NOTICE`
+        // names no subscription, and neither does an unrecognised verb. Giving
+        // one to an aggregate means the reader picked an aggregate arbitrarily
+        // — and since every live sub on a shared socket would qualify, the
+        // process-global gate would then be armed once per subscription for a
+        // single notice. [`on_notice`] is the reader's one decision point.
+        RelayFrame::Notice { .. } | RelayFrame::Other => Routed::default(),
     }
+}
+
+/// Does this connection-scoped `NOTICE` arm the admission gate?
+///
+/// Lives beside [`indicates_rate_limit`] rather than in the reader so the
+/// heuristic has one owner: a second copy at the call site is a rule that can
+/// be deleted here without a test noticing.
+pub(super) fn on_notice(message: &str) -> bool {
+    indicates_rate_limit(message)
 }
 
 /// The transport ended without a `CLOSED` — still terminal in v1.
@@ -685,195 +699,66 @@ pub(super) enum OpenFailure {
 /// Rollback is structural: the `Reservation` is released by `Drop` on every
 /// early return here, so the four failure paths the contract enumerates do not
 /// each need remembering.
-pub(super) fn open_subscription(
+///
+/// # Registration precedes the `REQ`, deliberately
+///
+/// `register` runs between the revalidation and the burst, and that ordering is
+/// load-bearing rather than incidental. The relay may answer the first `REQ`
+/// before the last one has been written, so a subscription that were registered
+/// *after* the burst would have a window in which arriving frames resolve to no
+/// owner and are dropped. Those are precisely the stored events §5 requires be
+/// delivered, and losing them looks exactly like an empty channel.
+///
+/// Registration is not a network side effect, so putting it here does not
+/// weaken the "reserve before anything reaches the wire" property above. If the
+/// burst then fails, `unregister` takes the subscription back out — the one
+/// rollback `Drop` cannot express, because by then the reservation has been
+/// committed into the registry and must be released with the entry that owns it.
+///
+/// The argument count is the contract. Each parameter is one named step in the
+/// fixed admission order, and collapsing them into a struct would hide the very
+/// sequence this function exists to enforce — the probes below assert on which
+/// closures ran and in what order, which is only expressible while they are
+/// separate.
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn open_subscription<GateFut, SendFut>(
     quota: &Arc<SubscriptionQuota>,
     identity_pubkey: &str,
     extension_id: &str,
     branches: usize,
-    wait_gate: impl FnOnce(),
+    wait_gate: impl FnOnce() -> GateFut,
     revalidate: impl FnOnce() -> Result<(), CloseReason>,
-    send_reqs: impl FnOnce() -> Result<Vec<String>, ()>,
-) -> Result<(Vec<String>, CommittedReservation), OpenFailure> {
+    register: impl FnOnce(CommittedReservation),
+    send_reqs: impl FnOnce() -> SendFut,
+    unregister: impl FnOnce(),
+) -> Result<(), OpenFailure>
+where
+    GateFut: std::future::Future<Output = ()>,
+    SendFut: std::future::Future<Output = Result<(), ()>>,
+{
     let reservation = quota
         .reserve(identity_pubkey, extension_id, branches)
         .ok_or(OpenFailure::QuotaExhausted)?;
 
-    wait_gate();
+    wait_gate().await;
 
     if let Err(reason) = revalidate() {
         // `reservation` drops here, giving the branches back.
         return Err(OpenFailure::AuthorityLost(reason));
     }
 
-    let branch_ids = send_reqs().map_err(|()| OpenFailure::BranchOpenFailed)?;
-    Ok((branch_ids, reservation.commit()))
-}
+    register(reservation.commit());
 
-/// One live subscription and everything that must die with it.
-struct LiveSub {
-    aggregate: Aggregate,
-    /// Dropping this releases the branch budget, so a sub cannot be removed
-    /// from the registry without its quota coming back.
-    reservation: CommittedReservation,
-}
-
-/// Every live subscription, keyed by `(lease, sub id)`.
-///
-/// **The lease is the generation, on this side.** `frame_host::acquire` mints a
-/// fresh UUID per frame mount and `ExtensionFrame` releases it on unmount, so a
-/// successor port necessarily carries a different lease. Keying on it is what
-/// makes "no migration to a successor port" structural: a completion addressed
-/// to a lease that has been released simply finds nothing, and there is no code
-/// path that could hand it to the frame that replaced it. A sub id is
-/// meaningless without the lease that minted it.
-///
-/// An earlier revision keyed on an invented `port_generation: u64`. No such
-/// counter exists in this codebase — the lease already *is* that identifier, and
-/// carrying a second one would have meant two things to keep in step.
-///
-/// The two walls stay independent because they fall separately: the lease is
-/// released when the tab closes or the extension is disabled, while the TS port
-/// registry is disposed on its own schedule, and the contract notes those
-/// effects are unordered. This is the Rust wall; the forwarder enforces the
-/// other by refusing to deliver to a disposed port.
-#[derive(Default)]
-pub(super) struct SubscriptionRegistry {
-    subs: Mutex<HashMap<(String, String), LiveSub>>,
-}
-
-impl SubscriptionRegistry {
-    pub(super) fn new() -> Self {
-        Self::default()
+    if send_reqs().await.is_err() {
+        // The registry now owns the reservation, so releasing it means removing
+        // the entry — which `unregister` does, dropping the `CommittedReservation`
+        // with it.
+        unregister();
+        return Err(OpenFailure::BranchOpenFailed);
     }
-
-    pub(super) fn insert(
-        &self,
-        lease: &str,
-        sub: &str,
-        aggregate: Aggregate,
-        reservation: CommittedReservation,
-    ) {
-        let Ok(mut subs) = self.subs.lock() else {
-            return;
-        };
-        subs.insert(
-            (lease.to_string(), sub.to_string()),
-            LiveSub {
-                aggregate,
-                reservation,
-            },
-        );
-    }
-
-    pub(super) fn live_count(&self) -> usize {
-        self.subs.lock().map(|subs| subs.len()).unwrap_or(0)
-    }
-
-    /// Act on one live subscription's aggregate.
-    ///
-    /// Returns `None` when the `(generation, sub)` pair is not live — which is
-    /// exactly what a frame for a torn-down port hits. Dropping it here is the
-    /// no-migration rule doing its work.
-    pub(super) fn with_aggregate<T>(
-        &self,
-        lease: &str,
-        sub: &str,
-        act: impl FnOnce(&mut Aggregate) -> T,
-    ) -> Option<T> {
-        let mut subs = self.subs.lock().ok()?;
-        let live = subs.get_mut(&(lease.to_string(), sub.to_string()))?;
-        Some(act(&mut live.aggregate))
-    }
-
-    /// Close one subscription, releasing its quota.
-    ///
-    /// Returns the close emission when it was live. Removing the entry drops
-    /// its `CommittedReservation`, so the budget comes back on this path and on
-    /// every other one that removes an entry.
-    pub(super) fn close_one(&self, lease: &str, sub: &str, reason: CloseReason) -> Option<Emit> {
-        let mut subs = self.subs.lock().ok()?;
-        let mut live = subs.remove(&(lease.to_string(), sub.to_string()))?;
-        let emit = live.aggregate.close(reason);
-        live.reservation.release();
-        Some(emit)
-    }
-
-    /// The lease wall: close every subscription this lease owns.
-    pub(super) fn close_for_lease(
-        &self,
-        lease: &str,
-        reason: CloseReason,
-    ) -> Vec<(String, String)> {
-        self.close_matching(reason, |key| key.0 == lease)
-    }
-
-    fn close_matching(
-        &self,
-        reason: CloseReason,
-        matches: impl Fn(&(String, String)) -> bool,
-    ) -> Vec<(String, String)> {
-        let Ok(mut subs) = self.subs.lock() else {
-            return Vec::new();
-        };
-        let doomed: Vec<(String, String)> =
-            subs.keys().filter(|key| matches(key)).cloned().collect();
-        for key in &doomed {
-            if let Some(mut live) = subs.remove(key) {
-                live.aggregate.close(reason.clone());
-                live.reservation.release();
-            }
-        }
-        doomed
-    }
+    Ok(())
 }
 
 #[cfg(test)]
 #[path = "subscription_tests.rs"]
 mod subscription_tests;
-
-/// The process-wide subscription registry.
-///
-/// One per host, like the frame-host lease map: subscriptions outlive any one
-/// bridge call, and the teardown walls have to reach them from wherever they
-/// fire.
-pub(super) fn registry() -> &'static SubscriptionRegistry {
-    static REGISTRY: std::sync::OnceLock<SubscriptionRegistry> = std::sync::OnceLock::new();
-    REGISTRY.get_or_init(SubscriptionRegistry::new)
-}
-
-/// The process-wide `(identity, extension)` branch budget.
-pub(super) fn quota() -> &'static Arc<SubscriptionQuota> {
-    static QUOTA: std::sync::OnceLock<Arc<SubscriptionQuota>> = std::sync::OnceLock::new();
-    QUOTA.get_or_init(SubscriptionQuota::new)
-}
-
-/// §5 `unsubscribe({ sub }) → { ok }`.
-///
-/// **Idempotent ensure-not-live, scoped to the calling lease, and no existence
-/// oracle.** A well-formed `sub` returns `{ok:true}` whether or not it was
-/// live, consulting only this lease's own subscriptions. A foreign, stale or
-/// invented well-formed id therefore touches nothing and produces an identical
-/// reply — so the method cannot be used to discover whether an id exists on
-/// somebody else's frame. Only a malformed `sub` is distinguishable, because
-/// that is a statement about the caller's own request rather than about the
-/// host's state.
-pub(super) fn unsubscribe(lease: &str, params: Option<serde_json::Value>) -> BridgeReply {
-    let Some(serde_json::Value::Object(map)) = params else {
-        return BridgeReply::err(code::INVALID_PARAMS, "params must be an object");
-    };
-    let Some(sub) = map.get("sub").and_then(serde_json::Value::as_str) else {
-        return BridgeReply::err(code::INVALID_PARAMS, "sub is required and must be a string");
-    };
-    if sub.is_empty() || sub.len() > MAX_SUB_ID_LEN {
-        return BridgeReply::err(code::INVALID_PARAMS, "sub is not a subscription id");
-    }
-
-    // The outcome is deliberately discarded. Whether this lease held that sub
-    // is exactly the fact an existence oracle would leak.
-    let _ = registry().close_one(lease, sub, CloseReason::Unsubscribed);
-    BridgeReply::ok(serde_json::json!({ "ok": true }))
-}
-
-/// Longest `sub` id the host will look up. Host-minted ids are UUIDs; the bound
-/// keeps a hostile lookup key from being unbounded work.
-pub(super) const MAX_SUB_ID_LEN: usize = 128;

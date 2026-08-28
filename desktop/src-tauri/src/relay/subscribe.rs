@@ -31,14 +31,6 @@
 //! events §5 requires be delivered before the aggregate `eose`. The reader here
 //! multiplexes from the first frame.
 
-// The consumer is `extensions::query::subscription`, which lands next: this
-// module is the transport half of one seam and is deliberately committed first
-// so its strict-NIP-42 behaviour can be reviewed on its own. Matches the
-// `grants.rs` precedent, where the store shipped ahead of the grants UX.
-// **Remove this attribute when the aggregation module wires it up** — a
-// permanent allow here would hide a genuinely orphaned transport.
-#![allow(dead_code)]
-
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
@@ -105,6 +97,15 @@ pub(crate) struct IdentityWitness {
 }
 
 impl IdentityWitness {
+    /// Which socket authenticated.
+    ///
+    /// Read only by tests today: a subscription cannot currently observe a
+    /// stale generation, because a dead socket closes the subscriptions it
+    /// carried rather than leaving them to notice. Kept because it is what the
+    /// witness *is* — a statement about one connection, not a free-floating
+    /// pubkey — and a reconnecting v2 needs exactly this to refuse a witness
+    /// minted by the previous socket.
+    #[cfg(test)]
     pub(crate) fn connection_generation(&self) -> u64 {
         self.connection_generation
     }
