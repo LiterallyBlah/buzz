@@ -233,7 +233,16 @@ fn generated_passphrase_respects_word_count_and_separator() {
         WORDLIST.lines().filter(|l| !l.is_empty()).collect();
     assert_eq!(words.len(), 1296, "EFF short wordlist 2.0 has 1296 words");
 
-    for (count, separator) in [(3, "-"), (4, "-"), (6, " "), (5, "."), (10, "")] {
+    // Exact word counts can only be recovered by splitting when the separator
+    // cannot occur inside a word. The EFF list contains `yo-yo`, so `-` is not
+    // suitable for that assertion: drawing it makes three words look like four.
+    for (count, separator) in [(3, "|"), (4, "/"), (6, " "), (5, "."), (10, "")] {
+        if !separator.is_empty() {
+            assert!(
+                words.iter().all(|word| !word.contains(separator)),
+                "separator {separator:?} must not occur in the wordlist"
+            );
+        }
         let phrase = generate_passphrase(count, separator).unwrap();
         if separator.is_empty() {
             // No separator to split on; length gate below still applies.
@@ -246,6 +255,11 @@ fn generated_passphrase_respects_word_count_and_separator() {
         }
         assert!(phrase.chars().count() >= MIN_PASSPHRASE_LEN);
     }
+
+    // Keep coverage of the default hyphen separator without pretending it can
+    // unambiguously recover word boundaries from a list containing `yo-yo`.
+    let hyphenated = generate_passphrase(3, "-").unwrap();
+    assert!(hyphenated.matches('-').count() >= 2);
 }
 
 #[test]
