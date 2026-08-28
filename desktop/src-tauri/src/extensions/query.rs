@@ -779,3 +779,7 @@ pub(crate) async fn query_events<R: tauri::Runtime>(
 #[cfg(test)]
 #[path = "query_tests.rs"]
 mod query_tests;
+
+#[cfg(test)]
+#[path = "query_authority_tests.rs"]
+mod query_authority_tests;
