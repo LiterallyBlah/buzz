@@ -181,6 +181,13 @@ pub(crate) const SCOPE_READ: &str = "read";
 /// One row per pair, exactly as the sign side. A manifest `read` scope listing
 /// three kinds across two channels flattens to six rows — §5 is explicit that
 /// there is no entry grouping to reconstruct, so none is stored.
+///
+/// **Policy is enforced here, before the INSERT.** §5 names grant time as one
+/// of the four sites the floor and the allowlist are checked at, alongside
+/// manifest validation, rewrite and per event. Validating only at install would
+/// leave the store itself able to hold a pair the host would never construct —
+/// and the store, not the manifest, is what the read path reads. A row that
+/// cannot legally exist should be impossible to write, not merely unlikely.
 #[allow(dead_code)] // Called by the grants UX; the store capability lands first.
 pub(crate) fn grant_read_scope(
     conn: &Connection,
@@ -189,6 +196,17 @@ pub(crate) fn grant_read_scope(
     kind: u32,
     channel: &str,
 ) -> Result<(), String> {
+    if super::manifest::is_read_denied_kind(kind) {
+        return Err(format!(
+            "kind {kind} is on the read floor and may never be granted"
+        ));
+    }
+    if !super::manifest::is_channel_readable_kind(kind) {
+        return Err(format!("kind {kind} is not channel-readable"));
+    }
+    if !super::manifest::is_canonical_channel_uuid(channel) {
+        return Err(format!("{channel:?} is not a channel UUID"));
+    }
     conn.execute(
         "INSERT OR REPLACE INTO extension_grants
              (identity_pubkey, extension_id, scope, kind, channel, granted_at)
@@ -203,6 +221,44 @@ pub(crate) fn grant_read_scope(
         ],
     )
     .map_err(|error| format!("could not record the read grant: {error}"))?;
+    Ok(())
+}
+
+/// Write a grant row **without policy validation**, for tests only.
+///
+/// The defence-in-depth checks further down the read path — the rewrite-time
+/// re-check, the per-event allowlist and the canonical-UUID verifier — exist
+/// for rows that should not be there: a row written before a kind left the
+/// allowlist, or by a future writer with a bug. Reaching those branches needs
+/// exactly such a row.
+///
+/// This is the honest way to produce one. The alternative is to leave
+/// [`grant_read_scope`] permissive so tests can reach the lower checks, which
+/// weakens production to make a test convenient — and is how the grant-time
+/// site came to be missing in the first place.
+#[cfg(test)]
+pub(crate) fn insert_unchecked_grant_row_for_test(
+    conn: &Connection,
+    identity_pubkey: &str,
+    extension_id: &str,
+    scope: &str,
+    kind: i64,
+    channel: &str,
+) -> Result<(), String> {
+    conn.execute(
+        "INSERT OR REPLACE INTO extension_grants
+             (identity_pubkey, extension_id, scope, kind, channel, granted_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![
+            identity_pubkey,
+            extension_id,
+            scope,
+            kind,
+            channel,
+            now_unix()
+        ],
+    )
+    .map_err(|error| format!("could not record the row: {error}"))?;
     Ok(())
 }
 

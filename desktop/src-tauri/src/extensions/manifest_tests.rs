@@ -426,6 +426,18 @@ fn relay_only_kinds_are_off_the_floor_yet_not_read_grantable_and_never_signable(
         "expected at least one relay-only kind off the spec floor"
     );
 
+    // State the current intersection rather than implying both branches below
+    // are exercised. Every relay-only kind is excluded from the v1 read
+    // allowlist, so the positive arm is unreachable today — an earlier version
+    // of this test claimed otherwise. If the audit later admits a
+    // relay-authored kind under a relay-identity contract, this assertion is
+    // what fails and sends someone to read the branch.
+    assert!(
+        relay_only.iter().all(|k| !is_channel_readable_kind(*k)),
+        "no relay-only kind is on the v1 read allowlist; the positive arm below \
+         is unreachable and must not be described as exercised"
+    );
+
     for kind_value in &relay_only {
         assert!(
             !is_read_denied_kind(*kind_value),
@@ -436,8 +448,10 @@ fn relay_only_kinds_are_off_the_floor_yet_not_read_grantable_and_never_signable(
         );
         let result = parse_and_validate(&manifest_with_scopes(&scopes));
         if is_channel_readable_kind(*kind_value) {
-            // A relay-only kind that the audit did admit stays grantable —
-            // the allowlist decides, so this arm is not hypothetical guarding.
+            // Currently unreachable, and asserted to be: see the emptiness
+            // check below. Kept as a branch rather than deleted so that if the
+            // audit ever admits a relay-authored kind, this test states what
+            // must then happen instead of silently changing meaning.
             result.unwrap_or_else(|error| {
                 panic!("allowlisted kind {kind_value} rejected for read: {error}")
             });

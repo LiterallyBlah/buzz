@@ -425,7 +425,19 @@ fn a_global_kind_carrying_a_stray_h_naming_a_granted_channel_is_refused() {
     let (_dir, conn) = temp_db();
     let id = identity();
     super::super::grants::grant_read_scope(&conn, &id, EXTID, 9, CHAN_A).expect("grant");
-    super::super::grants::grant_read_scope(&conn, &id, EXTID, 1, CHAN_A).expect("grant");
+    // Written through the test-only raw writer: `grant_read_scope` now refuses
+    // kind 1 at grant time, which is the point of that check. The row this
+    // clause defends against is one that should not exist — written before the
+    // kind left the allowlist, or by a future writer with a bug.
+    super::super::grants::insert_unchecked_grant_row_for_test(
+        &conn,
+        &id,
+        EXTID,
+        super::super::grants::SCOPE_READ,
+        1,
+        CHAN_A,
+    )
+    .expect("raw row");
     let filters = construct_filters(
         &[(9u32, CHAN_A.to_string())],
         &ok_request(serde_json::json!({})),
@@ -494,7 +506,18 @@ fn an_h_that_is_not_a_channel_uuid_is_refused() {
     // with the UUID check deleted.
     let (_dir, conn) = temp_db();
     let id = identity();
-    super::super::grants::grant_read_scope(&conn, &id, EXTID, 9, "nonsense").expect("grant");
+    // Raw writer again: a non-canonical channel is refused at grant time now,
+    // so the only way this row exists is the stale/buggy-writer case the
+    // verifier's canonical-UUID clause is there for.
+    super::super::grants::insert_unchecked_grant_row_for_test(
+        &conn,
+        &id,
+        EXTID,
+        super::super::grants::SCOPE_READ,
+        9,
+        "nonsense",
+    )
+    .expect("raw row");
     let filters = construct_filters(
         &[(9u32, "nonsense".to_string())],
         &ok_request(serde_json::json!({})),
@@ -638,4 +661,291 @@ fn a_read_scope_naming_a_non_allowlisted_kind_is_rejected_at_validation() {
         "and it is deliberately not on the floor"
     );
     assert!(is_channel_readable_kind(9));
+}
+
+// ── result composition: dedup, order, truncation ───────────────────────────
+//
+// These four steps were unreachable from any test while they lived inside the
+// handler. Extracting `compose_results` made them addressable; each test below
+// pins one of them.
+
+fn signed_event_at(
+    keys: &nostr::Keys,
+    kind: u32,
+    tags: Vec<Vec<String>>,
+    created_at: u64,
+) -> nostr::Event {
+    let mut builder = nostr::EventBuilder::new(nostr::Kind::from(kind as u16), "{}")
+        .custom_created_at(nostr::Timestamp::from_secs(created_at));
+    for tag in tags {
+        builder = builder.tag(nostr::Tag::parse(tag).expect("tag"));
+    }
+    builder.sign_with_keys(keys).expect("sign")
+}
+
+#[test]
+fn the_same_event_delivered_twice_consumes_one_slot() {
+    // The relay runs each emitted filter separately and appends, so an event
+    // matching two filters arrives twice. Without dedup it would eat two slots
+    // of the caller's cap and appear twice in the reply.
+    let (_dir, conn, filters, id) = granted_a();
+    let keys = nostr::Keys::generate();
+    let event = signed_event_at(&keys, 9, vec![h(CHAN_A)], 1000);
+    let out = compose_results(
+        vec![event.clone(), event.clone()],
+        &filters,
+        &conn,
+        &id,
+        EXTID,
+        10,
+    );
+    assert_eq!(out.len(), 1, "a duplicate must not consume a second slot");
+}
+
+#[test]
+fn results_are_ordered_newest_first() {
+    let (_dir, conn, filters, id) = granted_a();
+    let keys = nostr::Keys::generate();
+    let old = signed_event_at(&keys, 9, vec![h(CHAN_A)], 1000);
+    let new = signed_event_at(&keys, 9, vec![h(CHAN_A)], 2000);
+    let out = compose_results(vec![old, new], &filters, &conn, &id, EXTID, 10);
+    assert_eq!(out.len(), 2);
+    assert!(
+        out[0].created_at > out[1].created_at,
+        "created_at must be descending"
+    );
+}
+
+#[test]
+fn events_sharing_a_timestamp_are_ordered_by_id_ascending() {
+    // Without the tiebreak the page order is whatever the relay happened to
+    // append, so two callers paging the same data can see different results.
+    let (_dir, conn, filters, id) = granted_a();
+    let keys = nostr::Keys::generate();
+    let mut events = Vec::new();
+    for n in 0..6u32 {
+        events.push(signed_event_at(
+            &keys,
+            9,
+            vec![h(CHAN_A), vec!["t".to_string(), format!("n{n}")]],
+            5000,
+        ));
+    }
+    let out = compose_results(events, &filters, &conn, &id, EXTID, 10);
+    assert_eq!(out.len(), 6);
+    for pair in out.windows(2) {
+        assert_eq!(pair[0].created_at, pair[1].created_at);
+        assert!(pair[0].id < pair[1].id, "id must break the tie ascending");
+    }
+}
+
+#[test]
+fn an_invalid_event_does_not_consume_a_slot_of_the_cap() {
+    // Truncation strictly after verification. Truncating first would let a
+    // relay pad the head of its answer with events it knows will be dropped
+    // and starve the caller of real ones.
+    let (_dir, conn, filters, id) = granted_a();
+    let keys = nostr::Keys::generate();
+    let bad_a = signed_event_at(&keys, 9, vec![h(CHAN_B)], 9000); // ungranted channel
+    let bad_b = signed_event_at(&keys, 1, vec![h(CHAN_A)], 8999); // not readable
+    let good_a = signed_event_at(&keys, 9, vec![h(CHAN_A)], 8000);
+    let good_b = signed_event_at(&keys, 9, vec![h(CHAN_A)], 7000);
+    let out = compose_results(
+        vec![bad_a, bad_b, good_a, good_b],
+        &filters,
+        &conn,
+        &id,
+        EXTID,
+        2,
+    );
+    assert_eq!(out.len(), 2, "both slots must go to valid events");
+    for event in &out {
+        assert_eq!(u32::from(event.kind.as_u16()), 9);
+    }
+}
+
+#[test]
+fn the_overall_cap_truncates_the_page() {
+    let (_dir, conn, filters, id) = granted_a();
+    let keys = nostr::Keys::generate();
+    let events: Vec<nostr::Event> = (0..5u64)
+        .map(|n| signed_event_at(&keys, 9, vec![h(CHAN_A)], 1000 + n))
+        .collect();
+    let out = compose_results(events, &filters, &conn, &id, EXTID, 3);
+    assert_eq!(out.len(), 3, "the caller's limit is the visible cap");
+}
+
+// ── every copied axis is matched, not just forwarded ───────────────────────
+
+fn filters_for(
+    filter: serde_json::Value,
+) -> (
+    tempfile::TempDir,
+    rusqlite::Connection,
+    ConstrainedFilters,
+    String,
+) {
+    let (dir, conn) = temp_db();
+    let id = identity();
+    super::super::grants::grant_read_scope(&conn, &id, EXTID, 9, CHAN_A).expect("grant");
+    let filters =
+        construct_filters(&[(9u32, CHAN_A.to_string())], &ok_request(filter)).expect("build");
+    (dir, conn, filters, id)
+}
+
+#[test]
+fn an_event_outside_the_requested_ids_is_dropped() {
+    let (_dir, conn, filters, id) = filters_for(serde_json::json!({ "ids": ["a".repeat(64)] }));
+    let keys = nostr::Keys::generate();
+    let event = signed_event(&keys, 9, vec![h(CHAN_A)]);
+    assert!(!verify_event(&event, &filters, &conn, &id, EXTID));
+}
+
+#[test]
+fn an_event_by_another_author_is_dropped() {
+    let (_dir, conn, filters, id) = filters_for(serde_json::json!({ "authors": ["b".repeat(64)] }));
+    let keys = nostr::Keys::generate();
+    let event = signed_event(&keys, 9, vec![h(CHAN_A)]);
+    assert!(!verify_event(&event, &filters, &conn, &id, EXTID));
+}
+
+#[test]
+fn an_event_after_until_is_dropped() {
+    let (_dir, conn, filters, id) = filters_for(serde_json::json!({ "until": 1000 }));
+    let keys = nostr::Keys::generate();
+    let event = signed_event_at(&keys, 9, vec![h(CHAN_A)], 2000);
+    assert!(!verify_event(&event, &filters, &conn, &id, EXTID));
+    let inside = signed_event_at(&keys, 9, vec![h(CHAN_A)], 500);
+    assert!(verify_event(&inside, &filters, &conn, &id, EXTID));
+}
+
+#[test]
+fn an_event_missing_a_copied_generic_tag_is_dropped() {
+    // `#t` is copied verbatim into every emitted filter. If the verifier does
+    // not match it, the host forwards a constraint and then accepts whatever
+    // comes back regardless of it.
+    let (_dir, conn, filters, id) = filters_for(serde_json::json!({ "#t": ["wanted"] }));
+    let keys = nostr::Keys::generate();
+    let without = signed_event(&keys, 9, vec![h(CHAN_A)]);
+    assert!(!verify_event(&without, &filters, &conn, &id, EXTID));
+    let with = signed_event(
+        &keys,
+        9,
+        vec![h(CHAN_A), vec!["t".to_string(), "wanted".to_string()]],
+    );
+    assert!(verify_event(&with, &filters, &conn, &id, EXTID));
+}
+
+// ── tag-filter grammar ─────────────────────────────────────────────────────
+
+#[test]
+fn reference_tag_axes_require_64_lowercase_hex() {
+    for axis in ["#e", "#q", "#p"] {
+        for bad in [
+            serde_json::json!("abc"),
+            serde_json::json!("A".repeat(64)),
+            serde_json::json!("g".repeat(64)),
+            serde_json::json!("a".repeat(63)),
+        ] {
+            let error = request(serde_json::json!({ axis: [bad] }))
+                .err()
+                .unwrap_or_else(|| panic!("{axis} must reject a malformed reference"));
+            assert_eq!(code_of(&error), "invalid_params", "axis {axis}");
+        }
+        // Positive control: the axis is not simply refusing everything.
+        assert!(
+            request(serde_json::json!({ axis: ["a".repeat(64)] })).is_ok(),
+            "{axis} must accept a well-formed reference"
+        );
+    }
+}
+
+#[test]
+fn free_form_tag_axes_are_bounded_and_printable() {
+    for axis in ["#t", "#d"] {
+        for bad in [
+            serde_json::json!(""),
+            serde_json::json!("x".repeat(MAX_TAG_VALUE_LEN + 1)),
+            serde_json::json!("bad\u{0007}value"),
+        ] {
+            let error = request(serde_json::json!({ axis: [bad] }))
+                .err()
+                .unwrap_or_else(|| panic!("{axis} must reject a malformed label"));
+            assert_eq!(code_of(&error), "invalid_params", "axis {axis}");
+        }
+        assert!(
+            request(serde_json::json!({ axis: ["ordinary-label"] })).is_ok(),
+            "{axis} must accept an ordinary label"
+        );
+    }
+}
+
+#[test]
+fn the_rewritten_query_size_bound_is_enforced() {
+    // The request itself must stay under MAX_REQUEST_BYTES (16 KiB) or it is
+    // refused before construction and this tests the wrong bound. 50 labels of
+    // 250 bytes is ~12.7 KiB inbound; copied into six channels it is ~75 KiB
+    // emitted, over the 64 KiB wire ceiling, while staying inside the filter
+    // count and aggregate-candidate bounds.
+    let labels: Vec<String> = (0..50)
+        .map(|n| format!("{n:04}{}", "x".repeat(246)))
+        .collect();
+    let granted: Vec<(u32, String)> = (0..6u32)
+        .map(|n| (9u32, format!("{n:08}-1111-4111-8111-111111111111")))
+        .collect();
+    let error = construct_filters(
+        &granted,
+        &ok_request(serde_json::json!({ "#t": labels, "limit": 1 })),
+    )
+    .err()
+    .expect("an oversized rewritten query must be refused");
+    assert_eq!(code_of(&error), "quota_exceeded");
+}
+
+// ── grant-time policy ──────────────────────────────────────────────────────
+
+#[test]
+fn a_floor_kind_cannot_be_granted() {
+    let (_dir, conn) = temp_db();
+    let id = identity();
+    assert!(
+        super::super::grants::grant_read_scope(&conn, &id, EXTID, 30800, CHAN_A).is_err(),
+        "extension data is on the floor and must not be grantable"
+    );
+    assert!(super::super::grants::list_read_pairs(&conn, &id, EXTID).is_empty());
+}
+
+#[test]
+fn a_non_allowlisted_kind_cannot_be_granted() {
+    let (_dir, conn) = temp_db();
+    let id = identity();
+    assert!(
+        super::super::grants::grant_read_scope(&conn, &id, EXTID, 1, CHAN_A).is_err(),
+        "a global kind is not channel-readable and must not be grantable"
+    );
+    assert!(super::super::grants::list_read_pairs(&conn, &id, EXTID).is_empty());
+}
+
+#[test]
+fn a_non_canonical_channel_cannot_be_granted() {
+    let (_dir, conn) = temp_db();
+    let id = identity();
+    assert!(
+        super::super::grants::grant_read_scope(&conn, &id, EXTID, 9, "nonsense").is_err(),
+        "a channel that is not a UUID must not be grantable"
+    );
+    assert!(super::super::grants::list_read_pairs(&conn, &id, EXTID).is_empty());
+}
+
+#[test]
+fn a_legitimate_pair_is_still_grantable() {
+    // The positive control for the three refusals above: grant-time policy
+    // must not have become "refuse everything".
+    let (_dir, conn) = temp_db();
+    let id = identity();
+    super::super::grants::grant_read_scope(&conn, &id, EXTID, 9, CHAN_A).expect("grant");
+    assert_eq!(
+        super::super::grants::list_read_pairs(&conn, &id, EXTID),
+        vec![(9u32, CHAN_A.to_string())]
+    );
 }

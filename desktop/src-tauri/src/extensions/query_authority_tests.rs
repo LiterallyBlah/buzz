@@ -16,6 +16,9 @@ use super::*;
 const QEXTID: &str = "demo-read";
 const QLEASE: &str = "lease-for-query-authority-tests";
 const QCHAN: &str = "33333333-3333-4333-8333-333333333333";
+/// A second channel for the live cross-product probe. It never needs to exist
+/// on the relay: construction must refuse before any request goes out.
+const CROSS_CHANNEL: &str = "44444444-4444-4444-8444-444444444444";
 
 /// A parked read: real armed gate, real grant store, real lease, and a
 /// listener that counts connections so "no request" is *observed* rather than
@@ -163,6 +166,19 @@ async fn query_against_relay(
     status: &'static str,
     before_reply: impl Fn() + Send + 'static,
 ) -> BridgeReply {
+    query_against_relay_body(status, None, before_reply).await
+}
+
+/// As [`query_against_relay`], but the caller supplies the exact response body.
+///
+/// Needed for the response-bound probes: the point of those is a body the host
+/// did not ask for and would not build, so it cannot be expressed by varying
+/// the one valid event this harness signs.
+async fn query_against_relay_body(
+    status: &'static str,
+    body_override: Option<String>,
+    before_reply: impl Fn() + Send + 'static,
+) -> BridgeReply {
     use tauri::Manager as _;
 
     let keys = nostr::Keys::generate();
@@ -181,7 +197,8 @@ async fn query_against_relay(
         .sign_with_keys(&keys)
         .expect("sign");
     use nostr::JsonUtil as _;
-    let url = fake_query_relay_with_status(status, format!("[{}]", event.as_json()), before_reply);
+    let body = body_override.unwrap_or_else(|| format!("[{}]", event.as_json()));
+    let url = fake_query_relay_with_status(status, body, before_reply);
 
     let state = crate::app_state::build_app_state();
     *state.keys.lock().unwrap() = keys;
@@ -412,6 +429,13 @@ async fn against_a_live_relay_the_read_path_authenticates_and_returns_real_event
         let conn = super::super::grants::open_grant_db(&db_path).expect("open");
         super::super::grants::grant_read_scope(&conn, &identity, QEXTID, 9, &channel)
             .expect("grant");
+        // 45001 granted in a *different* channel, so the probe below is a real
+        // cross-product: the kind is granted somewhere, just not here. Granting
+        // it nowhere would only have proved an ordinary ungranted-kind denial.
+        // Channel B needs no real existence — construction must refuse before
+        // any relay traffic, which is the property under test.
+        super::super::grants::grant_read_scope(&conn, &identity, QEXTID, 45001, CROSS_CHANNEL)
+            .expect("grant");
     }
 
     let state = crate::app_state::build_app_state();
@@ -473,8 +497,9 @@ async fn against_a_live_relay_the_read_path_authenticates_and_returns_real_event
     }
     println!("LIVE first_event_id={}", events[0]["id"]);
 
-    // 2. Cross product, against the real relay: 45001 is granted nowhere, so
-    //    asking for it in the granted channel must be denied outright.
+    // 2. A genuine cross product against the real relay: 45001 IS granted, in
+    //    CROSS_CHANNEL. Asking for it in *this* channel names a pair nobody
+    //    granted, and construction must refuse before any request goes out.
     let cross = query_events(
         app.handle(),
         QEXTID,
@@ -488,8 +513,11 @@ async fn against_a_live_relay_the_read_path_authenticates_and_returns_real_event
         "cross product must be denied: {cross:?}"
     );
 
-    // 3. Stray `h`: a global kind carrying this channel. Not channel-readable,
-    //    so it is denied at construction and never reaches the relay.
+    // 3. A **non-readable-kind construction refusal** — labelled honestly.
+    //    This is not the stray-`h` verifier path: no stray-`h` event is placed
+    //    or retrieved here. Kind 1 is simply not channel-readable, so the
+    //    request dies at construction. The verifier clause that drops a real
+    //    stray-`h` event is proven by the signed unit probe in `query_tests`.
     let stray = query_events(
         app.handle(),
         QEXTID,
@@ -497,7 +525,7 @@ async fn against_a_live_relay_the_read_path_authenticates_and_returns_real_event
         Some(serde_json::json!({ "filter": { "kinds": [1], "#h": [channel] } })),
     )
     .await;
-    println!("LIVE stray_h={stray:?}");
+    println!("LIVE non_readable_kind_refusal={stray:?}");
     assert!(
         denied_reply(&stray),
         "a non-readable kind must be denied: {stray:?}"
@@ -518,4 +546,73 @@ async fn against_a_live_relay_the_read_path_authenticates_and_returns_real_event
         "a released lease must deny: {revoked:?}"
     );
     assert!(revoked.result.is_none(), "a refusal must expose nothing");
+}
+
+// ── the response is bounded, not just the request ──────────────────────────
+//
+// `MAX_FETCHED_CANDIDATES` bounds the work the relay was *asked* for. These
+// bound what the host is willing to receive, which is a different question:
+// the relay is untrusted and under no obligation to honour a limit it was sent.
+
+fn relay_error(reply: &BridgeReply) -> bool {
+    reply.error.as_ref().map(|e| e.code.as_str()) == Some(super::super::dispatch::code::RELAY_ERROR)
+}
+
+#[tokio::test]
+async fn an_oversized_response_body_is_refused_before_it_is_parsed() {
+    // A body past the byte ceiling. Previously the whole thing was downloaded
+    // and deserialised before any cap could apply — a cap on the wrong side of
+    // the allocation.
+    // The lease map is process-global and a sibling test releases QLEASE, so
+    // take the lifecycle guard and re-register — otherwise this races into a
+    // `denied` and would "pass" for the wrong reason on the refusal probes.
+    let _host = super::super::frame_host::lifecycle_guard().await;
+    super::super::frame_host::insert_lease_for_test(QLEASE, QEXTID);
+    let filler = "x".repeat(9 * 1024 * 1024);
+    let body = format!("[{{\"junk\":\"{filler}\"}}]");
+    let reply = query_against_relay_body("200 OK", Some(body), || {}).await;
+    assert!(
+        relay_error(&reply),
+        "an oversized body must be refused: {:?}",
+        reply.error
+    );
+    assert!(reply.result.is_none(), "and expose nothing");
+}
+
+#[tokio::test]
+async fn more_events_than_were_asked_for_is_refused_not_silently_trimmed() {
+    // A relay returning more than the emitted limits is misbehaving. Keeping
+    // the first N and carrying on hides that, and the events kept are the ones
+    // the relay chose to put first.
+    let _host = super::super::frame_host::lifecycle_guard().await;
+    super::super::frame_host::insert_lease_for_test(QLEASE, QEXTID);
+    let keys = nostr::Keys::generate();
+    let event = nostr::EventBuilder::new(nostr::Kind::from(9u16), "{}")
+        .tag(nostr::Tag::parse(vec!["h".to_string(), QCHAN.to_string()]).expect("tag"))
+        .sign_with_keys(&keys)
+        .expect("sign");
+    use nostr::JsonUtil as _;
+    let one = event.as_json();
+    let body = format!("[{}]", vec![one; 4097].join(","));
+    let reply = query_against_relay_body("200 OK", Some(body), || {}).await;
+    assert!(
+        relay_error(&reply),
+        "an over-count array must be refused: {:?}",
+        reply.error
+    );
+}
+
+#[tokio::test]
+async fn a_response_inside_both_bounds_is_accepted() {
+    // THE POSITIVE CONTROL for the two refusals above: the bounds must not have
+    // become "refuse every response". This is the same harness, one valid
+    // event, well inside both ceilings.
+    let _host = super::super::frame_host::lifecycle_guard().await;
+    super::super::frame_host::insert_lease_for_test(QLEASE, QEXTID);
+    let reply = query_against_relay_body("200 OK", None, || {}).await;
+    assert!(
+        reply.error.is_none(),
+        "a well-formed bounded response must be accepted: {:?}",
+        reply.error
+    );
 }

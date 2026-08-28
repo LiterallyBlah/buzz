@@ -79,6 +79,30 @@ pub async fn query_relay_at_with_keys_no_wait(
     keys: &Keys,
     auth_tag: Option<&str>,
 ) -> Result<Vec<nostr::Event>, String> {
+    let response = send_query_no_wait(state, api_base_url, filters, keys, auth_tag).await?;
+    parse_json_response(response).await
+}
+
+/// Send the query and hand back the **unread** response.
+///
+/// The shared half of [`query_relay_at_with_keys_no_wait`]: URL, body, NIP-98
+/// signing with the explicit keys, the optional auth tag, and the status check
+/// — everything except deciding how much of the body to believe.
+///
+/// It exists so a caller that must bound the *response* can do so without
+/// re-implementing authentication. `parse_json_response` downloads and
+/// deserialises the whole body, which is the right default for callers talking
+/// to their own relay, and the wrong one for a caller whose threat model says
+/// the relay is untrusted: by the time a cap could be applied to the parsed
+/// vector, the allocation has already happened. Such a caller takes the
+/// response from here and reads it under its own ceiling.
+pub(crate) async fn send_query_no_wait(
+    state: &AppState,
+    api_base_url: &str,
+    filters: &[serde_json::Value],
+    keys: &Keys,
+    auth_tag: Option<&str>,
+) -> Result<reqwest::Response, String> {
     let url = format!("{}/query", api_base_url);
     let body_bytes =
         serde_json::to_vec(filters).map_err(|e| format!("filter serialization failed: {e}"))?;
@@ -99,5 +123,5 @@ pub async fn query_relay_at_with_keys_no_wait(
     if !response.status().is_success() {
         return Err(relay_error_message(response).await);
     }
-    parse_json_response(response).await
+    Ok(response)
 }

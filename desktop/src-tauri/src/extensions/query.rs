@@ -53,6 +53,15 @@ const MAX_FETCHED_CANDIDATES: usize = 4096;
 const OVERALL_RESULT_CAP: usize = 500;
 /// Most bytes of `params` this module will look at. Size before shape.
 const MAX_REQUEST_BYTES: usize = 16 * 1024;
+/// Hard ceiling on the relay's **response** body.
+///
+/// Separate from [`MAX_FETCHED_CANDIDATES`], which bounds how much work the
+/// relay was *asked* for. This bounds what the host is willing to allocate and
+/// parse from what it actually receives, because an untrusted relay is under no
+/// obligation to honour the limits it was sent.
+const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+/// Longest value the free-form tag axes (`#t`, `#d`) may carry.
+const MAX_TAG_VALUE_LEN: usize = 256;
 
 /// Tag filters an extension may name. `#h` is handled separately: it selects
 /// channels and is rewritten, never copied through.
@@ -211,6 +220,24 @@ pub(crate) fn validate_request(params: &Value) -> Result<ValidatedRequest, Query
                     let text = entry.as_str().ok_or_else(|| {
                         QueryError::InvalidParams(format!("{other} values must be strings"))
                     })?;
+                    // Every tag axis has a grammar. An axis that accepts any
+                    // string is a hole in a "bounded, default-deny" filter: it
+                    // is copied verbatim into every emitted filter and sent to
+                    // the relay, so "we only forward it" is not a defence.
+                    match other {
+                        // Event-id and quote references are ids.
+                        "#e" | "#q" => require_lowercase_hex64(text, other)?,
+                        // Pubkey references.
+                        "#p" => require_lowercase_hex64(text, other)?,
+                        // Free-form axes: bounded, printable, non-empty. Not
+                        // "anything", which is what they accepted before.
+                        "#t" | "#d" => require_bounded_label(text, other)?,
+                        _ => {
+                            return Err(QueryError::InvalidParams(format!(
+                                "{other} is not a filter key an extension may use"
+                            )))
+                        }
+                    }
                     values.push(text.to_string());
                 }
                 values.sort();
@@ -284,39 +311,166 @@ fn hex_axis(value: &Value, field: &str) -> Result<Vec<String>, QueryError> {
     Ok(out)
 }
 
+/// Exactly 64 lowercase hex characters — the form Buzz's matcher round-trips
+/// ids and pubkeys to. No prefixes, for the same reason `ids`/`authors` refuse
+/// them: a prefix cannot be honoured faithfully, and v1 refuses rather than
+/// pretending.
+fn require_lowercase_hex64(text: &str, field: &str) -> Result<(), QueryError> {
+    let ok = text.len() == 64
+        && text
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+    if ok {
+        Ok(())
+    } else {
+        Err(QueryError::InvalidParams(format!(
+            "{field} values must be 64 lowercase hex characters"
+        )))
+    }
+}
+
+/// The documented v1 grammar for the free-form tag axes (`#t`, `#d`).
+///
+/// Non-empty, at most [`MAX_TAG_VALUE_LEN`] bytes, and printable ASCII with no
+/// control characters. Deliberately narrow: these are copied into the emitted
+/// filter, so the bound is on what the host is willing to *send*, and control
+/// bytes in a value the relay will log or match on are nobody's legitimate
+/// filter.
+fn require_bounded_label(text: &str, field: &str) -> Result<(), QueryError> {
+    if text.is_empty() {
+        return Err(QueryError::InvalidParams(format!(
+            "{field} values must not be empty"
+        )));
+    }
+    if text.len() > MAX_TAG_VALUE_LEN {
+        return Err(QueryError::InvalidParams(format!(
+            "{field} values must be at most {MAX_TAG_VALUE_LEN} bytes"
+        )));
+    }
+    if !text.bytes().all(|b| (0x20..=0x7e).contains(&b)) {
+        return Err(QueryError::InvalidParams(format!(
+            "{field} values must be printable ASCII"
+        )));
+    }
+    Ok(())
+}
+
 fn integer(value: &Value, field: &str) -> Result<u64, QueryError> {
     value
         .as_u64()
         .ok_or_else(|| QueryError::InvalidParams(format!("{field} must be a non-negative integer")))
 }
 
-/// The single producer of relay-facing filters.
+/// The single producer of relay-facing filters — **and their only consumer**.
 ///
-/// Nothing outside this module can build a [`ConstrainedFilters`]: its fields
-/// are private and [`construct_filters`] is its only constructor. That is the
-/// point — the value's *existence* is the evidence that granted pairs produced
-/// it, so the send path needs no check of its own and has no check to forget.
-pub(crate) mod construction {
+/// This module is private, its items are `pub(super)`, and
+/// [`ConstrainedFilters`]'s field is private to it. Crucially, the `Vec<Value>`
+/// never leaves: there is no accessor that hands the filters out, so the
+/// generic relay helper — which accepts any `&[serde_json::Value]` — cannot be
+/// reached with them from anywhere in §5. Sending happens *inside* here, in
+/// [`ConstrainedFilters::send`].
+///
+/// An earlier revision exposed `as_filters()` and called the generic helper
+/// from `query_events`. That documented a seal it did not have: unwrapping the
+/// type one line before the send leaves an unconstrained read expressible, and
+/// the type is then only a convention the current caller happens to honour.
+/// R2 rejected exactly that shape — a check beside a freely constructible
+/// value — so the containment is structural now rather than described.
+mod construction {
     use super::{is_channel_readable_kind, is_read_denied_kind, QueryError};
     use super::{
         ValidatedRequest, Value, MAX_EMITTED_FILTERS, MAX_FETCHED_CANDIDATES, MAX_READ_PAIRS,
-        MAX_REWRITTEN_QUERY_BYTES,
+        MAX_RESPONSE_BYTES, MAX_REWRITTEN_QUERY_BYTES,
     };
 
     /// Relay filters built from granted pairs, and the pairs that produced them.
-    pub(crate) struct ConstrainedFilters {
+    pub(super) struct ConstrainedFilters {
         filters: Vec<Value>,
         pairs: Vec<(u32, String)>,
     }
 
     impl ConstrainedFilters {
-        pub(crate) fn as_filters(&self) -> &[Value] {
+        /// The surviving pairs, for the post-response recheck and the verifier.
+        pub(super) fn pairs(&self) -> &[(u32, String)] {
+            &self.pairs
+        }
+
+        /// Test-only view of the emitted filters.
+        ///
+        /// **Deliberately `cfg(test)`.** Handing these out in production is
+        /// what broke the seal: one `as_filters()` before the send and the
+        /// generic relay helper is reachable again. Tests need the *shape* of
+        /// what was built — one `#h` per filter, kinds grouped by channel, the
+        /// scalar axes copied — which `matches_any` cannot show. Compiling it
+        /// out of the shipped binary keeps the containment structural where it
+        /// matters and honest where it does not.
+        #[cfg(test)]
+        pub(super) fn as_filters(&self) -> &[Value] {
             &self.filters
         }
 
-        /// The surviving pairs, for the post-response recheck and the verifier.
-        pub(crate) fn pairs(&self) -> &[(u32, String)] {
-            &self.pairs
+        /// Does the event satisfy every axis of at least one filter that was
+        /// actually built? Matching lives here because it needs the filters,
+        /// and handing them out to do it elsewhere is what broke the seal.
+        pub(super) fn matches_any(&self, event: &nostr::Event, channel: &str, kind: u32) -> bool {
+            self.filters
+                .iter()
+                .any(|filter| super::matches_constructed_filter(event, filter, channel, kind))
+        }
+
+        /// Send these filters, and read the answer under a hard ceiling.
+        ///
+        /// **The only caller of the raw relay helper in the §5 path.** The
+        /// generic `query_relay_at_with_keys_no_wait` downloads and
+        /// deserialises the entire body before anything can cap it, which is
+        /// fine for a caller talking to its own relay and wrong here: §5's
+        /// whole premise is that the relay is untrusted. A hostile or defective
+        /// one can ignore every emitted `limit` and answer with an arbitrarily
+        /// large array, and `.take(N)` applied to the parsed vector is a cap on
+        /// the wrong side of the allocation.
+        ///
+        /// So: refuse an over-cap `Content-Length` before reading, accumulate
+        /// bytes under [`MAX_RESPONSE_BYTES`] and abort the moment it is
+        /// exceeded, deserialise only those bytes, and **refuse** more than
+        /// [`MAX_FETCHED_CANDIDATES`] events rather than silently keeping the
+        /// first N — a relay that returns more than it was asked for is
+        /// misbehaving, and quietly trimming its answer hides that.
+        pub(super) async fn send(
+            &self,
+            state: &crate::AppState,
+            keys: &nostr::Keys,
+        ) -> Result<Vec<nostr::Event>, QueryError> {
+            let mut response = crate::relay::send_query_no_wait(
+                state,
+                &crate::relay::relay_api_base_url_with_override(state),
+                &self.filters,
+                keys,
+                None,
+            )
+            .await
+            .map_err(|_| QueryError::Relay)?;
+
+            if response
+                .content_length()
+                .is_some_and(|len| len > MAX_RESPONSE_BYTES as u64)
+            {
+                return Err(QueryError::Relay);
+            }
+
+            let mut body: Vec<u8> = Vec::new();
+            while let Some(chunk) = response.chunk().await.map_err(|_| QueryError::Relay)? {
+                if body.len().saturating_add(chunk.len()) > MAX_RESPONSE_BYTES {
+                    return Err(QueryError::Relay);
+                }
+                body.extend_from_slice(&chunk);
+            }
+
+            let events: Vec<nostr::Event> =
+                serde_json::from_slice(&body).map_err(|_| QueryError::Relay)?;
+            if events.len() > MAX_FETCHED_CANDIDATES {
+                return Err(QueryError::Relay);
+            }
+            Ok(events)
         }
     }
 
@@ -327,7 +481,7 @@ pub(crate) mod construction {
     /// Survivors are grouped by channel, so every emitted filter carries one
     /// channel and only the kinds granted *in that channel* — the pairing is
     /// preserved and the cross product is unreachable.
-    pub(crate) fn construct_filters(
+    pub(super) fn construct_filters(
         granted: &[(u32, String)],
         request: &ValidatedRequest,
     ) -> Result<ConstrainedFilters, QueryError> {
@@ -571,10 +725,7 @@ fn verify_event(
     // And it must match at least one *complete* filter the host built. Matching
     // the pair alone would re-admit the cross product: `(45001, A)` can be a
     // granted pair while no emitted filter ever asked for 45001 in A.
-    filters
-        .as_filters()
-        .iter()
-        .any(|filter| matches_constructed_filter(event, filter, &channel, kind))
+    filters.matches_any(event, &channel, kind)
 }
 
 /// Does the event satisfy every axis of one filter this host constructed?
@@ -647,6 +798,50 @@ fn matches_constructed_filter(
     true
 }
 
+/// Dedup by id → verify → order → truncate, in that fixed order.
+///
+/// **Extracted so each step can be defended.** Inside the handler these lines
+/// were unreachable from any test — no fixture could reach them without a Tauri
+/// app and a relay — and an unreachable step is one that can be deleted without
+/// a single test noticing. Each of the four does distinct work:
+///
+/// - **dedup first**, because the relay runs each emitted filter separately and
+///   appends, so one event can arrive once per filter and would otherwise eat
+///   several slots of the caller's cap;
+/// - **verify before ordering**, so an invalid event is gone before it can
+///   influence position;
+/// - **order** `created_at` descending with an id-ascending tiebreak, so the
+///   page is deterministic when timestamps collide;
+/// - **truncate last**, strictly after verification, so a dropped invalid event
+///   frees a slot deterministically instead of the caller silently receiving
+///   fewer events than it asked for.
+fn compose_results(
+    events: Vec<nostr::Event>,
+    filters: &ConstrainedFilters,
+    conn: &rusqlite::Connection,
+    identity_pubkey: &str,
+    extension_id: &str,
+    limit: usize,
+) -> Vec<nostr::Event> {
+    let mut seen_ids = std::collections::HashSet::new();
+    let mut verified: Vec<nostr::Event> = Vec::new();
+    for event in events {
+        if !seen_ids.insert(event.id) {
+            continue;
+        }
+        if verify_event(&event, filters, conn, identity_pubkey, extension_id) {
+            verified.push(event);
+        }
+    }
+    verified.sort_by(|a, b| {
+        b.created_at
+            .cmp(&a.created_at)
+            .then_with(|| a.id.cmp(&b.id))
+    });
+    verified.truncate(limit);
+    verified
+}
+
 /// §5 `query.events({ filter }) → { events }`.
 ///
 /// Pipeline order is fixed by the spec and by what each step may assume:
@@ -713,15 +908,10 @@ pub(crate) async fn query_events<R: tauri::Runtime>(
     }
 
     // No await between that recheck and the send. The keys are the ones the
-    // grant admitted; nothing here re-reads `state` for identity.
-    let answered = crate::relay::query_relay_at_with_keys_no_wait(
-        &state,
-        &crate::relay::relay_api_base_url_with_override(&state),
-        filters.as_filters(),
-        &keys,
-        None,
-    )
-    .await;
+    // grant admitted; nothing here re-reads `state` for identity. The send is
+    // the constrained type's own method — the filters are never handed to the
+    // generic relay helper, which would accept any values at all.
+    let answered = filters.send(&state, &keys).await;
 
     // Boundary-1's precedence, on the failure branch: authority is rechecked
     // *before* the failure is classified, so a relay error can never outrank a
@@ -736,44 +926,49 @@ pub(crate) async fn query_events<R: tauri::Runtime>(
         }
     };
 
-    // Dedup by id before verifying: the relay runs each emitted filter
-    // separately and appends, so one event can arrive once per filter and
-    // would otherwise consume several slots of the caller's cap.
-    let mut seen_ids = std::collections::HashSet::new();
-    let mut verified: Vec<nostr::Event> = Vec::new();
-    for event in events.into_iter().take(MAX_FETCHED_CANDIDATES) {
-        if !seen_ids.insert(event.id) {
-            continue;
-        }
-        if verify_event(&event, &filters, &conn, &identity_pubkey, extension_id) {
-            verified.push(event);
+    let verified = compose_results(
+        events,
+        &filters,
+        &conn,
+        &identity_pubkey,
+        extension_id,
+        request.limit,
+    );
+
+    // Order, truncate and serialise **before** the last recheck.
+    //
+    // The recheck has to be the last authority-bearing operation before the
+    // reply, and none of this work is cheap: sorting and tiebreaking run over
+    // every verified event, and `as_json` + reparse serialises up to the
+    // overall cap. Rechecking first and then doing all of it reopens exactly
+    // the window Boundary 1 closed — "no `await`" is not a mutex, and another
+    // thread or another process writing the WAL-backed grant store can revoke
+    // authority while synchronous work runs.
+    use nostr::JsonUtil as _;
+    let mut encoded: Result<Vec<Value>, ()> = Ok(Vec::with_capacity(verified.len()));
+    for event in &verified {
+        match (
+            &mut encoded,
+            serde_json::from_str::<Value>(&event.as_json()),
+        ) {
+            (Ok(out), Ok(value)) => out.push(value),
+            (slot, Err(_)) => *slot = Err(()),
+            (Err(_), _) => {}
         }
     }
 
-    // The last thing before exposure. The verify loop above is unbounded from
-    // this task's point of view and entirely synchronous, and "no await" does
-    // not stop another thread — or another process writing the WAL-backed
-    // grant store — from revoking authority while it runs.
+    // Now, with the reply fully built and nothing left to do but hand it over.
     if revalidation.check().is_err() {
         return BridgeReply::err(code::DENIED, "missing scope: read");
     }
 
-    verified.sort_by(|a, b| {
-        b.created_at
-            .cmp(&a.created_at)
-            .then_with(|| a.id.cmp(&b.id))
-    });
-    verified.truncate(request.limit);
-
-    use nostr::JsonUtil as _;
-    let mut out = Vec::with_capacity(verified.len());
-    for event in &verified {
-        match serde_json::from_str::<Value>(&event.as_json()) {
-            Ok(value) => out.push(value),
-            Err(_) => return BridgeReply::err(code::INTERNAL, "could not encode an event"),
-        }
+    // Authority outranks an internal encoding failure, for the same reason it
+    // outranks a relay failure: a caller who is no longer entitled to ask must
+    // not learn that the host had trouble encoding something it held.
+    match encoded {
+        Ok(out) => BridgeReply::ok(serde_json::json!({ "events": out })),
+        Err(()) => BridgeReply::err(code::INTERNAL, "could not encode an event"),
     }
-    BridgeReply::ok(serde_json::json!({ "events": out }))
 }
 
 #[cfg(test)]
