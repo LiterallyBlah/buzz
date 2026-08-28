@@ -75,9 +75,52 @@ export type Admission =
       terminal?: boolean;
     };
 
+/**
+ * Most live subscriptions one port may hold at once.
+ *
+ * Separate from the request budget because a stream is many frames per `sub`
+ * rather than one settle per `id`. Bounding concurrency here is what stops an
+ * extension opening subscriptions until the host runs out of branches.
+ */
+export const MAX_SUBS_PER_PORT = 64;
+
+export type SubAdmission =
+  | { kind: "opened"; sub: string }
+  | { kind: "refused"; code: string; message: string };
+
 export type Registry = {
   /** Reserve an id, or explain why not. */
   readonly admit: (id: string) => Admission;
+  /**
+   * Open a subscription slot and mint its **host-generated opaque** id.
+   *
+   * The extension never proposes a `sub`: an id it chose could collide with a
+   * live one, or be guessed to probe another port. Ids are unique for the
+   * owning port's life and **never reused after close**, so a late frame or a
+   * stale `unsubscribe` for a dead sub can never bind to a new one.
+   *
+   * Consumes no request-id budget — streams must not burn
+   * `MAX_REQUESTS_PER_PORT`.
+   */
+  readonly openSub: () => SubAdmission;
+  /** Is this `sub` currently live on **this** port? */
+  readonly isSubLive: (sub: string) => boolean;
+  /**
+   * Ensure a `sub` is not live. Returns whether it was.
+   *
+   * The boolean is for the host's own bookkeeping — releasing quota, emitting
+   * a `closed` frame — and **must not** reach the extension: the reply to
+   * `unsubscribe` is identical either way, so a caller cannot use it to learn
+   * whether an id exists on another port.
+   */
+  readonly closeSub: (sub: string) => boolean;
+  /** Live subs, for teardown. */
+  readonly liveSubs: () => string[];
+  /**
+   * Stop admitting subs and hand back every live one, already marked closed,
+   * so the caller can emit `closed` frames and release their quota.
+   */
+  readonly closeAndDrainSubs: () => string[];
   /**
    * Mark a request terminal. Returns true only for the first call, so a late
    * completion after teardown cannot emit a second result.
@@ -104,6 +147,13 @@ export function createRegistry(): Registry {
   const used = new Set<string>();
   /** Ids admitted and not yet terminal. */
   const outstanding = new Set<string>();
+  /**
+   * Every `sub` this port has ever minted — never evicted while the port
+   * lives, so an id is not reissued after its subscription closes.
+   */
+  const usedSubs = new Set<string>();
+  /** Subs currently live on this port. */
+  const liveSubSet = new Set<string>();
   let admitting = true;
   let exhausted = false;
 
@@ -152,6 +202,62 @@ export function createRegistry(): Registry {
 
     settle(id: string): boolean {
       return outstanding.delete(id);
+    },
+
+    openSub(): SubAdmission {
+      if (!admitting) {
+        return { kind: "refused", ...TEARDOWN_ERROR };
+      }
+      if (liveSubSet.size >= MAX_SUBS_PER_PORT) {
+        return {
+          kind: "refused",
+          code: QUOTA_EXCEEDED,
+          message: "too many live subscriptions on this connection",
+        };
+      }
+      // Opaque and host-generated. `usedSubs` makes reuse impossible even
+      // across a close, which is what stops a late frame for a dead sub
+      // binding to a live one.
+      //
+      // A collision is refused rather than retried. Retrying reads as the
+      // obvious fix and is wrong twice over: it is an unbounded loop inside a
+      // module whose contract is that everything is bounded, and against a
+      // degenerate or stubbed generator it never terminates. Refusing is
+      // fail-closed, and it is reachable by a test, which a "cannot happen"
+      // branch otherwise is not.
+      const sub = crypto.randomUUID();
+      if (usedSubs.has(sub)) {
+        return {
+          kind: "refused",
+          code: INTERNAL,
+          message: "could not mint a unique subscription id",
+        };
+      }
+      usedSubs.add(sub);
+      liveSubSet.add(sub);
+      return { kind: "opened", sub };
+    },
+
+    isSubLive(sub: string): boolean {
+      return liveSubSet.has(sub);
+    },
+
+    closeSub(sub: string): boolean {
+      return liveSubSet.delete(sub);
+    },
+
+    liveSubs(): string[] {
+      return [...liveSubSet];
+    },
+
+    closeAndDrainSubs(): string[] {
+      // Same ordering as closeAndDrain: stop admitting before draining, so a
+      // sub cannot be opened into a set that has already been walked and
+      // would never be closed or have its quota released.
+      admitting = false;
+      const draining = [...liveSubSet];
+      liveSubSet.clear();
+      return draining;
     },
 
     closeAndDrain(): string[] {
