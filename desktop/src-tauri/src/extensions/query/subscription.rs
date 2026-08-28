@@ -468,6 +468,128 @@ impl Aggregate {
     }
 }
 
+/// How long the host waits for every branch to EOSE before failing closed.
+///
+/// Reconciles "never invent an EOSE" with "never wait forever". It does not
+/// synthesise the `eose` an absent branch owes — it ends the subscription.
+pub(super) const INITIAL_EOSE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// What the host must do after one relay frame.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(super) struct Routed {
+    /// Deliver these to the port, in this order.
+    pub(super) emits: Vec<Emit>,
+    /// The aggregate ended: send a real relay `CLOSE` for **every** branch it
+    /// opened, not just the one that failed. A half-closed aggregate would
+    /// leave the relay streaming into a subscription nobody is reading.
+    pub(super) close_branches: bool,
+    /// The relay signalled rate limiting; arm the process-global admission gate
+    /// before the next subscription tries again.
+    pub(super) arm_gate: bool,
+}
+
+/// Does this relay text indicate rate limiting?
+///
+/// NIP-01 gives `CLOSED`/`OK` reasons a machine-readable `rate-limited:`
+/// prefix; `NOTICE` is free-form, so that arm is a heuristic. Erring toward
+/// arming is the safe direction — a spurious arm costs a short wait, a missed
+/// one repeats the offence the relay just objected to.
+fn indicates_rate_limit(text: &str) -> bool {
+    let lowered = text.to_ascii_lowercase();
+    lowered.starts_with("rate-limited") || lowered.contains("rate limit")
+}
+
+/// Drive the aggregate from one raw relay frame.
+///
+/// Multiplexes from the first frame, which is the half `pairing.rs`'s
+/// `wait_for_eose` gets wrong: it reads until EOSE and discards every EVENT it
+/// passes, so the stored events §5 requires be delivered would be silently
+/// dropped. Here an `EVENT` before its branch's EOSE is stored, an `EVENT`
+/// after it is live, and the branch's own EOSE is what separates them.
+pub(super) fn route_frame(
+    aggregate: &mut Aggregate,
+    frame: crate::relay::subscribe::RelayFrame,
+    authority: impl FnOnce() -> Result<(), CloseReason>,
+    verify: impl FnOnce(&nostr::Event) -> bool,
+) -> Routed {
+    use crate::relay::subscribe::RelayFrame;
+    match frame {
+        RelayFrame::Event { sub_id, event } => {
+            // Two-stage admission, in that order: authority first, and the
+            // per-event check is not reached if it fails.
+            match admit(authority, || verify(&event)) {
+                Admission::CloseAggregate(reason) => Routed {
+                    emits: vec![aggregate.close(reason)],
+                    close_branches: true,
+                    arm_gate: false,
+                },
+                Admission::DropEvent => Routed::default(),
+                Admission::Deliver => Routed {
+                    emits: match aggregate.on_event(&sub_id, *event) {
+                        Emit::Nothing => Vec::new(),
+                        emit => vec![emit],
+                    },
+                    // A bound reached inside `on_event` closes the aggregate,
+                    // and that must still take the branches down with it.
+                    close_branches: aggregate.is_closed(),
+                    arm_gate: false,
+                },
+            }
+        }
+        RelayFrame::Eose { sub_id } => Routed {
+            emits: match aggregate.on_branch_eose(&sub_id) {
+                Emit::Nothing => Vec::new(),
+                emit => vec![emit],
+            },
+            close_branches: false,
+            arm_gate: false,
+        },
+        RelayFrame::Closed { sub_id, reason } => {
+            // Terminal in v1: no silent re-REQ, and one branch dying ends the
+            // whole aggregate rather than narrowing it.
+            let _ = sub_id;
+            Routed {
+                emits: vec![aggregate.close(CloseReason::RelayClosed)],
+                close_branches: true,
+                arm_gate: indicates_rate_limit(&reason),
+            }
+        }
+        RelayFrame::Notice { message } => Routed {
+            arm_gate: indicates_rate_limit(&message),
+            ..Routed::default()
+        },
+        RelayFrame::Other => Routed::default(),
+    }
+}
+
+/// The transport ended without a `CLOSED` — still terminal in v1.
+pub(super) fn on_transport_end(aggregate: &mut Aggregate) -> Routed {
+    Routed {
+        emits: vec![aggregate.close(CloseReason::RelayClosed)],
+        close_branches: true,
+        arm_gate: false,
+    }
+}
+
+/// The initial-EOSE deadline expired.
+///
+/// Fail-closed and explicit: **no public `eose`** is emitted, every opened
+/// branch gets a real relay `CLOSE`, the aggregate closes, and the caller
+/// releases the whole reservation exactly once. Inventing the missing `eose`
+/// would tell the extension it had seen all stored history when one channel
+/// never answered.
+pub(super) fn on_initial_eose_deadline(aggregate: &mut Aggregate) -> Routed {
+    if aggregate.has_eosed() || aggregate.is_closed() {
+        // Already resolved; the deadline is a no-op rather than a second close.
+        return Routed::default();
+    }
+    Routed {
+        emits: vec![aggregate.close(CloseReason::EoseDeadline)],
+        close_branches: true,
+        arm_gate: false,
+    }
+}
+
 /// One live subscription and everything that must die with it.
 struct LiveSub {
     /// The Rust-side wall. Released when the tab closes or the extension is

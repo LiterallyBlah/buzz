@@ -575,3 +575,186 @@ fn closing_one_sub_releases_only_its_own_branches() {
         .is_none());
     assert_eq!(quota.held_by(IDENTITY, EXTID), 2, "still exactly once");
 }
+
+// ── the reader: multiplex raw frames from the start ────────────────────────
+
+use crate::relay::subscribe::RelayFrame;
+
+fn event_frame(branch: &str, event: nostr::Event) -> RelayFrame {
+    RelayFrame::Event {
+        sub_id: branch.to_string(),
+        event: Box::new(event),
+    }
+}
+
+fn allow() -> impl FnOnce() -> Result<(), CloseReason> {
+    || Ok(())
+}
+
+#[test]
+fn an_event_before_its_branch_eose_is_stored_and_after_it_is_live() {
+    // The distinction `wait_for_eose` cannot make: it reads until EOSE and
+    // discards every EVENT on the way, so the stored history would vanish.
+    let mut agg = aggregate(&["b1"]);
+    let stored = event();
+    let routed = route_frame(&mut agg, event_frame("b1", stored.clone()), allow(), |_| {
+        true
+    });
+    assert_eq!(routed.emits, vec![Emit::Event(Box::new(stored))]);
+    assert!(!routed.close_branches);
+
+    assert_eq!(
+        route_frame(
+            &mut agg,
+            RelayFrame::Eose {
+                sub_id: "b1".into()
+            },
+            allow(),
+            |_| true
+        )
+        .emits,
+        vec![Emit::Eose]
+    );
+
+    let live = event();
+    let routed = route_frame(&mut agg, event_frame("b1", live.clone()), allow(), |_| true);
+    assert_eq!(routed.emits, vec![Emit::Event(Box::new(live))]);
+}
+
+#[test]
+fn a_bad_event_is_dropped_without_closing_the_stream() {
+    let mut agg = aggregate(&["b1"]);
+    let routed = route_frame(&mut agg, event_frame("b1", event()), allow(), |_| false);
+    assert_eq!(
+        routed,
+        Routed::default(),
+        "dropped, and nothing else happens"
+    );
+    assert!(!agg.is_closed(), "the stream continues");
+}
+
+#[test]
+fn lost_authority_closes_the_aggregate_and_takes_the_branches_down() {
+    let mut agg = aggregate(&["b1", "b2"]);
+    let routed = route_frame(
+        &mut agg,
+        event_frame("b1", event()),
+        || Err(CloseReason::AuthorityLost),
+        |_| true,
+    );
+    assert_eq!(routed.emits, vec![Emit::Closed(CloseReason::AuthorityLost)]);
+    assert!(
+        routed.close_branches,
+        "every opened branch must get a real relay CLOSE, not just the one that failed"
+    );
+}
+
+#[test]
+fn one_branch_closed_by_the_relay_ends_the_whole_aggregate() {
+    // Terminal in v1: no silent re-REQ, and no narrowing to the survivors.
+    let mut agg = aggregate(&["b1", "b2"]);
+    let routed = route_frame(
+        &mut agg,
+        RelayFrame::Closed {
+            sub_id: "b1".into(),
+            reason: String::new(),
+        },
+        allow(),
+        |_| true,
+    );
+    assert_eq!(routed.emits, vec![Emit::Closed(CloseReason::RelayClosed)]);
+    assert!(routed.close_branches);
+    assert!(!routed.arm_gate);
+}
+
+#[test]
+fn a_rate_limit_signal_arms_the_admission_gate() {
+    // There is no reconnect retry in v1, but the *next* explicit subscribe must
+    // not immediately repeat the offence the relay just objected to.
+    let mut agg = aggregate(&["b1"]);
+    let routed = route_frame(
+        &mut agg,
+        RelayFrame::Closed {
+            sub_id: "b1".into(),
+            reason: "rate-limited: slow down".into(),
+        },
+        allow(),
+        |_| true,
+    );
+    assert!(routed.arm_gate);
+
+    let mut agg2 = aggregate(&["b1"]);
+    let noticed = route_frame(
+        &mut agg2,
+        RelayFrame::Notice {
+            message: "NOTICE: rate limit reached".into(),
+        },
+        allow(),
+        |_| true,
+    );
+    assert!(noticed.arm_gate);
+    assert!(noticed.emits.is_empty(), "a notice delivers nothing");
+    assert!(!agg2.is_closed(), "and does not end the subscription");
+}
+
+#[test]
+fn an_unremarkable_notice_does_not_arm_the_gate() {
+    // The positive control for the heuristic: it must not arm on everything.
+    let mut agg = aggregate(&["b1"]);
+    let routed = route_frame(
+        &mut agg,
+        RelayFrame::Notice {
+            message: "server restarting shortly".into(),
+        },
+        allow(),
+        |_| true,
+    );
+    assert!(!routed.arm_gate);
+}
+
+#[test]
+fn the_transport_ending_is_terminal() {
+    let mut agg = aggregate(&["b1"]);
+    let routed = on_transport_end(&mut agg);
+    assert_eq!(routed.emits, vec![Emit::Closed(CloseReason::RelayClosed)]);
+    assert!(routed.close_branches);
+}
+
+// ── the initial-EOSE deadline ──────────────────────────────────────────────
+
+#[test]
+fn the_deadline_closes_without_ever_emitting_an_eose() {
+    // The reconciliation of "never invent an EOSE" with "never wait forever".
+    // A branch that never answers must not be papered over with a synthesised
+    // eose telling the extension it has seen all stored history.
+    let mut agg = aggregate(&["b1", "b2"]);
+    assert_eq!(agg.on_branch_eose("b1"), Emit::Nothing);
+
+    let routed = on_initial_eose_deadline(&mut agg);
+    assert_eq!(routed.emits, vec![Emit::Closed(CloseReason::EoseDeadline)]);
+    assert!(
+        routed.close_branches,
+        "every opened branch gets a real CLOSE"
+    );
+    assert!(
+        !agg.has_eosed(),
+        "no public eose may be emitted by the deadline path"
+    );
+}
+
+#[test]
+fn the_deadline_is_a_no_op_once_the_aggregate_has_eosed() {
+    // A timer that fires after the aggregate completed must not close a healthy
+    // live subscription.
+    let mut agg = aggregate(&["b1"]);
+    assert_eq!(agg.on_branch_eose("b1"), Emit::Eose);
+    assert_eq!(on_initial_eose_deadline(&mut agg), Routed::default());
+    assert!(!agg.is_closed());
+}
+
+#[test]
+fn the_deadline_does_not_close_an_already_closed_aggregate_twice() {
+    let mut agg = aggregate(&["b1"]);
+    agg.close(CloseReason::AuthorityLost);
+    assert_eq!(on_initial_eose_deadline(&mut agg), Routed::default());
+}
