@@ -971,6 +971,13 @@ pub(crate) async fn query_events<R: tauri::Runtime>(
     }
 }
 
+/// §5 `subscribe` — aggregation, quota and public-subscription lifecycle.
+///
+/// A **private** child, so it inherits this module's seal: it can reach
+/// `construct_filters`/`matches_any`/`verify_event`, and nothing outside can
+/// reach them through it.
+mod subscription;
+
 #[cfg(test)]
 #[path = "query_tests.rs"]
 mod query_tests;
