@@ -150,9 +150,42 @@ fn a_frame_for_a_released_lease_is_dropped() {
 fn the_same_sub_id_on_two_leases_is_two_subscriptions() {
     let quota = SubscriptionQuota::new();
     let registry = SubscriptionRegistry::new();
-    registered(&registry, &quota, LEASE, "s1");
-    registered(&registry, &quota, SUCCESSOR_LEASE, "s1");
+    // Distinct branches, so the two entries are **distinguishable** while both
+    // are live. With the same branch set this row could only ever look one up
+    // after the other was closed, where keying by `sub` alone returns the same
+    // answer as keying by `(lease, sub)` — it passed with the lease dropped
+    // from the key entirely.
+    registered_on(
+        &registry,
+        &quota,
+        LEASE,
+        "s1",
+        &["b-first"],
+        conn(),
+        permissive(),
+        Box::new(|_| {}),
+    );
+    registered_on(
+        &registry,
+        &quota,
+        SUCCESSOR_LEASE,
+        "s1",
+        &["b-second"],
+        conn(),
+        permissive(),
+        Box::new(|_| {}),
+    );
     assert_eq!(registry.live_count(), 2);
+    assert_eq!(
+        registry.with_aggregate(LEASE, "s1", |a| a.owns_branch("b-first")),
+        Some(true),
+        "one id, two leases, two subscriptions — resolved by the pair"
+    );
+    assert_eq!(
+        registry.with_aggregate(SUCCESSOR_LEASE, "s1", |a| a.owns_branch("b-second")),
+        Some(true),
+        "and the successor's is its own, not the first one found by id"
+    );
 
     registry.close_for_lease(LEASE, CloseReason::Unsubscribed);
     assert_eq!(registry.live_count(), 1);
@@ -395,8 +428,26 @@ fn each_subscriptions_own_admission_judges_its_events() {
     // not. If the reader supplied admission, or the registry used the wrong
     // entry's, the refusing sub's verdict would decide the permissive sub's
     // event — or worse, the other way round.
+    //
+    // **Which admission ran is recorded, not inferred from the outcome.** The
+    // aggregate refuses events for branches it does not own, so routing to the
+    // *wrong* entry also produces no frame — outcome alone cannot tell "the
+    // refusing sub dropped it" from "the permissive sub was handed a branch it
+    // does not own". Naming the verifier that ran removes the ambiguity.
     let quota = SubscriptionQuota::new();
     let registry = SubscriptionRegistry::new();
+    let judged: Arc<std::sync::Mutex<Vec<&'static str>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
+    let naming = |name: &'static str, verdict: bool| {
+        let log = Arc::clone(&judged);
+        SubAdmission {
+            authority: Box::new(|| Ok(())),
+            verify: Box::new(move |_| {
+                log.lock().unwrap().push(name);
+                verdict
+            }),
+        }
+    };
     registered_on(
         &registry,
         &quota,
@@ -404,7 +455,7 @@ fn each_subscriptions_own_admission_judges_its_events() {
         "yes",
         &["b-yes"],
         conn(),
-        permissive(),
+        naming("yes", true),
         Box::new(|_| {}),
     );
     registered_on(
@@ -414,10 +465,7 @@ fn each_subscriptions_own_admission_judges_its_events() {
         "no",
         &["b-no"],
         conn(),
-        SubAdmission {
-            authority: Box::new(|| Ok(())),
-            verify: Box::new(|_| false),
-        },
+        naming("no", false),
         Box::new(|_| {}),
     );
 
@@ -432,6 +480,11 @@ fn each_subscriptions_own_admission_judges_its_events() {
         )
         .expect("routed");
     assert_eq!(delivered.frames.len(), 1, "the permissive sub is delivered");
+    assert_eq!(
+        judged.lock().unwrap().clone(),
+        vec!["yes"],
+        "and it was the permissive sub's OWN verifier that ran"
+    );
 
     let dropped = registry
         .route_by_branch(
@@ -452,6 +505,11 @@ fn each_subscriptions_own_admission_judges_its_events() {
             .iter()
             .any(|f| matches!(f, StreamFrame::Closed { .. })),
         "and the stream is not closed"
+    );
+    assert_eq!(
+        judged.lock().unwrap().clone(),
+        vec!["yes", "no"],
+        "the refusing sub's own verifier ran — not the permissive one a second time"
     );
 }
 

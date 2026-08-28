@@ -248,16 +248,26 @@ fn dropping_a_reservation_releases_it() {
 
 #[test]
 fn releasing_twice_gives_back_once() {
+    // **A second holder, so an over-release is observable at all.** `give_back`
+    // saturates at zero, so releasing one reservation three times against an
+    // otherwise empty budget lands on the same number as releasing it once —
+    // this row asserted 0 == 0 and could not fail. Budget held by somebody else
+    // is what a double release eats into.
     let quota = SubscriptionQuota::new();
+    let other = quota.reserve(IDENTITY, EXTID, 5).expect("reserve");
     let mut reservation = quota.reserve(IDENTITY, EXTID, 3).expect("reserve");
+    assert_eq!(quota.held_by(IDENTITY, EXTID), 8);
+
     reservation.release();
     reservation.release();
     drop(reservation); // and Drop runs too
     assert_eq!(
         quota.held_by(IDENTITY, EXTID),
-        0,
-        "exactly once, not three times"
+        5,
+        "exactly once, not three times — the other holder keeps every branch"
     );
+    drop(other);
+    assert_eq!(quota.held_by(IDENTITY, EXTID), 0);
 }
 
 #[test]

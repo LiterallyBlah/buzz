@@ -52,8 +52,13 @@ struct LiveSub {
     aggregate: Aggregate,
     admission: SubAdmission,
     close_at_relay: RelayCloser,
-    /// Dropping this releases the branch budget, so a sub cannot be removed
-    /// from the registry without its quota coming back.
+    /// Held **only** for its `Drop`, which is what returns the branch budget:
+    /// a sub cannot be removed from the registry without its quota coming back,
+    /// on every removal path including ones not yet written. Never read, and
+    /// that is the point — reading it is what the explicit `release()` call in
+    /// `shut_down_at_relay` used to do, and deleting that call reddened nothing
+    /// because `Drop` had already done the work.
+    #[allow(dead_code)]
     reservation: CommittedReservation,
     /// The socket its branches live on. Recorded so a dead transport can close
     /// exactly the subscriptions it was carrying — and no others, since one
@@ -336,16 +341,20 @@ fn delivery_from((lease, sub): (String, String), routed: Routed) -> Delivery {
 }
 
 impl LiveSub {
-    /// Stop the relay streaming this subscription, then give its budget back.
+    /// Stop the relay streaming this subscription.
     ///
-    /// In that order, and both here rather than at each call site: the two
-    /// halves of "this subscription is over" are the relay's view and the
-    /// host's accounting, and every earlier revision that separated them
-    /// updated one and forgot the other.
+    /// **The budget is not released here, and that is deliberate.** An earlier
+    /// revision called `self.reservation.release()` on the next line, which
+    /// read as the matching half of the shutdown — but `CommittedReservation`
+    /// releases in `Drop`, and every caller removes the entry from the map, so
+    /// the value dies either way. Deleting that call reddened nothing, which is
+    /// the definition of a line that is not doing the work its presence claims.
+    /// `Drop` is the single producer of "the budget came back": it fires on
+    /// every removal path, including ones nobody has written yet, which is more
+    /// than a hand-placed call can promise.
     fn shut_down_at_relay(&mut self) {
         let branches: Vec<String> = self.aggregate.branch_ids().map(str::to_string).collect();
         (self.close_at_relay)(&branches);
-        self.reservation.release();
     }
 }
 
