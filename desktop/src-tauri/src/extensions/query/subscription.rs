@@ -290,8 +290,25 @@ pub(super) struct Aggregate {
     /// the aggregate EOSEs, because after that the window it guards is over.
     pre_eose_ids: HashSet<nostr::EventId>,
     pre_eose_bytes: usize,
-    public_eose_sent: bool,
+    /// Every branch has EOSE'd — the stored phase is over.
+    eose_reached: bool,
+    /// The single public `eose` has actually been handed out.
+    ///
+    /// Distinct from [`Self::eose_reached`] because the two can be separated by
+    /// the reply: the phase changes when the last branch reports, but nothing
+    /// may be emitted until the `{sub}` reply is out.
+    eose_emitted: bool,
     closed: Option<CloseReason>,
+    /// Has the correlated `{sub}` reply been written to the port yet?
+    ///
+    /// The relay can answer before the host has finished replying to the
+    /// `subscribe` call that caused it. Delivering those events first would
+    /// hand an extension frames for a `sub` it has not been told the id of —
+    /// unroutable at best, and at worst attributed to whatever sub it *has*
+    /// seen. So they are held until the reply is out.
+    reply_written: bool,
+    /// Events that arrived before the reply, in arrival order.
+    awaiting_reply: Vec<nostr::Event>,
 }
 
 impl Aggregate {
@@ -310,17 +327,55 @@ impl Aggregate {
             eosed: HashSet::new(),
             pre_eose_ids: HashSet::new(),
             pre_eose_bytes: 0,
-            public_eose_sent: false,
+            eose_reached: false,
+            eose_emitted: false,
             closed: None,
+            reply_written: false,
+            awaiting_reply: Vec::new(),
         })
+    }
+
+    /// The `{sub}` reply has been written; release anything held behind it.
+    ///
+    /// Returns the held events **in arrival order**, which is the whole point:
+    /// the queue is serial, so what the relay sent first is what the extension
+    /// sees first, even across the reply boundary.
+    pub(super) fn mark_reply_written(&mut self) -> Vec<Emit> {
+        if self.reply_written {
+            return Vec::new();
+        }
+        self.reply_written = true;
+        if self.closed.is_some() {
+            // Closed before the reply landed: the held events are not
+            // deliverable, and `closed` has already been emitted.
+            self.awaiting_reply.clear();
+            return Vec::new();
+        }
+        let mut out: Vec<Emit> = std::mem::take(&mut self.awaiting_reply)
+            .into_iter()
+            .map(|event| Emit::Event(Box::new(event)))
+            .collect();
+        // If every branch EOSE'd while the reply was still in flight, the
+        // public `eose` was held too — it must land *after* the stored events
+        // it terminates, not before them.
+        if self.eose_reached && !self.eose_emitted {
+            self.eose_emitted = true;
+            out.push(Emit::Eose);
+        }
+        out
+    }
+
+    pub(super) fn reply_written(&self) -> bool {
+        self.reply_written
     }
 
     pub(super) fn is_closed(&self) -> bool {
         self.closed.is_some()
     }
 
+    /// Has the single public `eose` been handed out?
     pub(super) fn has_eosed(&self) -> bool {
-        self.public_eose_sent
+        self.eose_emitted
     }
 
     pub(super) fn branch_count(&self) -> usize {
@@ -347,7 +402,7 @@ impl Aggregate {
     /// counting it could complete the aggregate early, which is the same defect
     /// as inventing an EOSE on a timer.
     pub(super) fn on_branch_eose(&mut self, branch_id: &str) -> Emit {
-        if self.closed.is_some() || self.public_eose_sent {
+        if self.closed.is_some() || self.eose_reached {
             return Emit::Nothing;
         }
         if !self.branches.contains(branch_id) {
@@ -357,10 +412,16 @@ impl Aggregate {
         if self.eosed.len() < self.branches.len() {
             return Emit::Nothing;
         }
-        self.public_eose_sent = true;
+        self.eose_reached = true;
         // The dedup window guarded the stored phase; that phase is over.
         self.pre_eose_ids.clear();
         self.pre_eose_bytes = 0;
+        if !self.reply_written {
+            // Held: the `eose` may not overtake the reply, nor the stored
+            // events it terminates. `mark_reply_written` releases it.
+            return Emit::Nothing;
+        }
+        self.eose_emitted = true;
         Emit::Eose
     }
 
@@ -378,21 +439,30 @@ impl Aggregate {
         if !self.branches.contains(branch_id) {
             return Emit::Nothing;
         }
-        if self.public_eose_sent {
-            return Emit::Event(Box::new(event));
+        // Stored phase: dedup and bounds apply whether or not the reply has
+        // landed, so holding events behind the reply cannot smuggle a
+        // duplicate or an unbounded buffer past them.
+        if !self.eose_reached {
+            if !self.pre_eose_ids.insert(event.id) {
+                return Emit::Nothing;
+            }
+            if self.pre_eose_ids.len() > MAX_PRE_EOSE_EVENTS {
+                return self.close(CloseReason::BoundExceeded);
+            }
+            use nostr::JsonUtil as _;
+            let size = event.as_json().len();
+            self.pre_eose_bytes = self.pre_eose_bytes.saturating_add(size);
+            if self.pre_eose_bytes > MAX_PRE_EOSE_BYTES {
+                return self.close(CloseReason::BoundExceeded);
+            }
         }
 
-        if !self.pre_eose_ids.insert(event.id) {
+        if !self.reply_written {
+            if self.awaiting_reply.len() >= MAX_PRE_EOSE_EVENTS {
+                return self.close(CloseReason::BoundExceeded);
+            }
+            self.awaiting_reply.push(event);
             return Emit::Nothing;
-        }
-        if self.pre_eose_ids.len() > MAX_PRE_EOSE_EVENTS {
-            return self.close(CloseReason::BoundExceeded);
-        }
-        use nostr::JsonUtil as _;
-        let size = event.as_json().len();
-        self.pre_eose_bytes = self.pre_eose_bytes.saturating_add(size);
-        if self.pre_eose_bytes > MAX_PRE_EOSE_BYTES {
-            return self.close(CloseReason::BoundExceeded);
         }
         Emit::Event(Box::new(event))
     }

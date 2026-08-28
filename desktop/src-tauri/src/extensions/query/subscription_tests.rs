@@ -17,7 +17,23 @@ fn event() -> nostr::Event {
         .expect("sign")
 }
 
+/// An aggregate whose `{sub}` reply has already been written.
+///
+/// That is the steady state for everything except the ordering probes below:
+/// production writes the reply immediately after `subscribe` returns, so
+/// aggregation behaviour is what happens *after* it. The probes that care
+/// about the boundary build a raw aggregate instead.
 fn aggregate(branches: &[&str]) -> Aggregate {
+    let mut agg = raw_aggregate(branches);
+    assert!(
+        agg.mark_reply_written().is_empty(),
+        "a fresh aggregate holds nothing"
+    );
+    agg
+}
+
+/// An aggregate that has **not** yet written its `{sub}` reply.
+fn raw_aggregate(branches: &[&str]) -> Aggregate {
     Aggregate::new(branches.iter().map(|b| b.to_string()).collect()).expect("aggregate")
 }
 
@@ -353,4 +369,90 @@ fn a_quiet_channel_revocation_closes_without_any_event() {
         agg.is_closed(),
         "a quiet revocation must not wait for traffic"
     );
+}
+
+// ── the reply precedes the stored drain ────────────────────────────────────
+//
+// The relay can answer before the host has finished replying to the
+// `subscribe` that caused it. Frames for a `sub` the extension has not been
+// told the id of are unroutable at best, and at worst get attributed to a sub
+// it has seen.
+
+#[test]
+fn events_arriving_before_the_reply_are_held_then_drained_in_order() {
+    let mut agg = raw_aggregate(&["b1"]);
+    let first = event();
+    let second = event();
+    assert_eq!(agg.on_event("b1", first.clone()), Emit::Nothing);
+    assert_eq!(agg.on_event("b1", second.clone()), Emit::Nothing);
+    assert!(!agg.reply_written());
+
+    let drained = agg.mark_reply_written();
+    assert_eq!(drained.len(), 2, "both held events must be released");
+    // Arrival order survives the boundary — the queue is serial.
+    assert_eq!(drained[0], Emit::Event(Box::new(first)));
+    assert_eq!(drained[1], Emit::Event(Box::new(second)));
+}
+
+#[test]
+fn an_eose_reached_before_the_reply_lands_after_the_stored_events() {
+    // The sharp one. If every branch EOSEs while the reply is still in flight,
+    // releasing the eose first would terminate a stored phase whose events had
+    // not been delivered yet.
+    let mut agg = raw_aggregate(&["b1"]);
+    let stored = event();
+    assert_eq!(agg.on_event("b1", stored.clone()), Emit::Nothing);
+    assert_eq!(
+        agg.on_branch_eose("b1"),
+        Emit::Nothing,
+        "held behind the reply"
+    );
+    assert!(!agg.has_eosed());
+
+    let drained = agg.mark_reply_written();
+    assert_eq!(
+        drained,
+        vec![Emit::Event(Box::new(stored)), Emit::Eose],
+        "stored events first, then the single eose"
+    );
+    assert!(agg.has_eosed());
+}
+
+#[test]
+fn marking_the_reply_written_twice_drains_once() {
+    let mut agg = raw_aggregate(&["b1"]);
+    agg.on_event("b1", event());
+    assert_eq!(agg.mark_reply_written().len(), 1);
+    assert!(
+        agg.mark_reply_written().is_empty(),
+        "a second reply must not replay the buffer"
+    );
+}
+
+#[test]
+fn a_close_before_the_reply_discards_the_held_events() {
+    // Nothing may follow `closed`, and that includes events that were waiting
+    // on a reply which then never mattered.
+    let mut agg = raw_aggregate(&["b1"]);
+    agg.on_event("b1", event());
+    agg.close(CloseReason::AuthorityLost);
+    assert!(
+        agg.mark_reply_written().is_empty(),
+        "held events must not be delivered after a close"
+    );
+}
+
+#[test]
+fn the_pre_reply_buffer_is_bounded() {
+    // Holding behind the reply must not become an unbounded buffer the relay
+    // controls the size of.
+    let mut agg = raw_aggregate(&["b1"]);
+    let mut closed = None;
+    for _ in 0..(MAX_PRE_EOSE_EVENTS + 5) {
+        if let Emit::Closed(reason) = agg.on_event("b1", event()) {
+            closed = Some(reason);
+            break;
+        }
+    }
+    assert_eq!(closed, Some(CloseReason::BoundExceeded));
 }
