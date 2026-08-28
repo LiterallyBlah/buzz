@@ -24,6 +24,8 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
+use super::super::dispatch::{code, BridgeReply};
+
 /// Most physical branches one public subscription may own.
 ///
 /// A subscription spanning more granted channels than this is refused rather
@@ -709,30 +711,34 @@ pub(super) fn open_subscription(
 
 /// One live subscription and everything that must die with it.
 struct LiveSub {
-    /// The Rust-side wall. Released when the tab closes or the extension is
-    /// disabled.
-    lease: String,
     aggregate: Aggregate,
     /// Dropping this releases the branch budget, so a sub cannot be removed
     /// from the registry without its quota coming back.
     reservation: CommittedReservation,
 }
 
-/// Every live subscription, keyed by **both** lifetime walls.
+/// Every live subscription, keyed by `(lease, sub id)`.
 ///
-/// The key is `(owning port generation, sub id)` — not the sub id alone. That
-/// is what makes "no migration to a successor port" structural: a completion
-/// addressed to a generation that has gone simply finds nothing, so there is no
-/// code path that could hand it to the port that replaced it. A sub id is
-/// meaningless without the generation that minted it.
+/// **The lease is the generation, on this side.** `frame_host::acquire` mints a
+/// fresh UUID per frame mount and `ExtensionFrame` releases it on unmount, so a
+/// successor port necessarily carries a different lease. Keying on it is what
+/// makes "no migration to a successor port" structural: a completion addressed
+/// to a lease that has been released simply finds nothing, and there is no code
+/// path that could hand it to the frame that replaced it. A sub id is
+/// meaningless without the lease that minted it.
 ///
-/// The second wall, the lease, is stored per sub so a lease release can close
-/// every subscription belonging to it regardless of which port they are on.
-/// The contract requires a sub to die when **either** wall falls, and the two
-/// teardown effects fire in no fixed order, so both paths are hooked.
+/// An earlier revision keyed on an invented `port_generation: u64`. No such
+/// counter exists in this codebase — the lease already *is* that identifier, and
+/// carrying a second one would have meant two things to keep in step.
+///
+/// The two walls stay independent because they fall separately: the lease is
+/// released when the tab closes or the extension is disabled, while the TS port
+/// registry is disposed on its own schedule, and the contract notes those
+/// effects are unordered. This is the Rust wall; the forwarder enforces the
+/// other by refusing to deliver to a disposed port.
 #[derive(Default)]
 pub(super) struct SubscriptionRegistry {
-    subs: Mutex<HashMap<(u64, String), LiveSub>>,
+    subs: Mutex<HashMap<(String, String), LiveSub>>,
 }
 
 impl SubscriptionRegistry {
@@ -742,9 +748,8 @@ impl SubscriptionRegistry {
 
     pub(super) fn insert(
         &self,
-        port_generation: u64,
-        sub: &str,
         lease: &str,
+        sub: &str,
         aggregate: Aggregate,
         reservation: CommittedReservation,
     ) {
@@ -752,9 +757,8 @@ impl SubscriptionRegistry {
             return;
         };
         subs.insert(
-            (port_generation, sub.to_string()),
+            (lease.to_string(), sub.to_string()),
             LiveSub {
-                lease: lease.to_string(),
                 aggregate,
                 reservation,
             },
@@ -772,12 +776,12 @@ impl SubscriptionRegistry {
     /// no-migration rule doing its work.
     pub(super) fn with_aggregate<T>(
         &self,
-        port_generation: u64,
+        lease: &str,
         sub: &str,
         act: impl FnOnce(&mut Aggregate) -> T,
     ) -> Option<T> {
         let mut subs = self.subs.lock().ok()?;
-        let live = subs.get_mut(&(port_generation, sub.to_string()))?;
+        let live = subs.get_mut(&(lease.to_string(), sub.to_string()))?;
         Some(act(&mut live.aggregate))
     }
 
@@ -786,52 +790,33 @@ impl SubscriptionRegistry {
     /// Returns the close emission when it was live. Removing the entry drops
     /// its `CommittedReservation`, so the budget comes back on this path and on
     /// every other one that removes an entry.
-    pub(super) fn close_one(
-        &self,
-        port_generation: u64,
-        sub: &str,
-        reason: CloseReason,
-    ) -> Option<Emit> {
+    pub(super) fn close_one(&self, lease: &str, sub: &str, reason: CloseReason) -> Option<Emit> {
         let mut subs = self.subs.lock().ok()?;
-        let mut live = subs.remove(&(port_generation, sub.to_string()))?;
+        let mut live = subs.remove(&(lease.to_string(), sub.to_string()))?;
         let emit = live.aggregate.close(reason);
         live.reservation.release();
         Some(emit)
     }
 
-    /// The lease wall: close everything belonging to this lease, on any port.
-    pub(super) fn close_for_lease(&self, lease: &str, reason: CloseReason) -> Vec<(u64, String)> {
-        self.close_matching(reason, |key, live| {
-            let _ = key;
-            live.lease == lease
-        })
-    }
-
-    /// The port wall: close everything owned by this generation.
-    pub(super) fn close_for_port(
+    /// The lease wall: close every subscription this lease owns.
+    pub(super) fn close_for_lease(
         &self,
-        port_generation: u64,
+        lease: &str,
         reason: CloseReason,
-    ) -> Vec<(u64, String)> {
-        self.close_matching(reason, |key, live| {
-            let _ = live;
-            key.0 == port_generation
-        })
+    ) -> Vec<(String, String)> {
+        self.close_matching(reason, |key| key.0 == lease)
     }
 
     fn close_matching(
         &self,
         reason: CloseReason,
-        matches: impl Fn(&(u64, String), &LiveSub) -> bool,
-    ) -> Vec<(u64, String)> {
+        matches: impl Fn(&(String, String)) -> bool,
+    ) -> Vec<(String, String)> {
         let Ok(mut subs) = self.subs.lock() else {
             return Vec::new();
         };
-        let doomed: Vec<(u64, String)> = subs
-            .iter()
-            .filter(|(key, live)| matches(key, live))
-            .map(|(key, _)| key.clone())
-            .collect();
+        let doomed: Vec<(String, String)> =
+            subs.keys().filter(|key| matches(key)).cloned().collect();
         for key in &doomed {
             if let Some(mut live) = subs.remove(key) {
                 live.aggregate.close(reason.clone());
@@ -845,3 +830,50 @@ impl SubscriptionRegistry {
 #[cfg(test)]
 #[path = "subscription_tests.rs"]
 mod subscription_tests;
+
+/// The process-wide subscription registry.
+///
+/// One per host, like the frame-host lease map: subscriptions outlive any one
+/// bridge call, and the teardown walls have to reach them from wherever they
+/// fire.
+pub(super) fn registry() -> &'static SubscriptionRegistry {
+    static REGISTRY: std::sync::OnceLock<SubscriptionRegistry> = std::sync::OnceLock::new();
+    REGISTRY.get_or_init(SubscriptionRegistry::new)
+}
+
+/// The process-wide `(identity, extension)` branch budget.
+pub(super) fn quota() -> &'static Arc<SubscriptionQuota> {
+    static QUOTA: std::sync::OnceLock<Arc<SubscriptionQuota>> = std::sync::OnceLock::new();
+    QUOTA.get_or_init(SubscriptionQuota::new)
+}
+
+/// §5 `unsubscribe({ sub }) → { ok }`.
+///
+/// **Idempotent ensure-not-live, scoped to the calling lease, and no existence
+/// oracle.** A well-formed `sub` returns `{ok:true}` whether or not it was
+/// live, consulting only this lease's own subscriptions. A foreign, stale or
+/// invented well-formed id therefore touches nothing and produces an identical
+/// reply — so the method cannot be used to discover whether an id exists on
+/// somebody else's frame. Only a malformed `sub` is distinguishable, because
+/// that is a statement about the caller's own request rather than about the
+/// host's state.
+pub(super) fn unsubscribe(lease: &str, params: Option<serde_json::Value>) -> BridgeReply {
+    let Some(serde_json::Value::Object(map)) = params else {
+        return BridgeReply::err(code::INVALID_PARAMS, "params must be an object");
+    };
+    let Some(sub) = map.get("sub").and_then(serde_json::Value::as_str) else {
+        return BridgeReply::err(code::INVALID_PARAMS, "sub is required and must be a string");
+    };
+    if sub.is_empty() || sub.len() > MAX_SUB_ID_LEN {
+        return BridgeReply::err(code::INVALID_PARAMS, "sub is not a subscription id");
+    }
+
+    // The outcome is deliberately discarded. Whether this lease held that sub
+    // is exactly the fact an existence oracle would leak.
+    let _ = registry().close_one(lease, sub, CloseReason::Unsubscribed);
+    BridgeReply::ok(serde_json::json!({ "ok": true }))
+}
+
+/// Longest `sub` id the host will look up. Host-minted ids are UUIDs; the bound
+/// keeps a hostile lookup key from being unbounded work.
+pub(super) const MAX_SUB_ID_LEN: usize = 128;

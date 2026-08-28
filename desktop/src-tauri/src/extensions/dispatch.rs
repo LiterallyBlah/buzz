@@ -141,6 +141,8 @@ pub(crate) enum Route {
     ExtensionDataGet { extension_id: String },
     /// §5 `query.events` — a one-shot channel-scoped read.
     QueryEvents { extension_id: String },
+    /// §5 `unsubscribe` — ensure a subscription is not live on this lease.
+    Unsubscribe { extension_id: String },
     /// Refuse, with this §8 code and message.
     Refuse { code: &'static str, message: String },
 }
@@ -189,6 +191,7 @@ pub(crate) fn route(
         "publish.extensionData" => Route::PublishExtensionData { extension_id },
         "extensionData.get" => Route::ExtensionDataGet { extension_id },
         "query.events" => Route::QueryEvents { extension_id },
+        "unsubscribe" => Route::Unsubscribe { extension_id },
         _ => Route::Refuse {
             code: code::UNKNOWN_METHOD,
             message: format!("unknown method: {method}"),
@@ -292,6 +295,10 @@ pub(crate) async fn dispatch<R: tauri::Runtime>(
         }
         Route::QueryEvents { extension_id } => {
             super::query::query_events(app, &extension_id, lease, params).await
+        }
+        Route::Unsubscribe { extension_id } => {
+            let _ = extension_id;
+            super::query::unsubscribe(lease, params)
         }
         Route::IdentityGetPublicKey { extension_id } => {
             let state = app.state::<crate::AppState>();

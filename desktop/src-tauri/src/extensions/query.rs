@@ -978,6 +978,14 @@ pub(crate) async fn query_events<R: tauri::Runtime>(
 /// reach them through it.
 mod subscription;
 
+/// §5 `unsubscribe({ sub }) → { ok }` — the crate-visible bridge handler.
+///
+/// Re-exported from the private child so `dispatch` can route to it without
+/// the sealed internals becoming reachable.
+pub(crate) fn unsubscribe(lease: &str, params: Option<Value>) -> BridgeReply {
+    subscription::unsubscribe(lease, params)
+}
+
 #[cfg(test)]
 #[path = "query_tests.rs"]
 mod query_tests;
