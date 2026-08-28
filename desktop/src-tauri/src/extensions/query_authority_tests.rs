@@ -716,11 +716,19 @@ async fn publish(http: &str, keys: &nostr::Keys, channel: &str, body: &str) -> S
 
 async fn post_event(http: &str, keys: &nostr::Keys, event: &nostr::Event) {
     use nostr::JsonUtil as _;
+    let body = event.as_json();
+    // Wired rather than exempted. The repo's events-URL inventory would have
+    // accepted a "test-only fixture, no guard" row here, and the precedent for
+    // one exists — but this probe signs and posts real events, and a fixture
+    // that grows a key-bearing body later would then leak in silence. One line
+    // makes that unrepresentable instead of merely unlikely.
+    crate::egress_guard::assert_no_key_backup(&body, "5b live proof publish")
+        .expect("the live proof must never post key material");
     let resp = reqwest::Client::new()
         .post(format!("{http}/events"))
         .header("X-Pubkey", keys.public_key().to_hex())
         .header("Content-Type", "application/json")
-        .body(event.as_json())
+        .body(body)
         .send()
         .await
         .expect("submit event");

@@ -254,6 +254,10 @@ const EVENTS_INVENTORY: &[(&str, usize, usize)] = &[
     // Mock-relay route in its in-file tests; production publish goes through
     // the guarded boundary-1 funnel (`submit_signed_event_at_with_keys`).
     ("src/commands/personas/sharing.rs", 1, 0),
+    // The 5b live-subscription proof publishes real signed events to a relay it
+    // owns. Guarded rather than listed as a test-only fixture: it is the one
+    // test-side site that builds a body from live material.
+    ("src/extensions/query_authority_tests.rs", 1, 1),
 ];
 
 // Needles are assembled at runtime so this scan file itself contains no
