@@ -468,6 +468,141 @@ impl Aggregate {
     }
 }
 
+/// One live subscription and everything that must die with it.
+struct LiveSub {
+    /// The Rust-side wall. Released when the tab closes or the extension is
+    /// disabled.
+    lease: String,
+    aggregate: Aggregate,
+    /// Dropping this releases the branch budget, so a sub cannot be removed
+    /// from the registry without its quota coming back.
+    reservation: CommittedReservation,
+}
+
+/// Every live subscription, keyed by **both** lifetime walls.
+///
+/// The key is `(owning port generation, sub id)` — not the sub id alone. That
+/// is what makes "no migration to a successor port" structural: a completion
+/// addressed to a generation that has gone simply finds nothing, so there is no
+/// code path that could hand it to the port that replaced it. A sub id is
+/// meaningless without the generation that minted it.
+///
+/// The second wall, the lease, is stored per sub so a lease release can close
+/// every subscription belonging to it regardless of which port they are on.
+/// The contract requires a sub to die when **either** wall falls, and the two
+/// teardown effects fire in no fixed order, so both paths are hooked.
+#[derive(Default)]
+pub(super) struct SubscriptionRegistry {
+    subs: Mutex<HashMap<(u64, String), LiveSub>>,
+}
+
+impl SubscriptionRegistry {
+    pub(super) fn new() -> Self {
+        Self::default()
+    }
+
+    pub(super) fn insert(
+        &self,
+        port_generation: u64,
+        sub: &str,
+        lease: &str,
+        aggregate: Aggregate,
+        reservation: CommittedReservation,
+    ) {
+        let Ok(mut subs) = self.subs.lock() else {
+            return;
+        };
+        subs.insert(
+            (port_generation, sub.to_string()),
+            LiveSub {
+                lease: lease.to_string(),
+                aggregate,
+                reservation,
+            },
+        );
+    }
+
+    pub(super) fn live_count(&self) -> usize {
+        self.subs.lock().map(|subs| subs.len()).unwrap_or(0)
+    }
+
+    /// Act on one live subscription's aggregate.
+    ///
+    /// Returns `None` when the `(generation, sub)` pair is not live — which is
+    /// exactly what a frame for a torn-down port hits. Dropping it here is the
+    /// no-migration rule doing its work.
+    pub(super) fn with_aggregate<T>(
+        &self,
+        port_generation: u64,
+        sub: &str,
+        act: impl FnOnce(&mut Aggregate) -> T,
+    ) -> Option<T> {
+        let mut subs = self.subs.lock().ok()?;
+        let live = subs.get_mut(&(port_generation, sub.to_string()))?;
+        Some(act(&mut live.aggregate))
+    }
+
+    /// Close one subscription, releasing its quota.
+    ///
+    /// Returns the close emission when it was live. Removing the entry drops
+    /// its `CommittedReservation`, so the budget comes back on this path and on
+    /// every other one that removes an entry.
+    pub(super) fn close_one(
+        &self,
+        port_generation: u64,
+        sub: &str,
+        reason: CloseReason,
+    ) -> Option<Emit> {
+        let mut subs = self.subs.lock().ok()?;
+        let mut live = subs.remove(&(port_generation, sub.to_string()))?;
+        let emit = live.aggregate.close(reason);
+        live.reservation.release();
+        Some(emit)
+    }
+
+    /// The lease wall: close everything belonging to this lease, on any port.
+    pub(super) fn close_for_lease(&self, lease: &str, reason: CloseReason) -> Vec<(u64, String)> {
+        self.close_matching(reason, |key, live| {
+            let _ = key;
+            live.lease == lease
+        })
+    }
+
+    /// The port wall: close everything owned by this generation.
+    pub(super) fn close_for_port(
+        &self,
+        port_generation: u64,
+        reason: CloseReason,
+    ) -> Vec<(u64, String)> {
+        self.close_matching(reason, |key, live| {
+            let _ = live;
+            key.0 == port_generation
+        })
+    }
+
+    fn close_matching(
+        &self,
+        reason: CloseReason,
+        matches: impl Fn(&(u64, String), &LiveSub) -> bool,
+    ) -> Vec<(u64, String)> {
+        let Ok(mut subs) = self.subs.lock() else {
+            return Vec::new();
+        };
+        let doomed: Vec<(u64, String)> = subs
+            .iter()
+            .filter(|(key, live)| matches(key, live))
+            .map(|(key, _)| key.clone())
+            .collect();
+        for key in &doomed {
+            if let Some(mut live) = subs.remove(key) {
+                live.aggregate.close(reason.clone());
+                live.reservation.release();
+            }
+        }
+        doomed
+    }
+}
+
 #[cfg(test)]
 #[path = "subscription_tests.rs"]
 mod subscription_tests;

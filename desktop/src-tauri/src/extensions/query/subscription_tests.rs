@@ -456,3 +456,122 @@ fn the_pre_reply_buffer_is_bounded() {
     }
     assert_eq!(closed, Some(CloseReason::BoundExceeded));
 }
+
+// ── the two lifetime walls ─────────────────────────────────────────────────
+//
+// A sub dies when *either* wall falls — the live lease (Rust) or the owning
+// port generation (TS) — and the two teardown effects fire in no fixed order,
+// so both paths are hooked and both must release the budget.
+
+const LEASE: &str = "lease-1";
+
+fn registered(
+    registry: &SubscriptionRegistry,
+    quota: &Arc<SubscriptionQuota>,
+    generation: u64,
+    sub: &str,
+    lease: &str,
+) {
+    let reservation = quota.reserve(IDENTITY, EXTID, 2).expect("reserve").commit();
+    registry.insert(generation, sub, lease, aggregate(&["b1"]), reservation);
+}
+
+#[test]
+fn a_frame_for_a_dead_port_generation_is_dropped() {
+    // THE NO-MIGRATION RULE. Keying by (generation, sub) rather than sub alone
+    // means there is no code path that could hand a late completion to the port
+    // that replaced the one which asked for it.
+    let quota = SubscriptionQuota::new();
+    let registry = SubscriptionRegistry::new();
+    registered(&registry, &quota, 7, "s1", LEASE);
+
+    assert!(registry.with_aggregate(7, "s1", |_| ()).is_some());
+    assert!(
+        registry.with_aggregate(8, "s1", |_| ()).is_none(),
+        "the same sub id under a successor generation must not resolve"
+    );
+}
+
+#[test]
+fn the_same_sub_id_on_two_generations_is_two_subscriptions() {
+    let quota = SubscriptionQuota::new();
+    let registry = SubscriptionRegistry::new();
+    registered(&registry, &quota, 1, "s1", LEASE);
+    registered(&registry, &quota, 2, "s1", LEASE);
+    assert_eq!(registry.live_count(), 2);
+
+    registry.close_for_port(1, CloseReason::Unsubscribed);
+    assert_eq!(registry.live_count(), 1);
+    assert!(registry.with_aggregate(2, "s1", |_| ()).is_some());
+}
+
+#[test]
+fn the_lease_wall_closes_every_port_it_owns_and_releases_quota() {
+    let quota = SubscriptionQuota::new();
+    let registry = SubscriptionRegistry::new();
+    registered(&registry, &quota, 1, "s1", LEASE);
+    registered(&registry, &quota, 2, "s2", LEASE);
+    registered(&registry, &quota, 3, "s3", "other-lease");
+    assert_eq!(quota.held_by(IDENTITY, EXTID), 6);
+
+    let closed = registry.close_for_lease(LEASE, CloseReason::AuthorityLost);
+    assert_eq!(closed.len(), 2, "both subs on that lease, across ports");
+    assert_eq!(registry.live_count(), 1, "the other lease survives");
+    assert_eq!(
+        quota.held_by(IDENTITY, EXTID),
+        2,
+        "only the closed subs' branches came back"
+    );
+}
+
+#[test]
+fn the_port_wall_closes_and_releases_independently_of_the_lease() {
+    let quota = SubscriptionQuota::new();
+    let registry = SubscriptionRegistry::new();
+    registered(&registry, &quota, 5, "s1", LEASE);
+    assert_eq!(quota.held_by(IDENTITY, EXTID), 2);
+
+    registry.close_for_port(5, CloseReason::Unsubscribed);
+    assert_eq!(registry.live_count(), 0);
+    assert_eq!(
+        quota.held_by(IDENTITY, EXTID),
+        0,
+        "the port wall must release the budget too"
+    );
+}
+
+#[test]
+fn tearing_down_twice_releases_the_budget_once() {
+    // Both walls can fire for the same sub, in either order, and the second
+    // must be a no-op rather than a double refund.
+    let quota = SubscriptionQuota::new();
+    let registry = SubscriptionRegistry::new();
+    registered(&registry, &quota, 4, "s1", LEASE);
+    let _other = quota.reserve(IDENTITY, EXTID, 3).expect("reserve").commit();
+    assert_eq!(quota.held_by(IDENTITY, EXTID), 5);
+
+    registry.close_for_lease(LEASE, CloseReason::AuthorityLost);
+    registry.close_for_port(4, CloseReason::Unsubscribed);
+    assert_eq!(
+        quota.held_by(IDENTITY, EXTID),
+        3,
+        "the surviving reservation must not be refunded by a second teardown"
+    );
+}
+
+#[test]
+fn closing_one_sub_releases_only_its_own_branches() {
+    let quota = SubscriptionQuota::new();
+    let registry = SubscriptionRegistry::new();
+    registered(&registry, &quota, 1, "s1", LEASE);
+    registered(&registry, &quota, 1, "s2", LEASE);
+    assert_eq!(quota.held_by(IDENTITY, EXTID), 4);
+
+    let emit = registry.close_one(1, "s1", CloseReason::Unsubscribed);
+    assert_eq!(emit, Some(Emit::Closed(CloseReason::Unsubscribed)));
+    assert_eq!(quota.held_by(IDENTITY, EXTID), 2);
+    assert!(registry
+        .close_one(1, "s1", CloseReason::Unsubscribed)
+        .is_none());
+    assert_eq!(quota.held_by(IDENTITY, EXTID), 2, "still exactly once");
+}
