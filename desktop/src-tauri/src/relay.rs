@@ -298,6 +298,9 @@ pub async fn relay_error_message(response: reqwest::Response) -> String {
 // ── HTTP bridge: POST /query ────────────────────────────────────────────────
 
 mod query;
+/// Extension-subscription WS transport (§5 subscribe). Authority lives in
+/// `extensions::query::subscription`; this is bytes-to-frames only.
+pub(crate) mod subscribe;
 /// The unread-response half of the query send, for callers that must bound the
 /// response themselves rather than let `parse_json_response` swallow it whole.
 pub(crate) use query::send_query_no_wait;
