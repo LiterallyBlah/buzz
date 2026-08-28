@@ -883,11 +883,16 @@ test("teardown closes every live subscription on both sides", async (t) => {
 
 test("a frame already in flight at teardown is not delivered", async (t) => {
   // Removing the listener does not recall a frame the event bus has already
-  // dispatched, so `onStream` has to refuse one on its own. What refuses it is
-  // the liveness check: teardown drains every sub before returning, so a frame
-  // arriving afterwards names a sub that is no longer live. An extra
-  // `disposed` guard was tried here and deleted — removing it failed no test,
-  // because this path never reaches a state the liveness check would admit.
+  // dispatched, so nothing may be delivered after teardown.
+  //
+  // **This row does not isolate which mechanism refuses it, and says so.**
+  // Teardown drains every sub (so the liveness check would refuse) *and* closes
+  // the port (so `postMessage` is a silent no-op). Deleting the liveness check
+  // leaves this row green, which is how the battery caught the over-claim in
+  // the comment that used to live here. The liveness check is isolated by
+  // `closed is delivered, and nothing follows it`, where the port is still
+  // open. What this row proves is the end-to-end property: after teardown, no
+  // frame reaches the extension.
   const sub = "sub-1";
   const h = harness(t, { reply: { ok: true, result: { sub } } });
   await openSubscription(h, uuid(1), sub);
