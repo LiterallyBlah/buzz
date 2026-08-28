@@ -143,12 +143,24 @@ fn fake_query_relay_with_status(
                 }
             }
             before_reply();
-            let response = format!(
-                "HTTP/1.1 {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                status,
-                events_json.len(),
-                events_json
-            );
+            // An empty status is the marker for "answer without a
+            // `Content-Length`", so the body ends at EOF. That is the shape
+            // that makes the streaming byte ceiling the *only* defence: with a
+            // declared length the early header check refuses first, and a probe
+            // against it proves nothing about the accumulation loop.
+            let response = if status.is_empty() {
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{}",
+                    events_json
+                )
+            } else {
+                format!(
+                    "HTTP/1.1 {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    status,
+                    events_json.len(),
+                    events_json
+                )
+            };
             let _ = stream.write_all(response.as_bytes());
             let _ = stream.flush();
         }
@@ -615,4 +627,24 @@ async fn a_response_inside_both_bounds_is_accepted() {
         "a well-formed bounded response must be accepted: {:?}",
         reply.error
     );
+}
+
+#[tokio::test]
+async fn an_oversized_response_without_a_content_length_is_still_refused() {
+    // The isolating probe for the streaming ceiling. A relay that declares no
+    // `Content-Length` gets past the header check entirely, so the only thing
+    // that can stop an unbounded body is the accumulation loop aborting as it
+    // reads. Without this, deleting that loop leaves every test green — the
+    // header check answers for it.
+    let _host = super::super::frame_host::lifecycle_guard().await;
+    super::super::frame_host::insert_lease_for_test(QLEASE, QEXTID);
+    let filler = "x".repeat(9 * 1024 * 1024);
+    let body = format!("[{{\"junk\":\"{filler}\"}}]");
+    let reply = query_against_relay_body("", Some(body), || {}).await;
+    assert!(
+        relay_error(&reply),
+        "an unbounded chunked body must be refused: {:?}",
+        reply.error
+    );
+    assert!(reply.result.is_none(), "and expose nothing");
 }
