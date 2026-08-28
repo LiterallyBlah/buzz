@@ -280,3 +280,77 @@ fn a_reservation_larger_than_one_sub_may_hold_is_refused() {
     assert!(quota.reserve(IDENTITY, EXTID, 0).is_none());
     assert_eq!(quota.held_by(IDENTITY, EXTID), 0);
 }
+
+// ── two-stage admission ────────────────────────────────────────────────────
+//
+// `verify_event` returns a bool and cannot say *why* it refused. These pin the
+// distinction that bool loses: a bad event is dropped and the stream carries
+// on; lost authority ends the whole aggregate.
+
+use std::cell::Cell;
+
+#[test]
+fn a_bad_event_is_dropped_and_the_stream_continues() {
+    let admission = admit(|| Ok(()), || false);
+    assert_eq!(admission, Admission::DropEvent);
+}
+
+#[test]
+fn a_good_event_under_live_authority_is_delivered() {
+    // The positive control. Without it the two refusals below are satisfied by
+    // an implementation that admits nothing.
+    assert_eq!(admit(|| Ok(()), || true), Admission::Deliver);
+}
+
+#[test]
+fn lost_authority_closes_the_aggregate_rather_than_dropping_the_event() {
+    // The outcome that must not be collapsed into DropEvent: a revoked grant is
+    // not a malformed event, and treating it as one leaves the subscription
+    // streaming under authority it no longer holds.
+    assert_eq!(
+        admit(|| Err(CloseReason::AuthorityLost), || true),
+        Admission::CloseAggregate(CloseReason::AuthorityLost)
+    );
+}
+
+#[test]
+fn the_per_event_check_is_not_reached_when_authority_has_gone() {
+    // THE ORDERING PROBE. If `verify` ran first, a revoked grant arriving
+    // alongside a bad event would report DropEvent — the stream would survive
+    // an authority failure because the event happened to be invalid too. So the
+    // property is not just "the result is CloseAggregate", it is that the
+    // per-event check is never consulted at all.
+    let verify_ran = Cell::new(false);
+    let admission = admit(
+        || Err(CloseReason::AuthorityLost),
+        || {
+            verify_ran.set(true);
+            false
+        },
+    );
+    assert_eq!(
+        admission,
+        Admission::CloseAggregate(CloseReason::AuthorityLost)
+    );
+    assert!(
+        !verify_ran.get(),
+        "authority is checked first and short-circuits; verify must not run"
+    );
+}
+
+#[test]
+fn a_quiet_channel_revocation_closes_without_any_event() {
+    // Per-event checking alone is not continuous authority: a channel with no
+    // traffic would keep a revoked subscription alive indefinitely. The
+    // grant-change path closes the aggregate directly.
+    let mut agg = aggregate(&["b1"]);
+    assert!(!agg.is_closed());
+    assert_eq!(
+        agg.close(CloseReason::AuthorityLost),
+        Emit::Closed(CloseReason::AuthorityLost)
+    );
+    assert!(
+        agg.is_closed(),
+        "a quiet revocation must not wait for traffic"
+    );
+}

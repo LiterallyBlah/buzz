@@ -93,6 +93,47 @@ pub(super) enum Emit {
     Closed(CloseReason),
 }
 
+/// What admission decided about one arriving event.
+///
+/// Three outcomes, not two, and that is the whole point: `verify_event` returns
+/// a `bool` and so cannot distinguish "this event is bad" from "this extension
+/// is no longer allowed to see anything". Collapsing them means a revoked grant
+/// looks like a malformed event and the stream carries on.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum Admission {
+    /// Authority changed under the subscription. The **whole aggregate** ends.
+    CloseAggregate(CloseReason),
+    /// Authority holds, but this event is not one the extension may see —
+    /// bad signature, misdelivered, matching no constructed filter. Dropped;
+    /// the stream continues.
+    DropEvent,
+    /// Deliver it.
+    Deliver,
+}
+
+/// Two-stage admission, in the order the contract fixes.
+///
+/// **Authority first, and `verify` is not called if authority fails.** That
+/// ordering is the safety property, not a style preference: if a per-event
+/// check ran first, a revoked grant arriving alongside a malformed event would
+/// be reported as a dropped event and the subscription would keep streaming
+/// under authority it no longer has. Taking the closures rather than the
+/// collaborators keeps the ordering testable without a port, a socket or an
+/// app handle — and lets a probe observe that `verify` really was not reached.
+pub(super) fn admit(
+    authority: impl FnOnce() -> Result<(), CloseReason>,
+    verify: impl FnOnce() -> bool,
+) -> Admission {
+    if let Err(reason) = authority() {
+        return Admission::CloseAggregate(reason);
+    }
+    if verify() {
+        Admission::Deliver
+    } else {
+        Admission::DropEvent
+    }
+}
+
 /// A reservation against the `(identity, extension)` branch budget.
 ///
 /// **Exactly-once release is structural.** The contract requires rollback on
