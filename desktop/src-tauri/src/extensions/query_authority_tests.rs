@@ -370,3 +370,152 @@ async fn a_relay_failure_alone_is_still_a_relay_error() {
         reply.error
     );
 }
+
+/// The whole §5 read path against a relay that answers 401 when authentication
+/// is wrong, with real Postgres and Redis behind it.
+///
+/// The read is the point: a constructed filter, signed with the keys the grant
+/// admitted, carried through the `_no_wait` seam, verified per event, and
+/// rechecked before exposure. A live event coming back is that whole sequence
+/// working end to end rather than against a fake that agrees with us.
+#[tokio::test]
+#[ignore = "needs a live relay: BUZZ_5A_REAL_RELAY=http://127.0.0.1:PORT"]
+async fn against_a_live_relay_the_read_path_authenticates_and_returns_real_events() {
+    use tauri::Manager as _;
+    let url = std::env::var("BUZZ_5A_REAL_RELAY").expect("BUZZ_5A_REAL_RELAY must be set");
+
+    let _gate = crate::relay_admission::gate_guard().await;
+    let _host = super::super::frame_host::lifecycle_guard().await;
+
+    // **Read-only, and the identity comes from outside.**
+    //
+    // A freshly generated key cannot seed a channel: the relay enforces
+    // membership on ingest (`restricted: not a channel member`), and creating a
+    // channel so a test can read it would be a write to shared infrastructure
+    // for the test's own convenience. So the identity and the channel are
+    // supplied, and this probe **never publishes anything** — every request it
+    // makes is a read, which is also why it is safe to point at real infra.
+    let secret = std::env::var("BUZZ_5A_READ_KEY").expect("BUZZ_5A_READ_KEY must be set");
+    let channel = std::env::var("BUZZ_5A_READ_CHANNEL").expect("BUZZ_5A_READ_CHANNEL must be set");
+    let keys = nostr::Keys::parse(&secret).expect("BUZZ_5A_READ_KEY must be a nostr secret key");
+    let identity = keys.public_key().to_hex();
+    assert!(
+        super::super::manifest::is_canonical_channel_uuid(&channel),
+        "the probe's channel must be canonical: {channel}"
+    );
+    println!("LIVE identity={identity}");
+    println!("LIVE channel={channel}");
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("grants").join("extension-grants.db");
+    {
+        let conn = super::super::grants::open_grant_db(&db_path).expect("open");
+        super::super::grants::grant_read_scope(&conn, &identity, QEXTID, 9, &channel)
+            .expect("grant");
+    }
+
+    let state = crate::app_state::build_app_state();
+    *state.keys.lock().unwrap() = keys.clone();
+    *state.relay_url_override.lock().unwrap() = Some(url.clone());
+
+    let app = tauri::test::mock_app();
+    app.manage(state);
+    if let Ok(prod) = super::super::dispatch::grant_db_path(app.handle()) {
+        if let Some(parent) = prod.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::copy(&db_path, &prod);
+    }
+    super::super::frame_host::insert_lease_for_test(QLEASE, QEXTID);
+
+    // 1. The granted read returns real, stored events, and every one of them
+    //    satisfies the constraints the host constructed — checked here rather
+    //    than trusted, because the relay is the untrusted party.
+    let reply = query_events(
+        app.handle(),
+        QEXTID,
+        QLEASE,
+        Some(serde_json::json!({ "filter": { "kinds": [9], "#h": [channel], "limit": 5 } })),
+    )
+    .await;
+    println!("LIVE granted_read_error={:?}", reply.error);
+    assert!(
+        reply.error.is_none(),
+        "granted read must succeed: {:?}",
+        reply.error
+    );
+    let events = reply
+        .result
+        .as_ref()
+        .and_then(|r| r.get("events"))
+        .and_then(|e| e.as_array())
+        .expect("events array");
+    println!("LIVE returned_events={}", events.len());
+    assert!(
+        !events.is_empty(),
+        "the granted channel must return real stored events"
+    );
+    assert!(events.len() <= 5, "the overall cap must be honoured");
+    for event in events {
+        assert_eq!(event["kind"].as_u64(), Some(9), "only the granted kind");
+        let hs: Vec<&str> = event["tags"]
+            .as_array()
+            .expect("tags")
+            .iter()
+            .filter(|t| t[0].as_str() == Some("h"))
+            .filter_map(|t| t[1].as_str())
+            .collect();
+        assert_eq!(
+            hs,
+            vec![channel.as_str()],
+            "every event must carry exactly the granted channel"
+        );
+    }
+    println!("LIVE first_event_id={}", events[0]["id"]);
+
+    // 2. Cross product, against the real relay: 45001 is granted nowhere, so
+    //    asking for it in the granted channel must be denied outright.
+    let cross = query_events(
+        app.handle(),
+        QEXTID,
+        QLEASE,
+        Some(serde_json::json!({ "filter": { "kinds": [45001], "#h": [channel] } })),
+    )
+    .await;
+    println!("LIVE cross_product={cross:?}");
+    assert!(
+        denied_reply(&cross),
+        "cross product must be denied: {cross:?}"
+    );
+
+    // 3. Stray `h`: a global kind carrying this channel. Not channel-readable,
+    //    so it is denied at construction and never reaches the relay.
+    let stray = query_events(
+        app.handle(),
+        QEXTID,
+        QLEASE,
+        Some(serde_json::json!({ "filter": { "kinds": [1], "#h": [channel] } })),
+    )
+    .await;
+    println!("LIVE stray_h={stray:?}");
+    assert!(
+        denied_reply(&stray),
+        "a non-readable kind must be denied: {stray:?}"
+    );
+
+    // 4. Authority revoked: denied, and nothing is exposed.
+    super::super::frame_host::release(QLEASE);
+    let revoked = query_events(
+        app.handle(),
+        QEXTID,
+        QLEASE,
+        Some(serde_json::json!({ "filter": { "kinds": [9], "#h": [channel] } })),
+    )
+    .await;
+    println!("LIVE after_release={revoked:?}");
+    assert!(
+        denied_reply(&revoked),
+        "a released lease must deny: {revoked:?}"
+    );
+    assert!(revoked.result.is_none(), "a refusal must expose nothing");
+}
