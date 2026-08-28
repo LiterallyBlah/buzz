@@ -433,6 +433,19 @@ fn marking_the_reply_written_twice_drains_once() {
 fn a_close_before_the_reply_discards_the_held_events() {
     // Nothing may follow `closed`, and that includes events that were waiting
     // on a reply which then never mattered.
+    //
+    // The control runs first because the assertion below cannot fail without
+    // it: "empty because the close discarded them" and "empty because nothing
+    // was ever held" are the same observation. With holding deleted this row
+    // stayed green.
+    let mut control = raw_aggregate(&["b1"]);
+    control.on_event("b1", event());
+    assert_eq!(
+        control.mark_reply_written().len(),
+        1,
+        "without a close the held event is delivered — so it really was held"
+    );
+
     let mut agg = raw_aggregate(&["b1"]);
     agg.on_event("b1", event());
     agg.close(CloseReason::AuthorityLost);
@@ -446,7 +459,20 @@ fn a_close_before_the_reply_discards_the_held_events() {
 fn the_pre_reply_buffer_is_bounded() {
     // Holding behind the reply must not become an unbounded buffer the relay
     // controls the size of.
+    //
+    // **The branch EOSEs first, and that is the whole point of this row.**
+    // `on_event` checks the stored-phase bound (`pre_eose_ids`) before the
+    // pre-reply one and both trip at `MAX_PRE_EOSE_EVENTS`, so feeding a raw
+    // aggregate reaches the stored bound every time — this test passed with the
+    // pre-reply bound deleted outright, because a different gate returned the
+    // same verdict. Past the EOSE the stored-phase checks no longer run, so the
+    // only bound that can close the aggregate is the one named here.
     let mut agg = raw_aggregate(&["b1"]);
+    assert_eq!(
+        agg.on_branch_eose("b1"),
+        Emit::Nothing,
+        "the eose is held behind the reply, and the stored phase is over"
+    );
     let mut closed = None;
     for _ in 0..(MAX_PRE_EOSE_EVENTS + 5) {
         if let Emit::Closed(reason) = agg.on_event("b1", event()) {
@@ -708,9 +734,24 @@ async fn quota_is_reserved_before_any_network_side_effect() {
     // authenticate against budget it does not hold.
     let quota = SubscriptionQuota::new();
     let mut hold = Vec::new();
-    while let Some(r) = quota.reserve(IDENTITY, EXTID, MAX_BRANCHES_PER_SUB) {
-        hold.push(r);
+    // **Bounded, and the bound is asserted.** This was `while let Some(..)`,
+    // which spins forever the moment the per-extension ceiling stops refusing —
+    // and a mutant that deletes that ceiling does exactly this. A test that
+    // hangs is worse than one that fails: it wedges the runner, reports nothing,
+    // and the mutant that caused it looks like a slow pass rather than a caught
+    // one. Exhausting a known budget in a known number of steps fails fast
+    // instead.
+    let expected = MAX_BRANCHES_PER_EXTENSION / MAX_BRANCHES_PER_SUB;
+    for _ in 0..=expected {
+        if let Some(reservation) = quota.reserve(IDENTITY, EXTID, MAX_BRANCHES_PER_SUB) {
+            hold.push(reservation);
+        }
     }
+    assert_eq!(
+        hold.len(),
+        expected,
+        "the budget must run out after exactly {expected} full-sized reservations"
+    );
     let steps = Steps::default();
     let result = open_subscription(
         &quota,
