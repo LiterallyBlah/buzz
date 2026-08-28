@@ -1727,6 +1727,7 @@ mod tests {
             source_team: None,
             source_team_persona_slug: None,
             catalog_source: None,
+            team_catalog_source: None,
             definition_respond_to: None,
             definition_respond_to_allowlist: Vec::new(),
             definition_parallelism: None,
@@ -1915,7 +1916,6 @@ mod tests {
             key: "OPENROUTER_API_KEY".to_string()
         }));
     }
-
     #[test]
     fn buzz_agent_openrouter_with_provider_model_fallback_is_ready() {
         let env = make_env(
