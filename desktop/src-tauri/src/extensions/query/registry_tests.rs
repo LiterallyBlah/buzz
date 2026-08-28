@@ -51,10 +51,49 @@ fn registered(
     lease: &str,
     sub: &str,
 ) {
-    registered_on(registry, quota, lease, sub, &["b1"], conn(), permissive());
+    registered_on(
+        registry,
+        quota,
+        lease,
+        sub,
+        &["b1"],
+        conn(),
+        permissive(),
+        Box::new(|_| {}),
+    );
+}
+
+/// Branches this subscription asked the relay to stop streaming.
+type ClosedAtRelay = Arc<std::sync::Mutex<Vec<String>>>;
+
+/// A closer that records instead of writing to a socket.
+///
+/// This is the probe the `unsubscribe` defect slipped past: every removal path
+/// released the branch budget and closed the aggregate, so every assertion
+/// about *host* state passed, while the relay was never told and kept pushing.
+/// Nothing watched the socket because nothing could.
+fn recording_closer(log: &ClosedAtRelay) -> (RelayCloser, ClosedAtRelay) {
+    let sink = Arc::clone(log);
+    (
+        Box::new(move |branches: &[String]| {
+            sink.lock().unwrap().extend(branches.iter().cloned());
+        }),
+        Arc::clone(log),
+    )
+}
+
+fn closed_log() -> ClosedAtRelay {
+    Arc::new(std::sync::Mutex::new(Vec::new()))
+}
+
+fn sorted(log: &ClosedAtRelay) -> Vec<String> {
+    let mut v = log.lock().unwrap().clone();
+    v.sort();
+    v
 }
 
 /// A registered subscription with an explicit branch set, socket and admission.
+#[allow(clippy::too_many_arguments)]
 fn registered_on(
     registry: &SubscriptionRegistry,
     quota: &Arc<SubscriptionQuota>,
@@ -63,6 +102,7 @@ fn registered_on(
     branches: &[&str],
     connection: (String, String),
     admission: SubAdmission,
+    close_at_relay: RelayCloser,
 ) {
     let reservation = quota.reserve(IDENTITY, EXTID, 2).expect("reserve").commit();
     registry.insert(
@@ -70,6 +110,7 @@ fn registered_on(
         sub,
         aggregate(branches),
         admission,
+        close_at_relay,
         reservation,
         connection,
     );
@@ -190,6 +231,7 @@ fn unsubscribe_reports_the_same_thing_whether_or_not_the_sub_was_live() {
         "known-sub",
         aggregate(&["b1"]),
         permissive(),
+        Box::new(|_| {}),
         live_reservation,
         conn(),
     );
@@ -219,6 +261,7 @@ fn unsubscribe_is_idempotent() {
         "s1",
         aggregate(&["b1"]),
         permissive(),
+        Box::new(|_| {}),
         reservation,
         conn(),
     );
@@ -240,6 +283,7 @@ fn unsubscribe_cannot_reach_another_leases_subscription() {
         "victim",
         aggregate(&["b1"]),
         permissive(),
+        Box::new(|_| {}),
         reservation,
         conn(),
     );
@@ -293,6 +337,7 @@ fn a_frame_is_routed_to_the_subscription_that_owns_its_branch() {
         &["b1", "b2"],
         conn(),
         permissive(),
+        Box::new(|_| {}),
     );
 
     let delivery = registry
@@ -329,6 +374,7 @@ fn a_frame_for_an_unowned_branch_routes_nowhere() {
         &["b1"],
         conn(),
         permissive(),
+        Box::new(|_| {}),
     );
 
     assert!(
@@ -359,6 +405,7 @@ fn each_subscriptions_own_admission_judges_its_events() {
         &["b-yes"],
         conn(),
         permissive(),
+        Box::new(|_| {}),
     );
     registered_on(
         &registry,
@@ -371,6 +418,7 @@ fn each_subscriptions_own_admission_judges_its_events() {
             authority: Box::new(|| Ok(())),
             verify: Box::new(|_| false),
         },
+        Box::new(|_| {}),
     );
 
     let e = event();
@@ -398,16 +446,24 @@ fn each_subscriptions_own_admission_judges_its_events() {
         dropped.frames.is_empty(),
         "the refusing sub's own verify drops it, and does not close the stream"
     );
-    assert!(dropped.close_branches.is_empty());
+    assert!(
+        !dropped
+            .frames
+            .iter()
+            .any(|f| matches!(f, StreamFrame::Closed { .. })),
+        "and the stream is not closed"
+    );
 }
 
 #[test]
-fn a_closing_frame_returns_every_branch_and_releases_the_quota() {
+fn a_closing_frame_closes_every_branch_and_releases_the_quota() {
     // A half-closed aggregate leaves the relay streaming into a subscription
     // nobody reads, so the CLOSE burst must name all of them — not the one the
     // frame arrived on.
     let quota = SubscriptionQuota::new();
     let registry = SubscriptionRegistry::new();
+    let log = closed_log();
+    let (closer, recorded) = recording_closer(&log);
     registered_on(
         &registry,
         &quota,
@@ -416,6 +472,7 @@ fn a_closing_frame_returns_every_branch_and_releases_the_quota() {
         &["b1", "b2", "b3"],
         conn(),
         permissive(),
+        closer,
     );
     assert_eq!(quota.held_by(IDENTITY, EXTID), 2);
 
@@ -428,12 +485,11 @@ fn a_closing_frame_returns_every_branch_and_releases_the_quota() {
             },
         )
         .expect("routed");
-    let mut branches = delivery.close_branches.clone();
-    branches.sort();
+    let _ = delivery;
     assert_eq!(
-        branches,
+        sorted(&recorded),
         vec!["b1", "b2", "b3"],
-        "every branch, not just b2"
+        "every branch, not just b2 — and sent, not merely returned"
     );
     assert_eq!(
         quota.held_by(IDENTITY, EXTID),
@@ -460,6 +516,7 @@ fn a_dead_socket_closes_only_the_subscriptions_it_carried() {
         &["b1"],
         conn(),
         permissive(),
+        Box::new(|_| {}),
     );
     registered_on(
         &registry,
@@ -469,6 +526,7 @@ fn a_dead_socket_closes_only_the_subscriptions_it_carried() {
         &["b2"],
         other.clone(),
         permissive(),
+        Box::new(|_| {}),
     );
 
     let closed = registry.close_for_connection(&conn());
@@ -480,10 +538,7 @@ fn a_dead_socket_closes_only_the_subscriptions_it_carried() {
             reason: CloseReason::RelayClosed,
         }]
     );
-    assert!(
-        closed[0].close_branches.is_empty(),
-        "there is no socket left to CLOSE on"
-    );
+
     assert!(
         registry.route_by_branch("b2", eose_frame("b2")).is_some(),
         "the other socket's subscription survives"
@@ -502,6 +557,7 @@ fn a_dead_socket_releases_the_branch_budget() {
         &["b1"],
         conn(),
         permissive(),
+        Box::new(|_| {}),
     );
     assert_eq!(quota.held_by(IDENTITY, EXTID), 2);
     registry.close_for_connection(&conn());
@@ -530,6 +586,7 @@ fn the_deadline_closes_a_silent_subscription_and_names_its_branches() {
         &["b1", "b2"],
         conn(),
         permissive(),
+        Box::new(|_| {}),
     );
 
     let delivery = registry
@@ -543,9 +600,7 @@ fn the_deadline_closes_a_silent_subscription_and_names_its_branches() {
         }],
         "closed with the named reason, and no eose before it"
     );
-    let mut branches = delivery.close_branches.clone();
-    branches.sort();
-    assert_eq!(branches, vec!["b1", "b2"]);
+    let _ = delivery;
     assert_eq!(quota.held_by(IDENTITY, EXTID), 0);
 }
 
@@ -562,6 +617,7 @@ fn the_deadline_does_nothing_to_a_subscription_that_eosed() {
         &["b1"],
         conn(),
         permissive(),
+        Box::new(|_| {}),
     );
     registry
         .route_by_branch("b1", eose_frame("b1"))
@@ -590,6 +646,7 @@ fn the_deadline_for_an_unknown_subscription_is_inert() {
         &["b1"],
         conn(),
         permissive(),
+        Box::new(|_| {}),
     );
     assert!(registry.close_on_eose_deadline(LEASE, "gone").is_none());
     assert!(registry
@@ -598,5 +655,156 @@ fn the_deadline_for_an_unknown_subscription_is_inert() {
     assert!(
         registry.close_on_eose_deadline(LEASE, "s1").is_some(),
         "the real one still fires — the lookup is not simply dead"
+    );
+}
+
+// ── every removal path tells the relay ─────────────────────────────────────
+//
+// The defect these exist for: each path below released the branch budget and
+// closed the aggregate — so every assertion about host state passed — while the
+// relay was never told and kept matching and pushing the branches for the life
+// of the connection. Invisible from the extension's side, because the reader
+// drops frames for a sub nobody owns.
+
+#[test]
+fn unsubscribe_tells_the_relay_to_stop_streaming() {
+    let quota = SubscriptionQuota::new();
+    let log = closed_log();
+    let (closer, recorded) = recording_closer(&log);
+    let reservation = quota.reserve(IDENTITY, EXTID, 2).expect("reserve").commit();
+    registry().insert(
+        "relay-close-lease",
+        "s1",
+        aggregate(&["b1", "b2"]),
+        permissive(),
+        closer,
+        reservation,
+        conn(),
+    );
+
+    let reply = unsubscribe(
+        "relay-close-lease",
+        Some(serde_json::json!({ "sub": "s1" })),
+    );
+    assert!(reply.error.is_none());
+    assert_eq!(
+        sorted(&recorded),
+        vec!["b1", "b2"],
+        "every branch must be CLOSEd at the relay, not just forgotten here"
+    );
+}
+
+#[test]
+fn the_lease_wall_tells_the_relay_to_stop_streaming() {
+    let quota = SubscriptionQuota::new();
+    let registry = SubscriptionRegistry::new();
+    let log = closed_log();
+    let (closer, recorded) = recording_closer(&log);
+    registered_on(
+        &registry,
+        &quota,
+        LEASE,
+        "s1",
+        &["b1", "b2"],
+        conn(),
+        permissive(),
+        closer,
+    );
+
+    registry.close_for_lease(LEASE, CloseReason::Unsubscribed);
+    assert_eq!(
+        sorted(&recorded),
+        vec!["b1", "b2"],
+        "a released lease must stop its branches at the relay too"
+    );
+}
+
+#[test]
+fn a_relay_closed_branch_stops_the_others_at_the_relay() {
+    // One branch dying ends the aggregate; the survivors must be CLOSEd or the
+    // relay keeps streaming into a subscription nobody reads.
+    let quota = SubscriptionQuota::new();
+    let registry = SubscriptionRegistry::new();
+    let log = closed_log();
+    let (closer, recorded) = recording_closer(&log);
+    registered_on(
+        &registry,
+        &quota,
+        LEASE,
+        "s1",
+        &["b1", "b2", "b3"],
+        conn(),
+        permissive(),
+        closer,
+    );
+
+    registry
+        .route_by_branch(
+            "b2",
+            crate::relay::subscribe::RelayFrame::Closed {
+                sub_id: "b2".to_string(),
+                reason: "whatever".to_string(),
+            },
+        )
+        .expect("routed");
+    assert_eq!(sorted(&recorded), vec!["b1", "b2", "b3"]);
+    assert_eq!(
+        quota.held_by(IDENTITY, EXTID),
+        0,
+        "and the budget came back"
+    );
+}
+
+#[test]
+fn the_eose_deadline_stops_its_branches_at_the_relay() {
+    // Unlike a dead transport there is still a socket, so the branches can and
+    // must be stopped.
+    let quota = SubscriptionQuota::new();
+    let registry = SubscriptionRegistry::new();
+    let log = closed_log();
+    let (closer, recorded) = recording_closer(&log);
+    registered_on(
+        &registry,
+        &quota,
+        LEASE,
+        "s1",
+        &["b1", "b2"],
+        conn(),
+        permissive(),
+        closer,
+    );
+
+    registry
+        .close_on_eose_deadline(LEASE, "s1")
+        .expect("the deadline fires");
+    assert_eq!(sorted(&recorded), vec!["b1", "b2"]);
+}
+
+#[test]
+fn a_subscription_that_stays_live_is_not_closed_at_the_relay() {
+    // The control. Without it every assertion above is satisfied by a closer
+    // that fires unconditionally, which would tear down healthy streams.
+    let quota = SubscriptionQuota::new();
+    let registry = SubscriptionRegistry::new();
+    let log = closed_log();
+    let (closer, recorded) = recording_closer(&log);
+    registered_on(
+        &registry,
+        &quota,
+        LEASE,
+        "s1",
+        &["b1", "b2"],
+        conn(),
+        permissive(),
+        closer,
+    );
+
+    // An ordinary EOSE on one branch: the aggregate is still live.
+    registry
+        .route_by_branch("b1", eose_frame("b1"))
+        .expect("routed");
+    assert!(
+        recorded.lock().unwrap().is_empty(),
+        "a live subscription must not be stopped at the relay"
     );
 }

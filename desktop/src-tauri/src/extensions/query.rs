@@ -775,5 +775,9 @@ pub(crate) async fn subscribe<R: tauri::Runtime>(
 mod query_tests;
 
 #[cfg(test)]
+#[path = "construction_tests.rs"]
+mod construction_tests;
+
+#[cfg(test)]
 #[path = "query_authority_tests.rs"]
 mod query_authority_tests;

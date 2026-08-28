@@ -78,12 +78,6 @@ impl Connection {
         &self.witness
     }
 
-    /// The outbound queue, for callers that must `CLOSE` branches on a socket
-    /// they did not open — the EOSE-deadline timer, in particular.
-    pub(super) fn outbound(&self) -> &mpsc::Sender<String> {
-        &self.outbound
-    }
-
     /// Queue one relay frame.
     ///
     /// `try_send` rather than `send`: a full queue or a dead writer must fail
@@ -169,9 +163,8 @@ async fn open(
         let _ = write.close().await;
     });
 
-    let reader_outbound = outbound.clone();
     tokio::spawn(async move {
-        pump(read, sink, key, reader_outbound).await;
+        pump(read, sink, key).await;
     });
 
     Ok(Arc::new(Connection { outbound, witness }))
@@ -194,7 +187,7 @@ fn branch_of(frame: &RelayFrame) -> Option<&str> {
 /// subscription this socket carried: v1 has no reconnect, and leaving them live
 /// against a dead socket would hold their branch budget forever while
 /// delivering nothing.
-async fn pump<S>(mut read: S, sink: StreamSink, key: ConnectionKey, outbound: mpsc::Sender<String>)
+async fn pump<S>(mut read: S, sink: StreamSink, key: ConnectionKey)
 where
     S: StreamExt<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin,
 {
@@ -231,7 +224,7 @@ where
                 // torn-down port, which is dropped rather than delivered to
                 // whatever frame is mounted now.
                 if let Some(delivery) = registry().route_by_branch(&branch, frame) {
-                    deliver(&sink, &outbound, delivery);
+                    deliver(&sink, delivery);
                 }
             }
         }
@@ -241,23 +234,32 @@ where
     // is no socket left to send a relay `CLOSE` on, so these deliveries carry
     // no branches.
     for delivery in registry().close_for_connection(&key) {
-        deliver(&sink, &outbound, delivery);
+        deliver(&sink, delivery);
     }
 }
 
 /// Hand one routed frame to the port, and take its branches down at the relay.
-fn deliver(sink: &StreamSink, outbound: &mpsc::Sender<String>, delivery: Delivery) {
+fn deliver(sink: &StreamSink, delivery: Delivery) {
     if delivery.arm_gate {
         crate::relay_admission::activate_rate_limit(None);
     }
     for frame in &delivery.frames {
         sink(&delivery.lease, frame);
     }
-    for branch in &delivery.close_branches {
-        // Best effort: the aggregate is already closed and its quota already
-        // released, so a failed CLOSE leaks nothing on this side.
-        let _ = outbound.try_send(format!("[\"CLOSE\",{}]", serde_json::json!(branch)));
-    }
+}
+
+/// The `CLOSE` burst for one subscription's branches, bound to its socket.
+///
+/// Handed to the registry entry so that **every** removal path can stop the
+/// relay, not just the one that happens to be holding the socket. `try_send`,
+/// so a dead or wedged socket fails here rather than blocking a teardown.
+fn relay_closer(connection: &Arc<Connection>) -> super::registry::RelayCloser {
+    let connection = Arc::clone(connection);
+    Box::new(move |branches: &[String]| {
+        for branch in branches {
+            let _ = connection.send(format!("[\"CLOSE\",{}]", serde_json::json!(branch)));
+        }
+    })
 }
 
 /// The production sink: a Tauri event carrying the lease and the §2 frame.
@@ -387,6 +389,7 @@ pub(super) async fn subscribe<R: tauri::Runtime>(
                 &sub,
                 aggregate,
                 admission,
+                relay_closer(&connection),
                 reservation,
                 connection_key.clone(),
             );
@@ -442,11 +445,10 @@ pub(super) async fn subscribe<R: tauri::Runtime>(
         let lease = lease.to_string();
         let sub = sub.clone();
         let sink = Arc::clone(&sink);
-        let connection = Arc::clone(&connection);
         tokio::spawn(async move {
             tokio::time::sleep(INITIAL_EOSE_DEADLINE).await;
             if let Some(delivery) = registry().close_on_eose_deadline(&lease, &sub) {
-                deliver(&sink, connection.outbound(), delivery);
+                deliver(&sink, delivery);
             }
         });
     }

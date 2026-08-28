@@ -37,10 +37,21 @@ pub(super) struct SubAdmission {
     pub(super) verify: Box<dyn Fn(&nostr::Event) -> bool + Send + Sync>,
 }
 
+/// Tell the relay to stop streaming these branches.
+///
+/// Held by the entry for the same reason [`SubAdmission`] is: every path that
+/// removes a subscription must be able to shut it down completely, and a
+/// removal path that has to *find* the socket first is a removal path that can
+/// forget to. An earlier revision returned the branch ids to the reader and let
+/// it send the burst, which meant only the reader's path ever sent one —
+/// `unsubscribe` and the lease wall silently left the relay streaming.
+pub(super) type RelayCloser = Box<dyn Fn(&[String]) + Send + Sync>;
+
 /// One live subscription and everything that must die with it.
 struct LiveSub {
     aggregate: Aggregate,
     admission: SubAdmission,
+    close_at_relay: RelayCloser,
     /// Dropping this releases the branch budget, so a sub cannot be removed
     /// from the registry without its quota coming back.
     reservation: CommittedReservation,
@@ -58,11 +69,6 @@ pub(super) struct Delivery {
     pub(super) lease: String,
     /// Frames for the extension, in order.
     pub(super) frames: Vec<StreamFrame>,
-    /// Branch ids to `CLOSE` at the relay. Non-empty exactly when the aggregate
-    /// ended, and it carries **every** branch the aggregate opened rather than
-    /// the one that failed — a half-closed aggregate leaves the relay streaming
-    /// into a subscription nobody reads.
-    pub(super) close_branches: Vec<String>,
     /// The relay signalled rate limiting on this frame.
     pub(super) arm_gate: bool,
 }
@@ -96,12 +102,18 @@ impl SubscriptionRegistry {
         Self::default()
     }
 
+    /// Every argument is a distinct thing that must die with the subscription:
+    /// its aggregate, its admission, its way of stopping the relay, its budget
+    /// hold, and the socket it rode in on. Bundling them into a struct would
+    /// only move the list.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn insert(
         &self,
         lease: &str,
         sub: &str,
         aggregate: Aggregate,
         admission: SubAdmission,
+        close_at_relay: RelayCloser,
         reservation: CommittedReservation,
         connection: ConnectionKey,
     ) {
@@ -113,6 +125,7 @@ impl SubscriptionRegistry {
             LiveSub {
                 aggregate,
                 admission,
+                close_at_relay,
                 reservation,
                 connection,
             },
@@ -166,25 +179,18 @@ impl SubscriptionRegistry {
             .into_iter()
             .filter_map(|emit| StreamFrame::from_emit(&sub, emit))
             .collect();
-        let close_branches: Vec<String> = if routed.close_branches {
-            aggregate.branch_ids().map(str::to_string).collect()
-        } else {
-            Vec::new()
-        };
-
-        // The aggregate is finished, so the entry goes — which drops its
-        // `CommittedReservation` and returns the branch budget. Reading the
-        // branch ids first is why this is not simply `close_one`: they are
-        // needed for the relay `CLOSE` burst and they live in the entry being
-        // removed.
-        if !close_branches.is_empty() {
-            subs.remove(&(lease.clone(), sub.clone()));
+        // The aggregate is finished, so the entry goes — which sends its own
+        // `CLOSE` burst and drops its `CommittedReservation`, returning the
+        // branch budget.
+        if routed.close_branches {
+            if let Some(mut live) = subs.remove(&(lease.clone(), sub.clone())) {
+                live.shut_down_at_relay();
+            }
         }
 
         Some(Delivery {
             lease,
             frames,
-            close_branches,
             arm_gate: routed.arm_gate,
         })
     }
@@ -219,7 +225,12 @@ impl SubscriptionRegistry {
         let mut subs = self.subs.lock().ok()?;
         let mut live = subs.remove(&(lease.to_string(), sub.to_string()))?;
         let emit = live.aggregate.close(reason);
-        live.reservation.release();
+        // The relay is told to stop before the budget comes back. Without this
+        // an `unsubscribe` freed the host's accounting and left the relay
+        // pushing the branches forever — invisible from the extension's side,
+        // because the reader drops frames for a sub nobody owns, and fatal on a
+        // shared socket once the relay's own subscription ceiling fills.
+        live.shut_down_at_relay();
         Some(emit)
     }
 
@@ -264,7 +275,11 @@ impl SubscriptionRegistry {
             // here would keep passing its own test while drifting from the one
             // the aggregate actually implements.
             let routed = on_transport_end(&mut live.aggregate);
-            live.reservation.release();
+            // Still through the entry's own closer, though this socket is dead
+            // and the send will simply fail. One shutdown path, no special
+            // case — a branch that only some removals take is the branch that
+            // rots.
+            live.shut_down_at_relay();
             closed.push(delivery_from(key, routed));
         }
         closed
@@ -283,11 +298,8 @@ impl SubscriptionRegistry {
             return None;
         }
         let mut live = subs.remove(&key)?;
-        let branches: Vec<String> = live.aggregate.branch_ids().map(str::to_string).collect();
-        live.reservation.release();
-        let mut delivery = delivery_from(key, routed);
-        delivery.close_branches = branches;
-        Some(delivery)
+        live.shut_down_at_relay();
+        Some(delivery_from(key, routed))
     }
 
     fn close_matching(
@@ -303,7 +315,7 @@ impl SubscriptionRegistry {
         for key in &doomed {
             if let Some(mut live) = subs.remove(key) {
                 live.aggregate.close(reason.clone());
-                live.reservation.release();
+                live.shut_down_at_relay();
             }
         }
         doomed
@@ -319,8 +331,21 @@ fn delivery_from((lease, sub): (String, String), routed: Routed) -> Delivery {
             .filter_map(|emit| StreamFrame::from_emit(&sub, emit))
             .collect(),
         lease,
-        close_branches: Vec::new(),
         arm_gate: routed.arm_gate,
+    }
+}
+
+impl LiveSub {
+    /// Stop the relay streaming this subscription, then give its budget back.
+    ///
+    /// In that order, and both here rather than at each call site: the two
+    /// halves of "this subscription is over" are the relay's view and the
+    /// host's accounting, and every earlier revision that separated them
+    /// updated one and forgot the other.
+    fn shut_down_at_relay(&mut self) {
+        let branches: Vec<String> = self.aggregate.branch_ids().map(str::to_string).collect();
+        (self.close_at_relay)(&branches);
+        self.reservation.release();
     }
 }
 
