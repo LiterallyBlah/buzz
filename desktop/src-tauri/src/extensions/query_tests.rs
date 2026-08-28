@@ -335,8 +335,13 @@ fn more_read_pairs_than_one_query_may_span_is_quota_exceeded() {
     // bound nor the aggregate bound can answer for this one. 24 allowlisted
     // kinds across 11 channels is 264 pairs — over MAX_READ_PAIRS (256) while
     // staying under MAX_EMITTED_FILTERS (32).
+    const CHANNELS: u32 = 11;
+    // Compile-time, so the fixture cannot silently start tripping the
+    // neighbouring bound if either constant is retuned later.
+    const { assert!(CHANNELS as usize <= MAX_EMITTED_FILTERS) };
+
     let mut granted: Vec<(u32, String)> = Vec::new();
-    for channel in 0..11u32 {
+    for channel in 0..CHANNELS {
         for kind in super::super::manifest::EXTENSION_CHANNEL_READABLE_KINDS {
             granted.push((*kind, format!("{channel:08}-1111-4111-8111-111111111111")));
         }
@@ -344,10 +349,6 @@ fn more_read_pairs_than_one_query_may_span_is_quota_exceeded() {
     assert!(
         granted.len() > MAX_READ_PAIRS,
         "fixture must exceed the bound"
-    );
-    assert!(
-        11 <= MAX_EMITTED_FILTERS,
-        "fixture must not trip the filter bound"
     );
     let error = construct_filters(&granted, &ok_request(serde_json::json!({ "limit": 1 })))
         .err()
