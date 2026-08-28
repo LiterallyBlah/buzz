@@ -92,17 +92,18 @@ export type Registry = {
   /** Reserve an id, or explain why not. */
   readonly admit: (id: string) => Admission;
   /**
-   * Open a subscription slot and mint its **host-generated opaque** id.
+   * Record a subscription id **minted by the Rust host**.
    *
-   * The extension never proposes a `sub`: an id it chose could collide with a
-   * live one, or be guessed to probe another port. Ids are unique for the
-   * owning port's life and **never reused after close**, so a late frame or a
-   * stale `unsubscribe` for a dead sub can never bind to a new one.
+   * Rust owns the protocol client and the authority registry; TS only
+   * forwards. So TS does not mint: it adopts what the host returned, which is
+   * what keeps a single authority over which ids exist. It still enforces its
+   * own per-port ceiling and refuses an id already used on this port — reuse
+   * would let a late frame for a dead sub bind to a live one.
    *
    * Consumes no request-id budget — streams must not burn
    * `MAX_REQUESTS_PER_PORT`.
    */
-  readonly openSub: () => SubAdmission;
+  readonly adoptSub: (sub: string) => SubAdmission;
   /** Is this `sub` currently live on **this** port? */
   readonly isSubLive: (sub: string) => boolean;
   /**
@@ -204,7 +205,7 @@ export function createRegistry(): Registry {
       return outstanding.delete(id);
     },
 
-    openSub(): SubAdmission {
+    adoptSub(sub: string): SubAdmission {
       if (!admitting) {
         return { kind: "refused", ...TEARDOWN_ERROR };
       }
@@ -215,22 +216,15 @@ export function createRegistry(): Registry {
           message: "too many live subscriptions on this connection",
         };
       }
-      // Opaque and host-generated. `usedSubs` makes reuse impossible even
-      // across a close, which is what stops a late frame for a dead sub
-      // binding to a live one.
-      //
-      // A collision is refused rather than retried. Retrying reads as the
-      // obvious fix and is wrong twice over: it is an unbounded loop inside a
-      // module whose contract is that everything is bounded, and against a
-      // degenerate or stubbed generator it never terminates. Refusing is
-      // fail-closed, and it is reachable by a test, which a "cannot happen"
-      // branch otherwise is not.
-      const sub = crypto.randomUUID();
+      // `usedSubs` makes reuse impossible even across a close, which is what
+      // stops a late frame for a dead sub binding to a live one. A repeat is
+      // refused rather than tolerated: the host should never mint one, so a
+      // repeat means something is wrong and continuing would hide it.
       if (usedSubs.has(sub)) {
         return {
           kind: "refused",
           code: INTERNAL,
-          message: "could not mint a unique subscription id",
+          message: "this subscription id has already been used on this port",
         };
       }
       usedSubs.add(sub);

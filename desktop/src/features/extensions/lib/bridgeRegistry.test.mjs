@@ -8,6 +8,8 @@ import {
   MAX_SUBS_PER_PORT,
 } from "./bridgeRegistry.ts";
 
+const hostSub = (n) => `9a1b2c3d-4e5f-4a6b-8c7d-${String(n).padStart(12, "0")}`;
+
 const id = (n) => `3f2504e0-4f89-41d3-9a0c-${String(n).padStart(12, "0")}`;
 
 test("a fresh id is admitted", () => {
@@ -146,8 +148,8 @@ test("draining twice yields nothing the second time", () => {
 
 test("subs are host-generated, opaque and distinct", () => {
   const registry = createRegistry();
-  const first = registry.openSub();
-  const second = registry.openSub();
+  const first = registry.adoptSub(hostSub(1));
+  const second = registry.adoptSub(hostSub(2));
   assert.equal(first.kind, "opened");
   assert.equal(second.kind, "opened");
   assert.notEqual(first.sub, second.sub);
@@ -168,13 +170,13 @@ test("a sub id is never reused after its subscription closes", () => {
   const real = globalThis.crypto.randomUUID;
   globalThis.crypto.randomUUID = () => "11111111-1111-4111-8111-111111111111";
   try {
-    const first = registry.openSub();
+    const first = registry.adoptSub(hostSub(0));
     assert.equal(first.kind, "opened");
     registry.closeSub(first.sub);
 
     // The generator hands back the same id; the port must refuse rather than
     // reissue it, and rather than spin looking for a different one.
-    const second = registry.openSub();
+    const second = registry.adoptSub(hostSub(0));
     assert.equal(second.kind, "refused");
     assert.equal(second.code, "internal");
   } finally {
@@ -187,7 +189,7 @@ test("subscriptions consume no request-id budget", () => {
   // the port's finite request ids.
   const registry = createRegistry();
   for (let n = 0; n < 50; n += 1) {
-    const opened = registry.openSub();
+    const opened = registry.adoptSub(hostSub(n));
     registry.closeSub(opened.sub);
   }
   assert.equal(registry.inFlight(), 0);
@@ -198,7 +200,7 @@ test("subscriptions consume no request-id budget", () => {
 
 test("closing a sub is idempotent, and unknown ids touch nothing", () => {
   const registry = createRegistry();
-  const opened = registry.openSub();
+  const opened = registry.adoptSub(hostSub(41));
   assert.equal(registry.isSubLive(opened.sub), true);
   assert.equal(registry.closeSub(opened.sub), true);
   assert.equal(registry.closeSub(opened.sub), false);
@@ -214,27 +216,30 @@ test("closing a sub is idempotent, and unknown ids touch nothing", () => {
 test("the live-sub ceiling refuses excess without ending the port", () => {
   const registry = createRegistry();
   for (let n = 0; n < MAX_SUBS_PER_PORT; n += 1) {
-    assert.equal(registry.openSub().kind, "opened");
+    assert.equal(registry.adoptSub(hostSub(n)).kind, "opened");
   }
-  const refused = registry.openSub();
+  const refused = registry.adoptSub(hostSub(MAX_SUBS_PER_PORT));
   assert.equal(refused.kind, "refused");
   assert.equal(refused.code, "quota_exceeded");
   // Unlike the request budget, this is a concurrency ceiling: closing one
   // frees a slot rather than leaving the port spent.
   assert.equal(registry.isExhausted(), false);
   registry.closeSub(registry.liveSubs()[0]);
-  assert.equal(registry.openSub().kind, "opened");
+  assert.equal(
+    registry.adoptSub(hostSub(MAX_SUBS_PER_PORT + 1)).kind,
+    "opened",
+  );
 });
 
 test("teardown drains live subs and stops new ones", () => {
   const registry = createRegistry();
-  const a = registry.openSub();
-  const b = registry.openSub();
+  const a = registry.adoptSub(hostSub(71));
+  const b = registry.adoptSub(hostSub(72));
   const drained = registry.closeAndDrainSubs();
   assert.deepEqual(drained.sort(), [a.sub, b.sub].sort());
   assert.equal(registry.liveSubs().length, 0);
   // Admission stops before the drain, so a sub cannot slip into a set that
   // has already been walked and would never be closed or released.
-  assert.equal(registry.openSub().kind, "refused");
+  assert.equal(registry.adoptSub(hostSub(73)).kind, "refused");
   assert.deepEqual(registry.closeAndDrainSubs(), []);
 });
