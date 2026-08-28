@@ -936,7 +936,7 @@ fn unsubscribe_reports_the_same_thing_whether_or_not_the_sub_was_live() {
         "oracle-lease",
         Some(serde_json::json!({ "sub": "never-existed" })),
     );
-    assert_eq!(hit.error.is_none(), true);
+    assert!(hit.error.is_none());
     assert_eq!(
         hit.result, miss.result,
         "a live sub and an invented one must be indistinguishable"
