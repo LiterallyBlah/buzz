@@ -872,7 +872,7 @@ mod tests {
         );
         let text = format!(
             "\n{}\n\n{}\n",
-            jsonl(&[a.clone()]).trim(),
+            jsonl(std::slice::from_ref(&a)).trim(),
             jsonl(&[a]).trim()
         );
         let loaded = load_trace(&text).expect("loads");
