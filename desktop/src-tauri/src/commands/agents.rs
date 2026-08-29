@@ -19,8 +19,6 @@ use crate::{
     util::now_iso,
 };
 
-/// Read the workspace owner pubkey without holding the lock. Used to populate `BUZZ_ACP_AGENT_OWNER`
-/// as a fallback for legacy agent records that have no NIP-OA `auth_tag`.
 pub(super) fn workspace_owner_hex(state: &AppState) -> Result<String, String> {
     let keys = state.keys.lock().map_err(|e| e.to_string())?;
     Ok(keys.public_key().to_hex())
@@ -32,10 +30,6 @@ mod pending;
 use pending::build_agent_archive_request;
 pub(crate) use pending::{retain_managed_agent_pending, tombstone_managed_agent_pending};
 
-/// Build a summary from fresh disk state (personas, teams, global config).
-/// For one-shot command paths only — the 5s list poll calls
-/// `build_managed_agent_summary` directly with stores loaded once per call,
-/// not once per record.
 pub(super) fn summarize_from_disk(
     app: &AppHandle,
     record: &ManagedAgentRecord,
@@ -225,13 +219,6 @@ pub(super) async fn start_local_agent_with_preflight(
         return Err(format!("agent {pubkey} is not a local agent"));
     }
 
-    // Preflight against the same resolution spawn uses — `resolve_effective_config`
-    // (definition → global fallback). A linked instance's own `provider`/`model`/
-    // `relay_mesh` bytes never contribute: this reads the CURRENT definition
-    // directly, so a definition edit that flips `provider` to/from relay-mesh
-    // between saves is reflected here without needing a prospective re-snapshot;
-    // for a global-inherited blank definition, it also folds in the global
-    // default, which record-byte sniffing could never see.
     let personas = load_personas(app).unwrap_or_default();
     let global = crate::managed_agents::load_global_agent_config(app).unwrap_or_default();
     let mesh_model_id =
@@ -242,8 +229,6 @@ pub(super) async fn start_local_agent_with_preflight(
         );
     ensure_relay_mesh_for_record(app, mesh_model_id.as_deref(), allow_fresh_create_start).await?;
 
-    // Provider preflight before the store and runtime-map locks below. A
-    // programmatic start is always user-initiated (create-agent, Doctor
     // post-install restart), so it re-probes rather than trusting a verdict
     // taken before whatever the user just did — and it does so out here, where
     // the wait costs nobody else their lock. `start_managed_agent_process`
