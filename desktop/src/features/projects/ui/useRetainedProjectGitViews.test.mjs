@@ -4,6 +4,7 @@ import { after, before, test } from "node:test";
 
 import { JSDOM } from "jsdom";
 
+import { moduleDataUrl } from "../../../testing/moduleDataUrl.mjs";
 import { buildProjectDetailAgentContext } from "../lib/projectDetailAgentContext.ts";
 import { projectDetailSelectionItem } from "../lib/projectDetailSelectionItem.ts";
 import { reviewDiffWorkspaceBranch } from "../lib/projectReviewDisplay.ts";
@@ -13,23 +14,15 @@ import { buildProjectDetailCrumbs } from "./useProjectDetailCrumbs.ts";
 // The real composer mounts TipTap and never releases jsdom handles. Stub it so
 // the production panel can prove selectedPullRequest wiring without hanging
 // the node:test process.
+const forumComposerStubUrl = moduleDataUrl(
+  "globalThis.__FORUM_COMPOSER_STUBBED__ = true;\nexport function ForumComposer() { return null; }\n",
+);
 registerHooks({
   resolve(specifier, context, nextResolve) {
     if (specifier === "@/features/forum/ui/ForumComposer") {
-      return { shortCircuit: true, url: "buzz-pr-panel-stub:ForumComposer" };
+      return { shortCircuit: true, url: forumComposerStubUrl };
     }
     return nextResolve(specifier, context);
-  },
-  load(url, context, nextLoad) {
-    if (url === "buzz-pr-panel-stub:ForumComposer") {
-      return {
-        format: "module",
-        shortCircuit: true,
-        source:
-          "globalThis.__FORUM_COMPOSER_STUBBED__ = true;\nexport function ForumComposer() { return null; }\n",
-      };
-    }
-    return nextLoad(url, context);
   },
 });
 
