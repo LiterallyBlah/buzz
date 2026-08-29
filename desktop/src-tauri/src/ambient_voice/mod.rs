@@ -19,9 +19,12 @@
 //! | [`wake_word`] | tokenisation + the strict validation the engine needs |
 //! | [`utterance`] | the capture state machine (pure, clock-injected) |
 //! | [`session`] | the audio worker: spotter → barge-in → VAD → recogniser |
+//! | [`rolling`] | one utterance's chunks, transcribed off the worker thread |
 //! | [`publish`] | egress boundary 9: kind:9 transcripts and kind:48106 |
 //! | [`models`] | wake-word model access over the shared download manager |
+//! | [`speech_health`] | whether a configured speech server is answering |
 //! | [`speech_http`] | the wire contract for a role that runs on a server |
+//! | [`speech_text`] | Markdown flattened to what a voice should read |
 //! | [`speech_wav`] | PCM16 WAV coding for that wire |
 //! | [`status`] | what the listening indicator shows |
 //! | [`transcriber`] | which recogniser an utterance goes to |
@@ -45,14 +48,21 @@
 //! microphone continuously would be a different feature. Only a finished
 //! utterance, and only a reply already published to the relay, ever leave.
 
+/// The mute fence the audio worker and the publisher both answer to. Reached
+/// through [`session`], which re-exports it: this is where the fence is written,
+/// not a second door onto it.
+mod capture_authority;
 pub mod commands;
 pub mod http_tts;
 pub mod launch;
 pub mod models;
 pub mod publish;
+pub mod rolling;
 pub mod session;
 pub mod settings;
+pub mod speech_health;
 pub mod speech_http;
+pub mod speech_text;
 pub mod speech_wav;
 pub mod status;
 pub mod transcriber;
@@ -84,6 +94,7 @@ use launch::LaunchDiagnostics;
 use publish::{AmbientDestination, AmbientPublisher};
 use session::{AmbientSession, AmbientSessionConfig, AudioFlowSnapshot};
 use settings::AmbientVoiceSettings;
+use speech_health::{SpeechBackendHealthReport, SpeechHealth};
 use status::AmbientStatus;
 use tts_backend::{start_ambient_tts, AmbientTts};
 use wake_word::WakeWordTokenizer;
@@ -198,6 +209,13 @@ struct SessionConfig {
     /// Which backend speaks the replies. Bound once for the same reason: the
     /// pipeline is built at start, against one endpoint or one local model.
     tts: settings::SpeechBackendSettings,
+    /// How long a pause closes an utterance. The capture machine derives both
+    /// of its limits from this once, when the worker thread starts.
+    silence_hold_ms: u32,
+    /// The phrase that ends a capture, armed on the same spotter as the wake
+    /// word — so adding, changing or clearing it is a new keyword set, which
+    /// only exists at construction.
+    stop_phrase: Option<String>,
 }
 
 impl SessionConfig {
@@ -208,6 +226,8 @@ impl SessionConfig {
             output_device: settings.output_device.clone(),
             stt: settings.stt.clone(),
             tts: settings.tts.clone(),
+            silence_hold_ms: settings.silence_hold_ms,
+            stop_phrase: settings.armed_stop_phrase().map(str::to_string),
         }
     }
 }
@@ -225,8 +245,26 @@ pub struct AmbientVoiceState {
     tts_active: Arc<AtomicBool>,
     tts_cancel: Arc<AtomicBool>,
     muted: Arc<AtomicBool>,
+    /// Count of mute events, ever. Every capture is bound to the value in force
+    /// when it was armed ([`session::CaptureEpoch`]) and dies the moment the two
+    /// disagree — a mute is a death sentence for the capture in progress, and an
+    /// unmute must not commute it.
+    mute_epochs: Arc<AtomicU64>,
+    /// Serialises the two ways a transcript can lose its authority against the
+    /// dispatch of that transcript, so neither can overlap it: mute-on bumps
+    /// the counter above while holding this ([`session::apply_mute`]), a
+    /// teardown bumps the generation below while holding it ([`stop_session`]),
+    /// and a prepared transcript decides and starts its send while holding it
+    /// ([`publish::DispatchGate`]). Held for two stores on one side, one store
+    /// on the other and one decision at the gate — never across a network round
+    /// trip, so the mute button and the off switch stay as immediate as the
+    /// flags they set. Named for the mute it was built for; it is the authority
+    /// over the whole egress boundary now.
+    mute_authority: Arc<Mutex<()>>,
     reported: Arc<Mutex<AmbientStatus>>,
-    /// Invalidates in-flight publisher tasks from a previous session.
+    /// Invalidates in-flight publisher tasks from a previous session. Moved
+    /// only by [`stop_session`], under `mute_authority`, so a publisher that is
+    /// mid-dispatch cannot slip a stopped session's words past the bump.
     generation: Arc<AtomicU64>,
     /// Whether the last report announced to the frontend said the audio was
     /// stale. The staleness of a running session changes with the clock, not
@@ -236,6 +274,9 @@ pub struct AmbientVoiceState {
     stale_announced: AtomicBool,
     /// What kind of launch this is. Recorded once, by [`hydrate_at_boot`].
     launch: Mutex<Option<LaunchDiagnostics>>,
+    /// Whether the speech servers a running session was pointed at are
+    /// answering. Written by the worker threads, read by every status report.
+    speech_health: Arc<SpeechHealth>,
 }
 
 impl Default for AmbientVoiceState {
@@ -248,10 +289,13 @@ impl Default for AmbientVoiceState {
             tts_active: Arc::new(AtomicBool::new(false)),
             tts_cancel: Arc::new(AtomicBool::new(false)),
             muted: Arc::new(AtomicBool::new(false)),
+            mute_epochs: Arc::new(AtomicU64::new(0)),
+            mute_authority: Arc::new(Mutex::new(())),
             reported: Arc::new(Mutex::new(AmbientStatus::Off)),
             generation: Arc::new(AtomicU64::new(0)),
             stale_announced: AtomicBool::new(false),
             launch: Mutex::new(None),
+            speech_health: Arc::new(SpeechHealth::default()),
         }
     }
 }
@@ -328,14 +372,24 @@ pub struct AmbientVoiceStatusReport {
     pub audio_stale: bool,
     /// Batches the worker has taken off the queue since the session started.
     pub audio_batches_received: u64,
-    /// Milliseconds since the last batch reached the worker, or since the
-    /// session started when none has. `None` when no session is running.
+    /// Milliseconds the worker has been free to receive audio and received
+    /// none — since the last batch, or since the session started when none has.
+    /// `None` when no session is running. Time the worker spent transcribing is
+    /// excluded, because during it the worker was not reading its queue; see
+    /// [`session::AudioFlow`].
     pub ms_since_last_audio: Option<u64>,
     /// The webview's own view of the same audio path, as of its last report.
     /// `None` until it sends one.
     pub webview_capture: Option<WebviewCaptureFlow>,
     /// What kind of launch this is. `None` before boot hydration has run.
     pub launch: Option<LaunchDiagnostics>,
+    /// Whether the speech servers this session was pointed at are answering.
+    /// Both roles report `configured: false` when they run on this computer,
+    /// which is the default and the shape of every settings file that has
+    /// never named a server. The fallback is not affected by any of this — the
+    /// field exists so a server that is failing softly stops doing it
+    /// invisibly.
+    pub speech_backends: SpeechBackendHealthReport,
 }
 
 /// Whether a session is running and being fed nothing.
@@ -426,6 +480,7 @@ fn build_report(state: &AppState) -> Result<AmbientVoiceStatusReport, String> {
             .lock()
             .map(|launch| launch.clone())
             .unwrap_or(None),
+        speech_backends: ambient.speech_health.report(),
     })
 }
 
@@ -506,7 +561,30 @@ fn capture_failure_is_pacing(
 /// threads, and ONNX teardown is not instant.
 fn stop_session(state: &AppState, next: AmbientStatus) -> Result<(), String> {
     let ambient = &state.ambient_voice;
-    ambient.generation.fetch_add(1, Ordering::Release);
+    {
+        // Under the mute authority, for exactly the reason the mute epoch is
+        // ([`session::apply_mute`]): a transcript already inside the publisher
+        // decides whether it may be dispatched — and starts its send — while
+        // holding this same lock ([`publish::DispatchGate`]). Bumped outside
+        // it, the teardown was a race the words could win: the publisher had
+        // passed its last look at the generation and was blocked on the
+        // network, and the session it belonged to was gone by the time the gate
+        // let it through. Under it there is one winner — either this store
+        // lands first and the stale transcript is refused, or its send is
+        // already irrevocably under way and this teardown governs the next one.
+        //
+        // Held for the one store and released here: before the runtime lock,
+        // before the joins, and across nothing that can wait, so a teardown
+        // never makes a dispatch — or a mute — queue behind a round trip.
+        // Poisoning is recovered rather than propagated exactly as `apply_mute`
+        // does; the lock guards `()`, and a panic elsewhere under it must not
+        // be able to keep a stopped session's words alive.
+        let _authority = ambient
+            .mute_authority
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        ambient.generation.fetch_add(1, Ordering::Release);
+    }
     let (session, tts) = {
         let mut runtime = ambient.runtime()?;
         runtime.destination = None;
@@ -527,6 +605,10 @@ fn stop_session(state: &AppState, next: AmbientStatus) -> Result<(), String> {
     drop(tts);
     ambient.tts_cancel.store(false, Ordering::Release);
     ambient.tts_active.store(false, Ordering::Release);
+    // Nothing is left to fail, so nothing may still be reported as failing: a
+    // red line about a server the session that is ending was pointed at would
+    // outlive the thing it described.
+    ambient.speech_health.configure(false, false);
     ambient.set_status(next);
     Ok(())
 }
@@ -619,11 +701,40 @@ async fn start_session(state: &AppState, settings: &AmbientVoiceSettings) -> Res
         "the speech-to-text model is still downloading — ambient voice will start when it is ready",
     )?;
 
-    // Strict validation, always, before anything reaches the engine.
+    // Strict validation, always, before anything reaches the engine — for the
+    // stop phrase exactly as for the wake word, since both are armed on the one
+    // spotter and either can kill the process.
     let tokenizer = WakeWordTokenizer::load(&kws_dir)?;
+    let stop_phrase = settings
+        .armed_stop_phrase()
+        // A stop phrase equal to the wake word would arm one keyword twice and
+        // leave no answer to which job a detection is doing. Saving one is
+        // refused; a file that carries one anyway simply does not arm it.
+        .filter(|phrase| {
+            wake_word::engine_keyword(phrase) != wake_word::engine_keyword(&binding.wake_word)
+        })
+        // Dropped rather than fatal, unlike the wake word below. Saving a
+        // phrase the model cannot encode is refused now, and loading one drops
+        // it — but both of those need the model on disk, and it downloads after
+        // the settings file exists. A phrase that slipped through that window
+        // costs the user their second keyword; taking the wake word down with
+        // it would cost them the whole feature.
+        .filter(|phrase| match tokenizer.tokenize(phrase) {
+            Ok(_) => true,
+            Err(error) => {
+                eprintln!(
+                    "buzz-desktop: ambient stop phrase \"{phrase}\" cannot be armed ({error}); \
+                     starting with the wake word alone"
+                );
+                false
+            }
+        })
+        .map(str::to_string);
+    let mut phrases = vec![binding.wake_word.clone()];
+    phrases.extend(stop_phrase.clone());
     let keywords_buf = tokenizer
-        .keywords_buf(std::slice::from_ref(&binding.wake_word))
-        .map_err(|(phrase, error)| format!("wake word \"{phrase}\" cannot be used: {error}"))?;
+        .keywords_buf(&phrases)
+        .map_err(|(phrase, error)| format!("the phrase \"{phrase}\" cannot be used: {error}"))?;
 
     let destination_channel =
         publish::resolve_destination(state, &binding.agent_pubkey, binding.destination.as_deref())
@@ -632,6 +743,12 @@ async fn start_session(state: &AppState, settings: &AmbientVoiceSettings) -> Res
         .map_err(|_| "ambient destination is not a channel".to_string())?;
 
     let ambient = &state.ambient_voice;
+    // Before either backend is built, so the first attempt each makes is
+    // recorded against a clean slate rather than against the last session's.
+    ambient.speech_health.configure(
+        settings.stt.http_base_url().is_some(),
+        settings.tts.http_base_url().is_some(),
+    );
     let tts = start_ambient_tts(state, settings).await?;
 
     let (session, transcript_rx) = AmbientSession::new(AmbientSessionConfig {
@@ -639,9 +756,15 @@ async fn start_session(state: &AppState, settings: &AmbientVoiceSettings) -> Res
         stt_model_dir: stt_dir,
         stt_endpoint: settings.stt.http_base_url().map(str::to_string),
         keywords_buf,
+        stop_keyword: stop_phrase.as_deref().map(wake_word::engine_keyword),
+        stop_phrase,
+        silence_hold_ms: settings.silence_hold_ms,
+        stt_health: Arc::clone(&ambient.speech_health.stt),
         tts_active: Arc::clone(&ambient.tts_active),
         tts_cancel: Arc::clone(&ambient.tts_cancel),
         muted: Arc::clone(&ambient.muted),
+        mute_epochs: Arc::clone(&ambient.mute_epochs),
+        mute_authority: Arc::clone(&ambient.mute_authority),
         status: Arc::clone(&ambient.reported),
         on_status_change: worker_status_notifier(state),
         input_sample_rate: WORKLET_SAMPLE_RATE,
@@ -659,6 +782,8 @@ async fn start_session(state: &AppState, settings: &AmbientVoiceSettings) -> Res
         Arc::clone(&destination),
         publisher,
         Arc::clone(&ambient.generation),
+        Arc::clone(&ambient.mute_epochs),
+        Arc::clone(&ambient.mute_authority),
     );
 
     {
@@ -695,21 +820,53 @@ fn worker_status_notifier(state: &AppState) -> Option<session::AmbientStatusNoti
 }
 
 /// Drain transcripts and publish them, until the session generation moves.
+///
+/// Two authorities govern every transcript, and they answer different
+/// questions: the session generation says whether this *pipeline* is still the
+/// live one, and the transcript's own mute epoch says whether the *capture* it
+/// came from is still allowed to speak. Both are checked here on arrival,
+/// cheaply, because either can have moved while the transcript sat in this
+/// queue — and both are checked again at the egress boundary, under the mute
+/// authority ([`publish::DispatchGate`]), which is where each question is
+/// finally settled rather than merely asked.
+///
+/// The second look is the load-bearing one: the publisher awaits the guidelines
+/// POST and the relay admission gate in between, and either authority can move
+/// during that wait — a mute, or the `stop_session` behind the toggle, a huddle
+/// claiming the microphone and a settings change that rebuilds the session.
+/// Checking the generation at dequeue alone left that half unguarded, and a
+/// transcript already past it published words from a session the user had
+/// stopped. Both terms therefore live in the closure the gate re-evaluates
+/// under the authority — an extra unsynchronised load out here would only
+/// narrow the window, and a narrower window is still a window.
 fn spawn_publisher_task(
-    mut transcript_rx: tokio::sync::mpsc::Receiver<String>,
+    mut transcript_rx: tokio::sync::mpsc::Receiver<session::Transcript>,
     destination: Arc<AmbientDestination>,
     publisher: AmbientPublisher,
     generation: Arc<AtomicU64>,
+    mute_epochs: Arc<AtomicU64>,
+    mute_authority: Arc<Mutex<()>>,
 ) {
     let spawned_generation = generation.load(Ordering::Acquire);
     tauri::async_runtime::spawn(async move {
-        while let Some(text) = transcript_rx.recv().await {
+        while let Some(transcript) = transcript_rx.recv().await {
             if generation.load(Ordering::Acquire) != spawned_generation {
                 // The session was replaced or torn down; a transcript captured
                 // under the old configuration must not reach the new one.
                 break;
             }
-            destination.publish(&publisher, &text).await;
+            if !session::transcript_still_wanted(&mute_epochs, transcript.mute_epoch) {
+                // A mute landed while this transcript waited in the queue.
+                continue;
+            }
+            let still_wanted = || {
+                generation.load(Ordering::Acquire) == spawned_generation
+                    && session::transcript_still_wanted(&mute_epochs, transcript.mute_epoch)
+            };
+            let gate = publish::DispatchGate::new(&mute_authority, &still_wanted);
+            destination
+                .publish(&publisher, &transcript.text, &gate)
+                .await;
         }
     });
 }

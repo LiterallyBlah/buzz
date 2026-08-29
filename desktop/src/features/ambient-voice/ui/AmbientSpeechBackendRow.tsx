@@ -129,7 +129,13 @@ export function AmbientSpeechBackendRow({
       </SettingsOptionRow>
 
       {value.backend === "http" ? (
-        <div className="flex flex-col gap-1.5 px-4 pb-3">
+        // `pt-2` and not nothing: this block is inside the same divided row as
+        // the picker above it, so with no top padding the address field sits
+        // directly under the control that revealed it and reads as part of it.
+        <div
+          className="flex flex-col gap-1.5 px-4 pb-3 pt-2"
+          data-testid={`${testId}-address`}
+        >
           <div className="flex items-center gap-2">
             <Input
               aria-label={`${copy.label} server address`}

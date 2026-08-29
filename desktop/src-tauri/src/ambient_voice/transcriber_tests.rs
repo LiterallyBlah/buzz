@@ -21,6 +21,13 @@ use std::time::Duration;
 use super::*;
 use crate::ambient_voice::speech_stub_server::{StubReply, StubSpeechServer};
 
+/// A health handle configured as a running session's would be.
+fn health() -> Arc<RoleHealth> {
+    let health = Arc::new(RoleHealth::default());
+    health.configure(true);
+    health
+}
+
 const MODEL_DIR_ENV: &str = "BUZZ_AMBIENT_STT_MODEL_DIR";
 
 /// A second of quiet 16 kHz audio — enough to be a real upload.
@@ -36,7 +43,8 @@ fn a_configured_server_transcribes_the_utterance() {
     // server, what the user said comes back through it.
     let server = StubSpeechServer::always(StubReply::json(r#"{"text": "book me a room"}"#));
     let dir = tempfile::tempdir().expect("temp dir");
-    let transcriber = Transcriber::build(dir.path(), Some(server.base_url())).expect("transcriber");
+    let transcriber =
+        Transcriber::build(dir.path(), Some(server.base_url()), health()).expect("transcriber");
     assert!(
         matches!(transcriber, Transcriber::Http { local: None, .. }),
         "no speech model is installed here, so the server has no fallback to keep"
@@ -60,7 +68,8 @@ fn a_failing_server_with_nothing_to_fall_back_to_reports_the_failure() {
     // "listening for the wake word" as though nothing had been said.
     let server = StubSpeechServer::always(StubReply::status(502, "upstream is down"));
     let dir = tempfile::tempdir().expect("temp dir");
-    let transcriber = Transcriber::build(dir.path(), Some(server.base_url())).expect("transcriber");
+    let transcriber =
+        Transcriber::build(dir.path(), Some(server.base_url()), health()).expect("transcriber");
 
     let error = transcriber
         .transcribe(&utterance())
@@ -70,6 +79,69 @@ fn a_failing_server_with_nothing_to_fall_back_to_reports_the_failure() {
         error.contains("502"),
         "the server's own words survive: {error}"
     );
+}
+
+#[test]
+fn what_the_server_did_is_recorded_whether_or_not_anything_fell_back() {
+    // The fallback is deliberately quiet — the sentence still reaches the
+    // agent — and that quiet is exactly what left a user unable to tell a
+    // working server from a broken one. Nothing here changes the fallback; it
+    // records the server's own answer beside it, and the pill reads this.
+    let health = health();
+    let failing = StubSpeechServer::always(StubReply::status(502, "upstream is down"));
+    let dir = tempfile::tempdir().expect("temp dir");
+    let transcriber = Transcriber::build(dir.path(), Some(failing.base_url()), Arc::clone(&health))
+        .expect("transcriber");
+
+    let _ = transcriber.transcribe(&utterance());
+    let snapshot = health.snapshot_for_test();
+    assert!(snapshot.failing, "a 502 left the server looking healthy");
+    assert_eq!(snapshot.consecutive_failures, 1);
+    assert!(
+        snapshot
+            .last_error
+            .is_some_and(|error| error.contains("502")),
+        "the server's own words were not kept"
+    );
+
+    // And a server that answers clears it, so the line describes now rather
+    // than ever.
+    let answering = StubSpeechServer::always(StubReply::json(r#"{"text": "book me a room"}"#));
+    let transcriber =
+        Transcriber::build(dir.path(), Some(answering.base_url()), Arc::clone(&health))
+            .expect("transcriber");
+    transcriber.transcribe(&utterance()).expect("transcribe");
+    assert!(!health.snapshot_for_test().failing);
+}
+
+#[test]
+fn an_address_that_cannot_be_used_at_all_is_reported_like_any_other_failure() {
+    // A URL the client cannot even be pointed at is the *permanent* version of
+    // a failing server, and it was the one version nothing recorded: the
+    // request path is where failures are counted, and this never reaches it.
+    // The role sat at "configured, not failing" for the whole session while
+    // every utterance was quietly decoded on this computer.
+    for unusable in [
+        "not a url at all",
+        "speech.example:30120", // no scheme — the most common thing to type
+        "ftp://speech.example",
+    ] {
+        let health = health();
+        let dir = tempfile::tempdir().expect("temp dir");
+        // No speech model here either, so the session cannot start — what
+        // matters is that the answer was recorded before that was decided.
+        let _ = Transcriber::build(dir.path(), Some(unusable), Arc::clone(&health));
+
+        let snapshot = health.snapshot_for_test();
+        assert!(
+            snapshot.failing,
+            "{unusable:?} left the role looking healthy"
+        );
+        assert!(
+            snapshot.last_error.is_some(),
+            "{unusable:?} was recorded with nothing to explain it"
+        );
+    }
 }
 
 #[test]
@@ -94,7 +166,7 @@ fn an_address_that_cannot_be_used_keeps_the_session_on_the_local_model() {
     // installed there is nothing to degrade to, so the session start fails and
     // names both faults; the worker turns that into the error the pill shows.
     let dir = tempfile::tempdir().expect("temp dir");
-    let Err(error) = Transcriber::build(dir.path(), Some("speech.example:30120")) else {
+    let Err(error) = Transcriber::build(dir.path(), Some("speech.example:30120"), health()) else {
         panic!("a bare host:port with no model installed must not build a transcriber");
     };
     assert!(error.contains("must start with http"), "{error}");
@@ -109,7 +181,7 @@ fn no_endpoint_means_the_local_recogniser_and_its_absence_is_fatal() {
     // Unchanged M1 behaviour: with no server configured, a missing model is
     // the end of the session, and the worker reports it.
     let dir = tempfile::tempdir().expect("temp dir");
-    let Err(error) = Transcriber::build(dir.path(), None) else {
+    let Err(error) = Transcriber::build(dir.path(), None, health()) else {
         panic!("a session with neither a model nor a server must not start");
     };
     assert!(error.contains("speech-to-text model not found"), "{error}");
@@ -132,8 +204,8 @@ fn a_server_failure_is_answered_by_the_installed_recogniser() {
     // The whole of criterion (d) for STT, with a real model: the server is
     // configured and failing, and the utterance is still transcribed here.
     let server = StubSpeechServer::always(StubReply::status(503, "model is loading"));
-    let transcriber =
-        Transcriber::build(&model_dir_from_env(), Some(server.base_url())).expect("transcriber");
+    let transcriber = Transcriber::build(&model_dir_from_env(), Some(server.base_url()), health())
+        .expect("transcriber");
     assert!(
         matches!(transcriber, Transcriber::Http { local: Some(_), .. }),
         "the local recogniser must be kept even when a server is configured"

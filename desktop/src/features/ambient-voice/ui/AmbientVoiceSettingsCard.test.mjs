@@ -19,6 +19,7 @@ import { AMBIENT_STATE_CHANGED_EVENT } from "../lib/ambientVoiceApi.ts";
 import {
   ambientReport,
   deafAmbientReport,
+  failingSpeechServerReport,
   withAmbientDom,
 } from "../lib/ambientVoiceTestDom.mjs";
 
@@ -31,6 +32,8 @@ const SETTINGS = {
   ],
   stt: { backend: "local", endpointUrl: null },
   tts: { backend: "local", endpointUrl: null },
+  silenceHoldMs: 800,
+  stopPhrase: null,
   inputDeviceId: null,
   outputDevice: null,
   indicatorPosition: null,
@@ -47,6 +50,14 @@ const READY_ENDPOINT = {
   probedUrl: "http://speech.example:30120/v1/health/ready",
 };
 
+/** A `check_ambient_stop_phrase` answer: usable, as most phrases are. */
+const USABLE_STOP_PHRASE = {
+  valid: true,
+  message: null,
+  tokens: null,
+  checkedAgainstModel: true,
+};
+
 async function mountSettings(
   models,
   body,
@@ -54,11 +65,18 @@ async function mountSettings(
     report = ambientReport(),
     settings = SETTINGS,
     endpointCheck = READY_ENDPOINT,
+    stopPhraseCheck = USABLE_STOP_PHRASE,
+    // The settings `set_ambient_wake_binding` answers with. The native side
+    // reads the stored file itself, so its answer is the file as it now reads —
+    // by default the stored settings carrying the binding it was handed. A test
+    // about the native side changing something else in that file (a stop phrase
+    // dropped for clashing with the new wake word) supplies its own.
+    bindingSaveSettings = null,
   } = {},
 ) {
   await withAmbientDom(
     {
-      invoke: (command) => {
+      invoke: (command, args) => {
         switch (command) {
           case "get_ambient_voice_settings":
             return settings;
@@ -77,10 +95,27 @@ async function mountSettings(
               tokens: null,
               checkedAgainstModel: false,
             };
+          case "check_ambient_stop_phrase":
+            return stopPhraseCheck;
           case "check_speech_endpoint":
             return endpointCheck;
           case "set_ambient_voice_settings":
             return report;
+          case "set_ambient_wake_binding":
+            return {
+              settings: bindingSaveSettings ?? {
+                ...settings,
+                wakeBindings: [
+                  {
+                    wakeWord: args.wakeWord,
+                    agentPubkey: args.agentPubkey,
+                    destination: args.destination,
+                  },
+                  ...settings.wakeBindings.slice(1),
+                ],
+              },
+              status: report,
+            };
           default:
             throw new Error(`unexpected command: ${command}`);
         }
@@ -280,6 +315,371 @@ test("a session that fails after mount is shown here, not left as listening", as
   });
 });
 
+// ── The pause, and the phrase that skips it ──────────────────────────────────
+
+test("the pause slider renders bound to the stored hold", async () => {
+  await mountSettings(
+    READY_MODELS,
+    async ({ view }) => {
+      const slider = view.getByTestId("ambient-silence-hold");
+      assert.equal(slider.type, "range");
+      assert.equal(slider.min, "300");
+      assert.equal(slider.max, "10000");
+      assert.equal(slider.step, "100");
+      // Bound to the file, not to the default.
+      assert.equal(slider.value, "2500");
+      assert.equal(
+        view.getByTestId("ambient-silence-hold-value").textContent,
+        "2.5s",
+      );
+    },
+    { settings: { ...SETTINGS, silenceHoldMs: 2500 } },
+  );
+});
+
+test("a settings file with no stored hold shows the default rather than zero", async () => {
+  // What every existing install looks like: the key was added after this
+  // feature shipped, and the native side answers with its serde default. A
+  // slider that rendered `undefined` would post a broken value back on the
+  // first drag.
+  await mountSettings(
+    READY_MODELS,
+    async ({ view }) => {
+      assert.equal(view.getByTestId("ambient-silence-hold").value, "800");
+      assert.equal(
+        view.getByTestId("ambient-silence-hold-value").textContent,
+        "0.8s",
+      );
+    },
+    { settings: { ...SETTINGS, silenceHoldMs: 800 } },
+  );
+});
+
+test("moving the slider persists the hold once, when it is let go", async () => {
+  // Dragging reports every step. Persisting each one would post a settings
+  // write — and therefore a session restart, at two ONNX model loads — per
+  // pixel, so only the committed value is written.
+  await mountSettings(READY_MODELS, async ({ act, calls, testing, view }) => {
+    const slider = view.getByTestId("ambient-silence-hold");
+
+    await act(() => {
+      testing.fireEvent.change(slider, { target: { value: "1500" } });
+      testing.fireEvent.change(slider, { target: { value: "3200" } });
+    });
+    // The label follows the handle immediately …
+    assert.equal(
+      view.getByTestId("ambient-silence-hold-value").textContent,
+      "3.2s",
+    );
+    // … and nothing has been written yet.
+    assert.equal(
+      calls.filter((call) => call.command === "set_ambient_voice_settings")
+        .length,
+      0,
+    );
+
+    await act(() => {
+      testing.fireEvent.pointerUp(slider);
+    });
+    const saved = calls.filter(
+      (call) => call.command === "set_ambient_voice_settings",
+    );
+    assert.equal(saved.length, 1, "the hold was never persisted");
+    assert.equal(saved[0].args.settings.silenceHoldMs, 3200);
+    // The rest of the payload is carried through untouched.
+    assert.deepEqual(
+      saved[0].args.settings.wakeBindings,
+      SETTINGS.wakeBindings,
+    );
+    assert.equal(saved[0].args.settings.stopPhrase, null);
+  });
+});
+
+test("the stop phrase field renders bound to the stored phrase", async () => {
+  await mountSettings(
+    READY_MODELS,
+    async ({ view }) => {
+      assert.equal(view.getByTestId("ambient-stop-phrase").value, "buzz stop");
+    },
+    { settings: { ...SETTINGS, stopPhrase: "buzz stop" } },
+  );
+});
+
+test("a stop phrase the model cannot encode is never written to disk", async () => {
+  // The whole of F1 seen from the settings screen. "buzz stop." passes every
+  // shape check and the tokenizer refuses it, so before this the field saved
+  // it happily and the next session start failed with the wake word, the
+  // microphone and the transcript path going down with it.
+  const refused = {
+    valid: false,
+    message:
+      "Stop phrase: The wake-word model only understands unaccented English letters. It cannot hear: .",
+    tokens: null,
+    checkedAgainstModel: true,
+  };
+  await mountSettings(
+    READY_MODELS,
+    async ({ act, calls, testing, view }) => {
+      const field = view.getByTestId("ambient-stop-phrase");
+      await act(() => {
+        testing.fireEvent.change(field, { target: { value: "buzz stop." } });
+        testing.fireEvent.blur(field);
+      });
+
+      assert.equal(
+        calls.filter((call) => call.command === "set_ambient_voice_settings")
+          .length,
+        0,
+        "a phrase the model cannot encode reached the settings file",
+      );
+      // And the user is told why, in the validator's own words rather than a
+      // second wording of them.
+      assert.match(
+        view.getByTestId("ambient-stop-phrase-error").textContent,
+        /cannot hear/,
+      );
+    },
+    { stopPhraseCheck: refused },
+  );
+});
+
+test("a refused stop phrase does not hold the wake word hostage", async () => {
+  // A stop-phrase error is about the other field. The wake word goes to its
+  // own native command carrying the binding and nothing else, so a phrase
+  // sitting in its refused state has nothing to refuse — where a whole-settings
+  // write would have handed the save door the stored phrase along with the new
+  // wake word and had the lot rejected.
+  const refused = {
+    valid: false,
+    message: "Stop phrase: The wake-word model cannot hear: 7",
+    tokens: null,
+    checkedAgainstModel: true,
+  };
+  await mountSettings(
+    READY_MODELS,
+    async ({ act, calls, testing, view }) => {
+      const field = view.getByTestId("ambient-wake-word");
+      await act(() => {
+        testing.fireEvent.change(field, { target: { value: "okay hermes" } });
+      });
+      // Let both debounced checks land: the wake word's (valid) and the
+      // loaded stop phrase's (refused). Blur is the commit, and it must see
+      // the refusal on screen for this test to mean anything. The wait is a
+      // plain awaited timeout OUTSIDE `act`: wrapping it in `act(async …)`
+      // returns instantly and the debounce never elapses.
+      const before = Date.now();
+      await new Promise((resolve) => setTimeout(resolve, 500));
+      await act(() => {});
+      assert.ok(
+        Date.now() - before >= 450,
+        `the debounce wait was skipped (${Date.now() - before}ms)`,
+      );
+      assert.match(
+        view.getByTestId("ambient-stop-phrase-error").textContent,
+        /cannot hear/,
+      );
+      await act(() => {
+        testing.fireEvent.blur(field);
+      });
+
+      const saved = calls.filter(
+        (call) => call.command === "set_ambient_wake_binding",
+      );
+      assert.equal(saved.length, 1, "the wake word was never persisted");
+      // The binding fields, and only them: no settings object goes over this
+      // wire, so nothing else in the file is re-validated or re-written.
+      assert.deepEqual(saved[0].args, {
+        wakeWord: "okay hermes",
+        agentPubkey: "a".repeat(64),
+        destination: null,
+      });
+      assert.equal(
+        calls.filter((call) => call.command === "set_ambient_voice_settings")
+          .length,
+        0,
+        "the wake word was still saved by re-posting the whole settings file",
+      );
+    },
+    {
+      settings: { ...SETTINGS, stopPhrase: "buzz 7" },
+      stopPhraseCheck: refused,
+    },
+  );
+});
+
+test("a wake word equal to the stored stop phrase saves, and the phrase goes", async () => {
+  // The reviewer's reproducer, end to end. Stored: "hey hermes" bound, "buzz
+  // stop" as the stop phrase; the user types "buzz stop" as their wake word.
+  // Both fields cannot arm the same keyword, and the whole write used to be
+  // refused for it — so the wake word never persisted, and the field that
+  // would have resolved the clash was the one that could not be saved.
+  //
+  // The wake word is the primary control, so the phrase yields natively
+  // (`a_wake_word_that_clashes_with_the_stored_stop_phrase_still_saves` pins
+  // the file side). What this covers is the half only the card can: the answer
+  // is a readback, and the field showing a phrase that is no longer on disk
+  // must empty.
+  const clash = {
+    valid: false,
+    message: "The stop phrase must be different from the wake word",
+    tokens: null,
+    checkedAgainstModel: true,
+  };
+  await mountSettings(
+    READY_MODELS,
+    async ({ act, calls, testing, view }) => {
+      assert.equal(view.getByTestId("ambient-stop-phrase").value, "buzz stop");
+
+      const field = view.getByTestId("ambient-wake-word");
+      await act(() => {
+        testing.fireEvent.change(field, { target: { value: "buzz stop" } });
+      });
+      const before = Date.now();
+      await new Promise((resolve) => setTimeout(resolve, 500));
+      await act(() => {});
+      assert.ok(
+        Date.now() - before >= 450,
+        `the debounce wait was skipped (${Date.now() - before}ms)`,
+      );
+      assert.match(
+        view.getByTestId("ambient-stop-phrase-error").textContent,
+        /different from the wake word/,
+      );
+
+      await act(() => {
+        testing.fireEvent.blur(field);
+      });
+
+      const saved = calls.filter(
+        (call) => call.command === "set_ambient_wake_binding",
+      );
+      assert.equal(saved.length, 1, "the clash blocked the wake word again");
+      assert.deepEqual(saved[0].args, {
+        wakeWord: "buzz stop",
+        agentPubkey: "a".repeat(64),
+        destination: null,
+      });
+      // The readback, on screen: the stop phrase the native side dropped is
+      // gone from the field, and with it the error explaining the clash.
+      assert.equal(view.getByTestId("ambient-stop-phrase").value, "");
+      assert.equal(view.queryByTestId("ambient-stop-phrase-error"), null);
+    },
+    {
+      settings: { ...SETTINGS, stopPhrase: "buzz stop" },
+      stopPhraseCheck: clash,
+      // What the native side answers with: the binding written, the clashing
+      // phrase dropped.
+      bindingSaveSettings: {
+        ...SETTINGS,
+        wakeBindings: [
+          {
+            wakeWord: "buzz stop",
+            agentPubkey: "a".repeat(64),
+            destination: null,
+          },
+        ],
+        stopPhrase: null,
+      },
+    },
+  );
+});
+
+test("clearing a stop phrase works even once it would be refused", async () => {
+  // The way out. A phrase on disk that has stopped being valid — because the
+  // wake word was edited to match it, or because it predates the check — must
+  // still be removable, or the field becomes a trap.
+  await mountSettings(
+    READY_MODELS,
+    async ({ act, calls, testing, view }) => {
+      const field = view.getByTestId("ambient-stop-phrase");
+      await act(() => {
+        testing.fireEvent.change(field, { target: { value: "" } });
+        testing.fireEvent.blur(field);
+      });
+
+      const saved = calls.filter(
+        (call) => call.command === "set_ambient_voice_settings",
+      );
+      assert.equal(saved.length, 1, "the stop phrase could not be cleared");
+      assert.equal(saved[0].args.settings.stopPhrase, null);
+    },
+    {
+      settings: { ...SETTINGS, stopPhrase: "buzz stop." },
+      stopPhraseCheck: {
+        valid: false,
+        message: "Stop phrase: It cannot hear: .",
+        tokens: null,
+        checkedAgainstModel: true,
+      },
+    },
+  );
+});
+
+test("an empty stop phrase field is how the feature is switched off", async () => {
+  await mountSettings(READY_MODELS, async ({ view }) => {
+    assert.equal(view.getByTestId("ambient-stop-phrase").value, "");
+  });
+});
+
+test("a stop phrase typed into the field is saved trimmed", async () => {
+  await mountSettings(READY_MODELS, async ({ act, calls, testing, view }) => {
+    const field = view.getByTestId("ambient-stop-phrase");
+    await act(() => {
+      testing.fireEvent.change(field, { target: { value: "  that's all  " } });
+      testing.fireEvent.blur(field);
+    });
+
+    const saved = calls.filter(
+      (call) => call.command === "set_ambient_voice_settings",
+    );
+    assert.equal(saved.length, 1, "the stop phrase was never persisted");
+    assert.equal(saved[0].args.settings.stopPhrase, "that's all");
+    // And nothing else moved: the hold and the binding are what they were.
+    assert.equal(saved[0].args.settings.silenceHoldMs, 800);
+    assert.deepEqual(
+      saved[0].args.settings.wakeBindings,
+      SETTINGS.wakeBindings,
+    );
+  });
+});
+
+test("clearing the stop phrase writes null rather than an empty string", async () => {
+  // `null` is what an install that never set one has, so clearing has to land
+  // back on the same file rather than on a second representation of "none".
+  await mountSettings(
+    READY_MODELS,
+    async ({ act, calls, testing, view }) => {
+      const field = view.getByTestId("ambient-stop-phrase");
+      await act(() => {
+        testing.fireEvent.change(field, { target: { value: "   " } });
+        testing.fireEvent.blur(field);
+      });
+      const saved = calls.filter(
+        (call) => call.command === "set_ambient_voice_settings",
+      );
+      assert.equal(saved.length, 1);
+      assert.equal(saved[0].args.settings.stopPhrase, null);
+    },
+    { settings: { ...SETTINGS, stopPhrase: "buzz stop" } },
+  );
+});
+
+test("leaving either field untouched writes nothing at all", async () => {
+  // Every write restarts the session. Blurring a field the user only looked at
+  // must not cost them two ONNX model loads.
+  await mountSettings(READY_MODELS, async ({ act, calls, testing, view }) => {
+    await act(() => {
+      testing.fireEvent.blur(view.getByTestId("ambient-stop-phrase"));
+      testing.fireEvent.pointerUp(view.getByTestId("ambient-silence-hold"));
+    });
+    assert.equal(
+      calls.filter((call) => call.command === "set_ambient_voice_settings")
+        .length,
+      0,
+    );
+  });
+});
+
 // ── Speech backends ──────────────────────────────────────────────────────────
 
 /** Settings with speech-to-text pointed at a server. */
@@ -325,6 +725,30 @@ test("a role pointed at a server shows the address and names what is sent there"
       assert.match(hint, /wake word itself is always heard on this computer/);
       // The other role is untouched by the first one's choice.
       assert.equal(view.queryByTestId("ambient-speech-tts-url"), null);
+    },
+    { settings: SERVER_STT },
+  );
+});
+
+test("the address field is set off from the picker that revealed it", async () => {
+  // The address block lives inside the same divided row as its picker, so
+  // without top padding the field sits flush against the control above and
+  // reads as part of it. jsdom loads no Tailwind, so the class is the only
+  // thing on the element that can be asserted; the value it carries is what
+  // the reviewer sees on screen.
+  await mountSettings(
+    READY_MODELS,
+    async ({ view }) => {
+      for (const role of ["stt", "tts"]) {
+        const block = view.queryByTestId(`ambient-speech-${role}-address`);
+        if (!block) continue;
+        assert.match(
+          block.className,
+          /\bpt-\d/,
+          `the ${role} address block has no top padding`,
+        );
+      }
+      assert.ok(view.getByTestId("ambient-speech-stt-address"));
     },
     { settings: SERVER_STT },
   );
@@ -427,4 +851,30 @@ test("an address typed into the field is saved in the shape the native side read
       },
     },
   );
+});
+
+test("a speech server that has stopped answering is named under the status", async () => {
+  // The feature keeps working when a server fails — the utterance falls back
+  // to this computer, the reply is still on screen — and until now that was
+  // the whole of it: the address sat in this section looking like it was in
+  // use, and nothing anywhere said otherwise.
+  await mountSettings(
+    READY_MODELS,
+    async ({ view }) => {
+      const line = view.getByTestId("ambient-speech-health");
+      assert.match(line.textContent, /Speech-to-text server is not answering/);
+      assert.match(line.textContent, /connection refused/);
+      // Said as a problem, not as another grey diagnostic line.
+      assert.match(line.className, /destructive/);
+    },
+    { report: failingSpeechServerReport() },
+  );
+});
+
+test("nothing is said about speech servers when none is failing", async () => {
+  // The control: a standing "servers OK" row would be furniture, and this
+  // section already lists the addresses.
+  await mountSettings(READY_MODELS, async ({ view }) => {
+    assert.equal(view.queryByTestId("ambient-speech-health"), null);
+  });
 });

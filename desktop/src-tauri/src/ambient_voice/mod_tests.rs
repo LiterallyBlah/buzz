@@ -164,12 +164,21 @@ fn a_settings_save_cannot_flip_mute_or_enablement() {
     // unmuting from the indicator never stuck, and a save from an open
     // settings page could silently re-open the microphone after the user had
     // switched the feature off.
-    let current = AmbientVoiceSettings {
+    //
+    // The wake binding is held back for the same reason and was not, which is
+    // the rollback `a_stale_full_settings_save_cannot_undo_a_wake_word_saved_beside_it`
+    // pins against the file. The two wake words below differ on purpose: with
+    // the same phrase on both sides this assertion passes whichever object the
+    // merge took it from, and proves nothing.
+    let mut current = AmbientVoiceSettings {
         enabled: true,
         muted: false,
         ..bound(true)
     };
-    // What a card mounted before the user unmuted would send back.
+    // What the user just saved through the binding's own save door.
+    current.wake_bindings[0].wake_word = "okay hermes".to_string();
+    // What a card mounted before the user unmuted — and before that binding
+    // write — would send back.
     let stale = AmbientVoiceSettings {
         enabled: false,
         muted: true,
@@ -188,9 +197,12 @@ fn a_settings_save_cannot_flip_mute_or_enablement() {
         merged.enabled,
         "a stale save re-asserted enablement: {merged:?} (current {current:?})"
     );
-    // Everything else in the payload is still the client's to set.
+    assert_eq!(
+        merged.wake_bindings, current.wake_bindings,
+        "a stale save carried a wake binding back: {merged:?} (current {current:?})"
+    );
+    // Everything that has no door of its own is still the client's to set.
     assert_eq!(merged.input_device_id.as_deref(), Some("mic-abc"));
-    assert_eq!(merged.wake_bindings, stale.wake_bindings);
     assert_eq!(merged.version, settings::CURRENT_VERSION);
 
     // And the mirror case: a card that mounted while unmuted and enabled must
@@ -212,6 +224,43 @@ fn a_settings_save_cannot_flip_mute_or_enablement() {
         !merged.enabled,
         "a stale save re-enabled capture: {merged:?}"
     );
+}
+
+#[test]
+fn a_stop_phrase_is_checked_against_the_wake_word_the_save_door_will_see() {
+    // The settings card checks a stop phrase against the wake-word field as it
+    // is typed, and then posts the phrase over the settings object it loaded —
+    // so an edited but unsaved wake word is not what `save_to_path` validates
+    // against. Asking about the field alone called this phrase valid and let
+    // the save refuse it, with an error naming a wake word that was no longer
+    // anywhere on the screen.
+    let saved = Some("hey hermes");
+    let refused = stop_phrase_check("hey hermes", "hey buzz", saved, None);
+    assert!(!refused.valid, "{refused:?}");
+    let message = refused.message.unwrap_or_default();
+    assert!(
+        message.contains("hey hermes"),
+        "the clash names no wake word the user can act on: {message}"
+    );
+
+    // The field is still asked, and a phrase that clashes with neither wake
+    // word is still valid.
+    assert!(!stop_phrase_check("hey buzz", "hey buzz", saved, None).valid);
+    assert!(stop_phrase_check("that is all", "hey buzz", saved, None).valid);
+
+    // Nothing saved yet — a wake word being entered for the first time — and
+    // the field is the only wake word there is.
+    assert!(!stop_phrase_check("hey buzz", "hey buzz", None, None).valid);
+    assert!(stop_phrase_check("that is all", "hey buzz", None, None).valid);
+
+    // A saved wake word the user has not touched must not be reported twice
+    // over, and an empty phrase is how the feature is switched off.
+    let same = stop_phrase_check("hey hermes", "hey hermes", saved, None);
+    assert_eq!(
+        same.message.unwrap_or_default(),
+        "The stop phrase must be different from the wake word"
+    );
+    assert!(stop_phrase_check("", "hey buzz", saved, None).valid);
 }
 
 #[test]
@@ -319,6 +368,58 @@ fn a_speech_backend_change_restarts_the_running_session() {
     assert!(!session_needs_restart(
         Some(&SessionConfig::of(&remembered)),
         &remembered
+    ));
+}
+
+#[test]
+fn the_silence_hold_and_the_stop_phrase_restart_the_running_session() {
+    // Both are bound once, when the worker thread starts: the capture machine
+    // derives its limits from the hold at construction, and the stop phrase is
+    // tokenised into the keyword payload the spotter is created with. Without
+    // these in the recorded configuration, a slider moved or a phrase typed
+    // while ambient voice was running would take effect only after the whole
+    // feature was switched off and on again — exactly the defect that put the
+    // wake word in here.
+    let running = bound(true);
+    let started_with = SessionConfig::of(&running);
+    assert!(!session_needs_restart(Some(&started_with), &running));
+
+    let held_longer = AmbientVoiceSettings {
+        silence_hold_ms: 2_500,
+        ..running.clone()
+    };
+    assert!(session_needs_restart(Some(&started_with), &held_longer));
+
+    let with_stop = AmbientVoiceSettings {
+        stop_phrase: Some("buzz stop".to_string()),
+        ..running.clone()
+    };
+    assert!(session_needs_restart(Some(&started_with), &with_stop));
+
+    // Changing the phrase is a different keyword set again, and clearing it
+    // means the second keyword must come back off the spotter.
+    let rephrased = AmbientVoiceSettings {
+        stop_phrase: Some("that is all".to_string()),
+        ..running.clone()
+    };
+    assert!(session_needs_restart(
+        Some(&SessionConfig::of(&with_stop)),
+        &rephrased
+    ));
+    assert!(session_needs_restart(
+        Some(&SessionConfig::of(&with_stop)),
+        &running
+    ));
+
+    // Whitespace the user left around the phrase is not a new keyword set, and
+    // must not cost them two ONNX model loads while they are typing.
+    let padded = AmbientVoiceSettings {
+        stop_phrase: Some("  buzz stop  ".to_string()),
+        ..running.clone()
+    };
+    assert!(!session_needs_restart(
+        Some(&SessionConfig::of(&with_stop)),
+        &padded
     ));
 }
 
@@ -609,6 +710,7 @@ fn the_status_report_serialises_with_the_keys_the_frontend_reads() {
         "msSinceLastAudio",
         "webviewCapture",
         "launch",
+        "speechBackends",
     ] {
         assert!(value.get(key).is_some(), "missing {key} in {value}");
     }
@@ -619,6 +721,82 @@ fn the_status_report_serialises_with_the_keys_the_frontend_reads() {
         Some(&serde_json::Value::Null)
     );
     assert_eq!(value.get("audioStale"), Some(&serde_json::json!(false)));
+}
+
+#[test]
+fn a_wake_binding_save_answers_in_the_shape_the_settings_card_reads() {
+    // The card takes two things off this answer: the settings it now shows
+    // (the stop phrase among them, which this write may have dropped) and the
+    // status report every other write returns. A frontend written against an
+    // invented shape renders nothing and nothing fails — which here would mean
+    // the card going on displaying a stop phrase that is no longer on disk.
+    // `AmbientWakeBindingSaved` in `ambientVoiceApi.ts` changes with this test.
+    let state = crate::app_state::build_app_state();
+    let saved = AmbientWakeBindingSaved {
+        settings: bound(true),
+        status: build_report(&state).expect("report"),
+    };
+    let value = serde_json::to_value(&saved).expect("json");
+    assert_eq!(
+        value["settings"]["wakeBindings"][0]["wakeWord"],
+        "hey hermes"
+    );
+    assert_eq!(value["settings"]["wakeBindings"][0]["agentPubkey"], AGENT);
+    assert!(
+        value["settings"]["stopPhrase"].is_null(),
+        "the card reads the phrase off this answer: {value}"
+    );
+    assert_eq!(value["status"]["muted"], serde_json::json!(false));
+    assert!(value["status"]["status"].is_object() || value["status"]["status"].is_string());
+}
+
+#[test]
+fn the_speech_backend_health_serialises_in_the_shape_the_frontend_parses() {
+    // The labels bug in its other form: a frontend written against an invented
+    // shape renders nothing and nothing fails, which for this field means the
+    // app goes back to hiding a server that is down. Pinned from the producing
+    // side; `AmbientSpeechHealth` in `ambientVoiceApi.ts` and the fixtures in
+    // `ambientVoiceTestDom.mjs` change with it.
+    let state = crate::app_state::build_app_state();
+    let health = &state.ambient_voice.speech_health;
+    health.configure(true, true);
+    health
+        .stt
+        .failed("speech server answered HTTP 502: gateway");
+
+    let value = serde_json::to_value(build_report(&state).expect("report")).expect("json");
+    assert_eq!(
+        value.get("speechBackends"),
+        Some(&serde_json::json!({
+            "stt": {
+                "configured": true,
+                "failing": true,
+                "consecutiveFailures": 1,
+                "lastError": "speech server answered HTTP 502: gateway",
+            },
+            "tts": {
+                "configured": true,
+                "failing": false,
+                "consecutiveFailures": 0,
+                "lastError": null,
+            },
+        }))
+    );
+}
+
+#[test]
+fn nothing_configured_reports_no_speech_server_trouble() {
+    // The default, and the shape of every settings file that has never named a
+    // server: two roles on this computer, nothing that can be down.
+    let state = crate::app_state::build_app_state();
+    let value = serde_json::to_value(build_report(&state).expect("report")).expect("json");
+    assert_eq!(
+        value.get("speechBackends"),
+        Some(&serde_json::json!({
+            "stt": { "configured": false, "failing": false, "consecutiveFailures": 0, "lastError": null },
+            "tts": { "configured": false, "failing": false, "consecutiveFailures": 0, "lastError": null },
+        }))
+    );
 }
 
 #[test]

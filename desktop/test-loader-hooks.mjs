@@ -65,6 +65,21 @@ const stubModules = new Map([
 
 const STUB_URL_PREFIX = "buzz-test-stub:";
 
+// The real ForumComposer mounts TipTap, which never releases its jsdom
+// handles and hangs the node:test process, so tests that render the projects
+// panels need it stubbed. The stub lives here rather than in the test file
+// because a `module.registerHooks` sync hook in front of this async chain
+// makes Node 22 reject every uncached CommonJS module loaded after it
+// registers (the chain's `source: null` answer fails the sync validator);
+// upstream CI runs Node 24, where the interop works, and never sees it.
+// Scoped by importer so anything outside the projects feature — including a
+// future test of the composer itself — still gets the real component.
+const FORUM_COMPOSER_SPECIFIER = "@/features/forum/ui/ForumComposer";
+const FORUM_COMPOSER_STUB_URL = "buzz-test-stub-scoped:ForumComposer";
+const FORUM_COMPOSER_STUB_SOURCE =
+  "globalThis.__FORUM_COMPOSER_STUBBED__ = true;\n" +
+  "export function ForumComposer() { return null; }\n";
+
 // Vite resolves asset imports (`./logo.png`, `./logo.png?inline`) to a URL or
 // base64 string at bundle time; node's ESM resolver has no such loader and
 // throws on the query suffix. Serve an inert string so components that embed
@@ -84,6 +99,12 @@ export function resolve(specifier, context, nextResolve) {
       shortCircuit: true,
       url: `${STUB_URL_PREFIX}${specifier}`,
     };
+  }
+  if (
+    specifier === FORUM_COMPOSER_SPECIFIER &&
+    context.parentURL?.includes("/src/features/projects/")
+  ) {
+    return { shortCircuit: true, url: FORUM_COMPOSER_STUB_URL };
   }
   if (specifier === "@features-manifest") {
     const resolved = path.join(repoRoot, "preview-features.json");
@@ -142,6 +163,14 @@ export async function load(url, context, nextLoad) {
       format: "module",
       shortCircuit: true,
       source: stubModules.get(url.slice(STUB_URL_PREFIX.length)) ?? "",
+    };
+  }
+
+  if (url === FORUM_COMPOSER_STUB_URL) {
+    return {
+      format: "module",
+      shortCircuit: true,
+      source: FORUM_COMPOSER_STUB_SOURCE,
     };
   }
 

@@ -9,8 +9,10 @@
 //!       ├─ sherpa-onnx KeywordSpotter   (ALWAYS fed, including during TTS)
 //!       │     on fire → cancel TTS (barge-in) → arm the utterance machine
 //!       └─ earshot VAD → UtteranceMachine (gated while TTS plays)
-//!             on decode → Transcriber → transcript
-//!                         (sherpa-onnx Parakeet here, or a speech server)
+//!             on chunk  → RollingCapture — hand off, keep capturing
+//!             on decode → RollingCapture — hand off the last chunk, wait,
+//!                         stitch  [ambient-voice-transcriber thread:
+//!                         sherpa-onnx Parakeet here, or a speech server]
 //!   → transcript_tx  [tokio mpsc]
 //!   → publisher task → kind:9 to the bound agent's destination
 //! ```
@@ -40,9 +42,25 @@ use std::{
 
 use tokio::sync::mpsc as tokio_mpsc;
 
+use super::rolling::RollingCapture;
 use super::status::AmbientStatus;
 use super::transcriber::Transcriber;
-use super::utterance::{FrameOutcome, UtteranceMachine, VAD_FRAME_SAMPLES};
+use super::utterance::{FrameOutcome, UtteranceMachine, UtteranceTiming, VAD_FRAME_SAMPLES};
+
+// The mute fence is a file of its own ([`super::capture_authority`]) — it is one
+// argument, and reading it in one place is the point. It is re-exported here
+// because it is the worker's fence: every caller outside it, in `mod.rs` and in
+// `publish`, already names it through `session`, and where an item lives is not
+// a reason to move their call sites.
+pub(super) use super::capture_authority::{abandon_capture, finish_capture};
+pub(crate) use super::capture_authority::{
+    apply_mute, transcript_still_wanted, CaptureEpoch, MuteSignal, Transcript,
+};
+// The close that calls this went with the fence; what is left here is the test
+// pinning what the indicator shows afterwards, so the name is re-exported only
+// where that test can see it.
+#[cfg(test)]
+pub(super) use super::capture_authority::status_after_decode;
 
 /// Bounded audio queue capacity — same shape and reasoning as `huddle::stt`:
 /// 100 ms batches at 48 kHz ≈ 19 KB each, so 50 slots ≈ 5 s / ~1 MB.
@@ -143,8 +161,38 @@ impl StatusSink {
 ///
 /// Written from the audio thread and read from command threads, so it is
 /// atomics rather than a mutex: a status report must never be able to block the
-/// worker, and a millisecond of skew between the two fields cannot matter to a
-/// five-second staleness window.
+/// worker, and a millisecond of skew between the fields cannot matter to a
+/// five-second staleness window. Every write is made by the worker thread
+/// alone, so the fields cannot interleave with each other.
+///
+/// ## Why transcription time is subtracted
+///
+/// The worker is a single loop: while it *waits* for an utterance to come back
+/// as text it is not draining its audio queue, and with speech-to-text pointed
+/// at a server that wait is a network round trip which runs to the budget
+/// `super::speech_http` gives it — ten seconds for a short utterance and longer
+/// for a long one — before the local fallback even starts. Measured naively, an
+/// ordinary utterance through a slow server therefore reads as five seconds of
+/// nothing arriving — so the pill claimed "No audio arriving from the
+/// microphone" and the webview's watchdog rebuilt the whole capture pipeline,
+/// once per utterance, against a microphone that was working perfectly.
+///
+/// What the watchdog needs to know is whether the worker is *starved*, not
+/// whether time has passed, so the time the worker spent doing its own work is
+/// excluded. The audio the webview pushed meanwhile is not lost: it waits in
+/// the bounded queue and is stamped when the worker takes it.
+///
+/// ## What the mark must not cover
+///
+/// Decoding happens on its own thread now ([`super::rolling`]), and the mark
+/// follows the *worker*, not the decoder. A chunk handed off mid-capture is
+/// transcribed while the worker goes on draining its queue, so nothing is
+/// marked for it and nothing needs to be: every batch the worker takes calls
+/// [`AudioFlow::record`], which restamps the clock this measures from. Marking
+/// a rolling capture busy would be the opposite mistake to the one above — it
+/// would subtract minutes of a genuinely fed session's time, and a microphone
+/// that died mid-conversation would never be reported at all. Only
+/// [`finish_capture`]'s wait, where the worker really is blocked, is marked.
 #[derive(Debug)]
 pub struct AudioFlow {
     started_at: Instant,
@@ -153,6 +201,16 @@ pub struct AudioFlow {
     /// arrives, which is why `batches` is what distinguishes "none yet" from
     /// "one arrived in the first millisecond".
     last_batch_ms: AtomicU64,
+    /// Milliseconds the worker has spent inside finished transcriptions since
+    /// the last batch arrived. Reset by [`AudioFlow::record`]: a batch that has
+    /// arrived settles the starvation question on its own.
+    busy_since_last_batch_ms: AtomicU64,
+    /// When the transcription now in flight started, as milliseconds from
+    /// `started_at` **plus one**; `0` means none is. The offset is what keeps a
+    /// transcription that began in the session's first millisecond from reading
+    /// as "not transcribing", in one atomic rather than two that could be read
+    /// out of step.
+    transcribing_since_ms: AtomicU64,
 }
 
 /// One read of [`AudioFlow`], for one status report.
@@ -160,9 +218,13 @@ pub struct AudioFlow {
 pub struct AudioFlowSnapshot {
     /// Batches the worker has taken off the queue since the session started.
     pub batches: u64,
-    /// Since the last batch reached the worker — or since the session started,
-    /// when none ever has. The session start is the right zero point: a session
-    /// that has never been fed is precisely the state being watched for.
+    /// How long the worker has been free to receive audio and received none —
+    /// since the last batch, or since the session started when none ever
+    /// arrived. The session start is the right zero point: a session that has
+    /// never been fed is precisely the state being watched for.
+    ///
+    /// Time the worker spent transcribing is not counted, because during it the
+    /// worker was not listening to the queue at all. See [`AudioFlow`].
     pub since_last_batch: Duration,
 }
 
@@ -172,26 +234,101 @@ impl AudioFlow {
             started_at: Instant::now(),
             batches: AtomicU64::new(0),
             last_batch_ms: AtomicU64::new(0),
+            busy_since_last_batch_ms: AtomicU64::new(0),
+            transcribing_since_ms: AtomicU64::new(0),
         }
+    }
+
+    fn elapsed_ms(&self) -> u64 {
+        self.started_at.elapsed().as_millis() as u64
     }
 
     /// Record that `batches` arrived from the webview, now.
     fn record(&self, batches: u64) {
         self.batches.fetch_add(batches, Ordering::Release);
-        self.last_batch_ms.store(
-            self.started_at.elapsed().as_millis() as u64,
-            Ordering::Release,
-        );
+        self.busy_since_last_batch_ms.store(0, Ordering::Release);
+        self.last_batch_ms
+            .store(self.elapsed_ms(), Ordering::Release);
+    }
+
+    /// Mark the worker busy until the returned guard is dropped.
+    ///
+    /// A guard rather than a matching call because the mark is what switches
+    /// the staleness watchdog off: an exit that skipped the closing call —
+    /// an unwind out of the recogniser, a `?` added to the block later —
+    /// would leave `transcribing_since_ms` set for the life of the session,
+    /// and `starved_ms` would answer "not starved" forever. The watchdog
+    /// would be off with nothing to show that it was.
+    pub(super) fn transcribing(&self) -> Transcribing<'_> {
+        self.begin_transcription();
+        Transcribing { flow: self }
+    }
+
+    /// The worker is about to block on turning an utterance into text.
+    fn begin_transcription(&self) {
+        self.transcribing_since_ms
+            .store(self.elapsed_ms() + 1, Ordering::Release);
+    }
+
+    /// It has finished, however it went.
+    fn end_transcription(&self) {
+        let started = self.transcribing_since_ms.swap(0, Ordering::AcqRel);
+        if started == 0 {
+            return;
+        }
+        let spent = self.elapsed_ms().saturating_sub(started - 1);
+        self.busy_since_last_batch_ms
+            .fetch_add(spent, Ordering::Release);
     }
 
     pub fn snapshot(&self) -> AudioFlowSnapshot {
-        let elapsed = self.started_at.elapsed().as_millis() as u64;
-        let last_batch_ms = self.last_batch_ms.load(Ordering::Acquire);
         AudioFlowSnapshot {
             batches: self.batches.load(Ordering::Acquire),
-            since_last_batch: Duration::from_millis(elapsed.saturating_sub(last_batch_ms)),
+            since_last_batch: Duration::from_millis(starved_ms(
+                self.elapsed_ms(),
+                self.last_batch_ms.load(Ordering::Acquire),
+                self.busy_since_last_batch_ms.load(Ordering::Acquire),
+                self.transcribing_since_ms.load(Ordering::Acquire),
+            )),
         }
     }
+}
+
+/// Held for as long as the worker is inside a transcription.
+///
+/// Its whole job is the `Drop`: however the transcription ends, the mark comes
+/// off with it.
+pub(super) struct Transcribing<'a> {
+    flow: &'a AudioFlow,
+}
+
+impl Drop for Transcribing<'_> {
+    fn drop(&mut self) {
+        self.flow.end_transcription();
+    }
+}
+
+/// How long the worker has gone without audio while it was free to receive it.
+///
+/// Pure, with the clock passed in, so every edge is testable without sleeping:
+/// nothing transcribed, a transcription still in flight, one that has finished,
+/// and the impossible orderings a torn read could produce. Saturating
+/// throughout — the answer is a duration, and no combination of reads may
+/// produce a longer one than the session has existed for.
+fn starved_ms(
+    now_ms: u64,
+    last_batch_ms: u64,
+    busy_since_last_batch_ms: u64,
+    transcribing_since_ms: u64,
+) -> u64 {
+    let in_flight = match transcribing_since_ms {
+        0 => 0,
+        started => now_ms.saturating_sub(started - 1),
+    };
+    now_ms
+        .saturating_sub(last_batch_ms)
+        .saturating_sub(busy_since_last_batch_ms)
+        .saturating_sub(in_flight)
 }
 
 /// A running ambient session.
@@ -203,6 +340,8 @@ pub struct AmbientSession {
     audio_tx: SyncSender<Vec<u8>>,
     shutdown: Arc<AtomicBool>,
     muted: Arc<AtomicBool>,
+    mute_epochs: Arc<AtomicU64>,
+    mute_authority: Arc<Mutex<()>>,
     status: Arc<Mutex<AmbientStatus>>,
     flow: Arc<AudioFlow>,
     thread: Option<thread::JoinHandle<()>>,
@@ -220,13 +359,38 @@ pub struct AmbientSessionConfig {
     pub stt_endpoint: Option<String>,
     /// Pre-validated, pre-tokenised keyword payload. **Must** come from
     /// [`super::wake_word::WakeWordTokenizer::keywords_buf`] — raw text here
-    /// kills the process.
+    /// kills the process. Carries the wake word and, when one is configured,
+    /// the stop phrase: both are armed on this one spotter.
     pub keywords_buf: String,
+    /// Which of the armed keywords ends a capture rather than starting one, in
+    /// the form the engine reports (see
+    /// [`super::wake_word::engine_keyword`]). `None` when no stop phrase is
+    /// configured, in which case every detection is a wake word.
+    pub stop_keyword: Option<String>,
+    /// The phrase as the user typed it, for trimming it back out of the
+    /// transcript it inevitably ends up in.
+    pub stop_phrase: Option<String>,
+    /// How long a pause closes an utterance, in milliseconds.
+    pub silence_hold_ms: u32,
+    /// Where the speech server's answers are recorded when this session runs
+    /// speech-to-text on one, so a server that is failing softly is visible
+    /// rather than only on stderr.
+    pub stt_health: Arc<super::speech_health::RoleHealth>,
     /// Shared with the ambient TTS pipeline: true while it is playing.
     pub tts_active: Arc<AtomicBool>,
     /// Shared with the ambient TTS pipeline: set to cancel playback.
     pub tts_cancel: Arc<AtomicBool>,
     pub muted: Arc<AtomicBool>,
+    /// Count of mute events; see [`AmbientVoiceState`]'s field of the same
+    /// name. The worker binds it to each capture as that capture is armed
+    /// ([`CaptureEpoch`]) and kills the capture whenever the two disagree.
+    pub mute_epochs: Arc<AtomicU64>,
+    /// The lock a mute-on takes to bump that counter, shared with the publisher
+    /// so a mute and a transcript's dispatch cannot overlap. See [`apply_mute`]
+    /// and [`super::publish::DispatchGate`]. The audio worker never takes it:
+    /// it only ever reads the counter, and reading it is not a decision that
+    /// has to be ordered against anything.
+    pub mute_authority: Arc<Mutex<()>>,
     pub status: Arc<Mutex<AmbientStatus>>,
     /// Announces every worker status transition to the frontend. `None` in
     /// tests and when the app handle is not available yet; the session still
@@ -243,12 +407,14 @@ impl AmbientSession {
     /// straight into an async task without holding a mutex across an await.
     pub fn new(
         config: AmbientSessionConfig,
-    ) -> Result<(Self, tokio_mpsc::Receiver<String>), String> {
+    ) -> Result<(Self, tokio_mpsc::Receiver<Transcript>), String> {
         let (audio_tx, audio_rx) = mpsc::sync_channel::<Vec<u8>>(AUDIO_QUEUE_DEPTH);
-        let (transcript_tx, transcript_rx) = tokio_mpsc::channel::<String>(16);
+        let (transcript_tx, transcript_rx) = tokio_mpsc::channel::<Transcript>(16);
         let shutdown = Arc::new(AtomicBool::new(false));
 
         let muted = Arc::clone(&config.muted);
+        let mute_epochs = Arc::clone(&config.mute_epochs);
+        let mute_authority = Arc::clone(&config.mute_authority);
         let status = Arc::clone(&config.status);
         let shutdown_worker = Arc::clone(&shutdown);
         // Built here rather than taken from the caller: the clock starts when
@@ -275,6 +441,8 @@ impl AmbientSession {
                 audio_tx,
                 shutdown,
                 muted,
+                mute_epochs,
+                mute_authority,
                 status,
                 flow,
                 thread: Some(handle),
@@ -313,13 +481,13 @@ impl AmbientSession {
     /// announcing from inside would re-enter that lock for an event the
     /// command is about to send anyway.
     pub fn set_muted(&self, muted: bool) {
-        self.muted.store(muted, Ordering::Release);
-        let mut status = self.status.lock().unwrap_or_else(|e| e.into_inner());
-        *status = if muted {
-            AmbientStatus::Muted
-        } else {
-            AmbientStatus::Listening
-        };
+        apply_mute(
+            &self.muted,
+            &self.mute_epochs,
+            &self.mute_authority,
+            &self.status,
+            muted,
+        );
     }
 
     pub fn status(&self) -> AmbientStatus {
@@ -432,7 +600,7 @@ pub(crate) fn drain_detections(
 fn ambient_worker(
     config: AmbientSessionConfig,
     audio_rx: Receiver<Vec<u8>>,
-    transcript_tx: tokio_mpsc::Sender<String>,
+    transcript_tx: tokio_mpsc::Sender<Transcript>,
     shutdown: Arc<AtomicBool>,
     flow: Arc<AudioFlow>,
 ) {
@@ -441,9 +609,17 @@ fn ambient_worker(
         stt_model_dir,
         stt_endpoint,
         keywords_buf,
+        stop_keyword,
+        stop_phrase,
+        silence_hold_ms,
+        stt_health,
         tts_active,
         tts_cancel,
         muted,
+        mute_epochs,
+        // The command thread's, not this one's: the worker reads the counter
+        // and never writes it, and a read needs no ordering against a mute.
+        mute_authority: _,
         status,
         on_status_change,
         input_sample_rate,
@@ -462,10 +638,23 @@ fn ambient_worker(
             return;
         }
     };
-    let transcriber = match Transcriber::build(&stt_model_dir, stt_endpoint.as_deref()) {
+    let transcriber = match Transcriber::build(&stt_model_dir, stt_endpoint.as_deref(), stt_health)
+    {
         Ok(transcriber) => transcriber,
         Err(error) => {
             eprintln!("buzz-desktop: ambient speech recognizer unavailable: {error}");
+            status.set(AmbientStatus::Error(error));
+            drain_until_shutdown(audio_rx, &shutdown, &flow);
+            return;
+        }
+    };
+    // The recogniser moves onto its own thread: a chunk closed by the ceiling
+    // is decoded there while this loop keeps draining the audio queue, which is
+    // what makes a capture longer than the ceiling possible at all.
+    let mut rolling = match RollingCapture::spawn(move |samples| transcriber.transcribe(samples)) {
+        Ok(rolling) => rolling,
+        Err(error) => {
+            eprintln!("buzz-desktop: ambient transcription thread unavailable: {error}");
             status.set(AmbientStatus::Error(error));
             drain_until_shutdown(audio_rx, &shutdown, &flow);
             return;
@@ -486,9 +675,10 @@ fn ambient_worker(
     let mut vad = Detector::new(DefaultPredictor::new());
 
     let stream = spotter.create_stream();
-    let mut machine = UtteranceMachine::new();
+    let mut machine = UtteranceMachine::new(UtteranceTiming::from_silence_hold_ms(silence_hold_ms));
     let mut leftover_16k: Vec<f32> = Vec::new();
     let mut speech_buf: Vec<f32> = Vec::new();
+    let mut capture_epoch = CaptureEpoch::default();
 
     status.set(if muted.load(Ordering::Acquire) {
         AmbientStatus::Muted
@@ -518,11 +708,32 @@ fn ambient_worker(
         // half-captured utterance is abandoned rather than resumed later.
         if muted.load(Ordering::Acquire) {
             if machine.phase() != super::utterance::UtterancePhase::Idle {
-                machine.reset();
-                speech_buf.clear();
+                abandon_capture(
+                    &mut machine,
+                    &mut speech_buf,
+                    &mut rolling,
+                    &mut capture_epoch,
+                );
             }
             leftover_16k.clear();
             continue;
+        }
+
+        // A mute this loop never saw as a flag still kills the capture. Both
+        // halves of a mute-then-unmute can land between two batches, and the
+        // flag above is false again by the time we look; the counter is not,
+        // and the capture is bound to the value it was armed under. The audio
+        // collected before the mute goes with it — but the batch itself is
+        // processed as usual, because the session is unmuted and the wake word
+        // that starts the *next* capture may be in it.
+        if capture_epoch.revoked(&mute_epochs) {
+            abandon_capture(
+                &mut machine,
+                &mut speech_buf,
+                &mut rolling,
+                &mut capture_epoch,
+            );
+            leftover_16k.clear();
         }
 
         for bytes in batch {
@@ -539,6 +750,38 @@ fn ambient_worker(
                     // `start_time` is always 0.00, so the only trustworthy
                     // clock is ours.
                     let now = Instant::now();
+                    if is_stop_keyword(stop_keyword.as_deref(), &keyword) {
+                        // Deliberately none of the wake-word side effects: no
+                        // barge-in, no arming, no `Heard`. Outside a capture
+                        // the machine answers `Idle` and this is a no-op.
+                        eprintln!("buzz-desktop: ambient stop phrase fired ({keyword})");
+                        match machine.on_stop_phrase() {
+                            FrameOutcome::Decode => finish_capture(
+                                &mut rolling,
+                                &mut speech_buf,
+                                &transcript_tx,
+                                &status,
+                                stop_phrase.as_deref(),
+                                &flow,
+                                MuteSignal {
+                                    muted: &muted,
+                                    epochs: &mute_epochs,
+                                    armed_under: capture_epoch.disarm(),
+                                },
+                            ),
+                            FrameOutcome::Drop => {
+                                speech_buf.clear();
+                                rolling.abort();
+                                capture_epoch.clear_if_idle(&machine);
+                                status.set(current_idle_status(
+                                    &machine,
+                                    tts_active.load(Ordering::Acquire),
+                                ));
+                            }
+                            FrameOutcome::Idle | FrameOutcome::Buffer | FrameOutcome::Chunk => {}
+                        }
+                        continue;
+                    }
                     eprintln!("buzz-desktop: ambient wake word fired ({keyword})");
 
                     // Barge-in: stop whatever the agent is saying before the
@@ -546,7 +789,12 @@ fn ambient_worker(
                     tts_cancel.store(true, Ordering::Release);
                     if machine.on_wake(now) {
                         speech_buf.clear();
+                        rolling.abort();
                     }
+                    // The capture starts here, and so does its authority. A
+                    // wake word during a capture is a restart — a new capture,
+                    // and a fresh binding — not a continuation of the old one.
+                    capture_epoch.arm(&mute_epochs);
                     status.set(AmbientStatus::Heard);
                 }
 
@@ -567,16 +815,37 @@ fn ambient_worker(
                             }
                             speech_buf.extend_from_slice(&frame);
                         }
+                        FrameOutcome::Chunk => {
+                            // The ceiling, mid-sentence. The chunk leaves for
+                            // the transcription thread and the buffer starts
+                            // again empty; the status deliberately does not
+                            // move, because from the user's side nothing has
+                            // happened — they are still talking and the app is
+                            // still listening.
+                            speech_buf.extend_from_slice(&frame);
+                            rolling.hand_off(std::mem::take(&mut speech_buf));
+                        }
                         FrameOutcome::Drop => {
                             speech_buf.clear();
+                            rolling.abort();
+                            capture_epoch.clear_if_idle(&machine);
                             status.set(current_idle_status(&machine, playing));
                         }
                         FrameOutcome::Decode => {
                             speech_buf.extend_from_slice(&frame);
-                            status.set(AmbientStatus::Transcribing);
-                            let outcome = transcribe(&transcriber, &speech_buf, &transcript_tx);
-                            speech_buf.clear();
-                            status.set(status_after_decode(outcome));
+                            finish_capture(
+                                &mut rolling,
+                                &mut speech_buf,
+                                &transcript_tx,
+                                &status,
+                                None,
+                                &flow,
+                                MuteSignal {
+                                    muted: &muted,
+                                    epochs: &mute_epochs,
+                                    armed_under: capture_epoch.disarm(),
+                                },
+                            );
                         }
                     }
                 }
@@ -585,21 +854,6 @@ fn ambient_worker(
     }
 
     status.set(AmbientStatus::Off);
-}
-
-/// What the indicator shows once an utterance has been decoded.
-///
-/// A failure stays there until the next transition rather than flashing past.
-/// The user has just spoken and heard nothing back, and going straight back to
-/// "listening for the wake word" would be the same class of lie the audio
-/// watchdog was built to end: a pill claiming to work while the thing it
-/// describes is broken. The next wake word replaces it, so nothing has to
-/// clear it.
-fn status_after_decode(outcome: Result<(), String>) -> AmbientStatus {
-    match outcome {
-        Ok(()) => AmbientStatus::Listening,
-        Err(error) => AmbientStatus::Error(error),
-    }
 }
 
 fn current_idle_status(machine: &UtteranceMachine, tts_playing: bool) -> AmbientStatus {
@@ -611,28 +865,13 @@ fn current_idle_status(machine: &UtteranceMachine, tts_playing: bool) -> Ambient
     }
 }
 
-/// Turn the captured utterance into a published transcript.
+/// Whether a detection is the configured stop phrase rather than the wake word.
 ///
-/// The error is the transcriber's own — already logged there, and returned
-/// here so the caller can leave it on the indicator. Audio that carried no
-/// words is `Ok`: an utterance the recogniser found nothing in is an ordinary
-/// outcome, not a fault to report.
-fn transcribe(
-    transcriber: &Transcriber,
-    speech_buf: &[f32],
-    transcript_tx: &tokio_mpsc::Sender<String>,
-) -> Result<(), String> {
-    if speech_buf.is_empty() {
-        return Ok(());
-    }
-    let text = transcriber.transcribe(speech_buf)?;
-    if text.is_empty() {
-        return Ok(());
-    }
-    if let Err(error) = transcript_tx.blocking_send(text) {
-        eprintln!("buzz-desktop: ambient transcript channel closed: {error}");
-    }
-    Ok(())
+/// The engine reports the keyword in its own uppercase, space-joined form, so
+/// the comparison is against [`super::wake_word::engine_keyword`]'s output and
+/// not against what the user typed.
+fn is_stop_keyword(stop_keyword: Option<&str>, fired: &str) -> bool {
+    stop_keyword.is_some_and(|stop| fired.trim().eq_ignore_ascii_case(stop))
 }
 
 /// Keep draining until shutdown so a dead worker cannot back-pressure the
@@ -741,3 +980,15 @@ fn bytes_to_f32(bytes: &[u8]) -> Vec<f32> {
 #[cfg(test)]
 #[path = "session_tests.rs"]
 mod session_tests;
+
+/// The mute-fence regressions, split off `session_tests` so neither file grows
+/// past the size ceiling. Still a child of `session`, so both halves resolve the
+/// worker's items through the same `use super::*`.
+#[cfg(test)]
+#[path = "session_fence_tests.rs"]
+mod session_fence_tests;
+
+/// The handful of test helpers both of those files build on.
+#[cfg(test)]
+#[path = "session_test_support.rs"]
+mod session_test_support;

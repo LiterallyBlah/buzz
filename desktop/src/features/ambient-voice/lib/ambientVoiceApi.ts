@@ -33,6 +33,32 @@ export type AmbientWebviewCapture = {
   captureReady: boolean;
 };
 
+/**
+ * Mirrors `ambient_voice::speech_health::SpeechRoleHealth` — whether one
+ * server-backed speech role is answering.
+ *
+ * `configured` is false whenever the role runs on this computer, which is the
+ * default and the shape of every settings file that has never named a server;
+ * nothing about a local role can be "failing". The shape is pinned from the
+ * producing side by
+ * `the_speech_backend_health_serialises_in_the_shape_the_frontend_parses`.
+ */
+export type AmbientSpeechRoleHealth = {
+  configured: boolean;
+  /** Its last attempt failed and it has not answered since. */
+  failing: boolean;
+  /** Attempts since the last success. */
+  consecutiveFailures: number;
+  /** The server's own words. `null` when there is nothing to explain. */
+  lastError: string | null;
+};
+
+/** Mirrors `ambient_voice::speech_health::SpeechBackendHealthReport`. */
+export type AmbientSpeechHealth = {
+  stt: AmbientSpeechRoleHealth;
+  tts: AmbientSpeechRoleHealth;
+};
+
 /** Mirrors `ambient_voice::launch::LaunchDiagnostics`. */
 export type AmbientLaunchDiagnostics = {
   version: string;
@@ -77,12 +103,31 @@ export type AmbientVoiceStatusReport = {
   audioStale: boolean;
   /** Batches the native worker has taken off its queue this session. */
   audioBatchesReceived: number;
-  /** Since the last batch reached the worker, or since the session started. */
+  /**
+   * How long the native worker has been free to receive audio and received
+   * none — since the last batch, or since the session started when none ever
+   * arrived.
+   *
+   * Not wall-clock time since the last batch. The worker is one loop, and time
+   * it spends inside a transcription is excluded, because during it the worker
+   * is not reading its queue at all: measured naively, one utterance through a
+   * speech server read as five seconds of silence and the watchdog rebuilt the
+   * capture pipeline against a microphone that was working perfectly.
+   */
   msSinceLastAudio: number | null;
   /** What this webview last reported pushing. `null` until it reports. */
   webviewCapture: AmbientWebviewCapture | null;
   /** `null` before native boot hydration has run. */
   launch: AmbientLaunchDiagnostics | null;
+  /**
+   * Whether the speech servers this session was pointed at are answering.
+   *
+   * Both roles fall back on their own — an utterance to the on-device
+   * recogniser, a reply to silence — and that is deliberate. What is not is
+   * doing it invisibly, which left the pill saying "Listening for the wake
+   * word" while the server behind it had been down for an hour.
+   */
+  speechBackends: AmbientSpeechHealth;
 };
 
 /** Mirrors `ambient_voice::settings::WakeBinding`. */
@@ -135,6 +180,19 @@ export type AmbientVoiceSettings = {
   stt: SpeechBackendSettings;
   /** Where the agent's replies are turned into speech. */
   tts: SpeechBackendSettings;
+  /**
+   * How long a pause must last before it ends what you are saying.
+   *
+   * Read with a serde default on the native side, so a settings file written
+   * before this existed loads `SILENCE_HOLD_DEFAULT_MS` rather than zero.
+   */
+  silenceHoldMs: number;
+  /**
+   * Optional phrase that ends a capture the moment it is heard. `null` — and a
+   * blank string — mean none is armed. It goes onto the same keyword spotter as
+   * the wake word, so it is held to the same validation.
+   */
+  stopPhrase: string | null;
   inputDeviceId: string | null;
   outputDevice: string | null;
   /**
@@ -180,6 +238,44 @@ export const getAmbientVoiceSettings = () =>
 export const setAmbientVoiceSettings = (settings: AmbientVoiceSettings) =>
   invoke<AmbientVoiceStatusReport>("set_ambient_voice_settings", { settings });
 
+/**
+ * Mirrors `ambient_voice::commands::AmbientWakeBindingSaved`.
+ *
+ * Both halves, because a binding write can change a field the card is showing:
+ * a stored stop phrase the new wake word clashes with is dropped rather than
+ * refusing the write, so `settings` is the file as the native side re-read it
+ * and is what the card must render from. Pinned from the producing side by
+ * `a_wake_binding_save_answers_in_the_shape_the_settings_card_reads` in
+ * `ambient_voice/mod_tests.rs`; that test and this type change together.
+ */
+export type AmbientWakeBindingSaved = {
+  settings: AmbientVoiceSettings;
+  status: AmbientVoiceStatusReport;
+};
+
+/**
+ * Persist the wake word and its agent, and nothing else.
+ *
+ * Deliberately not a `setAmbientVoiceSettings` round trip with the binding
+ * spliced in. The card holds a whole settings object it loaded at mount, and
+ * posting that back made every other field in it a condition of the wake word
+ * being saved: the native save door re-validates what it is handed, so a
+ * stored stop phrase that clashes with the NEW wake word — or one an older
+ * build wrote that the model cannot encode — refused the write entire, and the
+ * wake word did not persist. The field that would have resolved the clash was
+ * the one the user could not save.
+ *
+ * The native side reads the stored file itself (the card's copy may be stale),
+ * replaces the primary binding, drops a stop phrase that can no longer stand
+ * beside it, and answers with the file as re-read from disk.
+ */
+export const setAmbientWakeBinding = (binding: WakeBinding) =>
+  invoke<AmbientWakeBindingSaved>("set_ambient_wake_binding", {
+    wakeWord: binding.wakeWord,
+    agentPubkey: binding.agentPubkey,
+    destination: binding.destination,
+  });
+
 export const setAmbientVoiceEnabled = (enabled: boolean) =>
   invoke<AmbientVoiceStatusReport>("set_ambient_voice_enabled", { enabled });
 
@@ -202,6 +298,19 @@ export const getAmbientModelStatus = () =>
 
 export const checkAmbientWakeWord = (wakeWord: string) =>
   invoke<WakeWordCheck>("check_ambient_wake_word", { wakeWord });
+
+/**
+ * Ask whether a stop phrase can be armed, before it is saved.
+ *
+ * The wake word's check with the stop phrase's two extra rules: an empty
+ * phrase is valid (it is how the feature is switched off), and the phrase must
+ * differ from `wakeWord`. Both are the native side's, so what this reports is
+ * what the save door enforces — the field used to be unchecked, and a phrase
+ * the model could not encode saved cleanly and then took the whole session
+ * down at arm time.
+ */
+export const checkAmbientStopPhrase = (stopPhrase: string, wakeWord: string) =>
+  invoke<WakeWordCheck>("check_ambient_stop_phrase", { stopPhrase, wakeWord });
 
 export const checkAmbientHotstart = () =>
   invoke<AmbientVoiceStatusReport>("check_ambient_hotstart");
@@ -259,11 +368,48 @@ export function ambientReportLabel(
 ): string {
   if (!report) return "Not started";
   if (report.audioStale) return AMBIENT_NO_AUDIO_MESSAGE;
+  // Only in place of "listening". Every other status is a specific fact about
+  // what is happening right now — transcribing, speaking, an error already on
+  // screen — and burying it under a server's health would be the same trade
+  // this exists to undo. "Listening for the wake word" is the one that claims
+  // all is well, so it is the one a failing server replaces.
+  if (report.status.state === "listening") {
+    const failing = speechBackendFailureLabel(report.speechBackends);
+    if (failing) return failing;
+  }
   return ambientStatusLabel(report.status);
 }
 
 /** Shown in place of "Listening for the wake word" when nothing arrives. */
 export const AMBIENT_NO_AUDIO_MESSAGE = "No audio arriving from the microphone";
+
+/** What each server-backed role is called, in the user's terms. */
+export const SPEECH_ROLE_NAMES = {
+  stt: "Speech-to-text",
+  tts: "Voice",
+} as const;
+
+/**
+ * One line naming the failing server, or `null` when both are fine.
+ *
+ * Deliberately short and deliberately not alarming: the feature still works —
+ * speech-to-text falls back to this computer, and a reply that cannot be
+ * synthesised is still on screen — so this says what is broken, not that
+ * everything is. Both roles failing is named as both rather than as the first
+ * one found, because "the server is down" and "both servers are down" are
+ * different things to go and look at.
+ */
+export function speechBackendFailureLabel(
+  health: AmbientSpeechHealth | undefined,
+): string | null {
+  if (!health) return null;
+  const failing = (["stt", "tts"] as const).filter(
+    (role) => health[role].failing,
+  );
+  if (failing.length === 0) return null;
+  if (failing.length === 2) return "Speech servers are not answering";
+  return `${SPEECH_ROLE_NAMES[failing[0]]} server is not answering`;
+}
 
 /** Human-readable label for the listening indicator. */
 export function ambientStatusLabel(status: AmbientStatus): string {

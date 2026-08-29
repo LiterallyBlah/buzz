@@ -19,12 +19,21 @@ use uuid::Uuid;
 use crate::app_state::AppState;
 use crate::events;
 
-/// Ceiling on a single transcribed utterance, in characters.
+/// Ceiling on a single transcribed utterance, in UTF-8 bytes.
 ///
-/// The utterance machine already caps capture at 30 s of audio; this is the
-/// belt-and-braces text-side bound so a pathological transcript cannot be
-/// posted as an enormous message.
-const MAX_TRANSCRIPT_CHARS: usize = 2_000;
+/// One utterance is one kind:9 message, so the bound is the relay's: it
+/// advertises `max_content_len` 65,536 in its NIP-11 document, and this stops
+/// 4 KiB short of that so no supported transcript is ever the relay's to
+/// refuse. Rolling capture made the old 2,000-character cap reachable —
+/// sixty seconds of ordinary speech — and it was applied by silently cutting
+/// the transcript's tail off, which is the user's words, edited, with nothing
+/// to say so. Sixty kibibytes is over an hour of continuous speech at the
+/// fifteen characters a second `speech_http` budgets by, so no utterance a
+/// person can produce is near it; what it bounds is a pathological
+/// transcription server, and [`super::rolling`] fails such an utterance
+/// loudly at this same line long before it reaches here. This copy of the
+/// bound is the belt-and-braces: over it is an explicit error, never a trim.
+pub(crate) const MAX_UTTERANCE_TEXT_BYTES: usize = 60 * 1024;
 
 /// Voice-mode guidelines posted as kind:48106 before the first ambient
 /// message of a session.
@@ -56,17 +65,27 @@ the same way — one sentence per separate call.
     )
 }
 
-/// Trim a transcript to something publishable, or `None` if there is nothing
-/// worth sending.
-pub fn normalize_transcript(text: &str) -> Option<String> {
+/// Pass a transcript through whole, or say exactly why it cannot be sent.
+///
+/// `Ok(None)` is audio that carried no words — an ordinary outcome, nothing to
+/// send. `Err` is a transcript over [`MAX_UTTERANCE_TEXT_BYTES`], which the
+/// capture pipeline fails loudly before publication ever sees it; if one
+/// arrives here anyway it is refused with a reason, because the one thing this
+/// function may never do is deliver the user's words with the end cut off and
+/// nothing to show for it.
+pub fn normalize_transcript(text: &str) -> Result<Option<String>, String> {
     let trimmed = text.trim();
     if trimmed.is_empty() {
-        return None;
+        return Ok(None);
     }
-    if trimmed.chars().count() <= MAX_TRANSCRIPT_CHARS {
-        return Some(trimmed.to_string());
+    if trimmed.len() > MAX_UTTERANCE_TEXT_BYTES {
+        return Err(format!(
+            "transcript is {} bytes, over the {} this app will post as one message",
+            trimmed.len(),
+            MAX_UTTERANCE_TEXT_BYTES
+        ));
     }
-    Some(trimmed.chars().take(MAX_TRANSCRIPT_CHARS).collect())
+    Ok(Some(trimmed.to_string()))
 }
 
 /// Sign an ambient event and produce the guarded POST body.
@@ -121,6 +140,22 @@ impl AmbientPublisher {
     }
 
     async fn post_body(&self, body_bytes: Vec<u8>, what: &'static str) -> Result<(), String> {
+        let request = self.build_post(body_bytes, what)?;
+        relay_outcome(request.send().await, what).await
+    }
+
+    /// Authenticate a signed body and build the request that carries it.
+    ///
+    /// Separate from sending it because the transcript path must have the
+    /// whole request in hand — signed, authenticated, built — *before* it takes
+    /// the authority gate: everything that can fail, wait or allocate happens
+    /// out here, so the critical section below contains one decision and one
+    /// spawn and nothing else.
+    fn build_post(
+        &self,
+        body_bytes: Vec<u8>,
+        what: &'static str,
+    ) -> Result<reqwest::RequestBuilder, String> {
         let url = format!("{}/events", self.relay_base_url);
         let auth_header = crate::relay::build_nip98_auth_header_for_keys(
             &self.keys,
@@ -130,25 +165,12 @@ impl AmbientPublisher {
         )
         .map_err(|e| format!("ambient {what} auth: {e}"))?;
 
-        let response = self
+        Ok(self
             .http_client
             .post(&url)
             .header("Authorization", auth_header)
             .header("Content-Type", "application/json")
-            .body(body_bytes)
-            .send()
-            .await;
-
-        match response {
-            Ok(resp) if resp.status().is_success() => Ok(()),
-            // Route through relay_error_message so a 429 arms the admission
-            // gate for every subsequent relay send, ambient or not.
-            Ok(resp) => Err(format!(
-                "ambient {what} rejected: {}",
-                crate::relay::relay_error_message(resp).await
-            )),
-            Err(e) => Err(format!("ambient {what} failed: {e}")),
-        }
+            .body(body_bytes))
     }
 
     /// Post the kind:48106 ambient guidelines to `channel_id`.
@@ -163,13 +185,27 @@ impl AmbientPublisher {
     }
 
     /// Post one transcribed utterance as a kind:9 message, p-tagging the agent.
+    ///
+    /// The transcript may have waited behind the guidelines POST and the relay
+    /// admission gate, and a mute that landed anywhere in that time means the
+    /// user muted this capture — it does not get to speak because it was
+    /// already in the pipeline. This is the last hand on the fence that starts
+    /// at `finish_capture`, and what makes it a fence rather than a narrower
+    /// window is [`DispatchGate`]: the request is prepared in full, and only
+    /// then is the gate taken, the epoch checked, and the send **started while
+    /// the gate is still held**. A mute is exactly as fast as it was — it takes
+    /// the same lock for the length of two stores, never for a round trip — but
+    /// it is now ordered with respect to this dispatch instead of racing it.
+    /// The check before the signing stays as an advisory: there is no point
+    /// signing and authenticating a capture that is already dead.
     pub(crate) async fn publish_transcript(
         &self,
         channel_id: Uuid,
         agent_pubkey: &str,
         text: &str,
+        gate: &DispatchGate<'_>,
     ) -> Result<(), String> {
-        let Some(content) = normalize_transcript(text) else {
+        let Some(content) = normalize_transcript(text)? else {
             return Ok(());
         };
         let builder = events::build_message(
@@ -184,8 +220,136 @@ impl AmbientPublisher {
             None,
             &self.relay_base_url,
         )?;
-        self.post(builder, "transcript").await
+        // The same steps `post` takes, unrolled so the whole request exists
+        // before the gate is taken. Signing stays after the admission wait so
+        // both timestamps are fresh when the request leaves.
+        crate::relay_admission::wait_for_rate_limit().await;
+        if !(gate.still_wanted)() {
+            return Ok(());
+        }
+        let body_bytes = sign_and_guard_ambient_body(builder, &self.keys)?;
+        let request = self.build_post(body_bytes, "transcript")?;
+        #[cfg(test)]
+        gate.wait_for_test_hold().await;
+        let dispatch = {
+            let _authority = gate.take_authority();
+            if !(gate.still_wanted)() {
+                // A mute, or the teardown of the session these words were
+                // spoken into, got here first. Both counters are bumped under
+                // this same lock, so this answer cannot be stale, and the
+                // prepared request is dropped unsent.
+                return Ok(());
+            }
+            // Started, not awaited: by the time the gate is released the send
+            // is irrevocably under way, so a mute waiting on the lock is
+            // ordered *after* this transcript and takes effect from the next
+            // one. Nothing is awaited inside the critical section — a mute must
+            // never wait on a network round trip.
+            tauri::async_runtime::spawn(async move { request.send().await })
+        };
+        let response = dispatch
+            .await
+            .map_err(|error| format!("ambient transcript dispatch failed: {error}"))?;
+        relay_outcome(response, "transcript").await
     }
+}
+
+/// Turn the relay's answer — or the absence of one — into this module's result.
+async fn relay_outcome(
+    response: Result<reqwest::Response, reqwest::Error>,
+    what: &'static str,
+) -> Result<(), String> {
+    match response {
+        Ok(resp) if resp.status().is_success() => Ok(()),
+        // Route through relay_error_message so a 429 arms the admission
+        // gate for every subsequent relay send, ambient or not.
+        Ok(resp) => Err(format!(
+            "ambient {what} rejected: {}",
+            crate::relay::relay_error_message(resp).await
+        )),
+        Err(e) => Err(format!("ambient {what} failed: {e}")),
+    }
+}
+
+/// The authority a prepared transcript needs before its bytes may leave.
+///
+/// Two things, because either alone leaves a race. `still_wanted` answers
+/// *whether* these words are still allowed out, and it is two questions in one
+/// closure: the capture's mute epoch is unmoved
+/// ([`super::session::transcript_still_wanted`]) **and** the session that
+/// captured them is still the live one (the generation
+/// `super::spawn_publisher_task` was spawned under). `authority` answers *in
+/// which order* a revocation and a dispatch happened when they happened at the
+/// same moment: [`super::session::apply_mute`] bumps the epoch and
+/// `super::stop_session` bumps the generation, each while holding this same
+/// lock, so one side wins outright. Either the revoking stores land first and
+/// the check under the lock sees them, or the send is already under way and the
+/// revocation governs the next transcript instead. An unsynchronised second
+/// look at either counter would only make the window narrower, and a narrower
+/// window is still a window: the words a user muted — or spoke into a session
+/// they have since switched off — would still, sometimes, be sent.
+///
+/// Only transcripts pass through here. The kind:48106 guidelines are not
+/// fenced — they carry no speech, only the etiquette an agent needs to answer
+/// in a voice conversation, and holding them against the mute epoch would give
+/// a muted session no way to be ready for the next thing the user says.
+pub(crate) struct DispatchGate<'a> {
+    authority: &'a std::sync::Mutex<()>,
+    still_wanted: &'a (dyn Fn() -> bool + Send + Sync),
+    /// Where a test stops the publisher between preparation and dispatch.
+    /// Absent from release builds along with the branch that reads it.
+    #[cfg(test)]
+    hold: Option<&'a DispatchHold>,
+}
+
+impl<'a> DispatchGate<'a> {
+    /// The gate a live session publishes through.
+    pub(crate) fn new(
+        authority: &'a std::sync::Mutex<()>,
+        still_wanted: &'a (dyn Fn() -> bool + Send + Sync),
+    ) -> Self {
+        Self {
+            authority,
+            still_wanted,
+            #[cfg(test)]
+            hold: None,
+        }
+    }
+
+    /// Hold the authority for the length of one dispatch decision.
+    ///
+    /// Poisoning is recovered rather than propagated: a panic elsewhere under
+    /// this lock must not be able to stop the user's words being fenced, and
+    /// the data it guards is `()` — there is no invariant left to be broken.
+    fn take_authority(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.authority
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Park at the hold point a test installed, if it installed one.
+    #[cfg(test)]
+    async fn wait_for_test_hold(&self) {
+        if let Some(hold) = self.hold {
+            hold.reached.notify_one();
+            hold.released.notified().await;
+        }
+    }
+}
+
+/// A test's grip on the moment between a prepared request and its dispatch.
+///
+/// The window this fence closes is a few instructions wide, so the regression
+/// that proves it closed has to be able to stop the publisher inside it and
+/// mute there. Compiled only for tests, like the branch that consults it.
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct DispatchHold {
+    /// Fires when the publisher has a complete request and has arrived at the
+    /// gate with it.
+    pub(crate) reached: tokio::sync::Notify,
+    /// Awaited there until the test lets go.
+    pub(crate) released: tokio::sync::Notify,
 }
 
 /// Resolve the destination channel for a binding.
@@ -234,7 +398,12 @@ impl AmbientDestination {
     /// A guidelines failure is logged but never blocks the transcript: the
     /// user said something and it must reach the agent even if the etiquette
     /// event did not.
-    pub(crate) async fn publish(&self, publisher: &AmbientPublisher, text: &str) {
+    pub(crate) async fn publish(
+        &self,
+        publisher: &AmbientPublisher,
+        text: &str,
+        gate: &DispatchGate<'_>,
+    ) {
         use std::sync::atomic::Ordering;
         if !self.guidelines_sent.swap(true, Ordering::AcqRel) {
             if let Err(error) = publisher
@@ -248,7 +417,7 @@ impl AmbientDestination {
             }
         }
         if let Err(error) = publisher
-            .publish_transcript(self.channel_id, &self.agent_pubkey, text)
+            .publish_transcript(self.channel_id, &self.agent_pubkey, text, gate)
             .await
         {
             eprintln!("buzz-desktop: ambient transcript publish failed: {error}");

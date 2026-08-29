@@ -21,12 +21,14 @@ import { Switch } from "@/shared/ui/switch";
 import {
   AMBIENT_STATE_CHANGED_EVENT,
   ambientReportLabel,
+  checkAmbientStopPhrase,
   checkAmbientWakeWord,
   getAmbientModelStatus,
   getAmbientVoiceSettings,
   getAmbientVoiceStatus,
   setAmbientVoiceMuted,
   setAmbientVoiceSettings,
+  setAmbientWakeBinding,
   type AmbientModelStatus,
   type AmbientVoiceSettings,
   type AmbientVoiceStatusReport,
@@ -37,9 +39,15 @@ import {
   ambientLaunchLine,
   ambientModelRows,
   ambientSaveBlock,
+  ambientSpeechHealthLines,
+  clampSilenceHoldMs,
   mergeAgentOptions,
   modelStatusLabel,
-  withPrimaryBinding,
+  silenceHoldLabel,
+  SILENCE_HOLD_DEFAULT_MS,
+  SILENCE_HOLD_MAX_MS,
+  SILENCE_HOLD_MIN_MS,
+  SILENCE_HOLD_STEP_MS,
   type AmbientAgentOption,
 } from "../lib/ambientSettingsLogic";
 import {
@@ -51,6 +59,9 @@ import { useAmbientAudioDevices } from "../lib/useAmbientAudioDevices";
 import { AmbientSpeechBackendRow } from "./AmbientSpeechBackendRow";
 
 const WAKE_WORD_CHECK_DEBOUNCE_MS = 250;
+
+/** The stop phrase is checked on the same cadence, and for the same reason. */
+const STOP_PHRASE_CHECK_DEBOUNCE_MS = 250;
 
 /**
  * Settings section for the `ambientVoice` preview feature.
@@ -68,8 +79,18 @@ export function AmbientVoiceSettingsCard() {
   const [models, setModels] = React.useState<AmbientModelStatus | null>(null);
   const [agents, setAgents] = React.useState<AmbientAgentOption[]>([]);
   const [wakeWord, setWakeWord] = React.useState("");
+  const [stopPhrase, setStopPhrase] = React.useState("");
+  // The slider's own position while it is being dragged. Persisting on every
+  // pointer move would post a settings write — and therefore a session restart,
+  // at two ONNX model loads — for each pixel, so the committed value is the one
+  // the user let go of.
+  const [silenceHoldMs, setSilenceHoldMs] = React.useState(
+    SILENCE_HOLD_DEFAULT_MS,
+  );
   const [agentPubkey, setAgentPubkey] = React.useState<string | null>(null);
   const [check, setCheck] = React.useState<WakeWordCheck | null>(null);
+  const [stopPhraseCheck, setStopPhraseCheck] =
+    React.useState<WakeWordCheck | null>(null);
   const [error, setError] = React.useState<string | null>(null);
   const [saving, setSaving] = React.useState(false);
   const { inputDevices, outputDevices } = useAmbientAudioDevices();
@@ -84,6 +105,8 @@ export function AmbientVoiceSettingsCard() {
         setSettings(loaded);
         const binding = loaded.wakeBindings[0];
         setWakeWord(binding?.wakeWord ?? "");
+        setStopPhrase(loaded.stopPhrase ?? "");
+        setSilenceHoldMs(clampSilenceHoldMs(loaded.silenceHoldMs));
         setAgentPubkey(binding?.agentPubkey ?? null);
       } catch (loadError) {
         if (!disposed) {
@@ -217,12 +240,46 @@ export function AmbientVoiceSettingsCard() {
     };
   }, [wakeWord]);
 
-  const block = ambientSaveBlock(
+  // ── Stop-phrase validation, debounced ────────────────────────────────────
+  //
+  // The same gate as the wake word, because it is armed on the same spotter: a
+  // phrase the model cannot encode used to save cleanly and then take the whole
+  // session down when it next started. It depends on the wake word too — the
+  // two must differ — so a wake-word edit re-runs it.
+  React.useEffect(() => {
+    setStopPhraseCheck(null);
+    if (stopPhrase.trim().length === 0) return;
+    let disposed = false;
+    const id = window.setTimeout(() => {
+      void checkAmbientStopPhrase(stopPhrase, wakeWord)
+        .then((next) => {
+          if (!disposed) setStopPhraseCheck(next);
+        })
+        .catch(() => {
+          if (!disposed) {
+            setStopPhraseCheck({
+              valid: false,
+              message: "The stop phrase could not be checked.",
+              tokens: null,
+              checkedAgainstModel: false,
+            });
+          }
+        });
+    }, STOP_PHRASE_CHECK_DEBOUNCE_MS);
+    return () => {
+      disposed = true;
+      window.clearTimeout(id);
+    };
+  }, [stopPhrase, wakeWord]);
+
+  const block = ambientSaveBlock({
     wakeWord,
+    wakeWordCheck: check,
+    stopPhrase,
+    stopPhraseCheck,
     agentPubkey,
-    check,
-    report?.loadError ?? null,
-  );
+    loadError: report?.loadError ?? null,
+  });
 
   const persist = React.useCallback(async (next: AmbientVoiceSettings) => {
     setSaving(true);
@@ -242,20 +299,109 @@ export function AmbientVoiceSettingsCard() {
     }
   }, []);
 
+  /**
+   * Write the wake binding on its own, through its own native command.
+   *
+   * Not a settings write. This card holds a whole settings object it loaded at
+   * mount, and posting that back made every other field in it a condition of
+   * the wake word being saved: the native save door re-validates what it is
+   * handed, so a stored stop phrase clashing with the NEW wake word refused
+   * the write entire — and the field that would have resolved the clash was
+   * the one that could not be saved. The native side now reads the file
+   * itself, replaces the binding, and drops a stop phrase that can no longer
+   * stand beside it, so what comes back is the file as it now reads.
+   */
+  const persistBinding = React.useCallback(
+    async (agent: string) => {
+      setSaving(true);
+      setError(null);
+      // What the stop-phrase field is showing on the file's behalf. A phrase
+      // this write drops has to leave the screen; one the user is in the
+      // middle of typing must not, so only an untouched field follows the
+      // file.
+      const shownPhrase = settings?.stopPhrase ?? "";
+      try {
+        const saved = await setAmbientWakeBinding({
+          wakeWord: wakeWord.trim(),
+          agentPubkey: agent,
+          destination: null,
+        });
+        setSettings(saved.settings);
+        setStopPhrase((typed) =>
+          typed === shownPhrase ? (saved.settings.stopPhrase ?? "") : typed,
+        );
+        setReport(saved.status);
+      } catch (saveError) {
+        setError(
+          saveError instanceof Error
+            ? saveError.message
+            : "The wake word could not be saved.",
+        );
+      } finally {
+        setSaving(false);
+      }
+    },
+    [settings, wakeWord],
+  );
+
   const saveBinding = React.useCallback(() => {
-    if (!settings || block || !agentPubkey) return;
-    void persist(
-      withPrimaryBinding(settings, {
-        wakeWord: wakeWord.trim(),
-        agentPubkey,
-        destination: null,
-      }),
-    );
-  }, [settings, block, agentPubkey, wakeWord, persist]);
+    // A stop-phrase refusal is about the other field: this write carries the
+    // binding alone, and the native side keeps the two fields apart rather
+    // than refusing one for the other. Holding the wake word hostage to a stop
+    // phrase the user is still typing turned one field's error into the whole
+    // card refusing to save, with a message about a field the user was not
+    // editing.
+    if (!settings || (block && block.reason !== "stop_phrase") || !agentPubkey)
+      return;
+    void persistBinding(agentPubkey);
+  }, [settings, block, agentPubkey, persistBinding]);
+
+  /** Write the slider's committed position, if it moved. */
+  const saveSilenceHold = React.useCallback(() => {
+    const next = clampSilenceHoldMs(silenceHoldMs);
+    if (!settings || settings.silenceHoldMs === next) return;
+    void persist({ ...settings, silenceHoldMs: next });
+  }, [persist, settings, silenceHoldMs]);
+
+  const saveStopPhrase = React.useCallback(async () => {
+    // Blank means "no stop phrase", which the native side reads from `null`
+    // as readily as from an empty string — but `null` is what an untouched
+    // install has, so writing it back keeps the file identical either way.
+    const trimmed = stopPhrase.trim();
+    const next = trimmed.length === 0 ? null : trimmed;
+    if (!settings || (settings.stopPhrase ?? null) === next) return;
+    // Clearing the field is always allowed: emptying it is how the second
+    // keyword is switched off, and a phrase already on disk must stay
+    // removable even after it stopped being valid — a wake word edited to
+    // match it, say.
+    if (next === null) {
+      void persist({ ...settings, stopPhrase: null });
+      return;
+    }
+    // A phrase is checked before it is written. Asked here and not only in the
+    // debounced effect because leaving the field is the commit, and someone
+    // who types and tabs away inside the debounce window would otherwise have
+    // a perfectly good phrase silently dropped.
+    let verdict = stopPhraseCheck;
+    if (!verdict) {
+      verdict = await checkAmbientStopPhrase(stopPhrase, wakeWord).catch(
+        (): WakeWordCheck => ({
+          valid: false,
+          message: "The stop phrase could not be checked.",
+          tokens: null,
+          checkedAgainstModel: false,
+        }),
+      );
+      setStopPhraseCheck(verdict);
+    }
+    if (!verdict.valid) return;
+    void persist({ ...settings, stopPhrase: next });
+  }, [persist, settings, stopPhrase, stopPhraseCheck, wakeWord]);
 
   const selectedAgent = agents.find((agent) => agent.pubkey === agentPubkey);
   const audioFlowLine = ambientAudioFlowLine(report);
   const launchLine = ambientLaunchLine(report);
+  const speechHealthLines = ambientSpeechHealthLines(report);
 
   return (
     <section className="min-w-0" data-testid="settings-ambient-voice">
@@ -331,14 +477,13 @@ export function AmbientVoiceSettingsCard() {
               <DropdownMenuRadioGroup
                 onValueChange={(next) => {
                   setAgentPubkey(next);
+                  // The same binding write as the wake-word field's blur, and
+                  // for the same reason it is field-isolated: choosing an
+                  // agent is not consent to re-post every other setting, and
+                  // a stop phrase that clashes with the wake word on screen
+                  // must not be able to swallow the choice.
                   if (settings && wakeWord.trim() && check?.valid) {
-                    void persist(
-                      withPrimaryBinding(settings, {
-                        wakeWord: wakeWord.trim(),
-                        agentPubkey: next,
-                        destination: null,
-                      }),
-                    );
+                    void persistBinding(next);
                   }
                 }}
                 value={agentPubkey ?? ""}
@@ -363,6 +508,76 @@ export function AmbientVoiceSettingsCard() {
             </DropdownMenuContent>
           </DropdownMenu>
         </SettingsOptionRow>
+
+        <SettingsOptionRow>
+          <div className="min-w-0">
+            <p className="text-sm font-medium">
+              Pause before it stops listening
+            </p>
+            <p className="text-sm font-normal text-muted-foreground">
+              How long a silence has to last before Buzz decides you have
+              finished. Longer lets you think mid-sentence without being cut
+              off.
+            </p>
+          </div>
+          <div className="flex w-48 shrink-0 items-center gap-2">
+            <input
+              aria-label="Pause before it stops listening"
+              aria-valuetext={silenceHoldLabel(silenceHoldMs)}
+              className="h-1.5 w-full cursor-pointer appearance-none rounded-full bg-muted accent-foreground"
+              data-testid="ambient-silence-hold"
+              disabled={saving}
+              max={SILENCE_HOLD_MAX_MS}
+              min={SILENCE_HOLD_MIN_MS}
+              // Dragging reports every step; only letting go, tabbing away, or
+              // finishing an arrow-key nudge writes the setting.
+              onBlur={saveSilenceHold}
+              onChange={(event) => setSilenceHoldMs(Number(event.target.value))}
+              onKeyUp={saveSilenceHold}
+              onPointerUp={saveSilenceHold}
+              step={SILENCE_HOLD_STEP_MS}
+              type="range"
+              value={silenceHoldMs}
+            />
+            <span
+              className="w-10 text-right text-xs text-muted-foreground"
+              data-testid="ambient-silence-hold-value"
+            >
+              {silenceHoldLabel(silenceHoldMs)}
+            </span>
+          </div>
+        </SettingsOptionRow>
+
+        <SettingsOptionRow>
+          <div className="min-w-0">
+            <p className="text-sm font-medium">Stop phrase</p>
+            <p className="text-sm font-normal text-muted-foreground">
+              Say this to send what you have said so far without waiting for the
+              pause. The phrase itself is not sent. Leave it empty for none.
+            </p>
+          </div>
+          <Input
+            aria-label="Stop phrase"
+            className="max-w-56"
+            data-testid="ambient-stop-phrase"
+            onBlur={() => void saveStopPhrase()}
+            onChange={(event) => setStopPhrase(event.target.value)}
+            placeholder="that's all"
+            value={stopPhrase}
+          />
+        </SettingsOptionRow>
+
+        {stopPhraseCheck &&
+        !stopPhraseCheck.valid &&
+        stopPhraseCheck.message ? (
+          <p
+            className="px-4 pb-3 text-sm text-destructive"
+            data-testid="ambient-stop-phrase-error"
+            role="alert"
+          >
+            {stopPhraseCheck.message}
+          </p>
+        ) : null}
 
         <DevicePickerRow
           devices={inputDevices.map((device) => ({
@@ -456,6 +671,20 @@ export function AmbientVoiceSettingsCard() {
                 {audioFlowLine}
               </p>
             ) : null}
+            {/* A configured server that is failing. The feature keeps
+                working — speech to text falls back to this computer, and a
+                reply that cannot be spoken is still on screen — which is
+                exactly why it had to be said out loud somewhere. */}
+            {speechHealthLines.map((line) => (
+              <p
+                className="text-2xs text-destructive"
+                data-testid="ambient-speech-health"
+                key={line}
+                role="alert"
+              >
+                {line}
+              </p>
+            ))}
             {launchLine ? (
               <p
                 className="text-2xs text-muted-foreground"

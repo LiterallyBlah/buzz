@@ -28,6 +28,7 @@
 //! is the same reason `huddle::stt` is a thread rather than a task. The health
 //! probe is async because its caller is a Tauri command on the runtime.
 
+use std::io::Read;
 use std::time::Duration;
 
 use serde::Serialize;
@@ -39,24 +40,154 @@ const TRANSCRIPTIONS_PATH: &str = "/v1/audio/transcriptions";
 const SPEECH_PATH: &str = "/v1/audio/speech";
 const HEALTH_PATH: &str = "/v1/health/ready";
 
-/// Upload-to-transcript budget for one utterance.
+/// The part of an utterance's budget that does not depend on its length.
 ///
-/// The utterance machine has already decided the user stopped talking, so this
-/// is dead air on the user's side; a server that has not answered in ten
-/// seconds has failed as far as a conversation is concerned, and the local
-/// recogniser (when installed) is a better answer than a longer wait.
-const TRANSCRIBE_TIMEOUT: Duration = Duration::from_secs(10);
+/// The connection, the server's own scheduling, and the model warm-up. The
+/// utterance machine has already decided the user stopped talking, so all of
+/// this is dead air on the user's side; ten seconds of it is the value this
+/// shipped with, and it stays the floor so an ordinary utterance behaves
+/// exactly as it did.
+const TRANSCRIBE_BASE_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Synthesis budget for one reply. Longer than transcription because the text
-/// is the whole reply and some servers synthesise it in one pass, and because
-/// nothing is waiting on it — the microphone stays open throughout.
-const SPEAK_TIMEOUT: Duration = Duration::from_secs(20);
+/// Milliseconds of budget added for every second of audio uploaded.
+///
+/// The flat ten seconds was set when an utterance could not exceed thirty, and
+/// the silence-hold slider raised that ceiling with it: at the ten-second hold
+/// one utterance may carry 230 seconds of audio (see
+/// [`super::utterance::MAX_SILENCE_HOLD_MS`]), which is a seven-megabyte upload
+/// a server is unlikely to transcribe inside a budget meant for a sentence. A
+/// long recording would therefore always have timed out and fallen back to this
+/// computer — the server the user chose being used for exactly the utterances
+/// it was least likely to be needed for.
+///
+/// Half a second per second of audio: a server that needs longer than half of
+/// what was said to write it down cannot hold a conversation, whatever it
+/// eventually answers, and waiting on it is worse than the local recogniser.
+const TRANSCRIBE_MS_PER_AUDIO_SECOND: u64 = 500;
+
+/// The most any one utterance may wait, however long it is.
+///
+/// Set just above what the longest recording this app can make asks for
+/// (230 seconds of audio → 125 seconds), so no honest request is clipped by it
+/// and a wrong address still cannot hold the audio worker indefinitely.
+const TRANSCRIBE_MAX_TIMEOUT: Duration = Duration::from_secs(130);
+
+/// Characters of text that come back as one second of speech.
+///
+/// Ordinary narration runs at about 150 words a minute, and an English word is
+/// close to six characters once its space is counted: 900 characters a minute,
+/// fifteen a second. Both reply budgets below are really statements about
+/// seconds of speech and reach them through this, because what a reply costs a
+/// server — time to make it, bytes to send it — is set by how long it takes to
+/// say and not by how much of it there is to read.
+const SPOKEN_CHARS_PER_SECOND: u64 = 15;
+
+/// The part of a reply's synthesis budget that does not depend on its length.
+///
+/// The connection, the server's own scheduling and the model warm-up — the same
+/// costs [`TRANSCRIBE_BASE_TIMEOUT`] covers, and twice as many of them because
+/// some servers synthesise a reply in one pass and because nothing is waiting on
+/// this request: the microphone stays open throughout it. Twenty seconds is the
+/// value this shipped with, and it stays the floor so a one-sentence reply
+/// behaves exactly as it did.
+const SPEAK_BASE_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Milliseconds of budget added for every second of speech the reply comes to.
+///
+/// The flat twenty seconds was sized for a reply of a sentence or two, and the
+/// silence-hold slider moved the other end of the conversation out from under
+/// it: one utterance may now carry 230 seconds of audio (see
+/// [`super::utterance::MAX_SILENCE_HOLD_MS`]), and an agent given four minutes
+/// of speech to answer answers at length. In testing a server synthesised such
+/// a reply in about 24 seconds and answered HTTP 200 — four seconds after this
+/// client had hung up, so the finished audio arrived at a closed socket and the
+/// user heard nothing at all. The server was not too slow; the budget was flat
+/// while the thing it was paying for had grown.
+///
+/// Two seconds of budget per second of speech, which makes the margin over that
+/// observation a ratio rather than a remainder that thins as replies lengthen:
+/// the reply above (a minute of speech, some 900 characters) is now given 140
+/// seconds where the server needed 24, and a reply twice as long is given twice
+/// as much again. Deliberately looser than [`TRANSCRIBE_MS_PER_AUDIO_SECOND`]'s
+/// half a second, for a reason about what expiry costs rather than about the
+/// work: a transcription that runs out of budget falls back to the on-device
+/// recogniser and the utterance survives, while a synthesis that runs out of
+/// budget is exactly the silence this constant exists to prevent. There is
+/// nothing behind it to catch the reply.
+const SPEAK_MS_PER_SPOKEN_SECOND: u64 = 2_000;
+
+/// The most any one reply may wait, however long it is.
+///
+/// Four minutes, taken from the other end of the same conversation: the longest
+/// recording this app can make is 230 seconds, and a reply is not owed more
+/// wall clock than the recording that prompted it. Only a reply of close to two
+/// minutes of speech — around 1,600 characters — reaches it, so no plausible
+/// answer is clipped by it, and past that it does what every ceiling here does:
+/// the address is whatever the user typed, and a wrong one may not hold the
+/// speaking worker for good.
+const SPEAK_MAX_TIMEOUT: Duration = Duration::from_secs(240);
 
 /// Health-probe budget. The user is watching a button, so this fails fast.
 const HEALTH_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// How much of a failing server's body is quoted back to the user.
 const MAX_DETAIL_CHARS: usize = 200;
+
+/// The most a transcription answer may weigh.
+///
+/// The answer is `{"text": "…"}` for one utterance — a few hundred bytes at
+/// the outside, and a megabyte is about eight hours of speech written down.
+/// The cap is not about the honest case: the address is whatever the user
+/// typed, so it may be a mistyped host, a captive portal or a server that has
+/// been replaced by something else entirely, and none of those are obliged to
+/// stop sending. Reading a body to the end with no ceiling makes any of them an
+/// out-of-memory kill of the whole app.
+const MAX_TRANSCRIPT_BYTES: u64 = 1024 * 1024;
+
+/// The least a synthesised reply may be allowed to weigh.
+///
+/// Eight megabytes: the flat cap this shipped with, kept as the floor of
+/// [`speech_bytes_cap`] so a short reply is bounded exactly as it was. On its
+/// own it is about 175 seconds of the audio these servers return, which is
+/// generous for a sentence and a wall for a reply to four minutes of speech —
+/// audio that arrived whole and inside its budget was discarded for being long.
+const SPEECH_BASE_BYTES: u64 = 8 * 1024 * 1024;
+
+/// Bytes one second of a spoken reply is expected to weigh.
+///
+/// 24 kHz, 16-bit, one channel — what these servers answer with: 48,000 bytes a
+/// second.
+const SPEECH_BYTES_PER_SPOKEN_SECOND: u64 = 48_000;
+
+/// How much wider than that expectation a reply's cap is drawn.
+///
+/// The cap is a bound, not a prediction, and it does not have to be a close
+/// one: the question it answers is "may this server reply with a gigabyte", not
+/// "how big should this WAV be". Four times covers the widest shape an
+/// OpenAI-compatible server plausibly answers with — 48 kHz stereo is four
+/// times 24 kHz mono — and half as much again covers a voice slower than
+/// [`SPOKEN_CHARS_PER_SECOND`], or silence left around the words.
+const SPEECH_BYTES_MARGIN: u64 = 6;
+
+/// The most a synthesised reply may weigh, whatever its text says.
+///
+/// Same reasoning as [`MAX_TRANSCRIPT_BYTES`] — the thing answering may not be
+/// a speech server at all, and none of the things it may be instead are obliged
+/// to stop sending — so the scaling in [`speech_bytes_cap`] needs an end.
+/// Sixty-four megabytes is eight times the floor and some twenty minutes of
+/// speech, so no honest reply is near it, and it is a body this app survives:
+/// [`speech_wav::decode_pcm16`] turns it into f32 samples twice its size and
+/// both are held at once, which is a bad moment for a desktop app rather than a
+/// killed process. A gigabyte is what the cap is for.
+const MAX_SPEECH_BYTES: u64 = 64 * 1024 * 1024;
+
+/// The most of a failing server's body that is read before it is clipped to
+/// [`MAX_DETAIL_CHARS`] for display.
+///
+/// Its own cap because the error path must not be the way in: a server that
+/// answers HTTP 500 with a gigabyte would otherwise be read to the end purely
+/// to quote its first 200 characters.
+const MAX_ERROR_BODY_BYTES: u64 = 64 * 1024;
 
 /// A speech server's base URL, validated and normalised.
 ///
@@ -208,22 +339,22 @@ pub(crate) fn transcribe(
             reqwest::header::CONTENT_TYPE,
             format!("multipart/form-data; boundary={boundary}"),
         )
-        .timeout(TRANSCRIBE_TIMEOUT)
+        .timeout(transcribe_timeout(samples.len(), sample_rate))
         .body(multipart_wav_body(&boundary, "utterance.wav", &wav))
         .send()
         .map_err(|error| format!("speech server did not answer: {error}"))?;
 
     let status = response.status();
-    let body = response
-        .text()
-        .map_err(|error| format!("speech server response could not be read: {error}"))?;
     if !status.is_success() {
         return Err(format!(
             "speech server answered HTTP {}: {}",
             status.as_u16(),
-            clip(&body)
+            clip(&error_body(response))
         ));
     }
+    let declared = response.content_length();
+    let body = read_capped(declared, response, MAX_TRANSCRIPT_BYTES, "transcript")?;
+    let body = String::from_utf8_lossy(&body).into_owned();
     let parsed: serde_json::Value = serde_json::from_str(&body).map_err(|error| {
         format!(
             "speech server did not answer JSON ({error}): {}",
@@ -247,6 +378,12 @@ pub(crate) fn transcribe(
 /// `voice` and `speed` are optional in the API and deliberately not sent: the
 /// server's own default is the voice the user picked when they chose that
 /// server, and the local voice rows in settings describe the local model.
+///
+/// Both bounds on the answer — how long the server is given, and how much audio
+/// it may answer with — are drawn from the length of `text` rather than fixed;
+/// see [`speak_timeout`] and [`speech_bytes_cap`]. A reply is as long as the
+/// conversation asks it to be, and a flat allowance for something that is not
+/// flat is a working server hung up on mid-sentence.
 pub(crate) fn synthesize(
     client: &reqwest::blocking::Client,
     endpoint: &SpeechEndpoint,
@@ -254,23 +391,125 @@ pub(crate) fn synthesize(
 ) -> Result<Vec<u8>, String> {
     let response = post_to(client, endpoint.speech_url())
         .json(&serde_json::json!({ "input": text }))
-        .timeout(SPEAK_TIMEOUT)
+        .timeout(speak_timeout(text.len()))
         .send()
         .map_err(|error| format!("speech server did not answer: {error}"))?;
 
     let status = response.status();
     if !status.is_success() {
-        let body = response.text().unwrap_or_default();
         return Err(format!(
             "speech server answered HTTP {}: {}",
             status.as_u16(),
-            clip(&body)
+            clip(&error_body(response))
         ));
     }
-    response
-        .bytes()
-        .map(|bytes| bytes.to_vec())
-        .map_err(|error| format!("speech audio could not be read: {error}"))
+    let declared = response.content_length();
+    read_capped(declared, response, speech_bytes_cap(text.len()), "audio")
+}
+
+/// How long this utterance's server is given to answer.
+///
+/// [`TRANSCRIBE_BASE_TIMEOUT`] plus [`TRANSCRIBE_MS_PER_AUDIO_SECOND`] for each
+/// second of audio, up to [`TRANSCRIBE_MAX_TIMEOUT`]. Saturating throughout: the
+/// answer is a wait, and no length of buffer may turn into a shorter one.
+fn transcribe_timeout(samples: usize, sample_rate: u32) -> Duration {
+    // A zero rate is not reachable through the callers — it is a constant — but
+    // dividing by it here would be a panic on the audio thread.
+    let rate = u64::from(sample_rate.max(1));
+    let audio_ms = (samples as u64).saturating_mul(1_000) / rate;
+    let for_the_audio = audio_ms.saturating_mul(TRANSCRIBE_MS_PER_AUDIO_SECOND) / 1_000;
+    TRANSCRIBE_BASE_TIMEOUT
+        .saturating_add(Duration::from_millis(for_the_audio))
+        .min(TRANSCRIBE_MAX_TIMEOUT)
+}
+
+/// How long the text of one reply takes to say, in milliseconds.
+///
+/// Counted in UTF-8 bytes rather than characters, and generously on purpose: an
+/// ASCII character is one byte and about a fifteenth of a second, while a CJK
+/// character is three bytes and a good deal more than a fifteenth of a second
+/// to say — so a byte count errs upward in exactly the scripts where a
+/// character count would err downward, and is the same number for ASCII.
+fn spoken_ms(text_len: usize) -> u64 {
+    (text_len as u64).saturating_mul(1_000) / SPOKEN_CHARS_PER_SECOND
+}
+
+/// How long this reply's server is given to speak it.
+///
+/// [`SPEAK_BASE_TIMEOUT`] plus [`SPEAK_MS_PER_SPOKEN_SECOND`] for every second
+/// of speech the text comes to, up to [`SPEAK_MAX_TIMEOUT`]. Saturating
+/// throughout, for the reason [`transcribe_timeout`] is: the answer is a wait,
+/// and no length of text may turn into a shorter one.
+fn speak_timeout(text_len: usize) -> Duration {
+    let for_the_speech = spoken_ms(text_len).saturating_mul(SPEAK_MS_PER_SPOKEN_SECOND) / 1_000;
+    SPEAK_BASE_TIMEOUT
+        .saturating_add(Duration::from_millis(for_the_speech))
+        .min(SPEAK_MAX_TIMEOUT)
+}
+
+/// The most audio this reply is allowed to come back as.
+///
+/// What its text is expected to weigh at [`SPEECH_BYTES_PER_SPOKEN_SECOND`],
+/// widened by [`SPEECH_BYTES_MARGIN`] and then held between
+/// [`SPEECH_BASE_BYTES`] and [`MAX_SPEECH_BYTES`]: a short reply keeps the bound
+/// this shipped with, a long one is allowed the audio it asked for, and nothing
+/// is allowed to be unbounded.
+fn speech_bytes_cap(text_len: usize) -> u64 {
+    let for_the_speech = spoken_ms(text_len)
+        .saturating_mul(SPEECH_BYTES_PER_SPOKEN_SECOND)
+        .saturating_mul(SPEECH_BYTES_MARGIN)
+        / 1_000;
+    for_the_speech.clamp(SPEECH_BASE_BYTES, MAX_SPEECH_BYTES)
+}
+
+/// Read a response body, refusing one that is bigger than `limit`.
+///
+/// Both checks are load-bearing and neither replaces the other: `declared` is
+/// what the server claims, which stops a huge body being transferred at all,
+/// and the read itself is bounded because `Content-Length` may be absent
+/// (chunked), wrong, or a deliberate lie. Reading `limit + 1` is what tells an
+/// over-cap body apart from one that exactly fills the cap — truncating
+/// silently would hand a half a WAV to the decoder and call it corrupt.
+///
+/// Over the cap is an `Err`, which every caller already treats as a server
+/// failure: the utterance falls back to the on-device recogniser, and the reply
+/// simply is not spoken.
+fn read_capped(
+    declared: Option<u64>,
+    reader: impl std::io::Read,
+    limit: u64,
+    what: &str,
+) -> Result<Vec<u8>, String> {
+    if declared.is_some_and(|length| length > limit) {
+        return Err(format!(
+            "speech server offered {} bytes of {what}, over the {limit}-byte limit",
+            declared.unwrap_or_default()
+        ));
+    }
+    let mut body = Vec::new();
+    reader
+        .take(limit + 1)
+        .read_to_end(&mut body)
+        .map_err(|error| format!("speech server {what} could not be read: {error}"))?;
+    if body.len() as u64 > limit {
+        return Err(format!(
+            "speech server sent more than the {limit}-byte {what} limit"
+        ));
+    }
+    Ok(body)
+}
+
+/// A failing server's own words, bounded, for quoting back to the user.
+///
+/// Never fails: this is already the error path, and an unreadable body is
+/// exactly the "(no detail)" case [`clip`] exists for. An error page over the
+/// cap is therefore quoted as nothing rather than as its first 200 characters
+/// — the same rule as everywhere else here, and the HTTP status, which is the
+/// actionable half, is still reported either way.
+fn error_body(response: reqwest::blocking::Response) -> String {
+    let declared = response.content_length();
+    let bytes = read_capped(declared, response, MAX_ERROR_BODY_BYTES, "error").unwrap_or_default();
+    String::from_utf8_lossy(&bytes).into_owned()
 }
 
 /// Build the async client the health probe uses.

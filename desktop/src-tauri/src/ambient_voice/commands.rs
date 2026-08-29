@@ -61,6 +61,20 @@ async fn persist_and_reconcile(
         state.ambient_voice.settings_snapshot()?.indicator_position,
     );
     settings::save_to_path(&settings::settings_path(app)?, &next)?;
+    adopt_and_reconcile(state, next).await
+}
+
+/// Take settings that are already on disk as the runtime's own, and reconcile.
+///
+/// The half of a settings write that happens *after* the file is written, in
+/// one place because there is now more than one door writing the file and they
+/// must not drift: a binding change that skipped [`reconcile`] would apply only
+/// after the user switched the feature off and on again, which is the shipped
+/// dogfood fix `a_configuration_change_restarts_the_running_session` pins.
+async fn adopt_and_reconcile(
+    state: &AppState,
+    next: AmbientVoiceSettings,
+) -> Result<AmbientVoiceStatusReport, String> {
     state
         .ambient_voice
         .muted
@@ -99,6 +113,17 @@ pub fn get_ambient_voice_settings(
 /// (`set_ambient_voice_muted`, `set_ambient_voice_enabled`); the settings card
 /// holds a copy from whenever it mounted, so a later save from it must not be
 /// able to re-assert those two fields.
+///
+/// The wake bindings are held back for exactly that reason, and letting them
+/// through was a silent data rollback. [`set_ambient_wake_binding`] is the
+/// binding's own save door and every mutation of it goes through there — the
+/// wake-word field's blur and the agent picker are the only two edits that
+/// exist, the first binding an install ever saves included — so a binding
+/// arriving on a whole-object write is never an edit. It is the snapshot the
+/// card loaded, and by the time a save of some *other* field carries it back
+/// (clearing the stop phrase, letting go of the silence slider) the binding
+/// door may already have written a newer one underneath it. Passing it through
+/// put the replaced wake word back, with nothing on screen to say so.
 pub(super) fn merge_client_settings(
     current: &AmbientVoiceSettings,
     incoming: AmbientVoiceSettings,
@@ -107,6 +132,7 @@ pub(super) fn merge_client_settings(
         version: settings::CURRENT_VERSION,
         muted: current.muted,
         enabled: current.enabled,
+        wake_bindings: current.wake_bindings.clone(),
         ..incoming
     }
 }
@@ -120,6 +146,56 @@ pub async fn set_ambient_voice_settings(
 ) -> Result<AmbientVoiceStatusReport, String> {
     let next = merge_client_settings(&state.ambient_voice.settings_snapshot()?, settings);
     persist_and_reconcile(&app, &state, next).await
+}
+
+/// What a wake-binding save answers with.
+///
+/// Both halves, because the write can change a field the card is showing:
+/// [`settings::patch_primary_binding`] drops a stored stop phrase that cannot
+/// stand beside the new wake word rather than refusing the write, and a card
+/// still displaying that phrase would be describing a file that no longer
+/// carries it. `settings` is therefore the file as re-read from disk, and
+/// `status` is the same report every other write returns.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AmbientWakeBindingSaved {
+    pub settings: AmbientVoiceSettings,
+    pub status: AmbientVoiceStatusReport,
+}
+
+/// Persist the wake word and its agent, without touching anything else.
+///
+/// Its own command rather than a [`set_ambient_voice_settings`] round trip, for
+/// the reason [`settings::patch_primary_binding`] documents at length: posting
+/// the whole settings object made every other field's validity a condition of
+/// the wake word being saved, and a stop phrase the new wake word clashed with
+/// took the whole write down — leaving the user unable to save the one field
+/// that would have resolved the clash.
+///
+/// Everything after the file is written is what a settings write does, through
+/// the same [`adopt_and_reconcile`]: a binding is bound once, when the session
+/// starts, so a new wake word or agent only reaches the engines through a
+/// restart of the live session.
+#[tauri::command]
+pub async fn set_ambient_wake_binding(
+    wake_word: String,
+    agent_pubkey: String,
+    destination: Option<String>,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<AmbientWakeBindingSaved, String> {
+    ensure_writable(&state)?;
+    let settings = settings::patch_primary_binding(
+        &settings::settings_path(&app)?,
+        settings::WakeBinding {
+            wake_word,
+            agent_pubkey,
+            destination,
+        },
+        settings::installed_tokenizer().as_ref(),
+    )?;
+    let status = adopt_and_reconcile(&state, settings.clone()).await?;
+    Ok(AmbientWakeBindingSaved { settings, status })
 }
 
 /// The Experiments toggle's native side effect.
@@ -310,6 +386,128 @@ pub fn check_ambient_wake_word(wake_word: String) -> WakeWordCheck {
             checked_against_model: true,
         },
     }
+}
+
+/// Validate a candidate stop phrase.
+///
+/// The stop-phrase field's counterpart to [`check_ambient_wake_word`], and it
+/// exists for the same reason: the phrase is armed on the same keyword spotter,
+/// so a phrase the model cannot encode fails the whole session at arm time. It
+/// went unchecked while the wake word beside it was checked on every keystroke,
+/// which made a full stop or a digit in this one field enough to take ambient
+/// voice down.
+///
+/// Two rules the wake word does not have: an empty phrase is *valid* (it is how
+/// the feature is switched off), and the phrase must differ from the wake word —
+/// one keyword armed twice leaves no answer to which job a detection is doing.
+/// Both live in `settings::validate_stop_phrase_against`, so the rule the UI
+/// reports is the rule the save door enforces.
+///
+/// `wake_word` is the settings card's field as it currently reads, which is not
+/// always the wake word the save door will see — hence the stored binding as
+/// well; [`stop_phrase_check`] carries the reason.
+#[tauri::command]
+pub fn check_ambient_stop_phrase(
+    stop_phrase: String,
+    wake_word: String,
+    state: State<'_, AppState>,
+) -> WakeWordCheck {
+    let saved = state
+        .ambient_voice
+        .settings_snapshot()
+        .ok()
+        .and_then(|settings| {
+            settings
+                .primary_binding()
+                .map(|binding| binding.wake_word.clone())
+        });
+    stop_phrase_check(
+        &stop_phrase,
+        &wake_word,
+        saved.as_deref(),
+        settings::installed_tokenizer().as_ref(),
+    )
+}
+
+/// Whether `stop_phrase` can be saved, against both wake words in play.
+///
+/// `typed` is what the wake-word field reads right now; `saved` is the wake word
+/// the stored binding still carries. They agree until the field is edited, and
+/// the field is not what the save door validates against: the settings card
+/// posts a stop phrase over the settings object it loaded, so the binding in
+/// that payload — and therefore in `save_to_path` — is the stored one until the
+/// wake word is saved in its own right.
+///
+/// Checking the typed one alone therefore answered "valid" for a phrase the very
+/// next save refused, with an error about a wake word that was no longer on the
+/// screen. Both are asked now, and a clash with the stored one names it, because
+/// it is the one thing here that cannot be read off the screen.
+///
+/// Naming it is as far as this goes. The settings card gates every field's save
+/// on one verdict, so this message is also the line telling the user why nothing
+/// else is saving — including the wake word, which is what would resolve the
+/// clash. A message from here that told them to go and save it would be the
+/// reason they could not.
+pub(super) fn stop_phrase_check(
+    stop_phrase: &str,
+    typed: &str,
+    saved: Option<&str>,
+    tokenizer: Option<&WakeWordTokenizer>,
+) -> WakeWordCheck {
+    let refused = |message: String| WakeWordCheck {
+        valid: false,
+        message: Some(message),
+        tokens: None,
+        checked_against_model: tokenizer.is_some(),
+    };
+    let probe = AmbientVoiceSettings {
+        wake_bindings: wake_binding_for_check(typed),
+        stop_phrase: Some(stop_phrase.to_string()),
+        ..AmbientVoiceSettings::default()
+    };
+    if let Err(message) = settings::validate_stop_phrase_against(&probe, tokenizer) {
+        return refused(message);
+    }
+    // The same question again, of the wake word the save door will see. Only
+    // the clash rule reads the binding, so this is the only rule that can
+    // answer differently from the pass above.
+    if let Some(saved) = saved.filter(|saved| !saved.trim().is_empty() && *saved != typed) {
+        let stored = AmbientVoiceSettings {
+            wake_bindings: wake_binding_for_check(saved),
+            ..probe.clone()
+        };
+        if let Err(message) = settings::validate_stop_phrase_against(&stored, tokenizer) {
+            return refused(format!(
+                "{message}, and \"{saved}\" is still the saved wake word"
+            ));
+        }
+    }
+    WakeWordCheck {
+        valid: true,
+        message: None,
+        tokens: tokenizer
+            .zip(probe.armed_stop_phrase())
+            .and_then(|(tokenizer, phrase)| tokenizer.tokenize(phrase).ok()),
+        checked_against_model: tokenizer.is_some(),
+    }
+}
+
+/// A stand-in binding carrying `wake_word`, for the clash rule alone.
+///
+/// The clash check reads `primary_binding()`, and the settings UI can be asked
+/// about a stop phrase before an agent has been chosen. The agent key is
+/// therefore a placeholder that is never validated, never persisted and never
+/// leaves this function — an empty wake word yields no binding at all, which is
+/// the honest answer to "does this clash with nothing".
+fn wake_binding_for_check(wake_word: &str) -> Vec<settings::WakeBinding> {
+    if wake_word.trim().is_empty() {
+        return Vec::new();
+    }
+    vec![settings::WakeBinding {
+        wake_word: wake_word.to_string(),
+        agent_pubkey: String::new(),
+        destination: None,
+    }]
 }
 
 /// Ask a speech server whether it is there, for the settings "Check" button.

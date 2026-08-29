@@ -1,10 +1,9 @@
-import type {
-  AmbientModelStatus,
-  AmbientVoiceSettings,
-  AmbientVoiceStatusReport,
-  ModelStatus,
-  WakeBinding,
-  WakeWordCheck,
+import {
+  SPEECH_ROLE_NAMES,
+  type AmbientModelStatus,
+  type AmbientVoiceStatusReport,
+  type ModelStatus,
+  type WakeWordCheck,
 } from "./ambientVoiceApi";
 import { truncatePubkey } from "@/shared/lib/pubkey";
 
@@ -65,58 +64,121 @@ export function mergeAgentOptions(
 /** Why the Save button is disabled, or `null` when it is not. */
 export type AmbientSaveBlock =
   | { reason: "wake_word"; message: string }
+  | { reason: "stop_phrase"; message: string }
   | { reason: "agent"; message: string }
   | { reason: "load_error"; message: string }
   | null;
 
+/** The form state the save block is decided from. */
+export type AmbientFormState = {
+  wakeWord: string;
+  /** The native answer for `wakeWord`. `null` while a check is in flight. */
+  wakeWordCheck: WakeWordCheck | null;
+  /** Empty means no stop phrase, which is how the feature is switched off. */
+  stopPhrase: string;
+  /** The native answer for `stopPhrase`. `null` while a check is in flight. */
+  stopPhraseCheck: WakeWordCheck | null;
+  agentPubkey: string | null;
+  loadError: string | null;
+};
+
 /**
  * Whether the current form can be saved, and if not, what to tell the user.
  *
- * A wake word that the model cannot encode must never be persisted: the
- * settings file is read at boot and handed to a C library that terminates the
- * process on input it cannot tokenise. The check is the same one the native
- * side runs, so a phrase accepted here cannot kill the app later.
+ * Neither phrase the model cannot encode may be persisted: the settings file
+ * is read at boot and both phrases are handed to a C library that terminates
+ * the process on input it cannot tokenise. The app's own tokenizer runs first,
+ * so what actually happens is that the session refuses to start — which is why
+ * the stop phrase needs this gate as much as the wake word does. Both checks
+ * are the native side's, so a phrase accepted here cannot fail later.
+ *
+ * Named fields rather than positional arguments: there are now two phrases and
+ * two answers about them, and a call site that transposed them would compile.
  */
-export function ambientSaveBlock(
-  wakeWord: string,
-  agentPubkey: string | null,
-  check: WakeWordCheck | null,
-  loadError: string | null,
-): AmbientSaveBlock {
-  if (loadError) {
+export function ambientSaveBlock(form: AmbientFormState): AmbientSaveBlock {
+  if (form.loadError) {
     return {
       reason: "load_error",
-      message: `Settings cannot be saved until the existing file is fixed: ${loadError}`,
+      message: `Settings cannot be saved until the existing file is fixed: ${form.loadError}`,
     };
   }
-  if (wakeWord.trim().length === 0) {
+  if (form.wakeWord.trim().length === 0) {
     return { reason: "wake_word", message: "Choose a wake word." };
   }
   // Fail closed while a check is in flight: no answer is not a pass.
-  if (!check) {
+  if (!form.wakeWordCheck) {
     return { reason: "wake_word", message: "Checking the wake word…" };
   }
-  if (!check.valid) {
+  if (!form.wakeWordCheck.valid) {
     return {
       reason: "wake_word",
-      message: check.message ?? "That wake word cannot be used.",
+      message: form.wakeWordCheck.message ?? "That wake word cannot be used.",
     };
   }
-  if (!agentPubkey) {
+  // An empty stop phrase is the default and is never checked — "no second
+  // keyword" is a valid configuration, not an unfinished one.
+  if (form.stopPhrase.trim().length > 0) {
+    if (!form.stopPhraseCheck) {
+      return { reason: "stop_phrase", message: "Checking the stop phrase…" };
+    }
+    if (!form.stopPhraseCheck.valid) {
+      return {
+        reason: "stop_phrase",
+        message:
+          form.stopPhraseCheck.message ?? "That stop phrase cannot be used.",
+      };
+    }
+  }
+  if (!form.agentPubkey) {
     return { reason: "agent", message: "Choose an agent to talk to." };
   }
   return null;
 }
 
-/** Build the settings payload from the form, preserving unrelated fields. */
-export function withPrimaryBinding(
-  settings: AmbientVoiceSettings,
-  binding: WakeBinding,
-): AmbientVoiceSettings {
-  // Replace the first binding and keep any extras a later milestone stored, so
-  // editing the M1 row never silently deletes M2 configuration.
-  const rest = settings.wakeBindings.slice(1);
-  return { ...settings, wakeBindings: [binding, ...rest] };
+// The binding payload used to be built here, by splicing a wake binding into
+// the whole settings object the card had loaded and posting that back. That is
+// what made every other field's validity a condition of the wake word being
+// saved — the native save door re-validates what it is handed, so a stored stop
+// phrase clashing with the new wake word refused the write entire. The binding
+// now goes through `setAmbientWakeBinding`, which carries the binding alone and
+// leaves the merge (extras included) to the native side, where the stored file
+// is.
+
+// ── The pause that ends what you are saying ──────────────────────────────────
+//
+// The bounds mirror `MIN_SILENCE_HOLD_MS` / `MAX_SILENCE_HOLD_MS` /
+// `DEFAULT_SILENCE_HOLD_MS` in `ambient_voice::utterance`, which clamps to the
+// same range on load. Duplicated rather than fetched because the slider has to
+// render before any native call answers, and pinned from the producing side by
+// `a_hold_no_slider_could_produce_is_clamped_on_load_and_refused_on_save`.
+
+export const SILENCE_HOLD_MIN_MS = 300;
+export const SILENCE_HOLD_MAX_MS = 10_000;
+export const SILENCE_HOLD_DEFAULT_MS = 800;
+
+/** 100 ms steps: fine enough to tune by ear, coarse enough to land on a value. */
+export const SILENCE_HOLD_STEP_MS = 100;
+
+/**
+ * Hold a slider value to what the native side will accept.
+ *
+ * A save outside the range is refused there, and the refusal reaches the user
+ * as a red banner over a setting they moved with a mouse — so it is clamped
+ * here instead. A value that is not a number at all (an empty or half-typed
+ * field) falls back to the default rather than to `NaN`.
+ */
+export function clampSilenceHoldMs(ms: number): number {
+  if (!Number.isFinite(ms)) return SILENCE_HOLD_DEFAULT_MS;
+  return Math.min(
+    SILENCE_HOLD_MAX_MS,
+    Math.max(SILENCE_HOLD_MIN_MS, Math.round(ms)),
+  );
+}
+
+/** What the row shows beside the slider: "0.3s", "0.8s", "10s". */
+export function silenceHoldLabel(ms: number): string {
+  const seconds = clampSilenceHoldMs(ms) / 1000;
+  return `${seconds.toFixed(1).replace(/\.0$/, "")}s`;
 }
 
 /** One local model, as listed in the settings section. */
@@ -177,6 +239,32 @@ export function ambientAudioFlowLine(
       ? "; this window has no microphone open"
       : "";
   return `Audio: none received${quietFor} (${received}, ${pushed})${pipeline}`;
+}
+
+/**
+ * One line per speech server that is failing, with what it said.
+ *
+ * The pill has room for the headline only; this is where someone who has read
+ * it comes to find out which server and why. Empty when both roles are fine or
+ * run on this computer — a permanently present "servers: OK" row would be
+ * furniture, and this section already lists the addresses.
+ */
+export function ambientSpeechHealthLines(
+  report: AmbientVoiceStatusReport | null,
+): string[] {
+  const health = report?.speechBackends;
+  if (!health) return [];
+  return (["stt", "tts"] as const)
+    .filter((role) => health[role].failing)
+    .map((role) => {
+      const detail = health[role].lastError;
+      const attempts = health[role].consecutiveFailures;
+      const tried =
+        attempts > 1 ? ` (${attempts} attempts)` : attempts === 1 ? "" : "";
+      return `${SPEECH_ROLE_NAMES[role]} server is not answering${tried}${
+        detail ? `: ${detail}` : ""
+      }`;
+    });
 }
 
 /**

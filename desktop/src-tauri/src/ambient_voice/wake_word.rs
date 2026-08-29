@@ -149,6 +149,21 @@ pub fn normalize(phrase: &str) -> String {
     normalized
 }
 
+/// The form the engine reports a fired keyword in.
+///
+/// `sherpa_onnx::KeywordResult::keyword` comes back uppercased with single
+/// spaces between words — not the `▁`-joined form [`normalize`] builds for the
+/// tokenizer. Deciding *which* of several armed keywords fired has to compare
+/// against this, which is why it is a function rather than a call site's
+/// improvisation.
+pub fn engine_keyword(phrase: &str) -> String {
+    phrase
+        .to_uppercase()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 fn letter_count(phrase: &str) -> usize {
     phrase.chars().filter(|c| !c.is_whitespace()).count()
 }

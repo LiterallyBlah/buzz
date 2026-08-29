@@ -28,6 +28,7 @@ use std::{
     time::Duration,
 };
 
+use super::speech_health::RoleHealth;
 use super::speech_http::{self, SpeechEndpoint};
 use super::speech_wav::{self, DecodedAudio};
 
@@ -134,20 +135,29 @@ impl HttpTtsPipeline {
         output_device: Option<String>,
         tts_active: Arc<AtomicBool>,
         tts_cancel: Arc<AtomicBool>,
+        health: Arc<RoleHealth>,
     ) -> Result<Self, String> {
         Self::with_player(
             endpoint,
             Box::new(move || RodioSpeechPlayer::open(output_device)),
             tts_active,
             tts_cancel,
+            health,
         )
     }
 
-    fn with_player(
+    /// The same pipeline with the audio device replaced.
+    ///
+    /// Visible to the rest of the feature, not just to this file's tests, so
+    /// `tts_backend`'s tests can drive a real `AmbientTts::Http` against a
+    /// loopback server without a sound card — the alternative is asserting
+    /// that the door flattens by reading the door.
+    pub(super) fn with_player(
         endpoint: SpeechEndpoint,
         player_factory: PlayerFactory,
         tts_active: Arc<AtomicBool>,
         tts_cancel: Arc<AtomicBool>,
+        health: Arc<RoleHealth>,
     ) -> Result<Self, String> {
         let (text_tx, text_rx) = mpsc::sync_channel::<String>(TEXT_QUEUE_DEPTH);
         let (startup_tx, startup_rx) = mpsc::sync_channel::<Result<(), String>>(1);
@@ -162,6 +172,7 @@ impl HttpTtsPipeline {
                     text_rx,
                     player_factory,
                     (tts_active, tts_cancel, shutdown_worker),
+                    health,
                     startup_tx,
                 )
             })
@@ -216,6 +227,7 @@ fn http_tts_worker(
     text_rx: Receiver<String>,
     player_factory: PlayerFactory,
     flags: WorkerFlags,
+    health: Arc<RoleHealth>,
     startup_tx: SyncSender<Result<(), String>>,
 ) {
     let (tts_active, tts_cancel, shutdown) = flags;
@@ -252,7 +264,7 @@ fn http_tts_worker(
             continue;
         }
 
-        let Some(audio) = fetch_speech(&client, &endpoint, &text) else {
+        let Some(audio) = fetch_speech(&client, &endpoint, &text, &health) else {
             continue;
         };
         if audio.samples.is_empty() {
@@ -291,8 +303,11 @@ fn fetch_speech(
     client: &reqwest::blocking::Client,
     endpoint: &SpeechEndpoint,
     text: &str,
+    health: &RoleHealth,
 ) -> Option<DecodedAudio> {
-    let bytes = match speech_http::synthesize(client, endpoint, text) {
+    let answered = speech_http::synthesize(client, endpoint, text);
+    health.record(&answered);
+    let bytes = match answered {
         Ok(bytes) => bytes,
         Err(error) => {
             eprintln!("buzz-desktop: ambient speech server could not speak: {error}");
@@ -302,7 +317,10 @@ fn fetch_speech(
     match speech_wav::decode_pcm16(&bytes) {
         Ok(audio) => Some(audio),
         Err(error) => {
+            // Audio this build cannot play is the server's failure as much as
+            // a 500 is: it answered, and nothing was spoken.
             eprintln!("buzz-desktop: ambient speech audio could not be decoded: {error}");
+            health.failed(&error);
             None
         }
     }

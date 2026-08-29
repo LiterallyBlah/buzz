@@ -17,7 +17,9 @@
 //!   against the real library. Everything else about that contract is
 //!   unobservable from Rust: bad input kills the process rather than erroring.
 
+use super::session_test_support::{recorder, scripted_capture, Announced};
 use super::*;
+use crate::ambient_voice::speech_stub_server::{StubReply, StubSpeechServer};
 use crate::ambient_voice::wake_word::WakeWordTokenizer;
 
 const MODEL_DIR_ENV: &str = "BUZZ_AMBIENT_KWS_MODEL_DIR";
@@ -124,21 +126,24 @@ fn an_utterance_that_could_not_be_transcribed_stays_on_the_indicator() {
     assert_eq!(status_after_decode(Ok(())), AmbientStatus::Listening);
 }
 
-// ── Status announcements ─────────────────────────────────────────────────────
+// ── Telling the two armed keywords apart ─────────────────────────────────────
 
-/// A shared, thread-safe list of the statuses a notifier was handed.
-type Announced = Arc<Mutex<Vec<AmbientStatus>>>;
-
-/// Build a notifier that appends every announced status to `announced`.
-fn recorder(announced: &Announced) -> AmbientStatusNotifier {
-    let announced = Arc::clone(announced);
-    Arc::new(move |next: &AmbientStatus| {
-        announced
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .push(next.clone());
-    })
+#[test]
+fn only_the_configured_stop_phrase_reads_as_a_stop() {
+    // The engine reports keywords in its own uppercase, space-joined form
+    // (measured: `KeywordResult::keyword` came back as "LOVELY CHILD" for a
+    // phrase typed "lovely child"), so the comparison is against that form.
+    let stop = crate::ambient_voice::wake_word::engine_keyword("  buzz   Stop  ");
+    assert_eq!(stop, "BUZZ STOP");
+    assert!(is_stop_keyword(Some(&stop), "BUZZ STOP"));
+    assert!(is_stop_keyword(Some(&stop), "buzz stop"));
+    // The wake word firing on the same spotter must not be mistaken for it.
+    assert!(!is_stop_keyword(Some(&stop), "HEY HERMES"));
+    // With no stop phrase configured every detection is a wake word.
+    assert!(!is_stop_keyword(None, "BUZZ STOP"));
 }
+
+// ── Status announcements ─────────────────────────────────────────────────────
 
 #[test]
 fn every_transition_is_announced_and_repeats_are_not() {
@@ -201,9 +206,15 @@ fn the_worker_announces_the_transitions_it_makes() {
         stt_model_dir: dir.path().to_path_buf(),
         stt_endpoint: None,
         keywords_buf: "\u{2581}HE Y\n".to_string(),
+        stop_keyword: None,
+        stop_phrase: None,
+        silence_hold_ms: super::super::utterance::DEFAULT_SILENCE_HOLD_MS,
+        stt_health: Arc::new(crate::ambient_voice::speech_health::RoleHealth::default()),
         tts_active: Arc::new(AtomicBool::new(false)),
         tts_cancel: Arc::new(AtomicBool::new(false)),
         muted: Arc::new(AtomicBool::new(false)),
+        mute_epochs: Arc::new(AtomicU64::new(0)),
+        mute_authority: Arc::new(Mutex::new(())),
         status: Arc::clone(&cell),
         on_status_change: Some(recorder(&announced)),
         input_sample_rate: 16_000,
@@ -242,9 +253,15 @@ fn the_worker_stamps_the_audio_it_takes_off_the_queue() {
         stt_model_dir: dir.path().to_path_buf(),
         stt_endpoint: None,
         keywords_buf: "\u{2581}HE Y\n".to_string(),
+        stop_keyword: None,
+        stop_phrase: None,
+        silence_hold_ms: super::super::utterance::DEFAULT_SILENCE_HOLD_MS,
+        stt_health: Arc::new(crate::ambient_voice::speech_health::RoleHealth::default()),
         tts_active: Arc::new(AtomicBool::new(false)),
         tts_cancel: Arc::new(AtomicBool::new(false)),
         muted: Arc::new(AtomicBool::new(false)),
+        mute_epochs: Arc::new(AtomicU64::new(0)),
+        mute_authority: Arc::new(Mutex::new(())),
         status: Arc::new(Mutex::new(AmbientStatus::Starting)),
         on_status_change: None,
         input_sample_rate: 16_000,
@@ -276,6 +293,320 @@ fn the_worker_stamps_the_audio_it_takes_off_the_queue() {
         "audio reached the worker and was never stamped: {flow:?}"
     );
     assert!(flow.since_last_batch < Duration::from_secs(1), "{flow:?}");
+}
+
+// ── A busy worker is not a starved one ───────────────────────────────────────
+
+#[test]
+fn time_spent_transcribing_is_not_counted_as_time_without_audio() {
+    // Every edge of the measurement, with the clock passed in. `now`, the last
+    // batch, the finished transcriptions and the one in flight are four reads
+    // of four atomics, and the answer has to stay a sane duration for all of
+    // them — including the orderings only a torn read could produce.
+    //
+    // The `+ 1` on the in-flight stamp is why a transcription that started at
+    // millisecond zero still counts: 1 means "started at 0", 0 means "none".
+    assert_eq!(starved_ms(10_000, 4_000, 0, 0), 6_000);
+    // The same six seconds, all of it spent transcribing: nothing was starved.
+    assert_eq!(starved_ms(10_000, 4_000, 6_000, 0), 0);
+    // Half of it finished, half still in flight.
+    assert_eq!(starved_ms(10_000, 4_000, 3_000, 7_000 + 1), 0);
+    // Quiet, then a transcription that is still running: only the quiet counts.
+    assert_eq!(starved_ms(10_000, 1_000, 0, 9_000 + 1), 8_000);
+    // A transcription that began in the session's first millisecond.
+    assert_eq!(starved_ms(5_000, 0, 0, 1), 0);
+    // Impossible orderings saturate instead of wrapping.
+    assert_eq!(starved_ms(1_000, 4_000, 0, 0), 0);
+    assert_eq!(starved_ms(10_000, 4_000, 99_000, 0), 0);
+    // A stamp later than `now` is the one torn read that can actually happen:
+    // `snapshot` reads the clock before the atomics, so a transcription that
+    // starts in between is stamped after the `now` it will be compared with.
+    // Nothing is subtracted for it, which errs towards reporting a starved
+    // worker rather than towards hiding a genuinely deaf one — and the time
+    // being ignored is the microsecond that race is wide.
+    assert_eq!(starved_ms(10_000, 4_000, 0, 99_000 + 1), 6_000);
+}
+
+#[test]
+fn a_slow_speech_server_does_not_make_a_fed_session_look_deaf() {
+    // The shipped fault this fixes, driven through the production
+    // `finish_capture` against a real loopback server that takes its time.
+    //
+    // The worker is one loop: while it waits for a transcript it is not
+    // draining its audio queue, so an utterance sent to a slow server used to
+    // read as that many seconds of "no audio arriving from the microphone" —
+    // which put the wrong words on the pill and had the webview's watchdog
+    // rebuild the whole capture pipeline, once per utterance, against a
+    // microphone that was working.
+    const SERVER_TAKES: Duration = Duration::from_millis(400);
+
+    let server = StubSpeechServer::start(|_| {
+        thread::sleep(SERVER_TAKES);
+        StubReply::json(r#"{"text": "book me a room"}"#)
+    });
+    let dir = tempfile::tempdir().expect("temp dir");
+    let transcriber = Transcriber::build(
+        dir.path(),
+        Some(server.base_url()),
+        Arc::new(crate::ambient_voice::speech_health::RoleHealth::default()),
+    )
+    .expect("transcriber");
+
+    let flow = AudioFlow::new();
+    flow.record(1);
+    let (transcript_tx, mut transcripts) = tokio_mpsc::channel::<Transcript>(4);
+    let status = StatusSink::new(Arc::new(Mutex::new(AmbientStatus::Capturing)), None);
+    let mut speech_buf = vec![0.05_f32; 16_000];
+    let mut rolling =
+        RollingCapture::spawn(move |samples| transcriber.transcribe(samples)).expect("rolling");
+
+    finish_capture(
+        &mut rolling,
+        &mut speech_buf,
+        &transcript_tx,
+        &status,
+        None,
+        &flow,
+        MuteSignal {
+            muted: &AtomicBool::new(false),
+            epochs: &AtomicU64::new(0),
+            armed_under: Some(0),
+        },
+    );
+
+    // The utterance really did go to the server and come back — otherwise this
+    // would be measuring a call that never blocked.
+    assert_eq!(
+        transcripts.try_recv().ok().map(|t| t.text).as_deref(),
+        Some("book me a room")
+    );
+    assert_eq!(server.requests().len(), 1);
+
+    let flow = flow.snapshot();
+    assert!(
+        flow.since_last_batch < SERVER_TAKES / 2,
+        "a worker busy with the server's own latency was reported starved of audio: {flow:?}"
+    );
+}
+
+#[test]
+fn a_worker_that_is_transcribing_nothing_is_still_measured_as_before() {
+    // The other half: subtracting the worker's own work must not make a
+    // genuinely deaf session look fed. Nothing is transcribing here, so time
+    // passing is exactly what it was before this existed.
+    let flow = AudioFlow::new();
+    flow.record(1);
+    thread::sleep(Duration::from_millis(120));
+    let quiet = flow.snapshot().since_last_batch;
+    assert!(
+        quiet >= Duration::from_millis(100),
+        "silence stopped being measured at all: {quiet:?}"
+    );
+}
+
+#[test]
+fn a_transcription_that_unwinds_gives_the_watchdog_back() {
+    // The mark is what switches the staleness watchdog off, so an exit that
+    // skipped its removal would leave the watchdog off for the life of the
+    // session — silently, since a session with the watchdog disabled looks
+    // exactly like a session that is being fed. That is a worse failure than
+    // the one the marking was added to fix, so it must not depend on control
+    // reaching a second call.
+    let flow = AudioFlow::new();
+    flow.record(1);
+
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let died = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _busy = flow.transcribing();
+        panic!("the recogniser gave up mid-utterance");
+    }));
+    std::panic::set_hook(previous);
+    assert!(died.is_err(), "the panic did not happen");
+
+    thread::sleep(Duration::from_millis(120));
+    let quiet = flow.snapshot().since_last_batch;
+    assert!(
+        quiet >= Duration::from_millis(100),
+        "the watchdog stayed marked busy after an unwind: {quiet:?}"
+    );
+}
+
+// ── Closing a capture, with and without a chunk behind it ────────────────────
+
+/// A capture about to be closed: the status recorder, the transcript channel
+/// and a buffer with something in it.
+struct ClosingCapture {
+    announced: Announced,
+    status: StatusSink,
+    transcript_tx: tokio_mpsc::Sender<Transcript>,
+    transcripts: tokio_mpsc::Receiver<Transcript>,
+    speech_buf: Vec<f32>,
+    flow: AudioFlow,
+}
+
+impl ClosingCapture {
+    fn new() -> Self {
+        let announced: Announced = Arc::new(Mutex::new(Vec::new()));
+        let status = StatusSink::new(
+            Arc::new(Mutex::new(AmbientStatus::Capturing)),
+            Some(recorder(&announced)),
+        );
+        let (transcript_tx, transcripts) = tokio_mpsc::channel::<Transcript>(4);
+        Self {
+            announced,
+            status,
+            transcript_tx,
+            transcripts,
+            speech_buf: vec![0.05_f32; 16_000],
+            flow: AudioFlow::new(),
+        }
+    }
+
+    fn close(&mut self, rolling: &mut RollingCapture, trim: Option<&str>) {
+        finish_capture(
+            rolling,
+            &mut self.speech_buf,
+            &self.transcript_tx,
+            &self.status,
+            trim,
+            &self.flow,
+            MuteSignal {
+                muted: &AtomicBool::new(false),
+                epochs: &AtomicU64::new(0),
+                armed_under: Some(0),
+            },
+        );
+    }
+
+    fn announced(&self) -> Vec<AmbientStatus> {
+        self.announced.lock().expect("announced").clone()
+    }
+
+    /// Every transcript submitted so far. One entry is one message to the
+    /// agent, which is what "submitted once" is counted in.
+    fn submitted(&mut self) -> Vec<String> {
+        let mut sent = Vec::new();
+        while let Ok(transcript) = self.transcripts.try_recv() {
+            sent.push(transcript.text);
+        }
+        sent
+    }
+}
+
+#[test]
+fn an_ordinary_utterance_announces_transcribing_once_and_sends_one_message() {
+    // The parity regression. Almost every utterance is one chunk, and for those
+    // the rolling machinery must be invisible: the pill goes Transcribing while
+    // the recogniser has it and back to Listening when it is done, and the
+    // agent is sent exactly one message.
+    let mut capture = ClosingCapture::new();
+    let mut rolling = scripted_capture(&["book me a room"]);
+
+    capture.close(&mut rolling, None);
+
+    assert_eq!(
+        capture.announced(),
+        vec![AmbientStatus::Transcribing, AmbientStatus::Listening]
+    );
+    assert_eq!(capture.submitted(), vec!["book me a room".to_string()]);
+    assert!(
+        capture.speech_buf.is_empty(),
+        "the buffer was left holding audio"
+    );
+}
+
+#[test]
+fn a_chunk_handed_off_mid_capture_announces_nothing_until_the_close() {
+    // Status honesty: from the user's side the ceiling is not an event. They
+    // are still talking, so the pill still says so — and the two chunks arrive
+    // as one message, in the order they were spoken.
+    //
+    // The handoff has no way to announce anything (it is not given the sink);
+    // what is asserted here is the sequence a whole rolled capture produces,
+    // which is the one an extra `Transcribing` per chunk would show up in.
+    let mut capture = ClosingCapture::new();
+    let mut rolling = scripted_capture(&["the first half", "and the second"]);
+
+    rolling.hand_off(vec![0.05_f32; 16_000]);
+    capture.close(&mut rolling, None);
+
+    assert_eq!(
+        capture.announced(),
+        vec![AmbientStatus::Transcribing, AmbientStatus::Listening],
+        "a rolled capture moved the indicator more than an ordinary one"
+    );
+    assert_eq!(
+        capture.submitted(),
+        vec!["the first half and the second".to_string()],
+        "a rolled capture must reach the agent as one message"
+    );
+}
+
+#[test]
+fn a_stop_phrase_that_closed_a_rolled_capture_is_still_trimmed_off() {
+    // The stop phrase closes the last chunk exactly as it closes a capture
+    // today, and what it must not do is end up in the message.
+    let mut capture = ClosingCapture::new();
+    let mut rolling = scripted_capture(&["remind me to buy milk", "buzz stop"]);
+
+    rolling.hand_off(vec![0.05_f32; 16_000]);
+    capture.close(&mut rolling, Some("buzz stop"));
+
+    assert_eq!(
+        capture.submitted(),
+        vec!["remind me to buy milk".to_string()]
+    );
+}
+
+#[test]
+fn a_chunk_that_failed_leaves_the_failure_on_the_indicator_and_sends_nothing() {
+    // A hole in the middle of a message, silently sent, would be worse than no
+    // message: the user would read their own words back with a sentence missing
+    // and nothing to say one had been lost.
+    let mut capture = ClosingCapture::new();
+    let mut rolling = RollingCapture::spawn(|_| Err("Speech server failed: HTTP 502".to_string()))
+        .expect("rolling");
+
+    rolling.hand_off(vec![0.05_f32; 16_000]);
+    capture.close(&mut rolling, None);
+
+    assert_eq!(
+        capture.announced(),
+        vec![
+            AmbientStatus::Transcribing,
+            AmbientStatus::Error("Speech server failed: HTTP 502".to_string()),
+        ]
+    );
+    assert!(capture.submitted().is_empty());
+}
+
+#[test]
+fn a_chunk_decoding_off_the_worker_thread_leaves_the_audio_watchdog_on() {
+    // The other half of `a_slow_speech_server_does_not_make_a_fed_session_look
+    // _deaf`, and the edge that arrives with rolling capture: the busy mark
+    // measures the *worker* being blocked, and a chunk being decoded elsewhere
+    // does not block it. Marking one would switch the staleness watchdog off
+    // for as long as a capture runs — minutes — and a microphone that died
+    // mid-conversation would never be reported at all.
+    const DECODE_TAKES: Duration = Duration::from_millis(400);
+
+    let flow = AudioFlow::new();
+    flow.record(1);
+    let mut rolling = RollingCapture::spawn(move |_| {
+        thread::sleep(DECODE_TAKES);
+        Ok("the first half".to_string())
+    })
+    .expect("rolling");
+
+    rolling.hand_off(vec![0.05_f32; 16_000]);
+    thread::sleep(Duration::from_millis(120));
+
+    let quiet = flow.snapshot().since_last_batch;
+    assert!(
+        quiet >= Duration::from_millis(100),
+        "a chunk decoding off the worker thread switched the audio watchdog off: {quiet:?}"
+    );
 }
 
 // ── Fixture-driven tests through the real engine ─────────────────────────────
@@ -340,6 +671,43 @@ fn a_wake_word_that_is_not_spoken_does_not_fire() {
         &model_dir.join("test_wavs/0.wav"),
     );
     assert!(fired.is_empty(), "unexpected detections: {fired:?}");
+}
+
+#[test]
+#[ignore = "needs the downloaded KWS model; set BUZZ_AMBIENT_KWS_MODEL_DIR"]
+fn a_wake_word_and_a_stop_phrase_both_fire_from_one_spotter() {
+    // The stop phrase is armed beside the wake word on the *same* spotter
+    // session rather than on a second engine — a second spotter would be a
+    // second ONNX model load and a second copy of every frame. This is the
+    // check that one engine really does answer for both: 1.wav says "lovely
+    // child" and, later, "for ever", and both come back distinguishable by
+    // `KeywordResult::keyword` alone. A third armed phrase that is not spoken
+    // in this fixture is the control against "everything fires".
+    let model_dir = model_dir_from_env();
+    let fired = detections_for(
+        &model_dir,
+        &["lovely child", "for ever", "light up"],
+        &model_dir.join("test_wavs/1.wav"),
+    );
+    assert!(
+        fired.iter().any(|k| k.eq_ignore_ascii_case("LOVELY CHILD")),
+        "the wake word did not fire: {fired:?}"
+    );
+    assert!(
+        fired.iter().any(|k| k.eq_ignore_ascii_case("FOR EVER")),
+        "the second armed keyword did not fire: {fired:?}"
+    );
+    assert!(
+        !fired.iter().any(|k| k.eq_ignore_ascii_case("LIGHT UP")),
+        "an armed keyword that was never spoken fired: {fired:?}"
+    );
+    // And the form the worker matches on is the form the engine reports.
+    for keyword in &fired {
+        assert_eq!(
+            keyword.trim(),
+            crate::ambient_voice::wake_word::engine_keyword(keyword)
+        );
+    }
 }
 
 #[test]

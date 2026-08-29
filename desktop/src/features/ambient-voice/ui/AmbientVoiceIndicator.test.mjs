@@ -22,6 +22,7 @@ import test from "node:test";
 import {
   ambientReport,
   deafAmbientReport,
+  failingSpeechServerReport,
   setViewport,
   withAmbientDom,
 } from "../lib/ambientVoiceTestDom.mjs";
@@ -216,6 +217,22 @@ test('a session that is hearing nothing says so instead of "listening"', async (
     // microphone still reads as "it is hearing me".
     assert.equal(pill().querySelector(".text-primary"), null);
   });
+});
+
+test("a speech server that has stopped answering is said on the pill", async () => {
+  // The session is alive, the microphone is feeding it, and the server it was
+  // pointed at has been refusing for three utterances — each of which quietly
+  // fell back to this computer. The fallback is right; saying "Listening for
+  // the wake word" through it is not.
+  await mountIndicator(
+    { report: failingSpeechServerReport() },
+    async ({ pill }) => {
+      assert.equal(
+        pill().textContent,
+        "Speech-to-text server is not answering",
+      );
+    },
+  );
 });
 
 test("a session that is being fed keeps the ordinary listening copy", async () => {
