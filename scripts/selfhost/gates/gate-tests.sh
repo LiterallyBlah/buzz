@@ -10,6 +10,7 @@
 #     C. cargo check -p buzz-relay --lib
 #     D. pnpm typecheck             (desktop)
 #     E. pnpm test                  (desktop)
+#     F. gate harness schema contract (canonical convergence path + invariants)
 #
 # WHAT IT DELIBERATELY DOES NOT PROVE
 #   * NOT a full-workspace green. See "Known environment gap" below and in
@@ -88,6 +89,12 @@ run_logged() {
   set -e
   return "${rc}"
 }
+
+if ! run_logged "gate harness schema contract" \
+    "${EVIDENCE}/harness-schema-contract.log" -- \
+    ./scripts/selfhost/gates/test-harness-schema-contract.sh; then
+  HARD_FAILS+=("gate harness schema contract failed (gate mechanism error — not waivable)")
+fi
 
 # ---- Rust ------------------------------------------------------------------
 

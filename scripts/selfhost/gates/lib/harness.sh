@@ -34,6 +34,7 @@ export GATES_MINIO_CONSOLE_PORT="${GATES_MINIO_CONSOLE_PORT:-9474}"
 GATES_RELAY_PORT="${GATES_RELAY_PORT:-3031}"
 GATES_RELAY_HEALTH_PORT="${GATES_RELAY_HEALTH_PORT:-8089}"
 GATES_RELAY_METRICS_PORT="${GATES_RELAY_METRICS_PORT:-9203}"
+GATES_POST_SCHEMA_SCRIPT_REL="scripts/reconcile-schema-after-pgschema.sql"
 
 # Compose projects this runner must NEVER drive. buzz-harness belongs to a
 # sibling worktree's test session; buzz-prod / buzz are live. Refusing by name
@@ -140,7 +141,8 @@ harness_up() {
   return 1
 }
 
-# harness_schema — reset + apply schema and partitions. The database belongs
+# harness_schema — reset + apply migrations and canonical post-schema
+# convergence. The database belongs
 # solely to our compose project, so a destructive reset every run is correct:
 # stale partitions from an earlier gate run must not colour this verdict.
 #
@@ -155,8 +157,8 @@ harness_up() {
 # source that provably matches prod. Applied ledger-less via psql, so the gate
 # relays keep auto-migrate OFF — a second applier would collide on migration 1.
 harness_schema() {
-  step "Reset isolated database and apply migrations + partitions"
-  preview "psql < migrations/*.sql (in order), then scripts/attach-schema-partitions.sql"
+  step "Reset isolated database and apply migrations + canonical post-schema convergence"
+  preview "psql < migrations/*.sql (in order), then ${GATES_POST_SCHEMA_SCRIPT_REL}"
   is_dry && return 0
 
   harness_compose exec -T postgres psql -U buzz -d buzz -v ON_ERROR_STOP=1 \
@@ -172,9 +174,9 @@ harness_schema() {
   done
 
   harness_compose exec -T postgres psql -U buzz -d buzz -v ON_ERROR_STOP=1 \
-    < "${REPO_ROOT}/scripts/attach-schema-partitions.sql" >/dev/null || return 1
+    < "${REPO_ROOT}/${GATES_POST_SCHEMA_SCRIPT_REL}" >/dev/null || return 1
 
-  ok "Schema applied from $(ls "${REPO_ROOT}"/migrations/*.sql | wc -l) migrations"
+  ok "Schema applied from $(ls "${REPO_ROOT}"/migrations/*.sql | wc -l) migrations plus canonical post-schema convergence"
 }
 
 # harness_seed — community/channels/members, keyed to OUR relay's host label so

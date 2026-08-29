@@ -36,6 +36,7 @@ bring-up and a five-minute soak.
 | C | `cargo check -p buzz-relay --lib` |
 | D | `pnpm typecheck` (desktop) |
 | E | `pnpm test` (desktop) |
+| F | `test-harness-schema-contract.sh` — requires migration-order setup to invoke the existing canonical `scripts/reconcile-schema-after-pgschema.sql`, including partition, heartbeat storage and singleton-row invariants |
 
 **Does not prove.** *Not a full-workspace green.* `buzz-relay`'s **test targets**
 pull OpenSSL through dev-dependencies and this host has no OpenSSL development
