@@ -7,6 +7,7 @@ import {
 } from "@/features/projects/hooks";
 import { eventToRepository } from "@/features/projects/projectModels";
 import { buildRepositoryChannelBindingTemplate } from "@/features/projects/projectRepositoryCreation";
+import { inheritProjectDataProvenance } from "@/features/projects/projectSnapshot";
 import { relayClient } from "@/shared/api/relayClient";
 import { signRelayEvent } from "@/shared/api/tauri";
 import { getIdentity } from "@/shared/api/tauriIdentity";
@@ -53,14 +54,24 @@ export function useBindProjectRepositoryChannelMutation() {
     mutationFn: bindProjectRepositoryChannel,
     onSuccess: async (repository) => {
       queryClient.setQueryData<Project[]>(projectsQueryKey, (current = []) =>
-        current.map((project) => ({
-          ...project,
-          repositories: project.repositories.map((candidate) =>
-            candidate.repoAddress === repository.repoAddress
-              ? repository
-              : candidate,
-          ),
-        })),
+        current.map((project) => {
+          if (
+            !project.repositories.some(
+              (candidate) => candidate.repoAddress === repository.repoAddress,
+            )
+          ) {
+            return project;
+          }
+          const updatedProject = {
+            ...project,
+            repositories: project.repositories.map((candidate) =>
+              candidate.repoAddress === repository.repoAddress
+                ? repository
+                : candidate,
+            ),
+          };
+          return inheritProjectDataProvenance(project, updatedProject);
+        }),
       );
       // The signed repository head changes the relay's git authorisation result
       // without changing the repository id or clone URL. Invalidate both the
