@@ -3,7 +3,6 @@ use crate::managed_agents::known_acp_runtime;
 #[path = "cli_tests.rs"]
 mod cli_tests;
 
-
 #[test]
 fn appimage_binary_matches_truncated_linux_comm_name() {
     assert!(super::is_desktop_binary("buzz-desktop.bi"));

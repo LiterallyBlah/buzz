@@ -72,8 +72,8 @@ mod spawn_key; // production spawn-key derivation + its regressions
 pub(crate) use spawn_key::bound_runtime_key;
 
 mod summary;
-pub use summary::{build_managed_agent_summary, find_managed_agent_mut};
 pub(crate) use summary::workspace_pair_key;
+pub use summary::{build_managed_agent_summary, find_managed_agent_mut};
 #[cfg(test)]
 use summary::{persona_drift_state, resolve_workspace_pair_key};
 
