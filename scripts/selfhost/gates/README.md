@@ -37,6 +37,7 @@ bring-up and a five-minute soak.
 | D | `pnpm typecheck` (desktop) |
 | E | `pnpm test` (desktop) |
 | F | `test-harness-schema-contract.sh` — requires migration-order setup to invoke the existing canonical `scripts/reconcile-schema-after-pgschema.sql`, including partition, heartbeat storage and singleton-row invariants |
+| G | `test-harness-relay-key-contract.sh` — requires every candidate-relay caller to use the shared harness path, with one valid relay key minted in memory and withheld from argv, output, evidence and production key paths |
 
 **Does not prove.** *Not a full-workspace green.* `buzz-relay`'s **test targets**
 pull OpenSSL through dev-dependencies and this host has no OpenSSL development
@@ -409,8 +410,12 @@ outside `scripts/selfhost/gates/**`.
 * Nothing reads or writes `/opt/buzz/keys`, `/etc`, systemd, or the `buzz-prod`
   stack. The deployed artifacts are **read-only inputs**: hashed, executed inside
   the harness, never modified.
-* Keys are minted per run via `buzz-admin generate-key`
-  (`crates/buzz-admin/src/main.rs:132`) and never persisted.
+* Agent, driver and candidate-relay keys are minted per run via
+  `buzz-admin generate-key` (`crates/buzz-admin/src/main.rs:132`) and never
+  persisted. The candidate relay key is held only in the gate shell and child
+  environment, reused by candidate relay starts in that gate process, and never
+  placed in argv or printed. The harness deliberately ignores inherited relay
+  keys and never reads `/opt/buzz/keys`.
 
 ### Two host-specific deviations
 

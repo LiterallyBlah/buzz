@@ -35,6 +35,11 @@ GATES_RELAY_PORT="${GATES_RELAY_PORT:-3031}"
 GATES_RELAY_HEALTH_PORT="${GATES_RELAY_HEALTH_PORT:-8089}"
 GATES_RELAY_METRICS_PORT="${GATES_RELAY_METRICS_PORT:-9203}"
 GATES_POST_SCHEMA_SCRIPT_REL="scripts/reconcile-schema-after-pgschema.sql"
+# Always mint this harness's relay identity in-process. Deliberately ignore any
+# inherited value so a production or developer relay key cannot cross into a
+# disposable gate run.
+unset GATES_RELAY_PRIVATE_KEY
+GATES_RELAY_PRIVATE_KEY=""
 
 # Compose projects this runner must NEVER drive. buzz-harness belongs to a
 # sibling worktree's test session; buzz-prod / buzz are live. Refusing by name
@@ -218,15 +223,70 @@ harness_relay_build() {
     -- cargo build --profile "${profile}" -p buzz-relay
 }
 
+# harness_relay_key_ensure — mint one relay signing identity for this gate
+# process and reuse it for every candidate relay start. The buzz-admin output is
+# captured, validated and never printed or written. Nothing reads /opt/buzz/keys
+# or an inherited BUZZ_RELAY_PRIVATE_KEY.
+harness_relay_key_ensure() {
+  [[ -z "${GATES_RELAY_PRIVATE_KEY}" ]] || {
+    [[ "${GATES_RELAY_PRIVATE_KEY}" =~ ^[0-9a-f]{64}$ ]]
+    return
+  }
+
+  ensure_cargo || return 1
+  local generated secret
+  generated="$(cargo run --quiet -p buzz-admin -- generate-key 2>/dev/null)" || return 1
+  secret="$(awk '/Secret key:/ {print $NF}' <<<"${generated}")"
+  unset generated
+  [[ "${secret}" =~ ^[0-9a-f]{64}$ ]] || {
+    unset secret
+    err "buzz-admin did not mint a valid 32-byte hex relay key"
+    return 1
+  }
+  GATES_RELAY_PRIVATE_KEY="${secret}"
+  unset secret
+}
+
+# harness_relay_exec <binary> [extra env KEY=VAL ...] — enter the candidate
+# relay environment without putting the private key in argv. Called only from
+# harness_relay_start and exposed separately so the executable regression can
+# inspect the environment boundary without starting Docker or a real relay.
+harness_relay_exec() {
+  local bin="$1"; shift
+  local assignment
+
+  export DATABASE_URL="postgres://buzz:buzz_dev@localhost:${GATES_PG_PORT}/buzz"
+  export REDIS_URL="redis://localhost:${GATES_REDIS_PORT}"
+  export RELAY_URL="$(harness_relay_ws)"
+  export BUZZ_BIND_ADDR="0.0.0.0:${GATES_RELAY_PORT}"
+  export BUZZ_HEALTH_PORT="${GATES_RELAY_HEALTH_PORT}"
+  export BUZZ_METRICS_PORT="${GATES_RELAY_METRICS_PORT}"
+  export BUZZ_S3_ENDPOINT="http://localhost:${GATES_MINIO_PORT}"
+  export BUZZ_S3_ACCESS_KEY=buzz_dev
+  export BUZZ_S3_SECRET_KEY=buzz_dev_secret
+  export BUZZ_S3_BUCKET=buzz-media
+  export BUZZ_REQUIRE_AUTH_TOKEN=false
+  export BUZZ_RECONCILE_CHANNELS=true
+  export BUZZ_RELAY_PRIVATE_KEY="${GATES_RELAY_PRIVATE_KEY}"
+  for assignment in "$@"; do
+    [[ "${assignment}" == *=* ]] || { err "invalid relay environment assignment"; return 1; }
+    export "${assignment}"
+  done
+  exec setsid "${bin}"
+}
+
 # harness_relay_start <binary> <logfile> [extra env KEY=VAL ...]
 harness_relay_start() {
   local bin="$1" logfile="$2"; shift 2
   local extra=("$@")
+  local assignment extra_names=()
 
   step "Start relay ${bin} on :${GATES_RELAY_PORT} (health :${GATES_RELAY_HEALTH_PORT}, metrics :${GATES_RELAY_METRICS_PORT})"
   preview "${bin}"
   note "daemonised with setsid (tmux is not installed on this host); log -> ${logfile}"
-  [[ ${#extra[@]} -gt 0 ]] && note "extra env: ${extra[*]}"
+  for assignment in "${extra[@]}"; do extra_names+=("${assignment%%=*}"); done
+  [[ ${#extra_names[@]} -gt 0 ]] && note "extra env names: ${extra_names[*]}"
+  note "relay signing identity: minted in memory for this gate process; value withheld"
   is_dry && return 0
 
   if ss -ltn 2>/dev/null | grep -q ":${GATES_RELAY_PORT} "; then
@@ -234,22 +294,9 @@ harness_relay_start() {
     return 1
   fi
   [[ -x "${bin}" ]] || { err "relay binary not executable: ${bin}"; return 1; }
+  harness_relay_key_ensure || return 1
 
-  setsid env \
-    DATABASE_URL="postgres://buzz:buzz_dev@localhost:${GATES_PG_PORT}/buzz" \
-    REDIS_URL="redis://localhost:${GATES_REDIS_PORT}" \
-    RELAY_URL="$(harness_relay_ws)" \
-    BUZZ_BIND_ADDR="0.0.0.0:${GATES_RELAY_PORT}" \
-    BUZZ_HEALTH_PORT="${GATES_RELAY_HEALTH_PORT}" \
-    BUZZ_METRICS_PORT="${GATES_RELAY_METRICS_PORT}" \
-    BUZZ_S3_ENDPOINT="http://localhost:${GATES_MINIO_PORT}" \
-    BUZZ_S3_ACCESS_KEY=buzz_dev \
-    BUZZ_S3_SECRET_KEY=buzz_dev_secret \
-    BUZZ_S3_BUCKET=buzz-media \
-    BUZZ_REQUIRE_AUTH_TOKEN=false \
-    BUZZ_RECONCILE_CHANNELS=true \
-    "${extra[@]}" \
-    "${bin}" >"${logfile}" 2>&1 < /dev/null &
+  (harness_relay_exec "${bin}" "${extra[@]}") >"${logfile}" 2>&1 < /dev/null &
   GATES_RELAY_PID=$!
   disown "${GATES_RELAY_PID}" 2>/dev/null || true
 

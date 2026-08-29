@@ -11,6 +11,7 @@
 #     D. pnpm typecheck             (desktop)
 #     E. pnpm test                  (desktop)
 #     F. gate harness schema contract (canonical convergence path + invariants)
+#     G. gate relay-key contract (ephemeral, in-memory, shared candidate path)
 #
 # WHAT IT DELIBERATELY DOES NOT PROVE
 #   * NOT a full-workspace green. See "Known environment gap" below and in
@@ -94,6 +95,12 @@ if ! run_logged "gate harness schema contract" \
     "${EVIDENCE}/harness-schema-contract.log" -- \
     ./scripts/selfhost/gates/test-harness-schema-contract.sh; then
   HARD_FAILS+=("gate harness schema contract failed (gate mechanism error — not waivable)")
+fi
+
+if ! run_logged "gate relay-key contract" \
+    "${EVIDENCE}/harness-relay-key-contract.log" -- \
+    ./scripts/selfhost/gates/test-harness-relay-key-contract.sh; then
+  HARD_FAILS+=("gate relay-key contract failed (gate mechanism error — not waivable)")
 fi
 
 # ---- Rust ------------------------------------------------------------------
