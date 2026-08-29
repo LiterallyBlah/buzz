@@ -11115,7 +11115,6 @@ mod heartbeat_base_prompt_tests {
             composed,
             "<base>\nyou are a helpful agent\n</base>\n\n[System: Heartbeat]\nrun feed get"
         );
-        assert!(composed.starts_with("[Base]\nyou are a helpful agent\n\n"));
     }
 
     #[test]

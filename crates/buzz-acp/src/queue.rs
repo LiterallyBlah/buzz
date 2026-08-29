@@ -3705,7 +3705,7 @@ mod project_context_tests {
         )
         .join("\n\n");
 
-        assert!(prompt.contains("[Context]"), "channel hints were lost");
+        assert!(prompt.contains("<context>"), "channel hints were lost");
         assert!(!prompt.contains("[Project]"));
         assert!(!prompt.contains("[Project Conversation"));
         assert!(!prompt.contains("[Peer Agents]"));
@@ -4354,7 +4354,7 @@ mod tests {
 
         assert!(batch.project_origin().is_none());
         assert!(!prompt.contains("[Project]"));
-        assert!(prompt.contains("[Context]"));
+        assert!(prompt.contains("<context>"));
     }
 
     #[test]
