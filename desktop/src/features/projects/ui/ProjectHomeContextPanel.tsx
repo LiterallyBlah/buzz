@@ -100,7 +100,10 @@ function ContextRowContent({
         {icon}
       </span>
       <span className="min-w-0 flex-1 truncate text-left">{children}</span>
-      <span className="w-8 shrink-0 text-right tabular-nums text-current opacity-60">
+      <span
+        aria-hidden="true"
+        className="w-8 shrink-0 text-right tabular-nums text-current opacity-60"
+      >
         {count ?? ""}
       </span>
     </>
@@ -114,6 +117,7 @@ function ContextNavButton({
   icon,
   onClick,
   pressed,
+  tab = false,
   testId,
   title,
 }: {
@@ -123,12 +127,14 @@ function ContextNavButton({
   icon: React.ReactNode;
   onClick?: () => void;
   pressed?: boolean;
+  tab?: boolean;
   testId?: string;
   title?: string;
 }) {
   return (
     <Button
-      aria-pressed={pressed}
+      aria-pressed={tab ? undefined : pressed}
+      aria-selected={tab ? Boolean(pressed) : undefined}
       className={cn(
         PROJECT_HOME_SIDEBAR_ROW_CLASS,
         pressed &&
@@ -137,6 +143,7 @@ function ContextNavButton({
       data-testid={testId}
       disabled={disabled}
       onClick={onClick}
+      role={tab ? "tab" : undefined}
       size="sm"
       title={title}
       type="button"
@@ -262,64 +269,75 @@ export function ProjectHomeContextPanel({
       data-testid="project-home-context-panel"
     >
       <ContextSection testId="project-home-context-workspace">
-        <ContextNavButton
-          count={presentContextCount(activity?.issueCount)}
-          disabled={!firstRepository && !onAddRepository}
-          icon={<CircleDot />}
-          onClick={() => openWorkspace("issues")}
-          pressed={activeWorkspaceTab === "issues"}
-          testId="project-home-context-tasks"
-          title={addRepositoryTitle}
+        <div
+          aria-label="Project workspace"
+          className="space-y-1"
+          role="tablist"
         >
-          Tasks
-        </ContextNavButton>
-        <ContextNavButton
-          count={presentContextCount(activity?.prCount)}
-          disabled={!firstRepository && !onAddRepository}
-          icon={<GitPullRequest />}
-          onClick={() => openWorkspace("prs")}
-          pressed={activeWorkspaceTab === "prs"}
-          testId="project-home-context-reviews"
-          title={addRepositoryTitle}
-        >
-          Reviews
-        </ContextNavButton>
-        <ContextNavButton
-          count={presentContextCount(activity?.commitCount)}
-          disabled={!firstRepository && !onAddRepository}
-          icon={<GitCommitHorizontal />}
-          onClick={() => openWorkspace("commits")}
-          pressed={activeWorkspaceTab === "commits"}
-          testId="project-home-context-commits"
-          title={addRepositoryTitle}
-        >
-          Commits
-        </ContextNavButton>
-        <ContextNavButton
-          count={presentContextCount(snapshotQuery.data?.files.length)}
-          disabled={!firstRepository && !onAddRepository}
-          icon={<FileCode2 />}
-          onClick={() => openWorkspace("files")}
-          pressed={activeWorkspaceTab === "files"}
-          testId="project-home-context-files"
-          title={addRepositoryTitle}
-        >
-          Files
-        </ContextNavButton>
-        <ContextNavButton
-          count={presentContextCount(peopleCount)}
-          disabled={!firstRepository}
-          icon={<Users />}
-          onClick={() =>
-            firstRepository &&
-            onOpenWorkspace(firstRepository.id, "contributors")
-          }
-          pressed={activeWorkspaceTab === "contributors"}
-          testId="project-home-context-people"
-          title={addRepositoryTitle}
-        >
-          People
-        </ContextNavButton>
+          <ContextNavButton
+            count={presentContextCount(activity?.issueCount)}
+            disabled={!firstRepository && !onAddRepository}
+            icon={<CircleDot />}
+            onClick={() => openWorkspace("issues")}
+            pressed={activeWorkspaceTab === "issues"}
+            tab
+            testId="project-home-context-tasks"
+            title={addRepositoryTitle}
+          >
+            Tasks
+          </ContextNavButton>
+          <ContextNavButton
+            count={presentContextCount(activity?.prCount)}
+            disabled={!firstRepository && !onAddRepository}
+            icon={<GitPullRequest />}
+            onClick={() => openWorkspace("prs")}
+            pressed={activeWorkspaceTab === "prs"}
+            tab
+            testId="project-home-context-reviews"
+            title={addRepositoryTitle}
+          >
+            Reviews
+          </ContextNavButton>
+          <ContextNavButton
+            count={presentContextCount(activity?.commitCount)}
+            disabled={!firstRepository && !onAddRepository}
+            icon={<GitCommitHorizontal />}
+            onClick={() => openWorkspace("commits")}
+            pressed={activeWorkspaceTab === "commits"}
+            tab
+            testId="project-home-context-commits"
+            title={addRepositoryTitle}
+          >
+            Commits
+          </ContextNavButton>
+          <ContextNavButton
+            count={presentContextCount(snapshotQuery.data?.files.length)}
+            disabled={!firstRepository && !onAddRepository}
+            icon={<FileCode2 />}
+            onClick={() => openWorkspace("files")}
+            pressed={activeWorkspaceTab === "files"}
+            tab
+            testId="project-home-context-files"
+            title={addRepositoryTitle}
+          >
+            Files
+          </ContextNavButton>
+          <ContextNavButton
+            count={presentContextCount(peopleCount)}
+            disabled={!firstRepository}
+            icon={<Users />}
+            onClick={() =>
+              firstRepository &&
+              onOpenWorkspace(firstRepository.id, "contributors")
+            }
+            pressed={activeWorkspaceTab === "contributors"}
+            tab
+            testId="project-home-context-people"
+            title={addRepositoryTitle}
+          >
+            People
+          </ContextNavButton>
+        </div>
       </ContextSection>
       <ContextSection
         collapsible

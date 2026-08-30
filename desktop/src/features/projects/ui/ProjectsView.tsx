@@ -476,11 +476,7 @@ export function ProjectsView() {
   // ambiguous across owners (forks can share the same dtag).
   const handleOpenProject = React.useCallback(
     (project: Project) => {
-      const primaryRepository = project.repositories[0];
-      void goProject(
-        project.id,
-        primaryRepository ? { repositoryId: primaryRepository.id } : undefined,
-      );
+      void goProject(project.id);
     },
     [goProject],
   );
