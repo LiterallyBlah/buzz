@@ -43,6 +43,12 @@ use tokio_tungstenite::tungstenite::Message;
 /// cap on the wrong side of the allocation.
 pub(crate) const MAX_WS_MESSAGE_BYTES: usize = 512 * 1024;
 
+/// Largest individual WebSocket frame accepted by tungstenite.
+///
+/// Kept separate from [`MAX_WS_MESSAGE_BYTES`] so neither decoder ceiling can
+/// silently fall back to tungstenite's much larger default.
+pub(crate) const MAX_WS_FRAME_BYTES: usize = 512 * 1024;
+
 /// Longest the host waits for the relay's AUTH challenge.
 pub(crate) const AUTH_CHALLENGE_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -99,19 +105,23 @@ pub(crate) struct IdentityWitness {
 impl IdentityWitness {
     /// Which socket authenticated.
     ///
-    /// Read only by tests today: a subscription cannot currently observe a
-    /// stale generation, because a dead socket closes the subscriptions it
-    /// carried rather than leaving them to notice. Kept because it is what the
-    /// witness *is* — a statement about one connection, not a free-floating
-    /// pubkey — and a reconnecting v2 needs exactly this to refuse a witness
-    /// minted by the previous socket.
-    #[cfg(test)]
+    /// Production routing and teardown use this value. A witness is a statement
+    /// about one authenticated socket, not a free-floating pubkey; dropping the
+    /// generation here lets an old reader route or sweep a newer connection.
     pub(crate) fn connection_generation(&self) -> u64 {
         self.connection_generation
     }
 
     pub(crate) fn authenticated_pubkey(&self) -> &str {
         &self.authenticated_pubkey
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(connection_generation: u64, authenticated_pubkey: &str) -> Self {
+        Self {
+            connection_generation,
+            authenticated_pubkey: authenticated_pubkey.to_string(),
+        }
     }
 }
 
@@ -226,11 +236,14 @@ fn parse_auth_challenge(text: &str) -> Option<String> {
 fn parse_ok(text: &str) -> Option<(String, bool)> {
     let value: serde_json::Value = serde_json::from_str(text).ok()?;
     let array = value.as_array()?;
-    if array.first()?.as_str()? != "OK" {
+    if array.len() != 4 || array.first()?.as_str()? != "OK" {
         return None;
     }
     let event_id = array.get(1)?.as_str()?.to_string();
     let success = array.get(2)?.as_bool()?;
+    // NIP-01's message field is part of the witness shape even when empty.
+    // `["OK", id, true]` is truncated, not a successful acknowledgement.
+    let _message = array.get(3)?.as_str()?;
     Some((event_id, success))
 }
 

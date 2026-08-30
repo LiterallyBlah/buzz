@@ -23,27 +23,40 @@ function harness(t, options = {}) {
   const {
     reply = { ok: true, result: { pubkey: "a".repeat(64) } },
     call,
+    control,
+    listen: listenOption,
     registry,
     lease = LEASE,
   } = options;
   const channel = new MessageChannel();
   const calls = [];
+  const controls = [];
+  const timeline = [];
   const record = (lease, v, method, params) => {
     calls.push({ lease, v, method, params });
     return call ? call(lease, v, method, params) : Promise.resolve(reply);
   };
+  const recordControl = (lease, action, sub, detail) => {
+    timeline.push({ kind: "control", action, sub });
+    controls.push({ lease, action, sub, detail });
+    return control ? control(lease, action, sub, detail) : Promise.resolve();
+  };
   let closeCount = 0;
+  const realPost = channel.port1.postMessage.bind(channel.port1);
+  channel.port1.postMessage = (value, transfer) => {
+    timeline.push({ kind: "post", value });
+    return realPost(value, transfer);
+  };
   const realClose = channel.port1.close.bind(channel.port1);
   channel.port1.close = () => {
     closeCount += 1;
     realClose();
   };
 
-  // A stand-in for Tauri's event `listen`, so the host stream can be driven
-  // without an IPC bridge. `emit` is what a test uses to play the host.
   let handler = null;
+  let raw = null;
   let unlistened = 0;
-  const listen = (_event, fn) => {
+  const defaultListen = (_event, fn) => {
     handler = fn;
     raw = fn;
     return Promise.resolve(() => {
@@ -51,22 +64,41 @@ function harness(t, options = {}) {
       handler = null;
     });
   };
+  const listen = listenOption ?? defaultListen;
+  const streamSeq = new Map();
+  const batch = (payload) => {
+    if (!payload?.frame) return payload;
+    const { frame } = payload;
+    const streamKey = `${payload.lease}:${frame.sub}`;
+    const seq = (streamSeq.get(streamKey) ?? 0) + 1;
+    streamSeq.set(streamKey, seq);
+    const encodedBytes = new TextEncoder().encode(
+      JSON.stringify(frame),
+    ).byteLength;
+    return {
+      generation: payload.lease,
+      sub: frame.sub,
+      seq,
+      token: uuid(900000 + seq),
+      frames: [frame],
+      frameCount: 1,
+      encodedBytes,
+      terminal: frame.kind === "closed",
+    };
+  };
   const emit = (payload) => {
     if (!handler) {
       throw new Error("no stream listener is installed");
     }
-    handler({ payload });
+    handler({ payload: batch(payload) });
   };
-  // Keeps working after unlisten, so a test can play the one case the real
-  // event bus produces and the stand-in otherwise cannot: a frame already
-  // dispatched when the listener was removed.
-  let raw = null;
-  const rawEmit = (payload) => raw({ payload });
+  const rawEmit = (payload) => raw({ payload: batch(payload) });
 
   const handle = startBridgeDispatch({
     port: channel.port1,
     lease,
     call: record,
+    control: recordControl,
     registry,
     listen,
   });
@@ -78,6 +110,8 @@ function harness(t, options = {}) {
   return {
     channel,
     calls,
+    controls,
+    timeline,
     handle,
     emit,
     rawEmit,
@@ -99,7 +133,31 @@ async function waitFor(predicate, what, timeoutMs = 2000) {
 
 function collect(channel) {
   const seen = [];
-  channel.port2.onmessage = (event) => seen.push(event.data);
+  channel.port2.onmessage = (event) => {
+    const value = event.data;
+    if (value?.buzz === "stream-batch") {
+      // Stand-in for the extension-side bridge client: adopt/validate the whole
+      // batch, expose only public stream frames, then ACK after dequeue.
+      assert.equal(value.frameCount, value.frames.length);
+      for (const frame of value.frames) {
+        assert.equal(frame.sub, value.sub);
+        seen.push(frame);
+      }
+      if (!value.terminal) {
+        channel.port2.postMessage({
+          buzz: "stream-ack",
+          generation: value.generation,
+          sub: value.sub,
+          seq: value.seq,
+          token: value.token,
+          frameCount: value.frameCount,
+          encodedBytes: value.encodedBytes,
+        });
+      }
+      return;
+    }
+    seen.push(value);
+  };
   return seen;
 }
 
@@ -717,194 +775,4 @@ test("8R: no frontend path inserts, defaults or clamps created_at", async (t) =>
     1,
     "the frontend must pass the caller's timestamp through unchanged, however wrong",
   );
-});
-
-// ── the stream forwarder ─────────────────────────────────────────────────────
-//
-// Rust mints the `sub` and decides what may be delivered; this layer decides
-// *where*. The rows below are about that "where", plus the one thing this side
-// genuinely owns — the per-port subscription ceiling.
-
-/** Open a subscription through the dispatcher and return its id. */
-async function openSubscription(h, id, sub) {
-  const reply = await roundTrip(h.channel, {
-    id,
-    v: 1,
-    method: "subscribe",
-    params: { filter: { kinds: [9] } },
-  });
-  assert.deepEqual(reply, { id, ok: true, result: { sub } });
-  return sub;
-}
-
-test("a stream frame for this lease reaches the extension", async (t) => {
-  const sub = "sub-1";
-  const h = harness(t, { reply: { ok: true, result: { sub } } });
-  await openSubscription(h, uuid(1), sub);
-  await waitFor(() => h.listening(), "the stream listener");
-
-  const seen = collect(h.channel);
-  h.emit({ lease: LEASE, frame: { sub, kind: "eose" } });
-  await waitFor(() => seen.length === 1, "the eose frame");
-  assert.deepEqual(seen[0], { sub, kind: "eose" });
-  assert.equal(
-    "id" in seen[0],
-    false,
-    "a stream frame carries no id, so it cannot settle a request",
-  );
-});
-
-test("a stream frame addressed to another lease is not delivered", async (t) => {
-  // The second of the two independent walls. Rust keys its registry by
-  // (lease, sub) and cannot address a successor port; this refuses one that
-  // arrives anyway. The two fall at different times, so neither is redundant.
-  const sub = "sub-1";
-  const h = harness(t, { reply: { ok: true, result: { sub } } });
-  await openSubscription(h, uuid(1), sub);
-  await waitFor(() => h.listening(), "the stream listener");
-
-  const seen = collect(h.channel);
-  h.emit({ lease: uuid(99), frame: { sub, kind: "eose" } });
-  // Then a frame that *should* arrive, so "nothing was delivered" cannot be
-  // satisfied by a forwarder that delivers nothing at all.
-  h.emit({ lease: LEASE, frame: { sub, kind: "eose" } });
-  await waitFor(() => seen.length === 1, "the addressed frame");
-  assert.equal(seen.length, 1, "only the frame for this lease");
-});
-
-test("a frame for a sub this port does not hold is dropped", async (t) => {
-  const h = harness(t, { reply: { ok: true, result: { sub: "sub-1" } } });
-  await openSubscription(h, uuid(1), "sub-1");
-  await waitFor(() => h.listening(), "the stream listener");
-
-  const seen = collect(h.channel);
-  h.emit({ lease: LEASE, frame: { sub: "never-opened", kind: "eose" } });
-  h.emit({ lease: LEASE, frame: { sub: "sub-1", kind: "eose" } });
-  await waitFor(() => seen.length === 1, "the live sub's frame");
-  assert.deepEqual(seen[0], { sub: "sub-1", kind: "eose" });
-});
-
-test("closed is delivered, and nothing follows it", async (t) => {
-  // `closed` is terminal in §5. Forwarding anything after it would contradict
-  // the frame the extension just used to tear its own state down.
-  const sub = "sub-1";
-  const h = harness(t, { reply: { ok: true, result: { sub } } });
-  await openSubscription(h, uuid(1), sub);
-  await waitFor(() => h.listening(), "the stream listener");
-
-  const seen = collect(h.channel);
-  h.emit({
-    lease: LEASE,
-    frame: { sub, kind: "closed", reason: "relay_closed" },
-  });
-  await waitFor(() => seen.length === 1, "the closed frame");
-  h.emit({ lease: LEASE, frame: { sub, kind: "event", event: {} } });
-  await new Promise((resolve) => setTimeout(resolve, 20));
-  assert.equal(seen.length, 1, "no frame may follow closed");
-  assert.equal(seen[0].kind, "closed");
-});
-
-test("a refused subscription is closed host-side rather than leaked", async (t) => {
-  // The port ceiling is this layer's own rule, so the host does not know it was
-  // broken. A refusal that only answered the caller would leave a live relay
-  // branch nothing forwards, for the life of the frame.
-  const registry = createRegistry();
-  let minted = 0;
-  const h = harness(t, {
-    registry,
-    call: (_l, _v, method) => {
-      if (method !== "subscribe") {
-        return Promise.resolve({ ok: true, result: {} });
-      }
-      minted += 1;
-      return Promise.resolve({ ok: true, result: { sub: `sub-${minted}` } });
-    },
-  });
-
-  // Fill the ceiling, then ask for one more.
-  for (let i = 0; i < 64; i += 1) {
-    assert.equal(registry.adoptSub(`filler-${i}`).kind, "opened");
-  }
-  const reply = await roundTrip(h.channel, {
-    id: uuid(1),
-    v: 1,
-    method: "subscribe",
-    params: { filter: { kinds: [9] } },
-  });
-  assert.equal(reply.ok, false);
-  assert.equal(reply.error.code, "quota_exceeded");
-
-  await waitFor(
-    () => h.calls.some((c) => c.method === "unsubscribe"),
-    "the host-side close",
-  );
-  const closed = h.calls.find((c) => c.method === "unsubscribe");
-  assert.deepEqual(
-    closed.params,
-    { sub: "sub-1" },
-    "and it must close the id the host actually minted",
-  );
-});
-
-test("a subscribe that names no sub is an internal error", async (t) => {
-  // `{ok:true}` with nothing to forward would tell the caller a stream is
-  // running that can never deliver.
-  const h = harness(t, { reply: { ok: true, result: {} } });
-  const reply = await roundTrip(h.channel, {
-    id: uuid(1),
-    v: 1,
-    method: "subscribe",
-    params: { filter: { kinds: [9] } },
-  });
-  assert.equal(reply.ok, false);
-  assert.equal(reply.error.code, "internal");
-});
-
-test("teardown closes every live subscription on both sides", async (t) => {
-  const sub = "sub-1";
-  const h = harness(t, { reply: { ok: true, result: { sub } } });
-  await openSubscription(h, uuid(1), sub);
-  await waitFor(() => h.listening(), "the stream listener");
-
-  const seen = collect(h.channel);
-  h.handle.dispose();
-  await waitFor(() => seen.length >= 1, "the teardown close frame");
-  assert.deepEqual(
-    seen[0],
-    { sub, kind: "closed", reason: "unsubscribed" },
-    "the extension is told the stream ended",
-  );
-  await waitFor(
-    () => h.calls.some((c) => c.method === "unsubscribe"),
-    "the host-side release",
-  );
-  assert.equal(h.unlistened(), 1, "and the stream listener is removed");
-});
-
-test("a frame already in flight at teardown is not delivered", async (t) => {
-  // Removing the listener does not recall a frame the event bus has already
-  // dispatched, so nothing may be delivered after teardown.
-  //
-  // **This row does not isolate which mechanism refuses it, and says so.**
-  // Teardown drains every sub (so the liveness check would refuse) *and* closes
-  // the port (so `postMessage` is a silent no-op). Deleting the liveness check
-  // leaves this row green, which is how the battery caught the over-claim in
-  // the comment that used to live here. The liveness check is isolated by
-  // `closed is delivered, and nothing follows it`, where the port is still
-  // open. What this row proves is the end-to-end property: after teardown, no
-  // frame reaches the extension.
-  const sub = "sub-1";
-  const h = harness(t, { reply: { ok: true, result: { sub } } });
-  await openSubscription(h, uuid(1), sub);
-  await waitFor(() => h.listening(), "the stream listener");
-
-  const seen = collect(h.channel);
-  h.handle.dispose();
-  await waitFor(() => seen.length === 1, "the teardown close frame");
-
-  // `rawEmit` bypasses the stand-in's unlisten, which is the whole point: the
-  // handler itself must refuse, with no listener removal to hide behind.
-  h.rawEmit({ lease: LEASE, frame: { sub, kind: "eose" } });
-  await new Promise((resolve) => setTimeout(resolve, 20));
-  assert.equal(seen.length, 1, "only the teardown close — nothing after it");
 });

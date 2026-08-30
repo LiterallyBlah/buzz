@@ -749,6 +749,9 @@ mod subscription;
 /// this module and the seal covers them identically.
 mod registry;
 
+/// End-to-end ACK/window flow control from Rust through the browser port.
+mod flow;
+
 /// The shared, authenticated relay socket the branches are opened on.
 mod connection;
 
@@ -758,6 +761,46 @@ mod connection;
 /// the sealed internals becoming reachable.
 pub(crate) fn unsubscribe(lease: &str, params: Option<Value>) -> BridgeReply {
     registry::unsubscribe(lease, params)
+}
+
+/// Production lease wall, called by the real frame-host lifecycle.
+///
+/// Removal performs the physical relay CLOSE burst before dropping each
+/// reservation, so a released frame cannot leave relay branches or quota
+/// behind. Idempotence comes from registry removal.
+pub(crate) fn close_subscriptions_for_lease(lease: &str) -> usize {
+    registry::registry()
+        .close_for_lease(lease, subscription::CloseReason::Unsubscribed)
+        .len()
+}
+
+pub(crate) fn activate_subscription<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    lease: &str,
+    sub: &str,
+) {
+    connection::activate_prepared(app, lease, sub);
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn acknowledge_subscription_batch<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    lease: &str,
+    sub: &str,
+    seq: u64,
+    token: &str,
+    frame_count: usize,
+    encoded_bytes: usize,
+) {
+    connection::acknowledge_batch(app, lease, sub, seq, token, frame_count, encoded_bytes);
+}
+
+pub(crate) fn stream_flow_violation<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    lease: &str,
+    sub: &str,
+) {
+    connection::report_flow_violation(app, lease, sub);
 }
 
 /// §5 `subscribe({ filter }) → { sub }` — the crate-visible bridge handler.

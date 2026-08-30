@@ -20,6 +20,8 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
+use nostr::JsonUtil as _;
+
 /// Most physical branches one public subscription may own.
 ///
 /// A subscription spanning more granted channels than this is refused rather
@@ -41,6 +43,17 @@ pub(super) const MAX_PRE_EOSE_EVENTS: usize = 2048;
 
 /// Most bytes of stored events one aggregate may buffer before its `eose`.
 pub(super) const MAX_PRE_EOSE_BYTES: usize = 4 * 1024 * 1024;
+
+/// Most stored frames retained solely because the correlated reply has not yet
+/// been adopted by the frontend.
+pub(super) const MAX_AWAITING_REPLY_EVENTS: usize = 2048;
+/// Encoded-byte companion to [`MAX_AWAITING_REPLY_EVENTS`]. A count-only queue
+/// permits roughly a GiB of near-ceiling events.
+pub(super) const MAX_AWAITING_REPLY_BYTES: usize = 4 * 1024 * 1024;
+/// Most live frames held behind another branch's stored replay.
+pub(super) const MAX_HELD_LIVE_EVENTS: usize = 2048;
+/// Encoded-byte companion to [`MAX_HELD_LIVE_EVENTS`].
+pub(super) const MAX_HELD_LIVE_BYTES: usize = 4 * 1024 * 1024;
 
 /// Why an aggregate ended. Normalised — no relay text reaches an extension.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -302,6 +315,11 @@ pub(super) struct Aggregate {
     reply_written: bool,
     /// Events that arrived before the reply, in arrival order.
     awaiting_reply: Vec<nostr::Event>,
+    awaiting_reply_bytes: usize,
+    /// Live events from a branch which has EOSE'd while another branch is still
+    /// replaying stored history. They are released only after aggregate EOSE.
+    held_live: Vec<nostr::Event>,
+    held_live_bytes: usize,
 }
 
 impl Aggregate {
@@ -325,6 +343,9 @@ impl Aggregate {
             closed: None,
             reply_written: false,
             awaiting_reply: Vec::new(),
+            awaiting_reply_bytes: 0,
+            held_live: Vec::new(),
+            held_live_bytes: 0,
         })
     }
 
@@ -338,22 +359,28 @@ impl Aggregate {
             return Vec::new();
         }
         self.reply_written = true;
-        if self.closed.is_some() {
-            // Closed before the reply landed: the held events are not
-            // deliverable, and `closed` has already been emitted.
+        if let Some(reason) = self.closed.clone() {
+            // Closed before activation: events stay discarded, but the terminal
+            // frame itself is retained until the correlated reply has been
+            // written and the exact-generation activation receipt arrives.
             self.awaiting_reply.clear();
-            return Vec::new();
+            self.awaiting_reply_bytes = 0;
+            self.held_live.clear();
+            self.held_live_bytes = 0;
+            return vec![Emit::Closed(reason)];
         }
         let mut out: Vec<Emit> = std::mem::take(&mut self.awaiting_reply)
             .into_iter()
             .map(|event| Emit::Event(Box::new(event)))
             .collect();
+        self.awaiting_reply_bytes = 0;
         // If every branch EOSE'd while the reply was still in flight, the
         // public `eose` was held too — it must land *after* the stored events
         // it terminates, not before them.
         if self.eose_reached && !self.eose_emitted {
             self.eose_emitted = true;
             out.push(Emit::Eose);
+            out.extend(self.take_held_live());
         }
         out
     }
@@ -365,6 +392,10 @@ impl Aggregate {
 
     pub(super) fn is_closed(&self) -> bool {
         self.closed.is_some()
+    }
+
+    pub(super) fn close_reason(&self) -> Option<CloseReason> {
+        self.closed.clone()
     }
 
     /// Has the single public `eose` been handed out?
@@ -397,6 +428,10 @@ impl Aggregate {
             return Emit::Closed(existing.clone());
         }
         self.closed = Some(reason.clone());
+        self.awaiting_reply.clear();
+        self.awaiting_reply_bytes = 0;
+        self.held_live.clear();
+        self.held_live_bytes = 0;
         Emit::Closed(reason)
     }
 
@@ -430,6 +465,15 @@ impl Aggregate {
         Emit::Eose
     }
 
+    /// Drain live events held behind branch EOSE skew, after the public EOSE.
+    pub(super) fn take_held_live(&mut self) -> Vec<Emit> {
+        self.held_live_bytes = 0;
+        std::mem::take(&mut self.held_live)
+            .into_iter()
+            .map(|event| Emit::Event(Box::new(event)))
+            .collect()
+    }
+
     /// An event that has already passed two-stage admission.
     ///
     /// Before the public `eose` it is a *stored* event: deduped across branches
@@ -444,6 +488,24 @@ impl Aggregate {
         if !self.branches.contains(branch_id) {
             return Emit::Nothing;
         }
+        let encoded_bytes = event.as_json().len();
+
+        // This branch has finished stored replay while at least one sibling has
+        // not. Its next event is live, and exposing it now would overtake the
+        // sibling's stored tail and the one aggregate EOSE.
+        if self.eosed.contains(branch_id) && !self.eose_emitted {
+            if self.held_live.len() >= MAX_HELD_LIVE_EVENTS {
+                return self.close(CloseReason::BoundExceeded);
+            }
+            let next = self.held_live_bytes.saturating_add(encoded_bytes);
+            if next > MAX_HELD_LIVE_BYTES {
+                return self.close(CloseReason::BoundExceeded);
+            }
+            self.held_live_bytes = next;
+            self.held_live.push(event);
+            return Emit::Nothing;
+        }
+
         // Stored phase: dedup and bounds apply whether or not the reply has
         // landed, so holding events behind the reply cannot smuggle a
         // duplicate or an unbounded buffer past them.
@@ -454,18 +516,21 @@ impl Aggregate {
             if self.pre_eose_ids.len() > MAX_PRE_EOSE_EVENTS {
                 return self.close(CloseReason::BoundExceeded);
             }
-            use nostr::JsonUtil as _;
-            let size = event.as_json().len();
-            self.pre_eose_bytes = self.pre_eose_bytes.saturating_add(size);
+            self.pre_eose_bytes = self.pre_eose_bytes.saturating_add(encoded_bytes);
             if self.pre_eose_bytes > MAX_PRE_EOSE_BYTES {
                 return self.close(CloseReason::BoundExceeded);
             }
         }
 
         if !self.reply_written {
-            if self.awaiting_reply.len() >= MAX_PRE_EOSE_EVENTS {
+            if self.awaiting_reply.len() >= MAX_AWAITING_REPLY_EVENTS {
                 return self.close(CloseReason::BoundExceeded);
             }
+            let next = self.awaiting_reply_bytes.saturating_add(encoded_bytes);
+            if next > MAX_AWAITING_REPLY_BYTES {
+                return self.close(CloseReason::BoundExceeded);
+            }
+            self.awaiting_reply_bytes = next;
             self.awaiting_reply.push(event);
             return Emit::Nothing;
         }
@@ -544,6 +609,11 @@ pub(super) fn route_frame(
         RelayFrame::Eose { sub_id } => Routed {
             emits: match aggregate.on_branch_eose(&sub_id) {
                 Emit::Nothing => Vec::new(),
+                Emit::Eose => {
+                    let mut emits = vec![Emit::Eose];
+                    emits.extend(aggregate.take_held_live());
+                    emits
+                }
                 emit => vec![emit],
             },
             close_branches: false,
@@ -722,10 +792,7 @@ pub(super) enum OpenFailure {
 /// separate.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn open_subscription<GateFut, SendFut>(
-    quota: &Arc<SubscriptionQuota>,
-    identity_pubkey: &str,
-    extension_id: &str,
-    branches: usize,
+    reservation: Reservation,
     wait_gate: impl FnOnce() -> GateFut,
     revalidate: impl FnOnce() -> Result<(), CloseReason>,
     register: impl FnOnce(CommittedReservation),
@@ -736,10 +803,6 @@ where
     GateFut: std::future::Future<Output = ()>,
     SendFut: std::future::Future<Output = Result<(), ()>>,
 {
-    let reservation = quota
-        .reserve(identity_pubkey, extension_id, branches)
-        .ok_or(OpenFailure::QuotaExhausted)?;
-
     wait_gate().await;
 
     if let Err(reason) = revalidate() {
@@ -762,3 +825,7 @@ where
 #[cfg(test)]
 #[path = "subscription_tests.rs"]
 mod subscription_tests;
+
+#[cfg(test)]
+#[path = "subscription_successor_tests.rs"]
+mod subscription_successor_tests;

@@ -14,8 +14,23 @@ use super::*;
 const IDENTITY: &str = "aaaa";
 const EXTID: &str = "demo";
 
-fn conn() -> (String, String) {
-    ("ws://relay.test".to_string(), IDENTITY.to_string())
+fn conn_generation(generation: u64) -> ConnectionInstance {
+    ConnectionInstance {
+        key: ("ws://relay.test".to_string(), IDENTITY.to_string()),
+        generation,
+    }
+}
+
+fn conn() -> ConnectionInstance {
+    conn_generation(1)
+}
+
+fn wire_frames(delivery: &Delivery) -> Vec<serde_json::Value> {
+    delivery
+        .batches
+        .iter()
+        .flat_map(|batch| batch.frames.iter().cloned())
+        .collect()
 }
 
 /// Admission that always admits — the registry's bookkeeping is the subject
@@ -100,7 +115,7 @@ fn registered_on(
     lease: &str,
     sub: &str,
     branches: &[&str],
-    connection: (String, String),
+    connection: ConnectionInstance,
     admission: SubAdmission,
     close_at_relay: RelayCloser,
 ) {
@@ -114,6 +129,7 @@ fn registered_on(
         reservation,
         connection,
     );
+    let _ = registry.activate(lease, sub);
 }
 
 fn event() -> nostr::Event {
@@ -374,21 +390,19 @@ fn a_frame_is_routed_to_the_subscription_that_owns_its_branch() {
     );
 
     let delivery = registry
-        .route_by_branch("b1", eose_frame("b1"))
+        .route_by_branch(&conn(), "b1", eose_frame("b1"))
         .expect("b1 is owned");
     assert_eq!(delivery.lease, LEASE);
     assert!(
-        delivery.frames.is_empty(),
+        wire_frames(&delivery).is_empty(),
         "one branch of two does not eose the aggregate"
     );
     let delivery = registry
-        .route_by_branch("b2", eose_frame("b2"))
+        .route_by_branch(&conn(), "b2", eose_frame("b2"))
         .expect("b2 is owned");
     assert_eq!(
-        delivery.frames,
-        vec![StreamFrame::Eose {
-            sub: "s1".to_string()
-        }],
+        wire_frames(&delivery),
+        vec![serde_json::json!({ "sub": "s1", "kind": "eose" })],
         "the last branch produces the single public eose, keyed by sub"
     );
 }
@@ -412,12 +426,14 @@ fn a_frame_for_an_unowned_branch_routes_nowhere() {
 
     assert!(
         registry
-            .route_by_branch("not-ours", eose_frame("not-ours"))
+            .route_by_branch(&conn(), "not-ours", eose_frame("not-ours"))
             .is_none(),
         "an unowned branch must find no aggregate"
     );
     assert!(
-        registry.route_by_branch("b1", eose_frame("b1")).is_some(),
+        registry
+            .route_by_branch(&conn(), "b1", eose_frame("b1"))
+            .is_some(),
         "and the owned one still routes — the lookup is not simply dead"
     );
 }
@@ -472,6 +488,7 @@ fn each_subscriptions_own_admission_judges_its_events() {
     let e = event();
     let delivered = registry
         .route_by_branch(
+            &conn(),
             "b-yes",
             crate::relay::subscribe::RelayFrame::Event {
                 sub_id: "b-yes".to_string(),
@@ -479,7 +496,11 @@ fn each_subscriptions_own_admission_judges_its_events() {
             },
         )
         .expect("routed");
-    assert_eq!(delivered.frames.len(), 1, "the permissive sub is delivered");
+    assert_eq!(
+        wire_frames(&delivered).len(),
+        1,
+        "the permissive sub is delivered"
+    );
     assert_eq!(
         judged.lock().unwrap().clone(),
         vec!["yes"],
@@ -488,6 +509,7 @@ fn each_subscriptions_own_admission_judges_its_events() {
 
     let dropped = registry
         .route_by_branch(
+            &conn(),
             "b-no",
             crate::relay::subscribe::RelayFrame::Event {
                 sub_id: "b-no".to_string(),
@@ -496,14 +518,13 @@ fn each_subscriptions_own_admission_judges_its_events() {
         )
         .expect("routed");
     assert!(
-        dropped.frames.is_empty(),
+        wire_frames(&dropped).is_empty(),
         "the refusing sub's own verify drops it, and does not close the stream"
     );
     assert!(
-        !dropped
-            .frames
+        !wire_frames(&dropped)
             .iter()
-            .any(|f| matches!(f, StreamFrame::Closed { .. })),
+            .any(|frame| frame["kind"] == "closed"),
         "and the stream is not closed"
     );
     assert_eq!(
@@ -536,6 +557,7 @@ fn a_closing_frame_closes_every_branch_and_releases_the_quota() {
 
     let delivery = registry
         .route_by_branch(
+            &conn(),
             "b2",
             crate::relay::subscribe::RelayFrame::Closed {
                 sub_id: "b2".to_string(),
@@ -554,7 +576,9 @@ fn a_closing_frame_closes_every_branch_and_releases_the_quota() {
         0,
         "and removing the entry gave the budget back"
     );
-    assert!(registry.route_by_branch("b1", eose_frame("b1")).is_none());
+    assert!(registry
+        .route_by_branch(&conn(), "b1", eose_frame("b1"))
+        .is_none());
 }
 
 // ── the transport wall ─────────────────────────────────────────────────────
@@ -565,7 +589,10 @@ fn a_dead_socket_closes_only_the_subscriptions_it_carried() {
     // subscriptions on another relay or under another identity.
     let quota = SubscriptionQuota::new();
     let registry = SubscriptionRegistry::new();
-    let other = ("ws://elsewhere.test".to_string(), IDENTITY.to_string());
+    let other = ConnectionInstance {
+        key: ("ws://elsewhere.test".to_string(), IDENTITY.to_string()),
+        generation: 1,
+    };
     registered_on(
         &registry,
         &quota,
@@ -590,15 +617,18 @@ fn a_dead_socket_closes_only_the_subscriptions_it_carried() {
     let closed = registry.close_for_connection(&conn());
     assert_eq!(closed.len(), 1, "only this socket's subscriptions");
     assert_eq!(
-        closed[0].frames,
-        vec![StreamFrame::Closed {
-            sub: "mine".to_string(),
-            reason: CloseReason::RelayClosed,
-        }]
+        wire_frames(&closed[0]),
+        vec![serde_json::json!({
+            "sub": "mine",
+            "kind": "closed",
+            "reason": "relay_closed"
+        })]
     );
 
     assert!(
-        registry.route_by_branch("b2", eose_frame("b2")).is_some(),
+        registry
+            .route_by_branch(&other, "b2", eose_frame("b2"))
+            .is_some(),
         "the other socket's subscription survives"
     );
 }
@@ -651,11 +681,12 @@ fn the_deadline_closes_a_silent_subscription_and_names_its_branches() {
         .close_on_eose_deadline(LEASE, "s1")
         .expect("the deadline fires");
     assert_eq!(
-        delivery.frames,
-        vec![StreamFrame::Closed {
-            sub: "s1".to_string(),
-            reason: CloseReason::EoseDeadline,
-        }],
+        wire_frames(&delivery),
+        vec![serde_json::json!({
+            "sub": "s1",
+            "kind": "closed",
+            "reason": "eose_deadline"
+        })],
         "closed with the named reason, and no eose before it"
     );
     let _ = delivery;
@@ -678,7 +709,7 @@ fn the_deadline_does_nothing_to_a_subscription_that_eosed() {
         Box::new(|_| {}),
     );
     registry
-        .route_by_branch("b1", eose_frame("b1"))
+        .route_by_branch(&conn(), "b1", eose_frame("b1"))
         .expect("routed");
 
     assert!(
@@ -798,6 +829,7 @@ fn a_relay_closed_branch_stops_the_others_at_the_relay() {
 
     registry
         .route_by_branch(
+            &conn(),
             "b2",
             crate::relay::subscribe::RelayFrame::Closed {
                 sub_id: "b2".to_string(),
@@ -859,7 +891,7 @@ fn a_subscription_that_stays_live_is_not_closed_at_the_relay() {
 
     // An ordinary EOSE on one branch: the aggregate is still live.
     registry
-        .route_by_branch("b1", eose_frame("b1"))
+        .route_by_branch(&conn(), "b1", eose_frame("b1"))
         .expect("routed");
     assert!(
         recorded.lock().unwrap().is_empty(),

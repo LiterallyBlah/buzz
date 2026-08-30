@@ -263,6 +263,7 @@ async fn authenticate_with_relay_reply(
     keys: &nostr::Keys,
     success: bool,
     generation: u64,
+    include_message: bool,
 ) -> Result<IdentityWitness, TransportError> {
     let (to_host, from_relay) = tokio::sync::mpsc::unbounded_channel::<Result<Message, WsError>>();
     let (to_relay, mut from_host) = tokio::sync::mpsc::unbounded_channel::<Message>();
@@ -293,8 +294,13 @@ async fn authenticate_with_relay_reply(
     };
     let value: serde_json::Value = serde_json::from_str(&text).expect("AUTH json");
     let event_id = value[1]["id"].as_str().expect("auth event id").to_string();
+    let reply = if include_message {
+        ok_frame(&event_id, success)
+    } else {
+        format!("[\"OK\",\"{event_id}\",{success}]")
+    };
     to_host
-        .send(Ok(Message::Text(ok_frame(&event_id, success).into())))
+        .send(Ok(Message::Text(reply.into())))
         .expect("send OK");
 
     auth.await.expect("join")
@@ -303,7 +309,7 @@ async fn authenticate_with_relay_reply(
 #[tokio::test]
 async fn a_rejected_auth_means_no_witness() {
     let keys = keys();
-    let result = authenticate_with_relay_reply(&keys, false, 7).await;
+    let result = authenticate_with_relay_reply(&keys, false, 7, true).await;
     assert_eq!(
         result.err(),
         Some(TransportError::Auth(AuthFailure::Rejected)),
@@ -316,7 +322,7 @@ async fn a_complete_strict_exchange_yields_a_witness_for_the_signing_key() {
     // THE POSITIVE CONTROL. Without it the five refusals above are satisfied by
     // an implementation that refuses everything.
     let keys = keys();
-    let witness = authenticate_with_relay_reply(&keys, true, 7)
+    let witness = authenticate_with_relay_reply(&keys, true, 7, true)
         .await
         .expect("a complete exchange must authenticate");
     assert_eq!(witness.connection_generation(), 7);
@@ -324,5 +330,17 @@ async fn a_complete_strict_exchange_yields_a_witness_for_the_signing_key() {
         witness.authenticated_pubkey(),
         keys.public_key().to_hex(),
         "the witness carries the key that actually signed, not a claimed one"
+    );
+}
+
+#[tokio::test]
+async fn a_truncated_exact_id_ok_never_mints_a_witness() {
+    // The host's dynamic exact AUTH id is echoed correctly; only the required
+    // NIP-01 message field is absent, isolating structural completeness.
+    let keys = keys();
+    let result = authenticate_with_relay_reply(&keys, true, 9, false).await;
+    assert_eq!(
+        result.err(),
+        Some(TransportError::Auth(AuthFailure::NoAcknowledgement))
     );
 }

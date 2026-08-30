@@ -37,6 +37,39 @@ fn raw_aggregate(branches: &[&str]) -> Aggregate {
     Aggregate::new(branches.iter().map(|b| b.to_string()).collect()).expect("aggregate")
 }
 
+/// Preserve the old test-facing shape while production receives an already
+/// reserved token. This keeps the admission-order rows explicit about which
+/// step was reached, including the zero-network quota refusal.
+#[allow(clippy::too_many_arguments)]
+async fn open_subscription<GateFut, SendFut>(
+    quota: &Arc<SubscriptionQuota>,
+    identity_pubkey: &str,
+    extension_id: &str,
+    branches: usize,
+    wait_gate: impl FnOnce() -> GateFut,
+    revalidate: impl FnOnce() -> Result<(), CloseReason>,
+    register: impl FnOnce(CommittedReservation),
+    send_reqs: impl FnOnce() -> SendFut,
+    unregister: impl FnOnce(),
+) -> Result<(), OpenFailure>
+where
+    GateFut: std::future::Future<Output = ()>,
+    SendFut: std::future::Future<Output = Result<(), ()>>,
+{
+    let reservation = quota
+        .reserve(identity_pubkey, extension_id, branches)
+        .ok_or(OpenFailure::QuotaExhausted)?;
+    super::open_subscription(
+        reservation,
+        wait_gate,
+        revalidate,
+        register,
+        send_reqs,
+        unregister,
+    )
+    .await
+}
+
 // ── the public eose waits for every branch ─────────────────────────────────
 
 #[test]
@@ -459,9 +492,10 @@ fn a_close_before_the_reply_discards_the_held_events() {
     let mut agg = raw_aggregate(&["b1"]);
     agg.on_event("b1", event());
     agg.close(CloseReason::AuthorityLost);
-    assert!(
-        agg.mark_reply_written().is_empty(),
-        "held events must not be delivered after a close"
+    assert_eq!(
+        agg.mark_reply_written(),
+        vec![Emit::Closed(CloseReason::AuthorityLost)],
+        "held events are discarded, but the terminal is retained until activation"
     );
 }
 

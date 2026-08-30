@@ -27,23 +27,26 @@
 //! itself would be choosing whose authority to apply to an arriving event.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use futures_util::{SinkExt, StreamExt};
 use serde_json::Value;
-use tokio::sync::mpsc;
-use tokio_tungstenite::tungstenite::Message;
+use tokio::sync::{mpsc, watch};
+use tokio_tungstenite::tungstenite::{protocol::WebSocketConfig, Message};
 
 use crate::relay::subscribe::{
-    authenticate, parse_frame, IdentityWitness, RelayFrame, TransportError, MAX_WS_MESSAGE_BYTES,
+    authenticate, parse_frame, IdentityWitness, RelayFrame, TransportError, MAX_WS_FRAME_BYTES,
+    MAX_WS_MESSAGE_BYTES,
 };
 
 use super::super::dispatch::{code, BridgeReply};
 use super::construction::construct_filters;
-use super::registry::{quota, registry, ConnectionKey, Delivery, SubAdmission};
+use super::flow::{StreamBatch, STREAM_ACK_TIMEOUT};
+use super::registry::{quota, registry, ConnectionInstance, ConnectionKey, Delivery, SubAdmission};
 use super::subscription::{
-    on_notice, open_subscription, Aggregate, CloseReason, OpenFailure, StreamFrame,
-    INITIAL_EOSE_DEADLINE, MAX_BRANCHES_PER_SUB,
+    on_notice, open_subscription, Aggregate, CloseReason, OpenFailure, INITIAL_EOSE_DEADLINE,
+    MAX_BRANCHES_PER_SUB,
 };
 use super::{validate_request, QueryError, QueryRevalidation};
 
@@ -62,15 +65,28 @@ pub(super) const STREAM_EVENT: &str = "extension-stream";
 /// host memory.
 const OUTBOUND_QUEUE: usize = 256;
 
+/// Priority-bounded control bursts. They are separate from data so a full REQ
+/// queue cannot starve teardown; if this queue itself is full the connection is
+/// aborted, which reliably drops every relay-side subscription on the socket.
+const CONTROL_QUEUE: usize = 64;
+
+enum OutboundCommand {
+    Burst(Vec<String>),
+}
+
 /// Where stream frames go. Erases the Tauri runtime parameter so the registry
 /// and the reader stay free of it.
-pub(super) type StreamSink = Arc<dyn Fn(&str, &StreamFrame) + Send + Sync>;
+pub(super) type StreamSink = Arc<dyn Fn(&StreamBatch) -> Result<(), ()> + Send + Sync>;
 
 /// A live, authenticated socket to one relay, shared by every subscription
 /// opened under one identity.
 pub(super) struct Connection {
-    outbound: mpsc::Sender<String>,
+    outbound: mpsc::Sender<OutboundCommand>,
+    control: mpsc::Sender<OutboundCommand>,
+    cancel: watch::Sender<bool>,
     witness: IdentityWitness,
+    instance: ConnectionInstance,
+    alive: Arc<AtomicBool>,
 }
 
 impl Connection {
@@ -78,14 +94,45 @@ impl Connection {
         &self.witness
     }
 
+    pub(super) fn instance(&self) -> &ConnectionInstance {
+        &self.instance
+    }
+
     /// Queue one relay frame.
     ///
     /// `try_send` rather than `send`: a full queue or a dead writer must fail
     /// the caller now. Awaiting here would block a `subscribe` on a relay that
     /// has stopped reading, and the caller is holding a committed reservation.
-    pub(super) fn send(&self, text: String) -> Result<(), ()> {
-        self.outbound.try_send(text).map_err(|_| ())
+    pub(super) fn send_reqs(&self, frames: Vec<String>) -> Result<(), ()> {
+        self.outbound
+            .try_send(OutboundCommand::Burst(frames))
+            .map_err(|_| ())
     }
+
+    pub(super) fn send_closes(&self, frames: Vec<String>) -> Result<(), ()> {
+        if self
+            .control
+            .try_send(OutboundCommand::Burst(frames))
+            .is_err()
+        {
+            self.abort();
+            return Err(());
+        }
+        Ok(())
+    }
+
+    fn abort(&self) {
+        self.alive.store(false, Ordering::Release);
+        let _ = self.cancel.send(true);
+    }
+
+    fn is_alive(&self) -> bool {
+        self.alive.load(Ordering::Acquire)
+    }
+}
+
+fn reusable(connection: &Connection) -> bool {
+    connection.is_alive()
 }
 
 /// Every open extension-subscription socket, by `(relay url, identity)`.
@@ -110,7 +157,7 @@ impl ConnectionManager {
         let mut conns = self.conns.lock().await;
 
         if let Some(existing) = conns.get(&key) {
-            if !existing.outbound.is_closed() {
+            if reusable(existing) {
                 return Ok(Arc::clone(existing));
             }
             // The writer task ended, so the socket is gone. Reusing the handle
@@ -121,6 +168,16 @@ impl ConnectionManager {
         let opened = open(relay_url, keys, key.clone(), Arc::clone(sink)).await?;
         conns.insert(key, Arc::clone(&opened));
         Ok(opened)
+    }
+
+    async fn remove_if_current(&self, instance: &ConnectionInstance) {
+        let mut conns = self.conns.lock().await;
+        let is_current = conns
+            .get(&instance.key)
+            .is_some_and(|connection| connection.instance() == instance);
+        if is_current {
+            conns.remove(&instance.key);
+        }
     }
 }
 
@@ -140,34 +197,94 @@ fn next_generation() -> u64 {
 /// **No `REQ` is possible before the witness exists**, because the witness is
 /// what this returns: [`authenticate`] is fail-closed at every step, and its
 /// error short-circuits before either task is spawned.
+fn websocket_config() -> WebSocketConfig {
+    WebSocketConfig::default()
+        .max_message_size(Some(MAX_WS_MESSAGE_BYTES))
+        .max_frame_size(Some(MAX_WS_FRAME_BYTES))
+}
+
+async fn send_burst<W>(write: &mut W, frames: Vec<String>) -> Result<(), ()>
+where
+    W: SinkExt<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin,
+{
+    for text in frames {
+        write
+            .send(Message::Text(text.into()))
+            .await
+            .map_err(|_| ())?;
+    }
+    Ok(())
+}
+
 async fn open(
     relay_url: &str,
     keys: &nostr::Keys,
     key: ConnectionKey,
     sink: StreamSink,
 ) -> Result<Arc<Connection>, TransportError> {
-    let (socket, _) = tokio_tungstenite::connect_async(relay_url)
-        .await
-        .map_err(|_| TransportError::Connect)?;
+    // Decoder ceilings are installed before tungstenite reads a frame. The
+    // application-side check remains defence in depth, not the allocation wall.
+    let (socket, _) =
+        tokio_tungstenite::connect_async_with_config(relay_url, Some(websocket_config()), false)
+            .await
+            .map_err(|_| TransportError::Connect)?;
     let (mut write, mut read) = socket.split();
 
-    let witness = authenticate(&mut read, &mut write, keys, relay_url, next_generation()).await?;
+    let generation = next_generation();
+    let witness = authenticate(&mut read, &mut write, keys, relay_url, generation).await?;
+    let instance = ConnectionInstance {
+        key: key.clone(),
+        generation: witness.connection_generation(),
+    };
+    let alive = Arc::new(AtomicBool::new(true));
+    let (cancel, cancel_rx) = watch::channel(false);
+    let (outbound, mut queued) = mpsc::channel::<OutboundCommand>(OUTBOUND_QUEUE);
+    let (control, mut controls) = mpsc::channel::<OutboundCommand>(CONTROL_QUEUE);
 
-    let (outbound, mut queued) = mpsc::channel::<String>(OUTBOUND_QUEUE);
+    let writer_alive = Arc::clone(&alive);
+    let writer_cancel = cancel.clone();
+    let mut writer_cancel_rx = cancel_rx.clone();
     tokio::spawn(async move {
-        while let Some(text) = queued.recv().await {
-            if write.send(Message::Text(text.into())).await.is_err() {
+        loop {
+            let command = tokio::select! {
+                biased;
+                changed = writer_cancel_rx.changed() => {
+                    if changed.is_err() || *writer_cancel_rx.borrow() { break; }
+                    continue;
+                }
+                command = controls.recv() => command,
+                command = queued.recv() => command,
+            };
+            let Some(OutboundCommand::Burst(frames)) = command else {
+                break;
+            };
+            if send_burst(&mut write, frames).await.is_err() {
                 break;
             }
         }
+        writer_alive.store(false, Ordering::Release);
+        let _ = writer_cancel.send(true);
         let _ = write.close().await;
     });
 
+    let reader_alive = Arc::clone(&alive);
+    let reader_cancel = cancel.clone();
+    let reader_instance = instance.clone();
     tokio::spawn(async move {
-        pump(read, sink, key).await;
+        pump(read, sink, reader_instance.clone(), cancel_rx).await;
+        reader_alive.store(false, Ordering::Release);
+        let _ = reader_cancel.send(true);
+        connections().remove_if_current(&reader_instance).await;
     });
 
-    Ok(Arc::new(Connection { outbound, witness }))
+    Ok(Arc::new(Connection {
+        outbound,
+        control,
+        cancel,
+        witness,
+        instance,
+        alive,
+    }))
 }
 
 /// Which branch a frame belongs to, or `None` for connection-scoped frames.
@@ -187,11 +304,26 @@ fn branch_of(frame: &RelayFrame) -> Option<&str> {
 /// subscription this socket carried: v1 has no reconnect, and leaving them live
 /// against a dead socket would hold their branch budget forever while
 /// delivering nothing.
-async fn pump<S>(mut read: S, sink: StreamSink, key: ConnectionKey)
-where
+async fn pump<S>(
+    mut read: S,
+    sink: StreamSink,
+    instance: ConnectionInstance,
+    mut cancel: watch::Receiver<bool>,
+) where
     S: StreamExt<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin,
 {
-    while let Some(message) = read.next().await {
+    loop {
+        let message = tokio::select! {
+            biased;
+            changed = cancel.changed() => {
+                if changed.is_err() || *cancel.borrow() { break; }
+                continue;
+            }
+            message = read.next() => message,
+        };
+        let Some(message) = message else {
+            break;
+        };
         let text = match message {
             Ok(Message::Text(text)) => text,
             // Ping/pong and binary are not this protocol; a close or an error
@@ -210,8 +342,6 @@ where
 
         match branch_of(&frame) {
             None => {
-                // Connection-scoped. A rate-limit notice arms the gate once,
-                // here, rather than once per live subscription.
                 if let RelayFrame::Notice { message } = &frame {
                     if on_notice(message) {
                         crate::relay_admission::activate_rate_limit(None);
@@ -220,20 +350,14 @@ where
             }
             Some(branch) => {
                 let branch = branch.to_string();
-                // `None` means no live subscription owns it — a frame for a
-                // torn-down port, which is dropped rather than delivered to
-                // whatever frame is mounted now.
-                if let Some(delivery) = registry().route_by_branch(&branch, frame) {
+                if let Some(delivery) = registry().route_by_branch(&instance, &branch, frame) {
                     deliver(&sink, delivery);
                 }
             }
         }
     }
 
-    // The transport ended. Close exactly what this socket was carrying; there
-    // is no socket left to send a relay `CLOSE` on, so these deliveries carry
-    // no branches.
-    for delivery in registry().close_for_connection(&key) {
+    for delivery in registry().close_for_connection(&instance) {
         deliver(&sink, delivery);
     }
 }
@@ -243,8 +367,30 @@ fn deliver(sink: &StreamSink, delivery: Delivery) {
     if delivery.arm_gate {
         crate::relay_admission::activate_rate_limit(None);
     }
-    for frame in &delivery.frames {
-        sink(&delivery.lease, frame);
+    for batch in delivery.batches {
+        if sink(&batch).is_err() {
+            if let Some(terminal) =
+                registry().close_for_flow_violation(&batch.generation, &batch.sub)
+            {
+                for terminal_batch in terminal.batches {
+                    let _ = sink(&terminal_batch);
+                }
+            }
+            continue;
+        }
+        if !batch.terminal {
+            let lease = batch.generation.clone();
+            let sub = batch.sub.clone();
+            let seq = batch.seq;
+            let token = batch.token.clone();
+            let sink = Arc::clone(sink);
+            tokio::spawn(async move {
+                tokio::time::sleep(STREAM_ACK_TIMEOUT).await;
+                if let Some(timeout) = registry().close_on_ack_timeout(&lease, &sub, seq, &token) {
+                    deliver(&sink, timeout);
+                }
+            });
+        }
     }
 }
 
@@ -256,22 +402,77 @@ fn deliver(sink: &StreamSink, delivery: Delivery) {
 fn relay_closer(connection: &Arc<Connection>) -> super::registry::RelayCloser {
     let connection = Arc::clone(connection);
     Box::new(move |branches: &[String]| {
-        for branch in branches {
-            let _ = connection.send(format!("[\"CLOSE\",{}]", serde_json::json!(branch)));
-        }
+        let frames = branches
+            .iter()
+            .map(|branch| format!("[\"CLOSE\",{}]", serde_json::json!(branch)))
+            .collect();
+        // A full priority queue aborts the socket; silently dropping CLOSE is
+        // forbidden because it leaves ownerless relay subscriptions alive.
+        let _ = connection.send_closes(frames);
     })
 }
 
 /// The production sink: a Tauri event carrying the lease and the §2 frame.
 fn app_sink<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> StreamSink {
     let app = app.clone();
-    Arc::new(move |lease: &str, frame: &StreamFrame| {
+    Arc::new(move |batch: &StreamBatch| {
         use tauri::Emitter as _;
-        let _ = app.emit(
-            STREAM_EVENT,
-            serde_json::json!({ "lease": lease, "frame": frame.to_wire() }),
-        );
+        app.emit(STREAM_EVENT, batch).map_err(|_| ())
     })
+}
+
+pub(super) fn activate_prepared<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    lease: &str,
+    sub: &str,
+) {
+    if let Some(delivery) = registry().activate(lease, sub) {
+        deliver(&app_sink(app), delivery);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn acknowledge_batch<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    lease: &str,
+    sub: &str,
+    seq: u64,
+    token: &str,
+    frame_count: usize,
+    encoded_bytes: usize,
+) {
+    if let Some(delivery) =
+        registry().acknowledge(lease, sub, seq, token, frame_count, encoded_bytes)
+    {
+        deliver(&app_sink(app), delivery);
+    }
+}
+
+pub(super) fn report_flow_violation<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    lease: &str,
+    sub: &str,
+) {
+    if let Some(delivery) = registry().close_for_flow_violation(lease, sub) {
+        deliver(&app_sink(app), delivery);
+    }
+}
+
+async fn reserve_before_network<T, NetworkFut>(
+    quota: &Arc<super::subscription::SubscriptionQuota>,
+    identity_pubkey: &str,
+    extension_id: &str,
+    branches: usize,
+    network: impl FnOnce() -> NetworkFut,
+) -> Result<(super::subscription::Reservation, T), OpenFailure>
+where
+    NetworkFut: std::future::Future<Output = Result<T, ()>>,
+{
+    let reservation = quota
+        .reserve(identity_pubkey, extension_id, branches)
+        .ok_or(OpenFailure::QuotaExhausted)?;
+    let connected = network().await.map_err(|_| OpenFailure::BranchOpenFailed)?;
+    Ok((reservation, connected))
 }
 
 /// §5 `subscribe({ filter }) → { sub }`.
@@ -352,11 +553,31 @@ pub(super) async fn subscribe<R: tauri::Runtime>(
     };
 
     let relay_url = crate::relay::relay_ws_url_with_override(&state);
-    let connection_key: ConnectionKey = (relay_url.clone(), identity_pubkey.clone());
     let sink = app_sink(app);
 
-    let connection = match connections().get_or_open(&relay_url, &keys, &sink).await {
-        Ok(connection) => connection,
+    // The helper owns both steps, so a quota mutant cannot accidentally leave
+    // connect/auth ahead of the reservation while a pure quota test stays green.
+    let (reservation, connection) = match reserve_before_network(
+        quota(),
+        &identity_pubkey,
+        extension_id,
+        branches,
+        || async {
+            connections()
+                .get_or_open(&relay_url, &keys, &sink)
+                .await
+                .map_err(|_| ())
+        },
+    )
+    .await
+    {
+        Ok(opened) => opened,
+        Err(OpenFailure::QuotaExhausted) => {
+            return QueryError::QuotaExceeded(
+                "this extension holds as many live subscriptions as it may",
+            )
+            .into_reply();
+        }
         Err(_) => return BridgeReply::err(code::INTERNAL, "could not reach the relay"),
     };
 
@@ -377,10 +598,7 @@ pub(super) async fn subscribe<R: tauri::Runtime>(
     );
 
     let outcome = open_subscription(
-        quota(),
-        &identity_pubkey,
-        extension_id,
-        branches,
+        reservation,
         crate::relay_admission::wait_for_rate_limit,
         || revalidation.check().map_err(|_| CloseReason::AuthorityLost),
         |reservation| {
@@ -391,17 +609,12 @@ pub(super) async fn subscribe<R: tauri::Runtime>(
                 admission,
                 relay_closer(&connection),
                 reservation,
-                connection_key.clone(),
+                connection.instance().clone(),
             );
         },
         || {
             let connection = Arc::clone(&connection);
-            async move {
-                for text in requests {
-                    connection.send(text)?;
-                }
-                Ok(())
-            }
+            async move { connection.send_reqs(requests) }
         },
         || {
             let _ = registry().close_one(lease, &sub, CloseReason::RelayClosed);
@@ -422,18 +635,10 @@ pub(super) async fn subscribe<R: tauri::Runtime>(
         };
     }
 
-    // The reply goes out before anything the relay has already sent, and
-    // `mark_reply_written` is what releases those held frames — in arrival
-    // order, so the extension never sees a frame for a `sub` it has not yet
-    // been told the id of.
+    // Prepared only. Rust retains every frame until the frontend writes this
+    // correlated reply, adopts the exact sub, and returns the internal
+    // exact-generation activation receipt.
     let reply = BridgeReply::ok(serde_json::json!({ "sub": sub }));
-    if let Some(held) = registry().with_aggregate(lease, &sub, Aggregate::mark_reply_written) {
-        for emit in held {
-            if let Some(frame) = StreamFrame::from_emit(&sub, emit) {
-                sink(lease, &frame);
-            }
-        }
-    }
 
     // Arm the initial-EOSE deadline. Nothing else bounds the stored phase: a
     // relay that accepts every `REQ` and then says nothing leaves the aggregate
@@ -509,3 +714,7 @@ fn live_admission<R: tauri::Runtime>(
 
     SubAdmission { authority, verify }
 }
+
+#[cfg(test)]
+#[path = "connection_tests.rs"]
+mod connection_tests;

@@ -94,13 +94,55 @@ pub(crate) async fn invoke<R: Runtime>(
     super::dispatch::dispatch(&app, &lease, v, &method, params).await
 }
 
+/// Internal stream transport control. It never enters the public request-id
+/// registry and exposes no method authority.
+#[allow(clippy::too_many_arguments)]
+#[tauri::command]
+pub(crate) async fn stream_control<R: Runtime>(
+    app: tauri::AppHandle<R>,
+    lease: String,
+    action: String,
+    sub: String,
+    seq: Option<u64>,
+    token: Option<String>,
+    frame_count: Option<usize>,
+    encoded_bytes: Option<usize>,
+) {
+    if lease.len() > 128 || sub.is_empty() || sub.len() > 128 {
+        return;
+    }
+    match action.as_str() {
+        "activate" => super::query::activate_subscription(&app, &lease, &sub),
+        "ack" => match (seq, token, frame_count, encoded_bytes) {
+            (Some(seq), Some(token), Some(frame_count), Some(encoded_bytes)) => {
+                super::query::acknowledge_subscription_batch(
+                    &app,
+                    &lease,
+                    &sub,
+                    seq,
+                    &token,
+                    frame_count,
+                    encoded_bytes,
+                );
+            }
+            _ => super::query::stream_flow_violation(&app, &lease, &sub),
+        },
+        "violation" => super::query::stream_flow_violation(&app, &lease, &sub),
+        _ => super::query::stream_flow_violation(&app, &lease, &sub),
+    }
+}
+
 /// Plugin name. Must match the `tauri_build::InlinedPlugin` entry in `build.rs`
 /// or the generated ACL manifest will not resolve and every grant fails.
 pub(crate) const PLUGIN_NAME: &str = "extension-bridge";
 
 pub(crate) fn init<R: Runtime>() -> TauriPlugin<R> {
     tauri::plugin::Builder::new(PLUGIN_NAME)
-        .invoke_handler(tauri::generate_handler![resolve_identity, invoke])
+        .invoke_handler(tauri::generate_handler![
+            resolve_identity,
+            invoke,
+            stream_control
+        ])
         .build()
 }
 

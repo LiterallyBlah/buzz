@@ -8,6 +8,32 @@
 use std::fs;
 use std::io::Write;
 use std::net::Ipv4Addr;
+use std::sync::{Arc, Mutex, OnceLock};
+
+pub(crate) struct AcquireInstallHook {
+    pub(crate) reached: tokio::sync::Notify,
+    pub(crate) proceed: tokio::sync::Notify,
+}
+
+static ACQUIRE_INSTALL_HOOK: OnceLock<Mutex<Option<Arc<AcquireInstallHook>>>> = OnceLock::new();
+
+pub(crate) async fn pause_before_install() {
+    let hook = ACQUIRE_INSTALL_HOOK
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .ok()
+        .and_then(|slot| slot.clone());
+    if let Some(hook) = hook {
+        hook.reached.notify_one();
+        hook.proceed.notified().await;
+    }
+}
+
+pub(crate) fn set_acquire_install_hook(hook: Option<Arc<AcquireInstallHook>>) {
+    if let Ok(mut slot) = ACQUIRE_INSTALL_HOOK.get_or_init(|| Mutex::new(None)).lock() {
+        *slot = hook;
+    }
+}
 
 /// An installed package containing `files`, under a fresh extensions base dir.
 pub(crate) fn installed(files: &[(&str, &[u8])]) -> tempfile::TempDir {

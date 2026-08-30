@@ -831,9 +831,29 @@ async fn against_a_live_relay_a_subscription_streams_two_channels_as_one() {
     let seen: Seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     {
         let seen = std::sync::Arc::clone(&seen);
+        let app_handle = app.handle().clone();
         app.handle().listen("extension-stream", move |event| {
             if let Ok(value) = serde_json::from_str::<serde_json::Value>(event.payload()) {
-                seen.lock().unwrap().push(value);
+                if let Some(frames) = value["frames"].as_array() {
+                    let mut sink = seen.lock().unwrap();
+                    for frame in frames {
+                        sink.push(serde_json::json!({
+                            "lease": value["generation"],
+                            "frame": frame
+                        }));
+                    }
+                }
+                if value["terminal"] != true {
+                    super::super::query::acknowledge_subscription_batch(
+                        &app_handle,
+                        value["generation"].as_str().unwrap_or_default(),
+                        value["sub"].as_str().unwrap_or_default(),
+                        value["seq"].as_u64().unwrap_or_default(),
+                        value["token"].as_str().unwrap_or_default(),
+                        value["frameCount"].as_u64().unwrap_or_default() as usize,
+                        value["encodedBytes"].as_u64().unwrap_or_default() as usize,
+                    );
+                }
             }
         });
     }
@@ -857,6 +877,10 @@ async fn against_a_live_relay_a_subscription_streams_two_channels_as_one() {
         .unwrap()
         .to_string();
     println!("LIVE sub={sub}");
+    // The real frontend writes the correlated reply first, then sends this
+    // exact-generation internal receipt. Nothing above may have emitted yet.
+    assert!(seen.lock().unwrap().is_empty());
+    super::super::query::activate_subscription(app.handle(), LLEASE, &sub);
 
     // ── steps 4+5: both stored events, then EXACTLY ONE eose ───────────
     let frames = wait_for(&seen, 3, "two stored events and one eose").await;

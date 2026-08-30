@@ -706,6 +706,9 @@ struct RunningHost {
 #[derive(Default)]
 struct FrameHostState {
     running: Option<RunningHost>,
+    /// Monotonic lifecycle epoch. A bind started under an older epoch may not
+    /// install listeners or a lease after release/shutdown advanced it.
+    epoch: u64,
     /// Leases handed to live frames and not yet released.
     ///
     /// A set of opaque ids rather than a count, because a count cannot tell
@@ -753,7 +756,7 @@ pub(crate) struct FrameLease {
 /// listener, but gets its **own** lease.
 pub(crate) async fn acquire(base_dir: PathBuf, extension_id: &str) -> Result<FrameLease, String> {
     let lease = uuid::Uuid::new_v4().to_string();
-    {
+    let opening_epoch = {
         let mut state = host_state();
         if let Some(running) = &state.running {
             let (extension_port, wrapper_port) = (running.extension_port, running.wrapper_port);
@@ -764,7 +767,8 @@ pub(crate) async fn acquire(base_dir: PathBuf, extension_id: &str) -> Result<Fra
                 lease,
             });
         }
-    }
+        state.epoch
+    };
 
     // Bind outside the lock: these are the only awaits in the path, and holding
     // a std Mutex across them would be a deadlock waiting to happen.
@@ -805,7 +809,17 @@ pub(crate) async fn acquire(base_dir: PathBuf, extension_id: &str) -> Result<Fra
             .ok();
     });
 
+    #[cfg(test)]
+    frame_host_test_support::pause_before_install().await;
+
     let mut state = host_state();
+    if state.epoch != opening_epoch {
+        // Release/shutdown won while the listeners were binding. Installing
+        // now would resurrect a host and lease after its lifecycle ended.
+        let _ = shutdown_extension.send(());
+        let _ = shutdown_wrapper.send(());
+        return Err("the extension frame closed while its host was opening".to_string());
+    }
     if let Some(running) = &state.running {
         // Another frame won the race while we were binding. Keep theirs and
         // retire BOTH listeners we just created rather than leaking them.
@@ -839,16 +853,26 @@ pub(crate) async fn acquire(base_dir: PathBuf, extension_id: &str) -> Result<Fra
 /// releasing the same one twice, does nothing. A frame that failed to open has
 /// no lease to present, so its cleanup is a no-op instead of a theft.
 pub(crate) fn release(lease: &str) {
-    let mut state = host_state();
-    if state.leases.remove(lease).is_none() {
-        return;
-    }
-    if state.leases.is_empty() {
-        if let Some(running) = state.running.take() {
-            // Both listeners, or the wrapper origin outlives the frames.
-            let _ = running.shutdown_extension.send(());
-            let _ = running.shutdown_wrapper.send(());
+    let released = {
+        let mut state = host_state();
+        if state.leases.remove(lease).is_none() {
+            false
+        } else {
+            if state.leases.is_empty() {
+                state.epoch = state.epoch.wrapping_add(1);
+                if let Some(running) = state.running.take() {
+                    // Both listeners, or the wrapper origin outlives the frames.
+                    let _ = running.shutdown_extension.send(());
+                    let _ = running.shutdown_wrapper.send(());
+                }
+            }
+            true
         }
+    };
+    if released {
+        // Outside the frame-host lock: relay teardown takes its own registry
+        // lock and may notify the connection writer.
+        super::query::close_subscriptions_for_lease(lease);
     }
 }
 
@@ -857,11 +881,19 @@ pub(crate) fn release(lease: &str) {
 /// Called on app shutdown. A frontend that never released — a crashed webview,
 /// a reload — must not leave a listener behind the process.
 pub(crate) fn shutdown_now() {
-    let mut state = host_state();
-    state.leases.clear();
-    if let Some(running) = state.running.take() {
-        let _ = running.shutdown_extension.send(());
-        let _ = running.shutdown_wrapper.send(());
+    let leases = {
+        let mut state = host_state();
+        state.epoch = state.epoch.wrapping_add(1);
+        let leases: Vec<String> = state.leases.keys().cloned().collect();
+        state.leases.clear();
+        if let Some(running) = state.running.take() {
+            let _ = running.shutdown_extension.send(());
+            let _ = running.shutdown_wrapper.send(());
+        }
+        leases
+    };
+    for lease in leases {
+        super::query::close_subscriptions_for_lease(&lease);
     }
 }
 
@@ -933,6 +965,9 @@ pub(crate) fn running_port() -> Option<u16> {
 #[cfg(test)]
 #[path = "frame_host_policy_tests.rs"]
 mod frame_host_policy_tests;
+#[cfg(test)]
+#[path = "frame_host_successor_tests.rs"]
+mod frame_host_successor_tests;
 #[cfg(test)]
 #[path = "frame_host_test_support.rs"]
 mod frame_host_test_support;
