@@ -264,6 +264,7 @@ enum OkShape {
     Complete,
     Truncated,
     Extra,
+    NonStringMessage,
 }
 
 async fn authenticate_with_relay_reply(
@@ -305,6 +306,7 @@ async fn authenticate_with_relay_reply(
         OkShape::Complete => ok_frame(&event_id, success),
         OkShape::Truncated => format!("[\"OK\",\"{event_id}\",{success}]"),
         OkShape::Extra => format!("[\"OK\",\"{event_id}\",{success},\"\",\"extra\"]"),
+        OkShape::NonStringMessage => format!("[\"OK\",\"{event_id}\",{success},7]"),
     };
     to_host
         .send(Ok(Message::Text(reply.into())))
@@ -356,6 +358,16 @@ async fn a_truncated_exact_id_ok_never_mints_a_witness() {
 async fn an_overlong_exact_id_ok_never_mints_a_witness() {
     let keys = keys();
     let result = authenticate_with_relay_reply(&keys, true, 10, OkShape::Extra).await;
+    assert_eq!(
+        result.err(),
+        Some(TransportError::Auth(AuthFailure::NoAcknowledgement))
+    );
+}
+
+#[tokio::test]
+async fn a_non_string_ok_message_never_mints_a_witness() {
+    let keys = keys();
+    let result = authenticate_with_relay_reply(&keys, true, 11, OkShape::NonStringMessage).await;
     assert_eq!(
         result.err(),
         Some(TransportError::Auth(AuthFailure::NoAcknowledgement))
