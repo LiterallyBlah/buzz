@@ -331,8 +331,10 @@ async fn against_a_live_relay_a_subscription_streams_two_channels_as_one() {
         .to_string();
     super::super::query::activate_subscription(app.handle(), &live_lease, &stalled_sub);
 
-    let large_body = "x".repeat(320 * 1024);
-    for index in 0..31 {
+    // Stay below the real relay's 256 KiB content ceiling while exceeding the
+    // host's independent 8 MiB retained-byte ceiling after its 1 MiB window.
+    let large_body = "x".repeat(240 * 1024);
+    for index in 0..40 {
         publish(
             &http,
             &keys,
