@@ -824,3 +824,7 @@ mod construction_tests;
 #[cfg(test)]
 #[path = "query_authority_tests.rs"]
 mod query_authority_tests;
+
+#[cfg(test)]
+#[path = "query_live_proof_tests.rs"]
+mod query_live_proof_tests;
