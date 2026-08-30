@@ -468,7 +468,8 @@ test("the TS per-sub queue fails closed before a third undrained batch", async (
   await openSubscription(h, uuid(720), sub);
   await waitFor(() => h.listening(), "listener");
   h.channel.port2.onmessage = () => {};
-  for (let i = 0; i < MAX_TS_QUEUED_BATCHES_PER_SUB + 3; i += 1) {
+  assert.equal(MAX_TS_QUEUED_BATCHES_PER_SUB, 2);
+  for (let i = 0; i < 3; i += 1) {
     h.emit({ lease: LEASE, frame: { sub, kind: "eose", ordinal: i } });
   }
   await waitFor(

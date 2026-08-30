@@ -84,11 +84,7 @@ fn the_in_flight_byte_window_stops_before_the_batch_count_window() {
 fn per_port_byte_windows_are_independent_of_count_windows() {
     let mut queue_limited = FlowState::default();
     assert_eq!(
-        queue_limited.enqueue(
-            vec![large_event()],
-            1,
-            MAX_QUEUED_BYTES_PER_PORT - 100 * 1024,
-        ),
+        queue_limited.enqueue(vec![large_event()], 1, 8 * 1024 * 1024 - 100 * 1024,),
         Err(FlowError::BoundExceeded),
         "port queued bytes close while frame count remains tiny"
     );
@@ -98,12 +94,7 @@ fn per_port_byte_windows_are_independent_of_count_windows() {
     blocked.enqueue(vec![large_event()], 0, 0).expect("queue");
     assert!(
         blocked
-            .drain(
-                "lease",
-                "sub",
-                1,
-                MAX_IN_FLIGHT_BYTES_PER_PORT - 100 * 1024,
-            )
+            .drain("lease", "sub", 1, 3 * 1024 * 1024 - 100 * 1024)
             .is_empty(),
         "port in-flight bytes stop a batch while batch count has room"
     );
