@@ -88,18 +88,6 @@ const PullRequestGridCard = React.memo(function PullRequestGridCard({
       >
         <span className="sr-only">View review {pullRequest.title}</span>
       </button>
-      <div className="absolute right-2 top-2 z-10">
-        <ProjectItemDeleteMenu
-          author={pullRequest.author}
-          label={`More options for ${pullRequest.title}`}
-          project={repository}
-          rootId={pullRequest.id}
-          subject="pull request"
-          targetId={pullRequest.id}
-          testId={`pull-request-card-${pullRequest.id}`}
-          title={pullRequest.title}
-        />
-      </div>
       <div className="flex min-h-0 flex-1 flex-col gap-2">
         <h3
           className="truncate text-sm font-semibold leading-5 text-foreground"

@@ -88,18 +88,6 @@ const IssueGridCard = React.memo(function IssueGridCard({
       >
         <span className="sr-only">View task {issue.title}</span>
       </button>
-      <div className="absolute right-2 top-2 z-10">
-        <ProjectItemDeleteMenu
-          author={issue.author}
-          label={`More options for ${issue.title}`}
-          project={repository}
-          rootId={issue.id}
-          subject="issue"
-          targetId={issue.id}
-          testId={`issue-card-${issue.id}`}
-          title={issue.title}
-        />
-      </div>
       <div className="flex min-h-0 flex-1 flex-col gap-2">
         <h3
           className="truncate text-sm font-semibold leading-5 text-foreground"
