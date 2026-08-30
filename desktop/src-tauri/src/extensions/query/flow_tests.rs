@@ -35,14 +35,11 @@ fn a_paused_consumer_cannot_grow_the_browser_window_without_bound() {
     let batches = flow.drain("lease", "sub", 0, 0);
     assert_eq!(
         batches.len(),
-        MAX_IN_FLIGHT_BATCHES_PER_SUB,
+        4,
         "only the exact in-flight count window reaches MessagePort"
     );
     let (queued, _) = flow.queued_totals();
-    assert_eq!(
-        queued,
-        100 - MAX_IN_FLIGHT_BATCHES_PER_SUB * MAX_STREAM_BATCH_FRAMES
-    );
+    assert_eq!(queued, 100 - 4 * MAX_STREAM_BATCH_FRAMES);
     assert!(
         flow.drain("lease", "sub", batches.len(), 0).is_empty(),
         "without an ACK no more browser credit exists"
