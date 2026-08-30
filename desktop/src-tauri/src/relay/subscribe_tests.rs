@@ -259,11 +259,18 @@ async fn a_malformed_ok_is_not_an_acknowledgement() {
 
 /// Drive the exchange far enough to learn the host's AUTH event id, then answer
 /// it — the only way to build an OK for an id the host chooses at runtime.
+#[derive(Clone, Copy)]
+enum OkShape {
+    Complete,
+    Truncated,
+    Extra,
+}
+
 async fn authenticate_with_relay_reply(
     keys: &nostr::Keys,
     success: bool,
     generation: u64,
-    include_message: bool,
+    shape: OkShape,
 ) -> Result<IdentityWitness, TransportError> {
     let (to_host, from_relay) = tokio::sync::mpsc::unbounded_channel::<Result<Message, WsError>>();
     let (to_relay, mut from_host) = tokio::sync::mpsc::unbounded_channel::<Message>();
@@ -294,10 +301,10 @@ async fn authenticate_with_relay_reply(
     };
     let value: serde_json::Value = serde_json::from_str(&text).expect("AUTH json");
     let event_id = value[1]["id"].as_str().expect("auth event id").to_string();
-    let reply = if include_message {
-        ok_frame(&event_id, success)
-    } else {
-        format!("[\"OK\",\"{event_id}\",{success}]")
+    let reply = match shape {
+        OkShape::Complete => ok_frame(&event_id, success),
+        OkShape::Truncated => format!("[\"OK\",\"{event_id}\",{success}]"),
+        OkShape::Extra => format!("[\"OK\",\"{event_id}\",{success},\"\",\"extra\"]"),
     };
     to_host
         .send(Ok(Message::Text(reply.into())))
@@ -309,7 +316,7 @@ async fn authenticate_with_relay_reply(
 #[tokio::test]
 async fn a_rejected_auth_means_no_witness() {
     let keys = keys();
-    let result = authenticate_with_relay_reply(&keys, false, 7, true).await;
+    let result = authenticate_with_relay_reply(&keys, false, 7, OkShape::Complete).await;
     assert_eq!(
         result.err(),
         Some(TransportError::Auth(AuthFailure::Rejected)),
@@ -322,7 +329,7 @@ async fn a_complete_strict_exchange_yields_a_witness_for_the_signing_key() {
     // THE POSITIVE CONTROL. Without it the five refusals above are satisfied by
     // an implementation that refuses everything.
     let keys = keys();
-    let witness = authenticate_with_relay_reply(&keys, true, 7, true)
+    let witness = authenticate_with_relay_reply(&keys, true, 7, OkShape::Complete)
         .await
         .expect("a complete exchange must authenticate");
     assert_eq!(witness.connection_generation(), 7);
@@ -338,7 +345,17 @@ async fn a_truncated_exact_id_ok_never_mints_a_witness() {
     // The host's dynamic exact AUTH id is echoed correctly; only the required
     // NIP-01 message field is absent, isolating structural completeness.
     let keys = keys();
-    let result = authenticate_with_relay_reply(&keys, true, 9, false).await;
+    let result = authenticate_with_relay_reply(&keys, true, 9, OkShape::Truncated).await;
+    assert_eq!(
+        result.err(),
+        Some(TransportError::Auth(AuthFailure::NoAcknowledgement))
+    );
+}
+
+#[tokio::test]
+async fn an_overlong_exact_id_ok_never_mints_a_witness() {
+    let keys = keys();
+    let result = authenticate_with_relay_reply(&keys, true, 10, OkShape::Extra).await;
     assert_eq!(
         result.err(),
         Some(TransportError::Auth(AuthFailure::NoAcknowledgement))

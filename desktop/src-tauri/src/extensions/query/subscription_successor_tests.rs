@@ -9,10 +9,11 @@ fn large_event() -> nostr::Event {
 #[test]
 fn post_eose_pre_activation_bytes_close_far_below_the_count_ceiling() {
     let mut aggregate = Aggregate::new(vec!["b1".to_string()]).expect("aggregate");
-    assert_eq!(aggregate.on_branch_eose("b1"), Emit::Nothing);
     let mut accepted = 0usize;
     loop {
-        match aggregate.on_event("b1", large_event()) {
+        let event = large_event();
+        let encoded = event.as_json().len();
+        match aggregate.retain_awaiting_reply(event, encoded) {
             Emit::Nothing => accepted += 1,
             Emit::Closed(reason) => {
                 assert_eq!(reason, CloseReason::BoundExceeded);

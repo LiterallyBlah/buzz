@@ -474,6 +474,26 @@ impl Aggregate {
             .collect()
     }
 
+    /// Retain one event solely behind the not-yet-activated correlated reply.
+    /// Extracted so the count and encoded-byte decisions can each be mutated
+    /// without the stored-phase belt masking them first.
+    pub(super) fn retain_awaiting_reply(
+        &mut self,
+        event: nostr::Event,
+        encoded_bytes: usize,
+    ) -> Emit {
+        if self.awaiting_reply.len() >= MAX_AWAITING_REPLY_EVENTS {
+            return self.close(CloseReason::BoundExceeded);
+        }
+        let next = self.awaiting_reply_bytes.saturating_add(encoded_bytes);
+        if next > MAX_AWAITING_REPLY_BYTES {
+            return self.close(CloseReason::BoundExceeded);
+        }
+        self.awaiting_reply_bytes = next;
+        self.awaiting_reply.push(event);
+        Emit::Nothing
+    }
+
     /// An event that has already passed two-stage admission.
     ///
     /// Before the public `eose` it is a *stored* event: deduped across branches
@@ -523,16 +543,7 @@ impl Aggregate {
         }
 
         if !self.reply_written {
-            if self.awaiting_reply.len() >= MAX_AWAITING_REPLY_EVENTS {
-                return self.close(CloseReason::BoundExceeded);
-            }
-            let next = self.awaiting_reply_bytes.saturating_add(encoded_bytes);
-            if next > MAX_AWAITING_REPLY_BYTES {
-                return self.close(CloseReason::BoundExceeded);
-            }
-            self.awaiting_reply_bytes = next;
-            self.awaiting_reply.push(event);
-            return Emit::Nothing;
+            return self.retain_awaiting_reply(event, encoded_bytes);
         }
         Emit::Event(Box::new(event))
     }
