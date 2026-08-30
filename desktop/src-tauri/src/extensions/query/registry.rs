@@ -362,6 +362,7 @@ impl SubscriptionRegistry {
         self.subs.lock().map(|subs| subs.len()).unwrap_or(0)
     }
 
+    #[cfg(test)]
     pub(super) fn with_aggregate<T>(
         &self,
         lease: &str,

@@ -660,6 +660,7 @@ pub(super) fn on_notice(message: &str) -> bool {
 }
 
 /// The transport ended without a `CLOSED` — still terminal in v1.
+#[cfg(test)]
 pub(super) fn on_transport_end(aggregate: &mut Aggregate) -> Routed {
     Routed {
         emits: vec![aggregate.close(CloseReason::RelayClosed)],
