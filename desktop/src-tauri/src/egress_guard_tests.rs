@@ -257,7 +257,7 @@ const EVENTS_INVENTORY: &[(&str, usize, usize)] = &[
     // The 5b live-subscription proof publishes real signed events to a relay it
     // owns. Guarded rather than listed as a test-only fixture: it is the one
     // test-side site that builds a body from live material.
-    ("src/extensions/query_authority_tests.rs", 1, 1),
+    ("src/extensions/query_live_proof_tests.rs", 1, 1),
 ];
 
 // Needles are assembled at runtime so this scan file itself contains no
