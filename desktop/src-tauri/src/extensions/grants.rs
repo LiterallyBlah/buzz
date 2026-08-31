@@ -26,6 +26,7 @@
 use std::path::Path;
 
 use rusqlite::{params, Connection};
+use serde::{Deserialize, Serialize};
 
 /// Boolean scope gating `identity.getPublicKey` (§3).
 pub(crate) const SCOPE_IDENTITY: &str = "identity";
@@ -42,8 +43,25 @@ CREATE TABLE IF NOT EXISTS extension_grants (
     scope           TEXT    NOT NULL,
     kind            INTEGER NOT NULL DEFAULT -1,
     channel         TEXT    NOT NULL DEFAULT '',
+    package_digest  TEXT    NOT NULL DEFAULT '',
     granted_at      INTEGER NOT NULL,
     PRIMARY KEY (identity_pubkey, extension_id, scope, kind, channel)
+);
+CREATE TABLE IF NOT EXISTS extension_egress_grants (
+    identity_pubkey TEXT NOT NULL,
+    extension_id TEXT NOT NULL,
+    origin TEXT NOT NULL,
+    package_digest TEXT NOT NULL,
+    granted_at INTEGER NOT NULL,
+    PRIMARY KEY (identity_pubkey, extension_id, origin)
+);
+CREATE TABLE IF NOT EXISTS extension_activation (
+    identity_pubkey TEXT NOT NULL,
+    extension_id TEXT NOT NULL,
+    package_digest TEXT NOT NULL,
+    enabled INTEGER NOT NULL DEFAULT 0,
+    consented_at INTEGER NOT NULL,
+    PRIMARY KEY (identity_pubkey, extension_id)
 );
 ";
 
@@ -61,7 +79,55 @@ pub(crate) fn open_grant_db(path: &Path) -> Result<Connection, String> {
         .map_err(|error| format!("could not set busy_timeout: {error}"))?;
     conn.execute_batch(SCHEMA)
         .map_err(|error| format!("could not initialise the grant store: {error}"))?;
+    ensure_package_digest_column(&conn)?;
     Ok(conn)
+}
+
+fn ensure_package_digest_column(conn: &Connection) -> Result<(), String> {
+    let mut statement = conn
+        .prepare("PRAGMA table_info(extension_grants)")
+        .map_err(|error| format!("could not inspect the grant store: {error}"))?;
+    let columns = statement
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(|error| format!("could not inspect the grant store: {error}"))?;
+    let mut has_digest = false;
+    for column in columns {
+        if matches!(column, Ok(name) if name == "package_digest") {
+            has_digest = true;
+        }
+    }
+    if !has_digest {
+        conn.execute(
+            "ALTER TABLE extension_grants ADD COLUMN package_digest TEXT NOT NULL DEFAULT ''",
+            [],
+        )
+        .map_err(|error| format!("could not migrate the grant store: {error}"))?;
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct GrantPair {
+    pub kind: u32,
+    pub channel: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct GrantSelection {
+    #[serde(default)]
+    pub identity: bool,
+    #[serde(default)]
+    pub storage: bool,
+    #[serde(default)]
+    pub extension_data: bool,
+    #[serde(default)]
+    pub sign: Vec<GrantPair>,
+    #[serde(default)]
+    pub read: Vec<GrantPair>,
+    #[serde(default)]
+    pub egress: Vec<String>,
 }
 
 /// Record a boolean scope grant (`identity`, `storage`, `extensionData`).
@@ -367,6 +433,317 @@ fn now_unix() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or_default()
+}
+
+fn requested_pairs(
+    manifest: &super::manifest::ExtensionManifest,
+) -> (
+    std::collections::BTreeSet<GrantPair>,
+    std::collections::BTreeSet<GrantPair>,
+) {
+    let mut sign = std::collections::BTreeSet::new();
+    let mut read = std::collections::BTreeSet::new();
+    for scope in &manifest.scopes.sign {
+        for channel in &scope.channels {
+            sign.insert(GrantPair {
+                kind: scope.kind,
+                channel: channel.clone(),
+            });
+        }
+    }
+    for scope in &manifest.scopes.read {
+        for kind in &scope.kinds {
+            for channel in &scope.channels {
+                read.insert(GrantPair {
+                    kind: *kind,
+                    channel: channel.clone(),
+                });
+            }
+        }
+    }
+    (sign, read)
+}
+
+pub(crate) fn validate_selection(
+    manifest: &super::manifest::ExtensionManifest,
+    selected: &GrantSelection,
+) -> Result<(), String> {
+    if selected.identity && !manifest.scopes.identity {
+        return Err("identity was not requested by the prepared manifest".to_string());
+    }
+    if selected.storage && !manifest.scopes.storage {
+        return Err("storage was not requested by the prepared manifest".to_string());
+    }
+    if selected.extension_data && !manifest.scopes.extension_data {
+        return Err("extensionData was not requested by the prepared manifest".to_string());
+    }
+    let (requested_sign, requested_read) = requested_pairs(manifest);
+    for pair in &selected.sign {
+        if !requested_sign.contains(pair)
+            || !super::manifest::EXTENSION_SIGNABLE_KINDS.contains(&pair.kind)
+            || !super::manifest::is_canonical_channel_uuid(&pair.channel)
+        {
+            return Err("a selected sign grant is not a permitted manifest subset".to_string());
+        }
+    }
+    for pair in &selected.read {
+        if !requested_read.contains(pair)
+            || super::manifest::is_read_denied_kind(pair.kind)
+            || !super::manifest::is_channel_readable_kind(pair.kind)
+            || !super::manifest::is_canonical_channel_uuid(&pair.channel)
+        {
+            return Err("a selected read grant is not a permitted manifest subset".to_string());
+        }
+    }
+    let requested_egress: std::collections::BTreeSet<&str> =
+        manifest.egress.iter().map(String::as_str).collect();
+    for origin in &selected.egress {
+        super::manifest::validate_egress_origin(origin)?;
+        if !requested_egress.contains(origin.as_str()) {
+            return Err(
+                "a selected egress origin was not declared by the prepared manifest".to_string(),
+            );
+        }
+    }
+    Ok(())
+}
+
+fn insert_selection(
+    tx: &rusqlite::Transaction<'_>,
+    identity_pubkey: &str,
+    extension_id: &str,
+    digest: &str,
+    selected: &GrantSelection,
+) -> Result<(), String> {
+    let now = now_unix();
+    for (scope, granted) in [
+        (SCOPE_IDENTITY, selected.identity),
+        ("storage", selected.storage),
+        ("extensionData", selected.extension_data),
+    ] {
+        if granted {
+            tx.execute(
+                "INSERT INTO extension_grants (identity_pubkey, extension_id, scope, kind, channel, package_digest, granted_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![identity_pubkey, extension_id, scope, NO_KIND, NO_CHANNEL, digest, now],
+            )
+            .map_err(|error| format!("could not record boolean grant: {error}"))?;
+        }
+    }
+    for (scope, pairs) in [(SCOPE_SIGN, &selected.sign), (SCOPE_READ, &selected.read)] {
+        let unique: std::collections::BTreeSet<_> = pairs.iter().collect();
+        for pair in unique {
+            tx.execute(
+                "INSERT INTO extension_grants (identity_pubkey, extension_id, scope, kind, channel, package_digest, granted_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![identity_pubkey, extension_id, scope, i64::from(pair.kind), pair.channel, digest, now],
+            )
+            .map_err(|error| format!("could not record pair grant: {error}"))?;
+        }
+    }
+    let unique_egress: std::collections::BTreeSet<_> = selected.egress.iter().collect();
+    for origin in unique_egress {
+        tx.execute(
+            "INSERT INTO extension_egress_grants (identity_pubkey, extension_id, origin, package_digest, granted_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![identity_pubkey, extension_id, origin, digest, now],
+        )
+        .map_err(|error| format!("could not record egress grant: {error}"))?;
+    }
+    Ok(())
+}
+
+pub(crate) fn replace_for_install(
+    conn: &mut Connection,
+    identity_pubkey: &str,
+    manifest: &super::manifest::ExtensionManifest,
+    digest: &str,
+    selected: &GrantSelection,
+) -> Result<(), String> {
+    validate_selection(manifest, selected)?;
+    let tx = conn
+        .transaction()
+        .map_err(|error| format!("could not begin grant transaction: {error}"))?;
+    tx.execute(
+        "DELETE FROM extension_grants WHERE extension_id = ?1",
+        params![manifest.id],
+    )
+    .map_err(|error| format!("could not replace grants: {error}"))?;
+    tx.execute(
+        "DELETE FROM extension_egress_grants WHERE extension_id = ?1",
+        params![manifest.id],
+    )
+    .map_err(|error| format!("could not replace egress grants: {error}"))?;
+    tx.execute(
+        "DELETE FROM extension_activation WHERE extension_id = ?1",
+        params![manifest.id],
+    )
+    .map_err(|error| format!("could not replace activation state: {error}"))?;
+    insert_selection(&tx, identity_pubkey, &manifest.id, digest, selected)?;
+    tx.execute(
+        "INSERT INTO extension_activation (identity_pubkey, extension_id, package_digest, enabled, consented_at) VALUES (?1, ?2, ?3, 0, ?4)",
+        params![identity_pubkey, manifest.id, digest, now_unix()],
+    )
+    .map_err(|error| format!("could not record install consent: {error}"))?;
+    tx.commit()
+        .map_err(|error| format!("could not commit grant transaction: {error}"))
+}
+
+pub(crate) fn replace_for_identity(
+    conn: &mut Connection,
+    identity_pubkey: &str,
+    manifest: &super::manifest::ExtensionManifest,
+    digest: &str,
+    selected: &GrantSelection,
+) -> Result<(), String> {
+    validate_selection(manifest, selected)?;
+    let enabled = is_enabled(conn, identity_pubkey, &manifest.id, digest);
+    let tx = conn
+        .transaction()
+        .map_err(|error| format!("could not begin grant transaction: {error}"))?;
+    tx.execute(
+        "DELETE FROM extension_grants WHERE identity_pubkey = ?1 AND extension_id = ?2",
+        params![identity_pubkey, manifest.id],
+    )
+    .map_err(|error| format!("could not replace grants: {error}"))?;
+    tx.execute(
+        "DELETE FROM extension_egress_grants WHERE identity_pubkey = ?1 AND extension_id = ?2",
+        params![identity_pubkey, manifest.id],
+    )
+    .map_err(|error| format!("could not replace egress grants: {error}"))?;
+    insert_selection(&tx, identity_pubkey, &manifest.id, digest, selected)?;
+    tx.execute(
+        "INSERT OR REPLACE INTO extension_activation (identity_pubkey, extension_id, package_digest, enabled, consented_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![identity_pubkey, manifest.id, digest, if enabled { 1 } else { 0 }, now_unix()],
+    )
+    .map_err(|error| format!("could not retain activation state: {error}"))?;
+    tx.commit()
+        .map_err(|error| format!("could not commit grant transaction: {error}"))
+}
+
+#[cfg(test)]
+pub(crate) fn has_consent(
+    conn: &Connection,
+    identity_pubkey: &str,
+    extension_id: &str,
+    digest: &str,
+) -> bool {
+    conn.query_row(
+        "SELECT COUNT(*) FROM extension_activation WHERE identity_pubkey = ?1 AND extension_id = ?2 AND package_digest = ?3",
+        params![identity_pubkey, extension_id, digest],
+        |row| row.get::<_, i64>(0),
+    )
+    .is_ok_and(|count| count == 1)
+}
+
+pub(crate) fn is_enabled(
+    conn: &Connection,
+    identity_pubkey: &str,
+    extension_id: &str,
+    digest: &str,
+) -> bool {
+    conn.query_row(
+        "SELECT enabled FROM extension_activation WHERE identity_pubkey = ?1 AND extension_id = ?2 AND package_digest = ?3",
+        params![identity_pubkey, extension_id, digest],
+        |row| row.get::<_, i64>(0),
+    )
+    .is_ok_and(|enabled| enabled == 1)
+}
+
+pub(crate) fn set_enabled(
+    conn: &Connection,
+    identity_pubkey: &str,
+    extension_id: &str,
+    digest: &str,
+    enabled: bool,
+) -> Result<(), String> {
+    let changed = conn
+        .execute(
+            "UPDATE extension_activation SET enabled = ?4 WHERE identity_pubkey = ?1 AND extension_id = ?2 AND package_digest = ?3",
+            params![identity_pubkey, extension_id, digest, if enabled { 1 } else { 0 }],
+        )
+        .map_err(|error| format!("could not update extension state: {error}"))?;
+    if changed != 1 {
+        return Err("no consent exists for this identity and installed package".to_string());
+    }
+    Ok(())
+}
+
+pub(crate) fn list_selection(
+    conn: &Connection,
+    identity_pubkey: &str,
+    extension_id: &str,
+    digest: &str,
+) -> GrantSelection {
+    let boolean = |scope: &str| {
+        conn.query_row(
+            "SELECT COUNT(*) FROM extension_grants WHERE identity_pubkey = ?1 AND extension_id = ?2 AND package_digest = ?3 AND scope = ?4 AND kind = -1 AND channel = ''",
+            params![identity_pubkey, extension_id, digest, scope],
+            |row| row.get::<_, i64>(0),
+        )
+        .is_ok_and(|count| count > 0)
+    };
+    let pairs = |scope: &str| -> Vec<GrantPair> {
+        let Ok(mut statement) = conn.prepare(
+            "SELECT kind, channel FROM extension_grants WHERE identity_pubkey = ?1 AND extension_id = ?2 AND package_digest = ?3 AND scope = ?4 AND kind >= 0 AND channel <> '' ORDER BY channel, kind",
+        ) else {
+            return Vec::new();
+        };
+        let Ok(rows) = statement.query_map(
+            params![identity_pubkey, extension_id, digest, scope],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+        ) else {
+            return Vec::new();
+        };
+        rows.filter_map(Result::ok)
+            .filter_map(|(kind, channel)| {
+                u32::try_from(kind)
+                    .ok()
+                    .map(|kind| GrantPair { kind, channel })
+            })
+            .collect()
+    };
+    let egress = conn
+        .prepare("SELECT origin FROM extension_egress_grants WHERE identity_pubkey = ?1 AND extension_id = ?2 AND package_digest = ?3 ORDER BY origin")
+        .ok()
+        .and_then(|mut statement| {
+            statement
+                .query_map(params![identity_pubkey, extension_id, digest], |row| row.get::<_, String>(0))
+                .ok()
+                .map(|rows| rows.filter_map(Result::ok).collect())
+        })
+        .unwrap_or_default();
+    GrantSelection {
+        identity: boolean(SCOPE_IDENTITY),
+        storage: boolean("storage"),
+        extension_data: boolean("extensionData"),
+        sign: pairs(SCOPE_SIGN),
+        read: pairs(SCOPE_READ),
+        egress,
+    }
+}
+
+pub(crate) fn delete_all_for_extension(
+    conn: &mut Connection,
+    extension_id: &str,
+) -> Result<(), String> {
+    let tx = conn
+        .transaction()
+        .map_err(|error| format!("could not begin removal transaction: {error}"))?;
+    tx.execute(
+        "DELETE FROM extension_grants WHERE extension_id = ?1",
+        params![extension_id],
+    )
+    .map_err(|error| format!("could not remove grants: {error}"))?;
+    tx.execute(
+        "DELETE FROM extension_egress_grants WHERE extension_id = ?1",
+        params![extension_id],
+    )
+    .map_err(|error| format!("could not remove egress grants: {error}"))?;
+    tx.execute(
+        "DELETE FROM extension_activation WHERE extension_id = ?1",
+        params![extension_id],
+    )
+    .map_err(|error| format!("could not remove activation state: {error}"))?;
+    tx.commit()
+        .map_err(|error| format!("could not commit removal transaction: {error}"))
 }
 
 #[cfg(test)]

@@ -90,6 +90,12 @@ test("a successful install appears in the installed list", async ({ page }) => {
 
   await expect(page.getByText("No extensions installed")).toBeVisible();
   await page.getByTestId("install-extension-from-folder").click();
+  await expect(page.getByTestId("extension-consent-dialog")).toBeVisible();
+  await page.getByTestId("grant-identity").click();
+  await page
+    .getByTestId("grant-sign-9-c8fb8f44-993d-4166-810e-ebdad7b8b944")
+    .click();
+  await page.getByTestId("extension-consent-confirm").click();
 
   const card = page.getByTestId("installed-extension-equation-explorer");
   await expect(card).toBeVisible();
@@ -98,6 +104,15 @@ test("a successful install appears in the installed list", async ({ page }) => {
   // The declared scopes are rendered, which is what P5's grant UI builds on.
   await expect(card).toContainText("Identity");
   await expect(card).toContainText("Sign kind 9 in 1 channel");
+  await expect(card).toContainText("Disabled");
+  await expect(
+    page.getByTestId("open-extension-equation-explorer"),
+  ).toBeDisabled();
+  await page.getByTestId("toggle-extension-equation-explorer").click();
+  await expect(card).toContainText("Enabled");
+  await expect(
+    page.getByTestId("open-extension-equation-explorer"),
+  ).toBeEnabled();
   await expect(page.getByText("No extensions installed")).toBeHidden();
 });
 
@@ -115,8 +130,9 @@ test("an authoritative Rust rejection is surfaced verbatim", async ({
   await page.goto("/#/extensions");
 
   await page.getByTestId("install-extension-from-zip").click();
+  await page.getByTestId("extension-consent-confirm").click();
 
-  const error = page.getByTestId("extension-install-error");
+  const error = page.getByTestId("extension-consent-dialog");
   await expect(error).toBeVisible();
   await expect(error).toContainText(rejection);
   await expect(page.getByText("No extensions installed")).toBeVisible();
@@ -147,4 +163,40 @@ test("a manifest that fails frontend shape validation never reaches install", as
   await expect(error).toContainText("extension.json");
   await expect(error).toContainText("id must match");
   await expect(error).not.toContainText("RUST-LOADER-WAS-CALLED");
+});
+
+test("picker cancellation remains cancellation and writes nothing", async ({
+  page,
+}) => {
+  await installMockBridge(page, { extensionPickPath: null });
+  await page.goto("/#/extensions");
+  await page.getByTestId("install-extension-from-folder").click();
+  await expect(page.getByTestId("extension-consent-dialog")).toHaveCount(0);
+  await expect(page.getByText("No extensions installed")).toBeVisible();
+  await expect(page.getByTestId("extension-install-error")).toHaveCount(0);
+});
+
+test("grants can be narrowed and removal clears the package", async ({
+  page,
+}) => {
+  await installMockBridge(page, {
+    extensionPickPath: "/tmp/equation-explorer",
+    extensionPreviewManifest: VALID_MANIFEST,
+  });
+  await page.goto("/#/extensions");
+  await page.getByTestId("install-extension-from-folder").click();
+  await page.getByTestId("grant-identity").click();
+  await page.getByTestId("extension-consent-confirm").click();
+  const card = page.getByTestId("installed-extension-equation-explorer");
+  await expect(card).toContainText("Identity");
+
+  await page.getByTestId("review-extension-equation-explorer").click();
+  await page.getByTestId("grant-identity").click();
+  await page.getByTestId("extension-consent-confirm").click();
+  await expect(card.getByText("None")).toBeVisible();
+
+  await page.getByTestId("remove-extension-equation-explorer").click();
+  await page.getByTestId("confirm-remove-extension").click();
+  await expect(card).toHaveCount(0);
+  await expect(page.getByText("No extensions installed")).toBeVisible();
 });

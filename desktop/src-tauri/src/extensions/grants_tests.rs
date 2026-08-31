@@ -226,3 +226,159 @@ fn a_kind_qualified_lookup_does_not_match_a_boolean_grant() {
         "a boolean row must not satisfy a (kind, channel) lookup"
     );
 }
+
+fn p5_manifest() -> super::super::manifest::ExtensionManifest {
+    super::super::manifest::ExtensionManifest {
+        id: "demo".into(),
+        name: "Demo".into(),
+        version: "1".into(),
+        entry: "index.html".into(),
+        scopes: super::super::manifest::ExtensionScopes {
+            identity: true,
+            storage: true,
+            extension_data: true,
+            sign: vec![super::super::manifest::SignScope {
+                kind: 9,
+                channels: vec!["c8fb8f44-993d-4166-810e-ebdad7b8b944".into()],
+            }],
+            read: vec![super::super::manifest::ReadScope {
+                kinds: vec![9],
+                channels: vec!["c8fb8f44-993d-4166-810e-ebdad7b8b944".into()],
+            }],
+        },
+        egress: vec!["https://example.com".into()],
+    }
+}
+
+fn p5_selection() -> GrantSelection {
+    GrantSelection {
+        identity: true,
+        storage: false,
+        extension_data: true,
+        sign: vec![GrantPair {
+            kind: 9,
+            channel: "c8fb8f44-993d-4166-810e-ebdad7b8b944".into(),
+        }],
+        read: vec![GrantPair {
+            kind: 9,
+            channel: "c8fb8f44-993d-4166-810e-ebdad7b8b944".into(),
+        }],
+        egress: vec!["https://example.com".into()],
+    }
+}
+
+#[test]
+fn p5_consent_is_transactional_digest_bound_and_restart_durable() {
+    let (_dir, path) = temp_db();
+    let identity = "a".repeat(64);
+    let mut conn = open_grant_db(&path).expect("open");
+    replace_for_install(
+        &mut conn,
+        &identity,
+        &p5_manifest(),
+        "digest-a",
+        &p5_selection(),
+    )
+    .expect("replace");
+    assert!(!is_enabled(&conn, &identity, "demo", "digest-a"));
+    assert!(!is_enabled(&conn, &identity, "demo", "digest-b"));
+    assert!(!is_enabled(&conn, &"b".repeat(64), "demo", "digest-a"));
+    set_enabled(&conn, &identity, "demo", "digest-a", true).expect("enable");
+    assert_eq!(
+        list_selection(&conn, &identity, "demo", "digest-a"),
+        p5_selection()
+    );
+    drop(conn);
+
+    let reopened = open_grant_db(&path).expect("reopen");
+    assert!(is_enabled(&reopened, &identity, "demo", "digest-a"));
+    assert_eq!(
+        list_selection(&reopened, &identity, "demo", "digest-a"),
+        p5_selection()
+    );
+}
+
+#[test]
+fn p5_invented_grant_is_rejected_without_partial_replacement() {
+    let (_dir, path) = temp_db();
+    let identity = "a".repeat(64);
+    let mut conn = open_grant_db(&path).expect("open");
+    replace_for_install(
+        &mut conn,
+        &identity,
+        &p5_manifest(),
+        "digest-a",
+        &p5_selection(),
+    )
+    .expect("initial");
+    let invented = GrantSelection {
+        egress: vec!["https://attacker.example".into()],
+        ..Default::default()
+    };
+    assert!(
+        replace_for_identity(&mut conn, &identity, &p5_manifest(), "digest-a", &invented).is_err()
+    );
+    assert_eq!(
+        list_selection(&conn, &identity, "demo", "digest-a"),
+        p5_selection()
+    );
+}
+
+#[test]
+fn p5_reinstall_invalidates_other_identity_and_old_digest_authority() {
+    let (_dir, path) = temp_db();
+    let a = "a".repeat(64);
+    let b = "b".repeat(64);
+    let mut conn = open_grant_db(&path).expect("open");
+    replace_for_install(&mut conn, &a, &p5_manifest(), "old", &p5_selection()).expect("a");
+    replace_for_identity(&mut conn, &b, &p5_manifest(), "old", &p5_selection()).expect("b");
+    set_enabled(&conn, &a, "demo", "old", true).expect("enable a");
+    set_enabled(&conn, &b, "demo", "old", true).expect("enable b");
+
+    replace_for_install(
+        &mut conn,
+        &a,
+        &p5_manifest(),
+        "new",
+        &GrantSelection::default(),
+    )
+    .expect("reinstall");
+    assert!(!is_enabled(&conn, &a, "demo", "old"));
+    assert!(!is_enabled(&conn, &b, "demo", "old"));
+    assert!(!has_consent(&conn, &b, "demo", "new"));
+    assert_eq!(
+        list_selection(&conn, &a, "demo", "new"),
+        GrantSelection::default()
+    );
+}
+
+#[test]
+fn p5_database_failure_rolls_back_every_grant_and_activation_row() {
+    let (_dir, path) = temp_db();
+    let identity = "a".repeat(64);
+    let mut conn = open_grant_db(&path).expect("open");
+    conn.execute_batch(
+        "CREATE TRIGGER fail_read_grant BEFORE INSERT ON extension_grants
+         WHEN NEW.scope = 'read' BEGIN SELECT RAISE(FAIL, 'forced'); END;",
+    )
+    .expect("trigger");
+    assert!(replace_for_install(
+        &mut conn,
+        &identity,
+        &p5_manifest(),
+        "digest-a",
+        &p5_selection(),
+    )
+    .is_err());
+    let grants: i64 = conn
+        .query_row("SELECT COUNT(*) FROM extension_grants", [], |row| {
+            row.get(0)
+        })
+        .expect("grant count");
+    let activations: i64 = conn
+        .query_row("SELECT COUNT(*) FROM extension_activation", [], |row| {
+            row.get(0)
+        })
+        .expect("activation count");
+    assert_eq!((grants, activations), (0, 0));
+}

@@ -535,7 +535,7 @@ pub(crate) fn is_canonical_channel_uuid(value: &str) -> bool {
 /// Anything carrying a path, query, fragment or credentials is rejected —
 /// decision 004 grants an *origin*, and a path-bearing string would give the
 /// grant UI something narrower to show than what the CSP actually widens.
-fn validate_egress_origin(origin: &str) -> Result<(), String> {
+pub(crate) fn validate_egress_origin(origin: &str) -> Result<(), String> {
     let reject = || {
         Err(format!(
             "{MANIFEST_FILE_NAME}: egress entry {origin:?} is not a bare origin (scheme://host[:port], no path, query or fragment)"

@@ -94,6 +94,16 @@ use axum::Router;
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 
+use super::frame_authority::{
+    active_owner_for_tree, content_security_policy_with_egress, LeaseOwner,
+};
+pub(crate) use super::frame_authority::{
+    extension_for_lease, lease_authority, release_for_extension_id, release_for_identity_extension,
+};
+#[cfg(test)]
+pub(crate) use super::frame_authority::{
+    insert_authorized_lease_for_test, insert_lease_for_test, lifecycle_guard, running_port,
+};
 use super::manifest::is_valid_extension_id;
 use super::package_path::check_package_relative_path;
 
@@ -219,21 +229,10 @@ fn content_type_for(path: &Path) -> &'static str {
 /// all, and the parent's origin differs across platforms (`tauri://localhost`
 /// vs `http://tauri.localhost`) — naming it would be a portability bug.
 ///
-/// Manifest-declared `egress` origins are **not** honoured yet: an extension
-/// that declares them is simply denied, which is the fail-closed direction.
+/// Manifest-declared `egress` origins are honoured only when the host-side
+/// enabled-package record carries the same explicitly selected subset.
 fn content_security_policy(origin: &str) -> String {
-    format!(
-        "default-src 'none'; \
-         script-src {origin}; \
-         style-src {origin} 'unsafe-inline'; \
-         img-src {origin} data: blob:; \
-         font-src {origin}; \
-         media-src {origin}; \
-         connect-src 'none'; \
-         webrtc 'block'; \
-         base-uri 'none'; \
-         form-action 'none'"
-    )
+    content_security_policy_with_egress(origin, &[])
 }
 
 /// The `Content-Security-Policy` served with the trusted wrapper document.
@@ -488,8 +487,17 @@ const ACTIVE_NON_HTML_DOCUMENT_TYPES: &[&str] = &[
 ///   Rendering is untouched, so an `<img src="asset.svg">` still draws — an
 ///   image never runs script, and an SVG that wants to is the attack.
 /// - **Subresources** are served the ordinary policy and are unaffected.
+#[cfg(test)]
 fn asset_content_security_policy(origin: &str, content_type: &str) -> String {
-    let base = content_security_policy(origin);
+    asset_content_security_policy_with_egress(origin, content_type, &[])
+}
+
+fn asset_content_security_policy_with_egress(
+    origin: &str,
+    content_type: &str,
+    egress: &[String],
+) -> String {
+    let base = content_security_policy_with_egress(origin, egress);
     if ACTIVE_NON_HTML_DOCUMENT_TYPES
         .iter()
         .any(|kind| content_type.starts_with(kind))
@@ -610,6 +618,9 @@ async fn serve_wrapper(
     State(state): State<HostState>,
     RoutePath(id): RoutePath<String>,
 ) -> Response {
+    if active_owner_for_tree(&state.base_dir, &id).is_none() {
+        return empty(StatusCode::NOT_FOUND);
+    }
     // The wrapper names the entry from the *installed manifest*, so a caller
     // cannot ask this document to embed an arbitrary path.
     let manifest = match super::resolve_frame_manifest(&state.base_dir, &id) {
@@ -635,6 +646,9 @@ async fn serve_asset(
     State(state): State<HostState>,
     RoutePath((id, asset)): RoutePath<(String, String)>,
 ) -> Response {
+    let Some(owner) = active_owner_for_tree(&state.base_dir, &id) else {
+        return empty(StatusCode::NOT_FOUND);
+    };
     let path = match resolve_asset(&state.base_dir, &id, &asset) {
         Ok(path) => path,
         Err(error) => return empty(error.status()),
@@ -664,7 +678,11 @@ async fn serve_asset(
     insert(
         headers,
         header::CONTENT_SECURITY_POLICY,
-        &asset_content_security_policy(&state.extension_origin, content_type),
+        &asset_content_security_policy_with_egress(
+            &state.extension_origin,
+            content_type,
+            &owner.egress,
+        ),
     );
     // The package's own naming decides the type; never let a browser re-guess.
     insert(headers, header::X_CONTENT_TYPE_OPTIONS, "nosniff");
@@ -696,16 +714,16 @@ fn empty(status: StatusCode) -> Response {
 /// listener there would be unreachable. A different port is a different origin
 /// by definition, needs no name resolution, and behaves identically on every
 /// platform.
-struct RunningHost {
-    extension_port: u16,
+pub(super) struct RunningHost {
+    pub(super) extension_port: u16,
     wrapper_port: u16,
     shutdown_extension: oneshot::Sender<()>,
     shutdown_wrapper: oneshot::Sender<()>,
 }
 
 #[derive(Default)]
-struct FrameHostState {
-    running: Option<RunningHost>,
+pub(super) struct FrameHostState {
+    pub(super) running: Option<RunningHost>,
     /// Monotonic lifecycle epoch. A bind started under an older epoch may not
     /// install listeners or a lease after release/shutdown advanced it.
     epoch: u64,
@@ -721,13 +739,13 @@ struct FrameHostState {
     /// Maps the opaque lease to the extension id it was issued for. The map
     /// (rather than a set) is what lets the bridge resolve identity from a
     /// host-minted token instead of trusting a caller-supplied id.
-    leases: std::collections::BTreeMap<String, String>,
+    pub(super) leases: std::collections::BTreeMap<String, LeaseOwner>,
 }
 
 static FRAME_HOST: OnceLock<Mutex<FrameHostState>> = OnceLock::new();
 
 /// The shared state, recovering rather than panicking on a poisoned lock.
-fn host_state() -> MutexGuard<'static, FrameHostState> {
+pub(super) fn host_state() -> MutexGuard<'static, FrameHostState> {
     let lock = FRAME_HOST.get_or_init(|| Mutex::new(FrameHostState::default()));
     match lock.lock() {
         Ok(guard) => guard,
@@ -754,13 +772,50 @@ pub(crate) struct FrameLease {
 ///
 /// Idempotent in the sense that matters: a second frame reuses the running
 /// listener, but gets its **own** lease.
+#[cfg(test)]
 pub(crate) async fn acquire(base_dir: PathBuf, extension_id: &str) -> Result<FrameLease, String> {
+    acquire_inner(base_dir, extension_id, "", "", Vec::new()).await
+}
+
+pub(crate) async fn acquire_authorized(
+    base_dir: PathBuf,
+    extension_id: &str,
+    identity_pubkey: &str,
+    package_digest: &str,
+    egress: Vec<String>,
+) -> Result<FrameLease, String> {
+    if identity_pubkey.is_empty() || package_digest.is_empty() {
+        return Err("enabled extension authority is incomplete".to_string());
+    }
+    acquire_inner(
+        base_dir,
+        extension_id,
+        identity_pubkey,
+        package_digest,
+        egress,
+    )
+    .await
+}
+
+async fn acquire_inner(
+    base_dir: PathBuf,
+    extension_id: &str,
+    identity_pubkey: &str,
+    package_digest: &str,
+    egress: Vec<String>,
+) -> Result<FrameLease, String> {
+    let owner = LeaseOwner {
+        extension_id: extension_id.to_string(),
+        identity_pubkey: identity_pubkey.to_string(),
+        package_digest: package_digest.to_string(),
+        egress,
+    };
     let lease = uuid::Uuid::new_v4().to_string();
     let opening_epoch = {
         let mut state = host_state();
         if let Some(running) = &state.running {
             let (extension_port, wrapper_port) = (running.extension_port, running.wrapper_port);
-            state.leases.insert(lease.clone(), extension_id.to_string());
+            state.leases.insert(lease.clone(), owner.clone());
             return Ok(FrameLease {
                 extension_port,
                 wrapper_port,
@@ -826,7 +881,7 @@ pub(crate) async fn acquire(base_dir: PathBuf, extension_id: &str) -> Result<Fra
         let (extension_port, wrapper_port) = (running.extension_port, running.wrapper_port);
         let _ = shutdown_extension.send(());
         let _ = shutdown_wrapper.send(());
-        state.leases.insert(lease.clone(), extension_id.to_string());
+        state.leases.insert(lease.clone(), owner.clone());
         return Ok(FrameLease {
             extension_port,
             wrapper_port,
@@ -839,7 +894,7 @@ pub(crate) async fn acquire(base_dir: PathBuf, extension_id: &str) -> Result<Fra
         shutdown_extension,
         shutdown_wrapper,
     });
-    state.leases.insert(lease.clone(), extension_id.to_string());
+    state.leases.insert(lease.clone(), owner.clone());
     Ok(FrameLease {
         extension_port,
         wrapper_port,
@@ -895,66 +950,6 @@ pub(crate) fn shutdown_now() {
     for lease in leases {
         super::query::close_subscriptions_for_lease(&lease);
     }
-}
-
-/// Resolve a host-minted lease to the extension it was issued for.
-///
-/// **This is the single producer of extension identity for the bridge.** The
-/// caller supplies only the opaque lease the host handed it; the id comes from
-/// host state. A caller that invents an id gets nowhere, because no parameter
-/// it can set is consulted.
-///
-/// Returns `None` for an unknown or already-released lease, which is what makes
-/// "released" terminal rather than advisory.
-pub(crate) fn extension_for_lease(lease: &str) -> Option<String> {
-    host_state().leases.get(lease).cloned()
-}
-
-/// Serialises every test that touches the **process-wide** frame host.
-///
-/// `acquire`/`release`/`shutdown_now` all mutate one global. Any test that
-/// calls them races every other one, and the failure is remote from the cause:
-/// a `shutdown_now()` in an unrelated module drops the running host's shutdown
-/// senders, its axum servers stop, and a *different* test's next probe gets
-/// `ECONNREFUSED` — measured at ~14% of parallel runs before this was shared.
-///
-/// It lives here, not in a test module, precisely so it is reachable from
-/// every module that touches the host. A private per-module lock is the bug.
-#[cfg(test)]
-pub(crate) static LIFECYCLE_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
-/// Take the lifecycle lock and reset the global to a known state.
-#[cfg(test)]
-pub(crate) async fn lifecycle_guard() -> tokio::sync::MutexGuard<'static, ()> {
-    let guard = LIFECYCLE_TEST_LOCK.lock().await;
-    // Whatever a previous test left behind is not this test's starting state.
-    shutdown_now();
-    guard
-}
-
-/// Register a lease in the real host map without starting a host.
-///
-/// The lease map is the single producer of extension identity, so a test that
-/// wants the production lease check to *pass* must put an entry in the map the
-/// production code reads. Starting two axum servers to obtain one is a slower
-/// way to reach the same state, and a test that instead skips the lease check
-/// is not testing it.
-///
-/// Callers must hold [`lifecycle_guard`], which clears whatever this leaves.
-#[cfg(test)]
-pub(crate) fn insert_lease_for_test(lease: &str, extension_id: &str) {
-    host_state()
-        .leases
-        .insert(lease.to_string(), extension_id.to_string());
-}
-
-/// The running extension-content port, if any. Test and diagnostic use.
-#[cfg(test)]
-pub(crate) fn running_port() -> Option<u16> {
-    host_state()
-        .running
-        .as_ref()
-        .map(|running| running.extension_port)
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────

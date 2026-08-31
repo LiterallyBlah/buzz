@@ -546,6 +546,15 @@ impl Revalidation<'_> {
             Some(current) if current == self.extension_id => {}
             _ => return Err(code::DENIED),
         }
+        if !super::management::revalidation_current(
+            self.state,
+            self.grant_db.as_deref(),
+            self.lease,
+            self.extension_id,
+            self.identity_at_entry,
+        ) {
+            return Err(code::DENIED);
+        }
 
         // The signing identity must still be available and unchanged. Recovery
         // swaps in an ephemeral key, so "available" is not enough on its own.

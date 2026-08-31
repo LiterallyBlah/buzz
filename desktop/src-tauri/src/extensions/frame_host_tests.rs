@@ -277,3 +277,17 @@ fn the_document_policy_does_not_govern_post_message() {
         "the served policy must not add its own sandbox; got: {policy}"
     );
 }
+
+#[test]
+fn selected_egress_widens_only_connect_src_and_empty_remains_denied() {
+    let origin = "http://127.0.0.1:4321";
+    let selected = vec![
+        "https://api.example.com".to_string(),
+        "wss://stream.example.com".to_string(),
+    ];
+    let widened = content_security_policy_with_egress(origin, &selected);
+    assert!(widened.contains("connect-src https://api.example.com wss://stream.example.com"));
+    assert!(!widened.contains("connect-src 'none'"));
+    assert!(widened.contains(&format!("script-src {origin}")));
+    assert!(content_security_policy_with_egress(origin, &[]).contains("connect-src 'none'"));
+}

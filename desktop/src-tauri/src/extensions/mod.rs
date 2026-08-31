@@ -20,8 +20,10 @@
 //! The directory convention (`<app-data>/<feature>/`) matches
 //! `custom_harnesses` and `managed_agents`.
 
+mod frame_authority;
 mod frame_host;
 mod install;
+pub(crate) mod management;
 // `pub(crate)` so the signer enforcement in the bridge (P4) can import
 // `manifest::EXTENSION_SIGNABLE_KINDS` rather than re-declare the allowlist.
 // One writer, two consumers.
@@ -78,6 +80,12 @@ pub struct InstalledExtension {
     pub scopes: ExtensionScopes,
     /// Egress origins the manifest declares (empty is the default and the norm).
     pub egress: Vec<String>,
+    /// SHA-256 identity of the exact installed package tree.
+    pub digest: String,
+    /// Active only for the current usable identity and this exact digest.
+    pub enabled: bool,
+    /// Current explicitly selected subset for the current identity/digest.
+    pub granted: grants::GrantSelection,
 }
 
 /// `<app-data>/extensions`, created if absent.
@@ -103,6 +111,7 @@ pub(crate) fn extensions_base_dir<R: tauri::Runtime>(
 /// `<app-data>/extensions/<id>`. Re-installing over an existing id replaces it
 /// (decision 008: updates are a manual re-install).
 #[tauri::command]
+#[cfg(test)]
 pub async fn install_extension_from_directory(
     app: AppHandle,
     source_dir: String,
@@ -120,6 +129,7 @@ pub async fn install_extension_from_directory(
 /// before anything is written, and the expanded package is capped in entry
 /// count and total size.
 #[tauri::command]
+#[cfg(test)]
 pub async fn install_extension_from_zip(
     app: AppHandle,
     archive_path: String,
@@ -137,6 +147,7 @@ pub async fn install_extension_from_zip(
 /// if a frame never released — a crashed or reloaded webview does exactly that.
 pub(crate) fn shutdown_frame_host() {
     frame_host::shutdown_now();
+    management::clear_prepared();
 }
 
 /// Where an installed extension's page is served from.
@@ -177,7 +188,9 @@ pub async fn open_extension_frame(
             .map_err(|error| format!("extension frame task failed: {error}"))??
     };
 
-    let claim = frame_host::acquire(base_dir, &manifest.id).await?;
+    let (identity, digest, egress) = management::enabled_context_for_app(&app, &manifest.id)?;
+    let claim =
+        frame_host::acquire_authorized(base_dir, &manifest.id, &identity, &digest, egress).await?;
     // Buzz frames the *wrapper*, so the origin the caller asserts against is
     // the wrapper origin — a different origin from the one serving package
     // content, which is the point of the split.
@@ -254,9 +267,10 @@ pub async fn preview_extension_package(source: String) -> Result<ExtensionPackag
 #[tauri::command]
 pub async fn list_installed_extensions(app: AppHandle) -> Result<Vec<InstalledExtension>, String> {
     let base_dir = extensions_base_dir(&app)?;
-    tokio::task::spawn_blocking(move || list_installed_in(&base_dir))
+    let installed = tokio::task::spawn_blocking(move || list_installed_in(&base_dir))
         .await
-        .map_err(|error| format!("extension list task failed: {error}"))?
+        .map_err(|error| format!("extension list task failed: {error}"))??;
+    Ok(management::decorate_list(&app, installed))
 }
 
 /// Ask the user for an extension package folder.
@@ -330,6 +344,7 @@ fn picked_path_to_string(picked: tauri_plugin_dialog::FilePath) -> Result<String
 // ── Testable cores (no `AppHandle` required) ─────────────────────────────────
 
 /// Install from a directory into an explicit base directory.
+#[cfg(test)]
 pub(crate) fn install_directory_in(
     base_dir: &Path,
     source_dir: &Path,
@@ -339,6 +354,7 @@ pub(crate) fn install_directory_in(
 }
 
 /// Install from a zip into an explicit base directory.
+#[cfg(test)]
 pub(crate) fn install_zip_in(
     base_dir: &Path,
     archive_path: &Path,
@@ -404,6 +420,7 @@ fn load_installed(path: &Path, directory_name: &str) -> Result<InstalledExtensio
 
 /// Build the IPC record for a validated manifest installed at `path`.
 fn installed_from(manifest: ExtensionManifest, path: &Path) -> InstalledExtension {
+    let digest = management::package_digest(path).unwrap_or_default();
     InstalledExtension {
         id: manifest.id,
         name: manifest.name,
@@ -413,6 +430,9 @@ fn installed_from(manifest: ExtensionManifest, path: &Path) -> InstalledExtensio
         installed_at: installed_at_secs(path),
         scopes: manifest.scopes,
         egress: manifest.egress,
+        digest,
+        enabled: false,
+        granted: grants::GrantSelection::default(),
     }
 }
 

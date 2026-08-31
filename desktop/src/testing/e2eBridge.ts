@@ -12615,6 +12615,12 @@ export function maybeInstallE2eTauriMocks() {
         // with it. It does NOT reproduce the containment itself; that is
         // platform-probed (probe/bx09), not CI-pinned.
         const frameId = String((payload as { id?: string })?.id ?? "");
+        const installed = mockInstalledExtensions.find(
+          (entry) => entry.id === frameId,
+        );
+        if (installed?.enabled !== true) {
+          throw new Error("extension is disabled");
+        }
         const origin =
           activeConfig?.mock?.extensionFrameOrigin ?? "http://127.0.0.1:51234";
         mockExtensionFrameLeases += 1;
@@ -12635,8 +12641,10 @@ export function maybeInstallE2eTauriMocks() {
       case "list_installed_extensions":
         return mockInstalledExtensions.slice();
       case "pick_extension_directory":
-      case "pick_extension_zip":
-        return activeConfig?.mock?.extensionPickPath ?? "/tmp/mock-extension";
+      case "pick_extension_zip": {
+        const picked = activeConfig?.mock?.extensionPickPath;
+        return picked === undefined ? "/tmp/mock-extension" : picked;
+      }
       case "preview_extension_package":
         return {
           source:
@@ -12650,14 +12658,8 @@ export function maybeInstallE2eTauriMocks() {
               entry: "index.html",
             }),
         };
-      case "install_extension_from_directory":
-      case "install_extension_from_zip": {
-        // The Rust loader is authoritative and can refuse a package the
-        // frontend's shape check accepted; this is that path.
-        const rejection = activeConfig?.mock?.extensionInstallError;
-        if (rejection) {
-          throw rejection;
-        }
+      case "prepare_extension_from_directory":
+      case "prepare_extension_from_zip": {
         const manifest = JSON.parse(
           activeConfig?.mock?.extensionPreviewManifest ??
             JSON.stringify({
@@ -12667,6 +12669,51 @@ export function maybeInstallE2eTauriMocks() {
               entry: "index.html",
             }),
         ) as Record<string, unknown>;
+        return {
+          token: "mock-prepared-token",
+          digest: "ab".repeat(32),
+          manifest: {
+            id: String(manifest.id ?? "mock-extension"),
+            name: String(manifest.name ?? "Mock Extension"),
+            version: String(manifest.version ?? "0.1.0"),
+            entry: String(manifest.entry ?? "index.html"),
+            scopes: {
+              identity: false,
+              storage: false,
+              extensionData: false,
+              sign: [],
+              read: [],
+              ...(manifest.scopes as Record<string, unknown> | undefined),
+            },
+            egress: (manifest.egress as string[] | undefined) ?? [],
+          },
+          sourceType: command.endsWith("zip") ? "zip" : "directory",
+          expiresAt: Math.floor(Date.now() / 1000) + 600,
+        };
+      }
+      case "cancel_prepared_extension":
+        return null;
+      case "approve_prepared_extension": {
+        const rejection = activeConfig?.mock?.extensionInstallError;
+        if (rejection) throw rejection;
+        const manifest = JSON.parse(
+          activeConfig?.mock?.extensionPreviewManifest ??
+            JSON.stringify({
+              id: "mock-extension",
+              name: "Mock Extension",
+              version: "0.1.0",
+              entry: "index.html",
+            }),
+        ) as Record<string, unknown>;
+        const selected = (payload as { selected?: Record<string, unknown> })
+          ?.selected ?? {
+          identity: false,
+          storage: false,
+          extensionData: false,
+          sign: [],
+          read: [],
+          egress: [],
+        };
         const installed = {
           id: String(manifest.id ?? "mock-extension"),
           name: String(manifest.name ?? "Mock Extension"),
@@ -12683,11 +12730,42 @@ export function maybeInstallE2eTauriMocks() {
             ...(manifest.scopes as Record<string, unknown> | undefined),
           },
           egress: (manifest.egress as string[] | undefined) ?? [],
+          digest: "ab".repeat(32),
+          enabled: false,
+          granted: selected,
         };
         mockInstalledExtensions = mockInstalledExtensions
           .filter((entry) => entry.id !== installed.id)
           .concat(installed);
         return installed;
+      }
+      case "set_extension_enabled": {
+        const request = payload as { id?: string; enabled?: boolean };
+        const existing = mockInstalledExtensions.find(
+          (entry) => entry.id === request.id,
+        );
+        if (!existing) throw new Error("extension is not installed");
+        existing.enabled = request.enabled === true;
+        return { ...existing };
+      }
+      case "update_extension_grants": {
+        const request = payload as {
+          id?: string;
+          selected?: Record<string, unknown>;
+        };
+        const existing = mockInstalledExtensions.find(
+          (entry) => entry.id === request.id,
+        );
+        if (!existing) throw new Error("extension is not installed");
+        existing.granted = request.selected ?? {};
+        return { ...existing };
+      }
+      case "remove_extension": {
+        const id = String((payload as { id?: string })?.id ?? "");
+        mockInstalledExtensions = mockInstalledExtensions.filter(
+          (entry) => entry.id !== id,
+        );
+        return { removed: true, recoveryPath: null };
       }
       case "list_archived_identities": {
         const archived = activeConfig?.mock?.archivedIdentities ?? [];

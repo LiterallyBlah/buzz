@@ -1,24 +1,10 @@
-// Typed wrappers over the Rust extension-install commands.
-//
-// Distribution is local-only (decision 008): a directory or a zip the user
-// picked themselves. There is deliberately no URL, repo or update surface here.
-//
-// The file pickers are Rust commands: this app ships no
-// `@tauri-apps/plugin-dialog` JS binding, so every picker in the tree is a
-// command the frontend invokes (see `export_util.rs`, `media.rs`).
+// Typed wrappers over the Rust extension-management commands.
+// Distribution is local-only: directory or ZIP, prepared into host-owned bytes.
 
 import { invoke } from "@tauri-apps/api/core";
 
-export type ExtensionSignScope = {
-  kind: number;
-  channels: string[];
-};
-
-export type ExtensionReadScope = {
-  kinds: number[];
-  channels: string[];
-};
-
+export type ExtensionSignScope = { kind: number; channels: string[] };
+export type ExtensionReadScope = { kinds: number[]; channels: string[] };
 export type ExtensionScopes = {
   identity: boolean;
   storage: boolean;
@@ -27,44 +13,69 @@ export type ExtensionScopes = {
   read: ExtensionReadScope[];
 };
 
+export type ExtensionGrantPair = { kind: number; channel: string };
+export type ExtensionGrantSelection = {
+  identity: boolean;
+  storage: boolean;
+  extensionData: boolean;
+  sign: ExtensionGrantPair[];
+  read: ExtensionGrantPair[];
+  egress: string[];
+};
+
 export type InstalledExtension = {
   id: string;
   name: string;
   version: string;
   entry: string;
-  /** Absolute path of the installed package under `<app-data>/extensions/`. */
   path: string;
-  /** Unix seconds. */
   installedAt: number;
   scopes: ExtensionScopes;
   egress: string[];
+  digest: string;
+  enabled: boolean;
+  granted: ExtensionGrantSelection;
 };
 
-/** Open a directory picker. Resolves to `null` when the user cancels. */
+export type PreparedExtension = {
+  token: string;
+  digest: string;
+  manifest: {
+    id: string;
+    name: string;
+    version: string;
+    entry: string;
+    scopes: ExtensionScopes;
+    egress: string[];
+  };
+  sourceType: "directory" | "zip";
+  expiresAt: number;
+};
+
+export function emptyGrantSelection(): ExtensionGrantSelection {
+  return {
+    identity: false,
+    storage: false,
+    extensionData: false,
+    sign: [],
+    read: [],
+    egress: [],
+  };
+}
+
 export function pickExtensionDirectory(): Promise<string | null> {
   return invoke<string | null>("pick_extension_directory");
 }
 
-/** Open a zip file picker. Resolves to `null` when the user cancels. */
 export function pickExtensionZip(): Promise<string | null> {
   return invoke<string | null>("pick_extension_zip");
 }
 
 export type ExtensionPackagePreview = {
-  /** The directory or zip that was inspected. */
   source: string;
-  /** Raw `extension.json` contents — not parsed and not validated by the host. */
   manifestJson: string;
 };
 
-/**
- * Read a candidate package's manifest without installing it.
- *
- * The webview cannot read local paths, so this is how decision 006's frontend
- * validation half gets something to validate. Read-only and non-authoritative:
- * a package that previews cleanly can still be rejected at install. P5's
- * grant-review UI reads the same preview.
- */
 export function previewExtensionPackage(
   source: string,
 ): Promise<ExtensionPackagePreview> {
@@ -73,55 +84,76 @@ export function previewExtensionPackage(
   });
 }
 
-export function installExtensionFromDirectory(
+export function prepareExtensionFromDirectory(
   sourceDir: string,
-): Promise<InstalledExtension> {
-  return invoke<InstalledExtension>("install_extension_from_directory", {
+): Promise<PreparedExtension> {
+  return invoke<PreparedExtension>("prepare_extension_from_directory", {
     sourceDir,
   });
 }
 
-export function installExtensionFromZip(
+export function prepareExtensionFromZip(
   archivePath: string,
-): Promise<InstalledExtension> {
-  return invoke<InstalledExtension>("install_extension_from_zip", {
+): Promise<PreparedExtension> {
+  return invoke<PreparedExtension>("prepare_extension_from_zip", {
     archivePath,
   });
+}
+
+export function approvePreparedExtension(
+  token: string,
+  selected: ExtensionGrantSelection,
+): Promise<InstalledExtension> {
+  return invoke<InstalledExtension>("approve_prepared_extension", {
+    token,
+    selected,
+  });
+}
+
+export function cancelPreparedExtension(token: string): Promise<void> {
+  return invoke<void>("cancel_prepared_extension", { token });
 }
 
 export function listInstalledExtensions(): Promise<InstalledExtension[]> {
   return invoke<InstalledExtension[]>("list_installed_extensions");
 }
 
+export function setExtensionEnabled(
+  id: string,
+  enabled: boolean,
+): Promise<InstalledExtension> {
+  return invoke<InstalledExtension>("set_extension_enabled", { id, enabled });
+}
+
+export function updateExtensionGrants(
+  id: string,
+  selected: ExtensionGrantSelection,
+): Promise<InstalledExtension> {
+  return invoke<InstalledExtension>("update_extension_grants", {
+    id,
+    selected,
+  });
+}
+
+export type RemoveExtensionResult = {
+  removed: boolean;
+  recoveryPath: string | null;
+};
+
+export function removeExtension(id: string): Promise<RemoveExtensionResult> {
+  return invoke<RemoveExtensionResult>("remove_extension", { id });
+}
+
 export type ExtensionFrameTarget = {
-  /** Absolute URL of the package's entry document. */
   url: string;
-  /** The origin that URL sits on. */
   origin: string;
-  /**
-   * Opaque claim on the frame host. Hand back exactly this on close.
-   *
-   * A frame whose open failed has no lease, so its cleanup must not call close
-   * at all — releasing "a" holder rather than "your" holder is what let a
-   * failed frame stop the server serving a healthy one.
-   */
   lease: string;
 };
 
-/**
- * Start (or join) the frame host and get the URL of an extension's page.
- *
- * The URL is composed host-side from the validated installed manifest — the
- * frontend deliberately does not build URLs into this boundary.
- *
- * Every successful call registers a live frame; pair it with
- * {@link closeExtensionFrame} or the localhost listener outlives the tab.
- */
 export function openExtensionFrame(id: string): Promise<ExtensionFrameTarget> {
   return invoke<ExtensionFrameTarget>("open_extension_frame", { id });
 }
 
-/** Release the lease from a successful {@link openExtensionFrame}. */
 export function closeExtensionFrame(lease: string): Promise<void> {
   return invoke<void>("close_extension_frame", { lease });
 }

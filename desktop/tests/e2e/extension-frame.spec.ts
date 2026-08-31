@@ -30,9 +30,23 @@ const MANIFEST = JSON.stringify({
 async function installOne(page: import("@playwright/test").Page) {
   await page.goto("/#/extensions");
   await page.getByTestId("install-extension-from-folder").click();
+  await page.getByTestId("extension-consent-confirm").click();
   await expect(
     page.getByTestId("installed-extension-equation-explorer"),
   ).toBeVisible();
+  await page.getByTestId("toggle-extension-equation-explorer").click();
+  await expect(
+    page.getByTestId("installed-extension-equation-explorer"),
+  ).toContainText("Enabled");
+}
+
+async function installDisabled(page: import("@playwright/test").Page) {
+  await page.goto("/#/extensions");
+  await page.getByTestId("install-extension-from-folder").click();
+  await page.getByTestId("extension-consent-confirm").click();
+  await expect(
+    page.getByTestId("installed-extension-equation-explorer"),
+  ).toContainText("Disabled");
 }
 
 test("opening an installed extension renders it in a sandboxed frame", async ({
@@ -69,6 +83,27 @@ test("opening an installed extension renders it in a sandboxed frame", async ({
   expect(src.startsWith("asset://")).toBe(false);
 });
 
+test("disabled extension cannot open even through a direct route", async ({
+  page,
+}) => {
+  await installMockBridge(page, {
+    extensionPickPath: "/tmp/equation-explorer",
+    extensionPreviewManifest: MANIFEST,
+  });
+  await installDisabled(page);
+  await expect(
+    page.getByTestId("open-extension-equation-explorer"),
+  ).toBeDisabled();
+  await page.goto("/#/extensions/equation-explorer");
+  await expect(page.getByTestId("extension-frame-error")).toContainText(
+    "extension is disabled",
+  );
+  const holders = await page.evaluate(() =>
+    window.__BUZZ_E2E_INVOKE_MOCK_COMMAND__?.("__mock_extension_frame_holders"),
+  );
+  expect(holders).toBe(0);
+});
+
 test("leaving the tab releases the frame host", async ({ page }) => {
   // The leak this guards against is a localhost listener that outlives the tab
   // that needed it.
@@ -80,7 +115,9 @@ test("leaving the tab releases the frame host", async ({ page }) => {
 
   const holders = async () =>
     await page.evaluate(() =>
-      window.__BUZZ_E2E_INVOKE_MOCK_COMMAND__("__mock_extension_frame_holders"),
+      window.__BUZZ_E2E_INVOKE_MOCK_COMMAND__?.(
+        "__mock_extension_frame_holders",
+      ),
     );
 
   expect(await holders()).toBe(0);

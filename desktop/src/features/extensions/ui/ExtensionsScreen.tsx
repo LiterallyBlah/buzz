@@ -2,51 +2,56 @@ import { FileArchive, FolderOpen, Puzzle } from "lucide-react";
 import * as React from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 
+import { useAppNavigation } from "@/app/navigation/useAppNavigation";
 import {
+  approvePreparedExtension,
+  cancelPreparedExtension,
+  type ExtensionGrantSelection,
   type InstalledExtension,
   listInstalledExtensions,
+  type PreparedExtension,
+  removeExtension,
+  setExtensionEnabled,
+  updateExtensionGrants,
 } from "@/features/extensions/lib/extensionsApi";
 import {
   type InstallSource,
   ManifestShapeError,
-  installFromPickedSource,
+  prepareFromPickedSource,
 } from "@/features/extensions/lib/installFlow";
 import { ExtensionCard } from "@/features/extensions/ui/ExtensionCard";
-import { useAppNavigation } from "@/app/navigation/useAppNavigation";
+import { ExtensionGrantDialog } from "@/features/extensions/ui/ExtensionGrantDialog";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/shared/ui/alert-dialog";
 import { Button } from "@/shared/ui/button";
 import { Card } from "@/shared/ui/card";
 import { Skeleton } from "@/shared/ui/skeleton";
 
 const installedExtensionsQueryKey = ["installed-extensions"] as const;
 
-type InstallFailure = {
-  /** Headline: which half of validation refused the package. */
-  title: string;
-  /** One line per problem. */
-  issues: string[];
-};
+type InstallFailure = { title: string; issues: string[] };
 
-/**
- * Rejections arrive from two places and both are already written for the user:
- * zod's shape complaints from the frontend preview, and the Rust loader's
- * string ("extension id \"../evil\" is not valid"). Show either verbatim rather
- * than replacing it with a generic failure — the specific reason is the whole
- * point of validating.
- */
-function toInstallFailure(error: unknown): InstallFailure {
+function toFailure(
+  error: unknown,
+  title = "Extension operation failed",
+): InstallFailure {
   if (error instanceof ManifestShapeError) {
     return {
       title: "This package's extension.json isn't valid",
       issues: error.issues,
     };
   }
-  if (typeof error === "string") {
-    return { title: "Install failed", issues: [error] };
-  }
-  if (error instanceof Error) {
-    return { title: "Install failed", issues: [error.message] };
-  }
-  return { title: "Install failed", issues: [String(error)] };
+  if (typeof error === "string") return { title, issues: [error] };
+  if (error instanceof Error) return { title, issues: [error.message] };
+  return { title, issues: [String(error)] };
 }
 
 function ExtensionsListSkeleton() {
@@ -55,10 +60,7 @@ function ExtensionsListSkeleton() {
       {["first", "second"].map((card) => (
         <Card className="p-4" key={card}>
           <div className="space-y-3">
-            <div className="flex items-center gap-2">
-              <Skeleton className="h-5 w-40" />
-              <Skeleton className="h-5 w-16 rounded-full" />
-            </div>
+            <Skeleton className="h-5 w-40" />
             <Skeleton className="h-4 w-full max-w-xl" />
           </div>
         </Card>
@@ -70,34 +72,112 @@ function ExtensionsListSkeleton() {
 export function ExtensionsScreen() {
   const queryClient = useQueryClient();
   const { goExtension } = useAppNavigation();
-  const [installError, setInstallError] = React.useState<InstallFailure | null>(
+  const [failure, setFailure] = React.useState<InstallFailure | null>(null);
+  const [prepared, setPrepared] = React.useState<PreparedExtension | null>(
     null,
   );
+  const [reviewing, setReviewing] = React.useState<InstalledExtension | null>(
+    null,
+  );
+  const [removing, setRemoving] = React.useState<InstalledExtension | null>(
+    null,
+  );
+  const [dialogError, setDialogError] = React.useState<string | null>(null);
 
   const installedQuery = useQuery({
     queryKey: installedExtensionsQueryKey,
     queryFn: listInstalledExtensions,
     staleTime: 30_000,
   });
+  const refresh = () =>
+    queryClient.invalidateQueries({ queryKey: installedExtensionsQueryKey });
 
-  const installMutation = useMutation({
-    // pick → preview → zod shape check → install. The preview step is what
-    // makes decision 006's frontend validation real rather than ornamental;
-    // Rust validates again and remains authoritative.
-    mutationFn: (source: InstallSource) => installFromPickedSource(source),
-    onMutate: () => setInstallError(null),
-    onSuccess: (installed: InstalledExtension | null) => {
-      if (installed === null) {
-        return;
+  const prepareMutation = useMutation({
+    mutationFn: (source: InstallSource) => prepareFromPickedSource(source),
+    onMutate: () => setFailure(null),
+    onSuccess: (next) => {
+      if (next) {
+        setDialogError(null);
+        setPrepared(next);
       }
-      void queryClient.invalidateQueries({
-        queryKey: installedExtensionsQueryKey,
-      });
     },
-    onError: (error: unknown) => setInstallError(toInstallFailure(error)),
+    onError: (error) => setFailure(toFailure(error, "Preparation failed")),
   });
 
-  const isInstalling = installMutation.isPending;
+  const approveMutation = useMutation({
+    mutationFn: ({
+      token,
+      selected,
+    }: {
+      token: string;
+      selected: ExtensionGrantSelection;
+    }) => approvePreparedExtension(token, selected),
+    onMutate: () => setDialogError(null),
+    onSuccess: () => {
+      setPrepared(null);
+      void refresh();
+    },
+    onError: (error) => setDialogError(toFailure(error).issues.join(" ")),
+  });
+
+  const grantsMutation = useMutation({
+    mutationFn: ({
+      id,
+      selected,
+    }: {
+      id: string;
+      selected: ExtensionGrantSelection;
+    }) => updateExtensionGrants(id, selected),
+    onMutate: () => setDialogError(null),
+    onSuccess: () => {
+      setReviewing(null);
+      void refresh();
+    },
+    onError: (error) => setDialogError(toFailure(error).issues.join(" ")),
+  });
+
+  const toggleMutation = useMutation({
+    mutationFn: (extension: InstalledExtension) =>
+      setExtensionEnabled(extension.id, !extension.enabled),
+    onMutate: () => setFailure(null),
+    onSuccess: () => void refresh(),
+    onError: (error) => setFailure(toFailure(error)),
+  });
+
+  const removeMutation = useMutation({
+    mutationFn: (extension: InstalledExtension) =>
+      removeExtension(extension.id),
+    onMutate: () => setFailure(null),
+    onSuccess: (result) => {
+      setRemoving(null);
+      if (result.recoveryPath) {
+        setFailure({
+          title: "Extension removed; files require cleanup",
+          issues: [`Files remain at ${result.recoveryPath}`],
+        });
+      }
+      void refresh();
+    },
+    onError: (error) => setFailure(toFailure(error, "Remove failed")),
+  });
+
+  const cancelPrepared = () => {
+    const token = prepared?.token;
+    setPrepared(null);
+    setDialogError(null);
+    if (token) {
+      void cancelPreparedExtension(token).catch((error) =>
+        setFailure(toFailure(error, "Could not cancel prepared package")),
+      );
+    }
+  };
+
+  const busy =
+    prepareMutation.isPending ||
+    approveMutation.isPending ||
+    grantsMutation.isPending ||
+    toggleMutation.isPending ||
+    removeMutation.isPending;
   const installed = installedQuery.data ?? [];
 
   return (
@@ -110,40 +190,43 @@ export function ExtensionsScreen() {
         data-scroll-restoration-id="extensions-list"
       >
         <div className="mb-4 flex items-center justify-between gap-4">
-          <h2 className="text-lg font-semibold">Extensions</h2>
+          <div>
+            <h2 className="text-lg font-semibold">Extensions</h2>
+            <p className="text-sm text-muted-foreground">
+              Local packages only. New and replaced packages install disabled.
+            </p>
+          </div>
           <div className="flex shrink-0 gap-2">
             <Button
               data-testid="install-extension-from-folder"
-              disabled={isInstalling}
-              onClick={() => installMutation.mutate("directory")}
+              disabled={busy}
+              onClick={() => prepareMutation.mutate("directory")}
               size="sm"
               variant="outline"
             >
-              <FolderOpen className="mr-1 h-4 w-4" />
-              Install from folder
+              <FolderOpen className="mr-1 h-4 w-4" /> Install from folder
             </Button>
             <Button
               data-testid="install-extension-from-zip"
-              disabled={isInstalling}
-              onClick={() => installMutation.mutate("zip")}
+              disabled={busy}
+              onClick={() => prepareMutation.mutate("zip")}
               size="sm"
             >
-              <FileArchive className="mr-1 h-4 w-4" />
-              Install from zip
+              <FileArchive className="mr-1 h-4 w-4" /> Install from zip
             </Button>
           </div>
         </div>
 
-        {installError ? (
+        {failure ? (
           <Card
             className="mb-4 border-destructive/50 p-4"
             data-testid="extension-install-error"
           >
             <p className="text-sm font-medium text-destructive">
-              {installError.title}
+              {failure.title}
             </p>
             <ul className="mt-1 space-y-1">
-              {installError.issues.map((issue) => (
+              {failure.issues.map((issue) => (
                 <li
                   className="break-words text-sm text-muted-foreground"
                   key={issue}
@@ -158,7 +241,7 @@ export function ExtensionsScreen() {
         {installedQuery.isLoading ? (
           <ExtensionsListSkeleton />
         ) : installedQuery.isError ? (
-          <div className="flex flex-1 flex-col items-center justify-center gap-2 text-muted-foreground">
+          <div className="flex flex-1 flex-col items-center justify-center gap-2">
             <p className="text-sm text-destructive">
               Failed to load installed extensions
             </p>
@@ -175,8 +258,8 @@ export function ExtensionsScreen() {
             <Puzzle className="h-10 w-10 opacity-30" />
             <p className="text-sm">No extensions installed</p>
             <p className="max-w-md text-center text-sm">
-              Install a package from a local folder or zip. Installed extensions
-              are listed here; running them arrives in a later preview.
+              Choose a local folder or ZIP, review its exact prepared digest and
+              requested access, then install it disabled.
             </p>
           </div>
         ) : (
@@ -186,11 +269,81 @@ export function ExtensionsScreen() {
                 extension={extension}
                 key={extension.id}
                 onOpen={(id) => void goExtension(id)}
+                onRemove={setRemoving}
+                onReview={(item) => {
+                  setDialogError(null);
+                  setReviewing(item);
+                }}
+                onToggle={(item) => toggleMutation.mutate(item)}
+                pending={busy}
               />
             ))}
           </div>
         )}
       </div>
+
+      <ExtensionGrantDialog
+        digest={prepared?.digest ?? ""}
+        error={dialogError}
+        manifest={prepared?.manifest ?? null}
+        mode="install"
+        onCancel={cancelPrepared}
+        onConfirm={(selected) => {
+          if (prepared)
+            approveMutation.mutate({ token: prepared.token, selected });
+        }}
+        open={prepared !== null}
+        pending={approveMutation.isPending}
+      />
+      <ExtensionGrantDialog
+        digest={reviewing?.digest ?? ""}
+        error={dialogError}
+        initial={reviewing?.granted}
+        manifest={reviewing ?? null}
+        mode="review"
+        onCancel={() => {
+          setReviewing(null);
+          setDialogError(null);
+        }}
+        onConfirm={(selected) => {
+          if (reviewing) grantsMutation.mutate({ id: reviewing.id, selected });
+        }}
+        open={reviewing !== null}
+        pending={grantsMutation.isPending}
+      />
+
+      <AlertDialog
+        onOpenChange={(open) => !open && setRemoving(null)}
+        open={removing !== null}
+      >
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Remove extension?</AlertDialogTitle>
+            <AlertDialogDescription>
+              Remove {removing?.name ?? "this extension"}, disable every live
+              generation, and delete its grants and enable state for every
+              identity.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel asChild>
+              <Button type="button" variant="outline">
+                Cancel
+              </Button>
+            </AlertDialogCancel>
+            <AlertDialogAction asChild>
+              <Button
+                data-testid="confirm-remove-extension"
+                onClick={() => removing && removeMutation.mutate(removing)}
+                type="button"
+                variant="destructive"
+              >
+                Remove
+              </Button>
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </div>
   );
 }

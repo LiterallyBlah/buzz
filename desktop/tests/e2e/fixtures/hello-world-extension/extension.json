@@ -1,0 +1,24 @@
+{
+  "id": "hello-world",
+  "name": "Hello World",
+  "version": "1.0.0",
+  "entry": "index.html",
+  "scopes": {
+    "identity": true,
+    "storage": false,
+    "extensionData": true,
+    "sign": [
+      {
+        "kind": 9,
+        "channels": ["c8fb8f44-993d-4166-810e-ebdad7b8b944"]
+      }
+    ],
+    "read": [
+      {
+        "kinds": [9],
+        "channels": ["c8fb8f44-993d-4166-810e-ebdad7b8b944"]
+      }
+    ]
+  },
+  "egress": []
+}

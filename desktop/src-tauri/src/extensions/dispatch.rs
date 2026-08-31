@@ -149,6 +149,21 @@ pub(crate) enum Route {
     Refuse { code: &'static str, message: String },
 }
 
+impl Route {
+    fn extension_id(&self) -> Option<&str> {
+        match self {
+            Route::IdentityGetPublicKey { extension_id }
+            | Route::PublishEvent { extension_id }
+            | Route::PublishExtensionData { extension_id }
+            | Route::ExtensionDataGet { extension_id }
+            | Route::QueryEvents { extension_id }
+            | Route::Subscribe { extension_id }
+            | Route::Unsubscribe { extension_id } => Some(extension_id),
+            Route::Refuse { .. } => None,
+        }
+    }
+}
+
 /// Decide what a frame means. Pure: no app, no database, no I/O.
 ///
 /// Note the signature — there is no `params`. A caller-supplied
@@ -274,12 +289,19 @@ pub(crate) async fn dispatch<R: tauri::Runtime>(
     method: &str,
     params: Option<Value>,
 ) -> BridgeReply {
-    match route(
+    let routed = route(
         super::frame_host::extension_for_lease,
         lease,
         version,
         method,
-    ) {
+    );
+    if routed
+        .extension_id()
+        .is_some_and(|extension_id| !super::management::enabled_for_app(app, extension_id))
+    {
+        return BridgeReply::err(code::DENIED, "extension is disabled");
+    }
+    match routed {
         Route::Refuse { code, message } => BridgeReply::err(code, message),
         Route::PublishEvent { extension_id } => {
             // The lease travels so the signer can **revalidate authority**

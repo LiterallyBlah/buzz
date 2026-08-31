@@ -183,6 +183,9 @@ fn installed_extension_serializes_in_camel_case() {
             }],
         },
         egress: vec!["https://example.com".to_string()],
+        digest: "ab".repeat(32),
+        enabled: false,
+        granted: grants::GrantSelection::default(),
     };
 
     let value = serde_json::to_value(&extension).expect("serialize");
@@ -193,7 +196,10 @@ fn installed_extension_serializes_in_camel_case() {
         keys,
         vec![
             "egress",
+            "digest",
+            "enabled",
             "entry",
+            "granted",
             "id",
             "installedAt",
             "name",

@@ -15,14 +15,18 @@
 
 use std::fs;
 use std::io::Read;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(test)]
+use std::path::PathBuf;
 
+#[cfg(test)]
 use super::manifest::{load_and_validate_manifest, ExtensionManifest};
 use super::package_path::check_package_relative_path;
 
 /// Prefix for a staging directory. Dot-prefixed so
 /// [`super::list_installed_in`] skips it — a half-built package is never an
 /// installed one.
+#[cfg(test)]
 const STAGING_PREFIX: &str = ".staging-";
 
 /// Prefix for the holder a replaced install is parked in during the swap.
@@ -88,6 +92,7 @@ impl Budget {
 /// Stage a source directory, validate it, and swap it into `<base>/<id>`.
 ///
 /// Returns the validated manifest and the directory it was installed to.
+#[cfg(test)]
 pub(crate) fn install_from_directory(
     base_dir: &Path,
     source_dir: &Path,
@@ -98,6 +103,7 @@ pub(crate) fn install_from_directory(
 /// Stage a zip archive, validate it, and swap it into `<base>/<id>`.
 ///
 /// Returns the validated manifest and the directory it was installed to.
+#[cfg(test)]
 pub(crate) fn install_from_zip(
     base_dir: &Path,
     archive_path: &Path,
@@ -106,6 +112,7 @@ pub(crate) fn install_from_zip(
 }
 
 /// The shared stage → validate → swap sequence.
+#[cfg(test)]
 fn install_staged<F>(base_dir: &Path, stage: F) -> Result<(ExtensionManifest, PathBuf), String>
 where
     F: FnOnce(&Path) -> Result<(), String>,
@@ -138,7 +145,11 @@ where
 /// updates are a manual re-install). The previous tree is parked in a
 /// dot-prefixed holder first so a failed rename can put it back rather than
 /// leaving the user with nothing.
-fn swap_into_place(base_dir: &Path, staged: &Path, destination: &Path) -> Result<(), String> {
+pub(super) fn swap_into_place(
+    base_dir: &Path,
+    staged: &Path,
+    destination: &Path,
+) -> Result<(), String> {
     let parked = if destination.exists() {
         let holder = tempfile::Builder::new()
             .prefix(REPLACED_PREFIX)
@@ -196,7 +207,7 @@ fn restore_or_preserve(
 /// symlink is a package escape (it names a path outside the package that the
 /// installed copy would then read from or serve), and silently dropping it
 /// would install a package that does not do what its author shipped.
-fn stage_directory(staging: &Path, source_dir: &Path) -> Result<(), String> {
+pub(super) fn stage_directory(staging: &Path, source_dir: &Path) -> Result<(), String> {
     // The root itself is followed if the user picked a symlinked folder — that
     // was their own choice — but nothing beneath it is.
     let metadata = fs::metadata(source_dir)
@@ -278,7 +289,7 @@ fn copy_tree(
 // ── Zip source ───────────────────────────────────────────────────────────────
 
 /// Extract a zip archive into `staging`, rejecting anything unsafe.
-fn stage_zip(staging: &Path, archive_path: &Path) -> Result<(), String> {
+pub(super) fn stage_zip(staging: &Path, archive_path: &Path) -> Result<(), String> {
     let file = fs::File::open(archive_path)
         .map_err(|error| format!("could not open the extension archive: {error}"))?;
     let mut archive = zip::ZipArchive::new(file)
