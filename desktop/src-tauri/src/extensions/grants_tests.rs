@@ -284,6 +284,7 @@ fn p5_consent_is_transactional_digest_bound_and_restart_durable() {
     assert!(!is_enabled(&conn, &identity, "demo", "digest-b"));
     assert!(!is_enabled(&conn, &"b".repeat(64), "demo", "digest-a"));
     set_enabled(&conn, &identity, "demo", "digest-a", true).expect("enable");
+    assert!(!is_enabled(&conn, &identity, "demo", "digest-b"));
     assert_eq!(
         list_selection(&conn, &identity, "demo", "digest-a"),
         p5_selection()

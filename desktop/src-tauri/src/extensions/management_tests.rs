@@ -17,7 +17,7 @@ fn package_digest_binds_paths_and_exact_bytes() {
     let root = tempfile::tempdir().expect("root");
     package(root.path(), "demo", "first");
     let first = package_digest(root.path()).expect("digest");
-    fs::write(root.path().join("index.html"), "second").expect("mutate");
+    fs::write(root.path().join("index.html"), "other").expect("same-length mutate");
     let second = package_digest(root.path()).expect("digest");
     assert_ne!(first, second);
     fs::write(root.path().join("extra.js"), "second").expect("extra");
@@ -103,7 +103,7 @@ fn removal_parks_only_a_valid_owned_directory() {
     assert!(parked
         .file_name()
         .and_then(|name| name.to_str())
-        .is_some_and(|name| name.starts_with(REMOVED_PREFIX)));
+        .is_some_and(|name| name.starts_with(".removed-")));
     assert!(park_extension_for_removal(base.path(), "../escape").is_err());
     remove_staged(&parked);
 }
