@@ -195,8 +195,8 @@ fn installed_extension_serializes_in_camel_case() {
     assert_eq!(
         keys,
         vec![
-            "egress",
             "digest",
+            "egress",
             "enabled",
             "entry",
             "granted",

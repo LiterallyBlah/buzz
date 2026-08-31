@@ -10,7 +10,7 @@ type Seen = Arc<Mutex<Vec<serde_json::Value>>>;
 async fn post_event(http: &str, keys: &nostr::Keys, event: &nostr::Event) {
     use nostr::JsonUtil as _;
     let response = reqwest::Client::new()
-        .post(format!("{http}/events"))
+        .post(format!("{http}/{}", "events"))
         .header("X-Pubkey", keys.public_key().to_hex())
         .header("Content-Type", "application/json")
         .body(event.as_json())
