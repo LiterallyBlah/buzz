@@ -325,6 +325,44 @@ fn p5_invented_grant_is_rejected_without_partial_replacement() {
 }
 
 #[test]
+fn p5_each_authority_dimension_rejects_an_invented_subset() {
+    let manifest = p5_manifest();
+
+    let mut without_identity = manifest.clone();
+    without_identity.scopes.identity = false;
+    assert!(validate_selection(
+        &without_identity,
+        &GrantSelection {
+            identity: true,
+            ..Default::default()
+        }
+    )
+    .is_err());
+
+    let mut without_sign = manifest.clone();
+    without_sign.scopes.sign.clear();
+    assert!(validate_selection(
+        &without_sign,
+        &GrantSelection {
+            sign: p5_selection().sign,
+            ..Default::default()
+        }
+    )
+    .is_err());
+
+    let mut without_egress = manifest;
+    without_egress.egress.clear();
+    assert!(validate_selection(
+        &without_egress,
+        &GrantSelection {
+            egress: vec!["https://example.com".into()],
+            ..Default::default()
+        }
+    )
+    .is_err());
+}
+
+#[test]
 fn p5_reinstall_invalidates_other_identity_and_old_digest_authority() {
     let (_dir, path) = temp_db();
     let a = "a".repeat(64);
