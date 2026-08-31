@@ -104,10 +104,43 @@ fn kinds_of(frames: &[serde_json::Value]) -> Vec<String> {
         .collect()
 }
 
+async fn relay_active_subscriptions(metrics: &str) -> f64 {
+    let body = reqwest::get(format!("{metrics}/metrics"))
+        .await
+        .expect("query relay metrics")
+        .error_for_status()
+        .expect("relay metrics status")
+        .text()
+        .await
+        .expect("relay metrics body");
+    body.lines()
+        .find_map(|line| {
+            line.strip_prefix("buzz_subscriptions_active ")
+                .and_then(|value| value.parse::<f64>().ok())
+        })
+        .expect("buzz_subscriptions_active metric")
+}
+
+async fn wait_for_relay_subscriptions(metrics: &str, want: f64, what: &str) -> f64 {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let got = relay_active_subscriptions(metrics).await;
+        if got == want {
+            return got;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for {what}: relay has {got}, wanted {want}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "needs a live relay: BUZZ_5B_REAL_RELAY=ws://127.0.0.1:PORT"]
 async fn against_a_live_relay_a_subscription_streams_two_channels_as_one() {
     let ws = std::env::var("BUZZ_5B_REAL_RELAY").expect("BUZZ_5B_REAL_RELAY must be set");
+    let metrics = std::env::var("BUZZ_5B_REAL_METRICS").expect("BUZZ_5B_REAL_METRICS must be set");
     let http = crate::relay::relay_http_base_url(&ws);
 
     let _gate = crate::relay_admission::gate_guard().await;
@@ -383,6 +416,18 @@ async fn against_a_live_relay_a_subscription_streams_two_channels_as_one() {
         .unwrap()
         .to_string();
     super::super::query::activate_subscription(app.handle(), &live_lease, &release_sub);
+    assert_eq!(
+        super::registry::registry().live_count(),
+        1,
+        "the release fixture must own exactly one live registry entry"
+    );
+    assert_eq!(
+        super::registry::quota().held_by(&identity, LEXTID),
+        1,
+        "the release fixture must hold exactly one branch reservation"
+    );
+    let relay_before_release =
+        wait_for_relay_subscriptions(&metrics, 1.0, "the release branch to be active").await;
     let release_start = seen.lock().unwrap().len();
     super::super::frame_host::release(&live_lease);
     assert!(
@@ -392,6 +437,16 @@ async fn against_a_live_relay_a_subscription_streams_two_channels_as_one() {
     assert!(
         super::super::frame_host::running_port().is_none(),
         "the final frame lease must stop both host listeners"
+    );
+    assert_eq!(
+        super::registry::registry().live_count(),
+        0,
+        "lease release must remove the registry entry"
+    );
+    assert_eq!(
+        super::registry::quota().held_by(&identity, LEXTID),
+        0,
+        "lease release must return the exact branch reservation"
     );
 
     let release_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -411,6 +466,8 @@ async fn against_a_live_relay_a_subscription_streams_two_channels_as_one() {
         );
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
+    let relay_after_release =
+        wait_for_relay_subscriptions(&metrics, 0.0, "the physical relay CLOSE").await;
 
     let after_release = seen.lock().unwrap().len();
     let after_release_event = publish(&http, &keys, &chan_b, "after-frame-release").await;
@@ -424,6 +481,9 @@ async fn against_a_live_relay_a_subscription_streams_two_channels_as_one() {
         "the released frame must not receive later relay traffic"
     );
     println!("LIVE release_sub={release_sub} closed_exactly_once=true");
+    println!(
+        "LIVE registry_removed=true quota_returned=1 relay_active_before_release={relay_before_release} relay_active_after_release={relay_after_release}"
+    );
     println!("LIVE frames_total={}", post_release.len());
     println!("LIVE PROOF COMPLETE");
 }
