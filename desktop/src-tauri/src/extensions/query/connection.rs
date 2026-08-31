@@ -43,7 +43,9 @@ use crate::relay::subscribe::{
 use super::super::dispatch::{code, BridgeReply};
 use super::construction::construct_filters;
 use super::flow::{StreamBatch, STREAM_ACK_TIMEOUT};
-use super::registry::{quota, registry, ConnectionInstance, ConnectionKey, Delivery, SubAdmission};
+use super::registry::{
+    quota, registry, ConnectionInstance, ConnectionKey, Delivery, StreamSink, SubAdmission,
+};
 use super::subscription::{
     on_notice, open_subscription, Aggregate, CloseReason, OpenFailure, INITIAL_EOSE_DEADLINE,
     MAX_BRANCHES_PER_SUB,
@@ -73,10 +75,6 @@ const CONTROL_QUEUE: usize = 64;
 enum OutboundCommand {
     Burst(Vec<String>),
 }
-
-/// Where stream frames go. Erases the Tauri runtime parameter so the registry
-/// and the reader stay free of it.
-pub(super) type StreamSink = Arc<dyn Fn(&StreamBatch) -> Result<(), ()> + Send + Sync>;
 
 /// A live, authenticated socket to one relay, shared by every subscription
 /// opened under one identity.
@@ -363,7 +361,7 @@ async fn pump<S>(
 }
 
 /// Hand one routed frame to the port, and take its branches down at the relay.
-fn deliver(sink: &StreamSink, delivery: Delivery) {
+pub(super) fn deliver(sink: &StreamSink, delivery: Delivery) {
     if delivery.arm_gate {
         crate::relay_admission::activate_rate_limit(None);
     }
@@ -413,7 +411,7 @@ fn relay_closer(connection: &Arc<Connection>) -> super::registry::RelayCloser {
 }
 
 /// The production sink: a Tauri event carrying the lease and the §2 frame.
-fn app_sink<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> StreamSink {
+pub(super) fn app_sink<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> StreamSink {
     let app = app.clone();
     Arc::new(move |batch: &StreamBatch| {
         use tauri::Emitter as _;
@@ -607,6 +605,7 @@ pub(super) async fn subscribe<R: tauri::Runtime>(
                 &sub,
                 aggregate,
                 admission,
+                Arc::clone(&sink),
                 relay_closer(&connection),
                 reservation,
                 connection.instance().clone(),

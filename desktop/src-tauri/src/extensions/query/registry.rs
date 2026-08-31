@@ -13,6 +13,11 @@ use super::subscription::{
 
 pub(super) type ConnectionKey = (String, String);
 
+/// Where this subscription's stream frames go. Retained with the subscription
+/// so lifecycle teardown that originates outside a Tauri command still has the
+/// exact production sink that admitted the stream.
+pub(super) type StreamSink = Arc<dyn Fn(&StreamBatch) -> Result<(), ()> + Send + Sync>;
+
 /// One authenticated socket. The key can be reused; the generation cannot.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(super) struct ConnectionInstance {
@@ -30,6 +35,7 @@ pub(super) type RelayCloser = Box<dyn Fn(&[String]) + Send + Sync>;
 struct LiveSub {
     aggregate: Aggregate,
     admission: SubAdmission,
+    sink: StreamSink,
     close_at_relay: Option<RelayCloser>,
     reservation: Option<CommittedReservation>,
     connection: ConnectionInstance,
@@ -60,6 +66,11 @@ pub(super) struct Delivery {
     pub(super) arm_gate: bool,
 }
 
+pub(super) struct LeaseClosure {
+    pub(super) closed: usize,
+    pub(super) deliveries: Vec<(StreamSink, Delivery)>,
+}
+
 #[derive(Default)]
 pub(super) struct SubscriptionRegistry {
     subs: Mutex<HashMap<(String, String), LiveSub>>,
@@ -77,6 +88,7 @@ impl SubscriptionRegistry {
         sub: &str,
         aggregate: Aggregate,
         admission: SubAdmission,
+        sink: StreamSink,
         close_at_relay: RelayCloser,
         reservation: CommittedReservation,
         connection: ConnectionInstance,
@@ -89,6 +101,7 @@ impl SubscriptionRegistry {
             LiveSub {
                 aggregate,
                 admission,
+                sink,
                 close_at_relay: Some(close_at_relay),
                 reservation: Some(reservation),
                 connection,
@@ -382,12 +395,38 @@ impl SubscriptionRegistry {
         Some(emit)
     }
 
-    pub(super) fn close_for_lease(
-        &self,
-        lease: &str,
-        reason: CloseReason,
-    ) -> Vec<(String, String)> {
-        self.close_matching(reason, |key| key.0 == lease)
+    pub(super) fn close_for_lease(&self, lease: &str, reason: CloseReason) -> LeaseClosure {
+        let Ok(mut subs) = self.subs.lock() else {
+            return LeaseClosure {
+                closed: 0,
+                deliveries: Vec::new(),
+            };
+        };
+        let doomed: Vec<(String, String)> =
+            subs.keys().filter(|key| key.0 == lease).cloned().collect();
+        let mut deliveries = Vec::new();
+        for key in &doomed {
+            let activated = subs.get(key).is_some_and(|live| live.flow.is_activated());
+            if activated {
+                let Some(mut live) = subs.remove(key) else {
+                    continue;
+                };
+                live.aggregate.close(reason.clone());
+                let sink = Arc::clone(&live.sink);
+                let delivery = Self::terminal_delivery(&key.0, &key.1, &mut live, reason.clone());
+                deliveries.push((sink, delivery));
+            } else if let Some(live) = subs.get_mut(key) {
+                // The correlated subscribe reply has not been written yet. Keep
+                // a terminated tombstone so its exact activation receipt emits
+                // the terminal frame after (never before) that reply.
+                live.aggregate.close(reason.clone());
+                live.terminate();
+            }
+        }
+        LeaseClosure {
+            closed: doomed.len(),
+            deliveries,
+        }
     }
 
     pub(super) fn close_for_connection(&self, connection: &ConnectionInstance) -> Vec<Delivery> {
@@ -445,25 +484,6 @@ impl SubscriptionRegistry {
                 arm_gate: false,
             })
         }
-    }
-
-    fn close_matching(
-        &self,
-        reason: CloseReason,
-        matches: impl Fn(&(String, String)) -> bool,
-    ) -> Vec<(String, String)> {
-        let Ok(mut subs) = self.subs.lock() else {
-            return Vec::new();
-        };
-        let doomed: Vec<(String, String)> =
-            subs.keys().filter(|key| matches(key)).cloned().collect();
-        for key in &doomed {
-            if let Some(mut live) = subs.remove(key) {
-                live.aggregate.close(reason.clone());
-                live.terminate();
-            }
-        }
-        doomed
     }
 }
 

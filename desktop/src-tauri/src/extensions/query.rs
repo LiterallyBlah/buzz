@@ -765,13 +765,18 @@ pub(crate) fn unsubscribe(lease: &str, params: Option<Value>) -> BridgeReply {
 
 /// Production lease wall, called by the real frame-host lifecycle.
 ///
-/// Removal performs the physical relay CLOSE burst before dropping each
-/// reservation, so a released frame cannot leave relay branches or quota
-/// behind. Idempotence comes from registry removal.
+/// Teardown performs the physical relay CLOSE burst before dropping each
+/// reservation, then emits one terminal batch for every activated stream. A
+/// pre-reply stream keeps only a terminated tombstone until its exact receipt,
+/// so `closed` cannot overtake the correlated reply. Idempotence comes from
+/// registry removal or the tombstone's terminated state.
 pub(crate) fn close_subscriptions_for_lease(lease: &str) -> usize {
-    registry::registry()
-        .close_for_lease(lease, subscription::CloseReason::Unsubscribed)
-        .len()
+    let closed =
+        registry::registry().close_for_lease(lease, subscription::CloseReason::Unsubscribed);
+    for (sink, delivery) in closed.deliveries {
+        connection::deliver(&sink, delivery);
+    }
+    closed.closed
 }
 
 pub(crate) fn activate_subscription<R: tauri::Runtime>(

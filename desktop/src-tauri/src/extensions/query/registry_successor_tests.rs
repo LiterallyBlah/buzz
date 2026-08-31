@@ -59,6 +59,7 @@ fn register(
         sub,
         aggregate,
         admission(),
+        Arc::new(|_| Ok(())),
         closer,
         reservation,
         connection,
@@ -293,6 +294,104 @@ async fn real_frame_release_closes_relay_registry_and_quota() {
     let mut got = closed.lock().unwrap().clone();
     got.sort();
     assert_eq!(got, ["b1", "b2"]);
+}
+
+#[tokio::test]
+async fn real_frame_release_emits_one_terminal_batch_through_the_tauri_sink() {
+    use tauri::Listener as _;
+
+    let _guard = crate::extensions::frame_host::lifecycle_guard().await;
+    let lease = "successor-release-sink-lease";
+    let sub = "sub-release-sink";
+    crate::extensions::frame_host::insert_lease_for_test(lease, EXTENSION);
+
+    let app = tauri::test::mock_app();
+    let seen = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
+    let listener_seen = Arc::clone(&seen);
+    app.handle()
+        .listen(super::super::connection::STREAM_EVENT, move |event| {
+            listener_seen
+                .lock()
+                .unwrap()
+                .push(serde_json::from_str(event.payload()).expect("stream batch json"));
+        });
+
+    let closed = Arc::new(Mutex::new(Vec::new()));
+    let relay_closed = Arc::clone(&closed);
+    let aggregate = Aggregate::new(vec!["b1".to_string()]).expect("aggregate");
+    let reservation = quota()
+        .reserve(IDENTITY, EXTENSION, 1)
+        .expect("reserve")
+        .commit();
+    registry().insert(
+        lease,
+        sub,
+        aggregate,
+        admission(),
+        super::super::connection::app_sink(app.handle()),
+        Box::new(move |branches| relay_closed.lock().unwrap().extend_from_slice(branches)),
+        reservation,
+        instance(41),
+    );
+    let activated = registry().activate(lease, sub).expect("activate");
+    assert!(activated.batches.is_empty());
+
+    crate::extensions::frame_host::release(lease);
+    let batches = seen.lock().unwrap().clone();
+    assert_eq!(batches.len(), 1, "lease release emits one terminal batch");
+    assert_eq!(batches[0]["generation"], lease);
+    assert_eq!(batches[0]["sub"], sub);
+    assert_eq!(batches[0]["terminal"], true);
+    assert_eq!(batches[0]["frames"].as_array().unwrap().len(), 1);
+    assert_eq!(batches[0]["frames"][0]["kind"], "closed");
+    assert_eq!(batches[0]["frames"][0]["reason"], "unsubscribed");
+    assert_eq!(closed.lock().unwrap().as_slice(), ["b1"]);
+    assert_eq!(quota().held_by(IDENTITY, EXTENSION), 0);
+    assert_eq!(registry().live_count(), 0);
+
+    crate::extensions::frame_host::release(lease);
+    assert_eq!(
+        seen.lock().unwrap().len(),
+        1,
+        "an idempotent second release cannot emit another terminal batch"
+    );
+}
+
+#[test]
+fn lease_release_before_activation_keeps_terminal_behind_the_reply_receipt() {
+    let quota = SubscriptionQuota::new();
+    let registry = SubscriptionRegistry::new();
+    let closed = Arc::new(Mutex::new(Vec::new()));
+    let relay_closed = Arc::clone(&closed);
+    register(
+        &registry,
+        &quota,
+        "lease-preactivation-release",
+        "sub-preactivation-release",
+        &["b1"],
+        instance(42),
+        false,
+        Box::new(move |branches| relay_closed.lock().unwrap().extend_from_slice(branches)),
+    );
+
+    let closure =
+        registry.close_for_lease("lease-preactivation-release", CloseReason::Unsubscribed);
+    assert_eq!(closure.closed, 1);
+    assert!(
+        closure.deliveries.is_empty(),
+        "a terminal frame cannot overtake the correlated subscribe reply"
+    );
+    assert_eq!(quota.held_by(IDENTITY, EXTENSION), 0);
+    assert_eq!(closed.lock().unwrap().as_slice(), ["b1"]);
+
+    let after_reply = registry
+        .activate("lease-preactivation-release", "sub-preactivation-release")
+        .expect("exact receipt releases the deferred terminal");
+    let frames = wire(&after_reply);
+    assert_eq!(frames.len(), 1);
+    assert_eq!(frames[0]["kind"], "closed");
+    assert_eq!(frames[0]["reason"], "unsubscribed");
+    assert_eq!(registry.live_count(), 0);
 }
 
 #[tokio::test]

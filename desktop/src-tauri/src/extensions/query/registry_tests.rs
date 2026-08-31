@@ -101,6 +101,10 @@ fn closed_log() -> ClosedAtRelay {
     Arc::new(std::sync::Mutex::new(Vec::new()))
 }
 
+fn discarding_sink() -> StreamSink {
+    Arc::new(|_| Ok(()))
+}
+
 fn sorted(log: &ClosedAtRelay) -> Vec<String> {
     let mut v = log.lock().unwrap().clone();
     v.sort();
@@ -125,6 +129,7 @@ fn registered_on(
         sub,
         aggregate(branches),
         admission,
+        discarding_sink(),
         close_at_relay,
         reservation,
         connection,
@@ -220,7 +225,7 @@ fn the_lease_wall_closes_its_subs_and_releases_their_quota() {
     assert_eq!(quota.held_by(IDENTITY, EXTID), 6);
 
     let closed = registry.close_for_lease(LEASE, CloseReason::AuthorityLost);
-    assert_eq!(closed.len(), 2);
+    assert_eq!(closed.closed, 2);
     assert_eq!(registry.live_count(), 1, "the other lease survives");
     assert_eq!(
         quota.held_by(IDENTITY, EXTID),
@@ -280,6 +285,7 @@ fn unsubscribe_reports_the_same_thing_whether_or_not_the_sub_was_live() {
         "known-sub",
         aggregate(&["b1"]),
         permissive(),
+        discarding_sink(),
         Box::new(|_| {}),
         live_reservation,
         conn(),
@@ -310,6 +316,7 @@ fn unsubscribe_is_idempotent() {
         "s1",
         aggregate(&["b1"]),
         permissive(),
+        discarding_sink(),
         Box::new(|_| {}),
         reservation,
         conn(),
@@ -332,6 +339,7 @@ fn unsubscribe_cannot_reach_another_leases_subscription() {
         "victim",
         aggregate(&["b1"]),
         permissive(),
+        discarding_sink(),
         Box::new(|_| {}),
         reservation,
         conn(),
@@ -766,6 +774,7 @@ fn unsubscribe_tells_the_relay_to_stop_streaming() {
         "s1",
         aggregate(&["b1", "b2"]),
         permissive(),
+        discarding_sink(),
         closer,
         reservation,
         conn(),
