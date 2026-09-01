@@ -305,7 +305,8 @@ async fn hello_world_production_flow_uses_only_digest_bound_bridge_authority() {
     super::super::grants::delete_all_for_extension(&mut conn, EXTENSION_ID).expect("remove state");
     fs::remove_dir_all(destination).expect("remove package");
     println!(
-        "M1 LIVE identity={identity} channel={channel} digest={} stored={stored} publish_ok=true query_ok=true subscribe_ok=true extension_data_ok=true denied_ok=true disable_closed=true",
+        "M1 LIVE identity={identity} channel={channel} digest={} stored={stored} publish_ok=true query_ok=true subscribe_ok=true extension_data_ok=true denied_ok=true closed_exactly_once=true registry_removed=true quota_returned=true",
         prepared.digest
     );
+    println!("M1 LIVE COMPLETE");
 }
