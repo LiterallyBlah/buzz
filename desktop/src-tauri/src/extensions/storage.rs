@@ -20,6 +20,8 @@ const MAX_KEY_BYTES: usize = 128;
 const MAX_VALUE_BYTES: usize = 256 * 1024;
 const MAX_KEYS_PER_NAMESPACE: i64 = 512;
 const MAX_NAMESPACE_BYTES: i64 = 4 * 1024 * 1024;
+const MAX_RETAINED_KEYS_PER_EXTENSION: i64 = 2_048;
+const MAX_RETAINED_BYTES_PER_EXTENSION: i64 = 16 * 1024 * 1024;
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS extension_storage (
@@ -193,6 +195,26 @@ fn set(
     if next_count > MAX_KEYS_PER_NAMESPACE || next_bytes > MAX_NAMESPACE_BYTES {
         return BridgeReply::err(code::QUOTA_EXCEEDED, "extension storage quota exceeded");
     }
+    let (retained_count, retained_bytes): (i64, i64) = match tx.query_row(
+        "SELECT count(*), coalesce(sum(length(CAST(value_json AS BLOB))), 0)
+         FROM extension_storage WHERE identity_pubkey = ?1 AND extension_id = ?2",
+        params![identity, extension],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    ) {
+        Ok(value) => value,
+        Err(_) => return BridgeReply::err(code::INTERNAL, "extension storage is unavailable"),
+    };
+    let retained_next_count = retained_count + i64::from(existing.is_none());
+    let retained_next_bytes =
+        retained_bytes - existing.map_or(0, |row| row.1) + encoded.len() as i64;
+    if retained_next_count > MAX_RETAINED_KEYS_PER_EXTENSION
+        || retained_next_bytes > MAX_RETAINED_BYTES_PER_EXTENSION
+    {
+        return BridgeReply::err(
+            code::QUOTA_EXCEEDED,
+            "retained extension storage quota exceeded",
+        );
+    }
     let revision = existing.map_or(1, |row| row.0.saturating_add(1));
     if tx
         .execute(
@@ -256,12 +278,17 @@ fn delete(
         );
     }
     let deleted = if existing.is_some() {
-        tx.execute(
+        match tx.execute(
             "DELETE FROM extension_storage WHERE identity_pubkey = ?1 AND extension_id = ?2
              AND package_digest = ?3 AND grant_generation = ?4 AND storage_key = ?5",
             params![identity, extension, digest, generation, params.key],
-        )
-        .is_ok_and(|count| count == 1)
+        ) {
+            Ok(1) => true,
+            Ok(_) => {
+                return BridgeReply::err(code::CONFLICT, "storage row changed before deletion")
+            }
+            Err(_) => return BridgeReply::err(code::INTERNAL, "extension storage is unavailable"),
+        }
     } else {
         false
     };

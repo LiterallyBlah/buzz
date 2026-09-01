@@ -115,6 +115,65 @@ fn malformed_keys_unknown_fields_and_oversized_values_fail_closed() {
 }
 
 #[test]
+fn retained_generations_share_a_bounded_disk_quota() {
+    let (_dir, mut conn) = db();
+    let owner = authority(&"a".repeat(64), &"d".repeat(64), 2);
+    conn.execute(
+        "INSERT INTO extension_storage
+         (identity_pubkey, extension_id, package_digest, grant_generation, storage_key, value_json, revision, updated_at)
+         VALUES (?1, ?2, ?3, 1, 'legacy', zeroblob(?4), 1, unixepoch())",
+        params![
+            owner.identity_pubkey,
+            owner.extension_id,
+            owner.package_digest,
+            MAX_RETAINED_BYTES_PER_EXTENSION
+        ],
+    )
+    .expect("legacy retained bytes");
+    assert_eq!(
+        set(
+            &mut conn,
+            &owner,
+            Some(serde_json::json!({"key":"state","value":1,"expectedRevision":null})),
+        )
+        .error_code(),
+        Some(code::QUOTA_EXCEEDED)
+    );
+}
+
+#[test]
+fn delete_database_fault_is_internal_and_preserves_the_row() {
+    let (_dir, mut conn) = db();
+    let owner = authority(&"a".repeat(64), &"d".repeat(64), 2);
+    assert!(
+        set(
+            &mut conn,
+            &owner,
+            Some(serde_json::json!({"key":"state","value":1,"expectedRevision":null})),
+        )
+        .ok
+    );
+    conn.execute_batch(
+        "CREATE TRIGGER refuse_storage_delete BEFORE DELETE ON extension_storage
+         BEGIN SELECT RAISE(ABORT, 'refuse'); END;",
+    )
+    .expect("trigger");
+    assert_eq!(
+        delete(
+            &mut conn,
+            &owner,
+            Some(serde_json::json!({"key":"state","expectedRevision":1})),
+        )
+        .error_code(),
+        Some(code::INTERNAL)
+    );
+    assert_eq!(
+        get(&conn, &owner, Some(serde_json::json!({"key":"state"}))).result,
+        Some(serde_json::json!({"value":1,"revision":1}))
+    );
+}
+
+#[test]
 fn storage_dispatch_requires_the_exact_live_scope_and_generation() {
     let app = tauri::test::mock_app();
     let base = super::super::extensions_base_dir(app.handle()).expect("base");

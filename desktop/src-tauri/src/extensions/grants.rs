@@ -600,10 +600,15 @@ fn allocate_generation(
             |row| row.get::<_, i64>(0),
         )
         .unwrap_or(0);
-    let next = retained.max(active).saturating_add(1);
-    if next <= 0 {
-        return Err("could not allocate grant generation".to_string());
-    }
+    // Generation 1 is reserved as a tombstone for the pre-ledger storage
+    // increment. Starting at 2 prevents an identical reinstall from adopting
+    // generation-1 bytes even when a legacy removal deleted activation state
+    // before this persistent ledger existed.
+    let next = retained
+        .max(active)
+        .max(1)
+        .checked_add(1)
+        .ok_or_else(|| "grant generation is exhausted".to_string())?;
     tx.execute(
         "INSERT INTO extension_grant_generations (identity_pubkey, extension_id, generation)
          VALUES (?1, ?2, ?3)
