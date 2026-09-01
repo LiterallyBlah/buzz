@@ -408,6 +408,8 @@ pub async fn approve_prepared_extension(
             return Err("prepared extension manifest changed after review".to_string());
         }
         super::grants::validate_selection(&current_manifest, &selected)?;
+        let retained_storage_floor =
+            super::storage::max_retained_generation(&app, &identity, &current_manifest.id)?;
         let db_path = super::dispatch::grant_db_path(&app)?;
         let mut conn = super::grants::open_grant_db(&db_path)?;
 
@@ -419,12 +421,13 @@ pub async fn approve_prepared_extension(
         let destination = base.join(&current_manifest.id);
         let replacement = (|| {
             super::install::swap_into_place(&base, &staged, &destination)?;
-            super::grants::replace_for_install(
+            super::grants::replace_for_install_with_floor(
                 &mut conn,
                 &identity,
                 &current_manifest,
                 &current_digest,
                 &selected,
+                retained_storage_floor,
             )?;
             let installed = super::installed_from(current_manifest.clone(), &destination);
             Ok(decorate(&app, installed))

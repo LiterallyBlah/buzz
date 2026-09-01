@@ -585,6 +585,7 @@ fn allocate_generation(
     tx: &rusqlite::Transaction<'_>,
     identity_pubkey: &str,
     extension_id: &str,
+    retained_storage_floor: u64,
 ) -> Result<u64, String> {
     let retained = tx
         .query_row(
@@ -604,8 +605,11 @@ fn allocate_generation(
     // increment. Starting at 2 prevents an identical reinstall from adopting
     // generation-1 bytes even when a legacy removal deleted activation state
     // before this persistent ledger existed.
+    let retained_storage_floor = i64::try_from(retained_storage_floor)
+        .map_err(|_| "retained storage generation is invalid".to_string())?;
     let next = retained
         .max(active)
+        .max(retained_storage_floor)
         .max(1)
         .checked_add(1)
         .ok_or_else(|| "grant generation is exhausted".to_string())?;
@@ -619,6 +623,7 @@ fn allocate_generation(
     u64::try_from(next).map_err(|_| "could not allocate grant generation".to_string())
 }
 
+#[cfg(test)]
 pub(crate) fn replace_for_install(
     conn: &mut Connection,
     identity_pubkey: &str,
@@ -626,11 +631,23 @@ pub(crate) fn replace_for_install(
     digest: &str,
     selected: &GrantSelection,
 ) -> Result<(), String> {
+    replace_for_install_with_floor(conn, identity_pubkey, manifest, digest, selected, 0)
+}
+
+pub(crate) fn replace_for_install_with_floor(
+    conn: &mut Connection,
+    identity_pubkey: &str,
+    manifest: &super::manifest::ExtensionManifest,
+    digest: &str,
+    selected: &GrantSelection,
+    retained_storage_floor: u64,
+) -> Result<(), String> {
     validate_selection(manifest, selected)?;
     let tx = conn
         .transaction()
         .map_err(|error| format!("could not begin grant transaction: {error}"))?;
-    let generation = allocate_generation(&tx, identity_pubkey, &manifest.id)?;
+    let generation =
+        allocate_generation(&tx, identity_pubkey, &manifest.id, retained_storage_floor)?;
     tx.execute(
         "DELETE FROM extension_grants WHERE extension_id = ?1",
         params![manifest.id],
@@ -668,7 +685,7 @@ pub(crate) fn replace_for_identity(
     let tx = conn
         .transaction()
         .map_err(|error| format!("could not begin grant transaction: {error}"))?;
-    let next_generation = allocate_generation(&tx, identity_pubkey, &manifest.id)?;
+    let next_generation = allocate_generation(&tx, identity_pubkey, &manifest.id, 0)?;
     tx.execute(
         "DELETE FROM extension_grants WHERE identity_pubkey = ?1 AND extension_id = ?2",
         params![identity_pubkey, manifest.id],

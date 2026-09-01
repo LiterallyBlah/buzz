@@ -274,12 +274,22 @@ fn storage_dispatch_requires_the_exact_live_scope_and_generation() {
     assert!(write.ok);
     super::super::grants::delete_all_for_extension(&mut grants, &extension_id)
         .expect("remove grants but retain generation ledger");
-    super::super::grants::replace_for_install(
+    grants
+        .execute(
+            "DELETE FROM extension_grant_generations WHERE identity_pubkey = ?1 AND extension_id = ?2",
+            rusqlite::params![identity, extension_id],
+        )
+        .expect("simulate pre-ledger removal");
+    let retained_floor = max_retained_generation(app.handle(), &identity, &extension_id)
+        .expect("retained storage floor");
+    assert_eq!(retained_floor, generation);
+    super::super::grants::replace_for_install_with_floor(
         &mut grants,
         &identity,
         &manifest,
         &digest,
         &selected,
+        retained_floor,
     )
     .expect("reinstall same bytes");
     let reinstalled_generation =

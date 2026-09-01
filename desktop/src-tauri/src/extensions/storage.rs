@@ -306,6 +306,26 @@ pub(crate) fn storage_db_path<R: tauri::Runtime>(
         .join("extension-storage.db"))
 }
 
+pub(crate) fn max_retained_generation<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    identity_pubkey: &str,
+    extension_id: &str,
+) -> Result<u64, String> {
+    let path = storage_db_path(app)?;
+    let conn = open_storage_db(&path)
+        .map_err(|_| "could not inspect retained extension storage".to_string())?;
+    let generation = conn
+        .query_row(
+            "SELECT coalesce(max(grant_generation), 0) FROM extension_storage
+             WHERE identity_pubkey = ?1 AND extension_id = ?2",
+            params![identity_pubkey, extension_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(|_| "could not inspect retained extension storage".to_string())?;
+    u64::try_from(generation)
+        .map_err(|_| "retained extension storage generation is invalid".to_string())
+}
+
 pub(crate) fn dispatch<R: tauri::Runtime>(
     app: &AppHandle<R>,
     authority: &LeaseAuthority,
