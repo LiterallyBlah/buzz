@@ -22,6 +22,7 @@
 
 mod frame_authority;
 mod frame_host;
+mod agent_conversation;
 mod install;
 pub(crate) mod management;
 // `pub(crate)` so the signer enforcement in the bridge (P4) can import

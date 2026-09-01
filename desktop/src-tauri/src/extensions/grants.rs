@@ -30,6 +30,8 @@ use serde::{Deserialize, Serialize};
 
 /// Boolean scope gating `identity.getPublicKey` (§3).
 pub(crate) const SCOPE_IDENTITY: &str = "identity";
+/// Boolean scope gating one-shot host-owned local-agent turns.
+pub(crate) const SCOPE_AGENT_CONVERSE: &str = "agentConverse";
 
 /// Stored for a scope that is not kind-qualified. Not a wildcard.
 const NO_KIND: i64 = -1;
@@ -151,6 +153,8 @@ pub struct GrantSelection {
     pub identity: bool,
     #[serde(default)]
     pub storage: bool,
+    #[serde(default)]
+    pub agent_converse: bool,
     #[serde(default)]
     pub extension_data: bool,
     #[serde(default)]
@@ -505,6 +509,9 @@ pub(crate) fn validate_selection(
     if selected.storage && !manifest.scopes.storage {
         return Err("storage was not requested by the prepared manifest".to_string());
     }
+    if selected.agent_converse && !manifest.scopes.agent_converse {
+        return Err("agentConverse was not requested by the prepared manifest".to_string());
+    }
     if selected.extension_data && !manifest.scopes.extension_data {
         return Err("extensionData was not requested by the prepared manifest".to_string());
     }
@@ -550,6 +557,7 @@ fn insert_selection(
     for (scope, granted) in [
         (SCOPE_IDENTITY, selected.identity),
         ("storage", selected.storage),
+        (SCOPE_AGENT_CONVERSE, selected.agent_converse),
         ("extensionData", selected.extension_data),
     ] {
         if granted {
@@ -828,6 +836,7 @@ pub(crate) fn list_selection(
     GrantSelection {
         identity: boolean(SCOPE_IDENTITY),
         storage: boolean("storage"),
+        agent_converse: boolean(SCOPE_AGENT_CONVERSE),
         extension_data: boolean("extensionData"),
         sign: pairs(SCOPE_SIGN),
         read: pairs(SCOPE_READ),

@@ -236,6 +236,7 @@ fn p5_manifest() -> super::super::manifest::ExtensionManifest {
         scopes: super::super::manifest::ExtensionScopes {
             identity: true,
             storage: true,
+            agent_converse: true,
             extension_data: true,
             sign: vec![super::super::manifest::SignScope {
                 kind: 9,
@@ -254,6 +255,7 @@ fn p5_selection() -> GrantSelection {
     GrantSelection {
         identity: true,
         storage: false,
+        agent_converse: true,
         extension_data: true,
         sign: vec![GrantPair {
             kind: 9,

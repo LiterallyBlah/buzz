@@ -199,6 +199,11 @@ pub struct ExtensionScopes {
     /// Requests device-local bridge storage.
     #[serde(default)]
     pub storage: bool,
+    /// Requests one-shot conversations through the owner's configured local
+    /// agent runtime. The host, not the extension, owns provider credentials
+    /// and process execution.
+    #[serde(default)]
+    pub agent_converse: bool,
     /// Requests `publish.extensionData` (kind 30800).
     #[serde(default)]
     pub extension_data: bool,

@@ -50,6 +50,16 @@ fn storage_methods_route_to_the_exact_leased_extension() {
 }
 
 #[test]
+fn agent_conversation_routes_to_the_exact_leased_extension() {
+    assert_eq!(
+        route(resolver(LIVE), "lease-a", 1, "agent.converse"),
+        Route::AgentConverse {
+            extension_id: "demo".to_string()
+        }
+    );
+}
+
+#[test]
 fn attribution_follows_the_lease_not_the_caller() {
     // Two live extensions. The lease alone decides which one a frame is.
     let a = route(resolver(LIVE), "lease-a", 1, "identity.getPublicKey");

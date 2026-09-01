@@ -172,6 +172,7 @@ fn installed_extension_serializes_in_camel_case() {
         scopes: ExtensionScopes {
             identity: true,
             storage: false,
+            agent_converse: true,
             extension_data: true,
             sign: vec![SignScope {
                 kind: 9,
@@ -215,7 +216,14 @@ fn installed_extension_serializes_in_camel_case() {
     scope_keys.sort();
     assert_eq!(
         scope_keys,
-        vec!["extensionData", "identity", "read", "sign", "storage"]
+        vec![
+            "agentConverse",
+            "extensionData",
+            "identity",
+            "read",
+            "sign",
+            "storage",
+        ]
     );
     assert_eq!(scopes["sign"][0]["kind"], serde_json::json!(9));
     assert_eq!(scopes["read"][0]["kinds"], serde_json::json!([9]));

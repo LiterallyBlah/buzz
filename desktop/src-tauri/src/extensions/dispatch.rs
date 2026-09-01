@@ -76,10 +76,14 @@ pub(crate) mod code {
     pub(crate) const QUOTA_EXCEEDED: &str = "quota_exceeded";
     /// An optimistic storage write or delete used a stale revision.
     pub(crate) const CONFLICT: &str = "conflict";
-    // §8 also defines `rate_limited`. That remains frontend-only — it is an
-    // admission decision the spine makes before a request reaches Rust — so it
-    // is not declared here. A constant nothing emits is a vocabulary entry
-    // pretending to be a code path.
+    /// A per-frame operation exceeded its concurrency budget.
+    pub(crate) const RATE_LIMITED: &str = "rate_limited";
+    /// No configured local agent runtime can currently serve the request.
+    pub(crate) const AGENT_UNAVAILABLE: &str = "agent_unavailable";
+    /// The configured local agent exceeded the bounded turn deadline.
+    pub(crate) const AGENT_TIMEOUT: &str = "agent_timeout";
+    /// The configured local agent failed without exposing raw provider text.
+    pub(crate) const AGENT_FAILED: &str = "agent_failed";
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -161,6 +165,10 @@ pub(crate) enum Route {
     StorageDelete {
         extension_id: String,
     },
+    /// One-shot host-owned configured local-agent conversation.
+    AgentConverse {
+        extension_id: String,
+    },
     /// §5 `query.events` — a one-shot channel-scoped read.
     QueryEvents {
         extension_id: String,
@@ -190,6 +198,7 @@ impl Route {
             | Route::StorageGet { extension_id }
             | Route::StorageSet { extension_id }
             | Route::StorageDelete { extension_id }
+            | Route::AgentConverse { extension_id }
             | Route::QueryEvents { extension_id }
             | Route::Subscribe { extension_id }
             | Route::Unsubscribe { extension_id } => Some(extension_id),
@@ -244,6 +253,7 @@ pub(crate) fn route(
         "storage.get" => Route::StorageGet { extension_id },
         "storage.set" => Route::StorageSet { extension_id },
         "storage.delete" => Route::StorageDelete { extension_id },
+        "agent.converse" => Route::AgentConverse { extension_id },
         "query.events" => Route::QueryEvents { extension_id },
         "subscribe" => Route::Subscribe { extension_id },
         "unsubscribe" => Route::Unsubscribe { extension_id },
@@ -348,6 +358,20 @@ pub(crate) async fn dispatch<R: tauri::Runtime>(
         super::frame_host::release(lease);
         return BridgeReply::err(code::DENIED, "extension authority is no longer current");
     }
+    if let Route::AgentConverse { extension_id } = &routed {
+        let Some(owner) = authority.as_ref() else {
+            return BridgeReply::err(code::DENIED, "extension authority is unavailable");
+        };
+        if &owner.extension_id != extension_id {
+            return BridgeReply::err(code::DENIED, "extension authority is no longer current");
+        }
+        // Unlike signing and bounded local storage, an agent turn can be long.
+        // Do not hold the lifecycle read fence across it: disable, removal,
+        // grant change, identity switch and replacement must be able to fence
+        // the lease and cancel the child while the turn is in flight.
+        drop(_fence);
+        return super::agent_conversation::converse(app, owner, lease, params).await;
+    }
     match routed {
         Route::Refuse { code, message } => BridgeReply::err(code, message),
         Route::PublishEvent { extension_id } => {
@@ -376,6 +400,7 @@ pub(crate) async fn dispatch<R: tauri::Runtime>(
             }
             super::storage::dispatch(app, owner, method, params)
         }
+        Route::AgentConverse { .. } => unreachable!("handled before lifecycle-fenced dispatch"),
         Route::QueryEvents { extension_id } => {
             super::query::query_events(app, &extension_id, lease, params).await
         }

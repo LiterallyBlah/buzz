@@ -140,6 +140,11 @@ export function ExtensionGrantDialog({
                 ["identity", "Identity public key", manifest.scopes.identity],
                 ["storage", "Device-local storage", manifest.scopes.storage],
                 [
+                  "agentConverse",
+                  "Use your configured local agent for scoped conversations",
+                  manifest.scopes.agentConverse,
+                ],
+                [
                   "extensionData",
                   "Namespaced kind 30800 data",
                   manifest.scopes.extensionData,
@@ -164,6 +169,7 @@ export function ExtensionGrantDialog({
               ))}
             {!manifest.scopes.identity &&
             !manifest.scopes.storage &&
+            !manifest.scopes.agentConverse &&
             !manifest.scopes.extensionData ? (
               <p className="text-muted-foreground">
                 No boolean scopes requested.

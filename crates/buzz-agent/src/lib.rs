@@ -148,6 +148,12 @@ fn die(msg: String) -> ! {
 
 pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
+    if matches!(args.get(1).map(String::as_str), Some("one-shot-no-tools")) {
+        return tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()?
+            .block_on(one_shot_no_tools());
+    }
     if matches!(args.get(1).map(String::as_str), Some("auth")) {
         return tokio::runtime::Builder::new_multi_thread()
             .enable_all()
@@ -158,6 +164,67 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         .enable_all()
         .build()?
         .block_on(async_main());
+    Ok(())
+}
+
+/// Execute one provider turn with an empty tool list.
+///
+/// This deliberately narrow sidecar mode is used by Buzz Desktop's granted
+/// extension conversation boundary. It reuses the managed-agent provider
+/// transport but cannot execute MCP, built-in tools, hooks, permissions,
+/// relay messages, or additional agent rounds.
+async fn one_shot_no_tools() -> Result<(), Box<dyn std::error::Error>> {
+    const MAX_REQUEST_BYTES: u64 = 24 * 1024;
+    const MAX_REPLY_BYTES: usize = 16 * 1024;
+
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Request {
+        system: String,
+        prompt: String,
+    }
+
+    use tokio::io::AsyncReadExt;
+    let mut input = Vec::new();
+    tokio::io::stdin()
+        .take(MAX_REQUEST_BYTES + 1)
+        .read_to_end(&mut input)
+        .await?;
+    if input.len() as u64 > MAX_REQUEST_BYTES {
+        return Err("one-shot request exceeds byte limit".into());
+    }
+    let request: Request = serde_json::from_slice(&input)?;
+    if request.system.is_empty()
+        || request.system.len() > 4 * 1024
+        || request.prompt.is_empty()
+        || request.prompt.len() > 16 * 1024
+    {
+        return Err("one-shot request is outside bounds".into());
+    }
+
+    let mut cfg = Config::from_env()?;
+    cfg.max_rounds = 1;
+    cfg.max_token_recoveries = 0;
+    cfg.max_output_tokens = cfg.max_output_tokens.min(1024);
+    cfg.llm_timeout = cfg.llm_timeout.min(std::time::Duration::from_secs(30));
+    let llm = Llm::new(&cfg)?;
+    let response = llm
+        .complete(
+            &cfg,
+            &request.system,
+            &[HistoryItem::User(request.prompt)],
+            &[],
+            &cfg.model,
+        )
+        .await?;
+    if !response.tool_calls.is_empty() {
+        return Err("one-shot provider returned an unrequested tool call".into());
+    }
+    let message = response.text.trim();
+    if message.is_empty() || message.len() > MAX_REPLY_BYTES {
+        return Err("one-shot provider reply is outside bounds".into());
+    }
+    serde_json::to_writer(std::io::stdout(), &json!({"message": message}))?;
     Ok(())
 }
 

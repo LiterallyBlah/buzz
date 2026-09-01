@@ -220,6 +220,7 @@ pub(crate) fn release(lease: &str) {
     };
     if released {
         super::super::query::close_subscriptions_for_lease(lease);
+        super::super::agent_conversation::cancel_lease(lease);
     }
 }
 
@@ -256,6 +257,7 @@ pub(crate) fn fence_extension(extension_id: &str) -> usize {
     };
     for lease in &leases {
         super::super::query::close_subscriptions_for_lease(lease);
+        super::super::agent_conversation::cancel_lease(lease);
     }
     leases.len()
 }
@@ -279,5 +281,6 @@ pub(crate) fn shutdown_now() {
     };
     for lease in leases {
         super::super::query::close_subscriptions_for_lease(&lease);
+        super::super::agent_conversation::cancel_lease(&lease);
     }
 }

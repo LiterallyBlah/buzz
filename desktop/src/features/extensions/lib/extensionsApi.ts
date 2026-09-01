@@ -8,6 +8,7 @@ export type ExtensionReadScope = { kinds: number[]; channels: string[] };
 export type ExtensionScopes = {
   identity: boolean;
   storage: boolean;
+  agentConverse: boolean;
   extensionData: boolean;
   sign: ExtensionSignScope[];
   read: ExtensionReadScope[];
@@ -17,6 +18,7 @@ export type ExtensionGrantPair = { kind: number; channel: string };
 export type ExtensionGrantSelection = {
   identity: boolean;
   storage: boolean;
+  agentConverse: boolean;
   extensionData: boolean;
   sign: ExtensionGrantPair[];
   read: ExtensionGrantPair[];
@@ -56,6 +58,7 @@ export function emptyGrantSelection(): ExtensionGrantSelection {
   return {
     identity: false,
     storage: false,
+    agentConverse: false,
     extensionData: false,
     sign: [],
     read: [],

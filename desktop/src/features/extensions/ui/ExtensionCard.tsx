@@ -17,6 +17,8 @@ function grantedSummary(extension: InstalledExtension): string[] {
   const granted: string[] = [];
   if (extension.granted.identity) granted.push("Identity");
   if (extension.granted.storage) granted.push("Storage");
+  if (extension.granted.agentConverse)
+    granted.push("Local agent conversations");
   if (extension.granted.extensionData) granted.push("Extension data");
   granted.push(
     ...extension.granted.sign.map(

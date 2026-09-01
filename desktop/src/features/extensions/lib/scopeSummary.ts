@@ -20,6 +20,9 @@ export function summarizeScopes(scopes: ExtensionScopes): string[] {
   if (scopes.storage) {
     summary.push("Storage");
   }
+  if (scopes.agentConverse) {
+    summary.push("Local agent conversations");
+  }
   if (scopes.extensionData) {
     summary.push("Extension data");
   }
