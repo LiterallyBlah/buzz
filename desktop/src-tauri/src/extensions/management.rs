@@ -270,7 +270,7 @@ pub(crate) fn revalidation_current(
     {
         return false;
     }
-    let Some(base) = grant_db.and_then(Path::parent) else {
+    let Some(base) = grant_db.and_then(installed_base_from_grant_db) else {
         return false;
     };
     let Ok(digest) = package_digest(&base.join(extension_id)) else {
@@ -284,6 +284,10 @@ pub(crate) fn revalidation_current(
         .is_some_and(|conn| {
             super::grants::is_enabled(&conn, identity_at_entry, extension_id, &leased_digest)
         })
+}
+
+fn installed_base_from_grant_db(path: &Path) -> Option<&Path> {
+    path.parent().and_then(Path::parent)
 }
 
 pub(crate) fn enabled_context_for_app<R: tauri::Runtime>(

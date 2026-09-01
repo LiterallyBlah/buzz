@@ -25,6 +25,15 @@ fn package_digest_binds_paths_and_exact_bytes() {
 }
 
 #[test]
+fn live_revalidation_resolves_the_installed_root_above_the_private_grant_directory() {
+    let path = Path::new("/app/extensions/.grants/extension-grants.db");
+    assert_eq!(
+        installed_base_from_grant_db(path),
+        Some(Path::new("/app/extensions"))
+    );
+}
+
+#[test]
 fn prepared_bytes_are_detached_from_source_and_token_is_one_use() {
     clear_prepared();
     let base = tempfile::tempdir().expect("base");
