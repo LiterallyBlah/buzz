@@ -23,6 +23,7 @@ test("parseExtensionManifest accepts a minimal manifest and defaults scopes clos
   const result = parseExtensionManifest(validManifest());
   assert.equal(result.ok, true);
   assert.deepEqual(result.manifest.scopes, {
+    agentConverse: false,
     extensionData: false,
     identity: false,
     read: [],
@@ -30,6 +31,14 @@ test("parseExtensionManifest accepts a minimal manifest and defaults scopes clos
     storage: false,
   });
   assert.deepEqual(result.manifest.egress, []);
+});
+
+test("parseExtensionManifest accepts the explicitly granted agent conversation scope", () => {
+  const result = parseExtensionManifest(
+    validManifest({ scopes: { agentConverse: true } }),
+  );
+  assert.equal(result.ok, true);
+  assert.equal(result.manifest.scopes.agentConverse, true);
 });
 
 test("parseExtensionManifest accepts the BRIDGE_SPEC §7 worked example", () => {

@@ -88,6 +88,7 @@ const ReadScopeSchema = z.strictObject({
 });
 
 const ScopesSchema = z.strictObject({
+  agentConverse: z.boolean().optional().default(false),
   extensionData: z.boolean().optional().default(false),
   identity: z.boolean().optional().default(false),
   read: z.array(ReadScopeSchema).optional().default([]),
@@ -118,6 +119,7 @@ export const ExtensionManifestSchema = z.strictObject({
   id: ExtensionIdSchema,
   name: z.string().min(1, "name must not be empty"),
   scopes: ScopesSchema.optional().default({
+    agentConverse: false,
     extensionData: false,
     identity: false,
     read: [],
