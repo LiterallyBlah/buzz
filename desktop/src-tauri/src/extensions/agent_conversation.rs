@@ -281,7 +281,7 @@ pub(crate) async fn converse<R: tauri::Runtime>(
     }
 
     match reply {
-        Ok(message) => BridgeReply::ok(json!({"message": message})),
+        Ok(message) => conversation_reply(message),
         Err(error) => match error.as_str() {
             "agent_cancelled" => BridgeReply::err(code::DENIED, "conversation authority was revoked"),
             "agent_timeout" => BridgeReply::err(code::AGENT_TIMEOUT, "configured agent timed out"),
@@ -294,6 +294,10 @@ pub(crate) async fn converse<R: tauri::Runtime>(
             _ => BridgeReply::err(code::AGENT_FAILED, "configured local agent could not complete the turn"),
         },
     }
+}
+
+fn conversation_reply(message: String) -> BridgeReply {
+    BridgeReply::ok(json!({"message": message, "evidence": false}))
 }
 
 #[cfg(test)]
@@ -356,5 +360,19 @@ mod tests {
         );
         drop(guard);
         cancel_lease("test-lease");
+    }
+
+    #[test]
+    fn successful_reply_has_the_exact_non_evidence_schema() {
+        let reply = conversation_reply("Consider the selected node.".to_string());
+        assert_eq!(
+            reply.result,
+            Some(json!({
+                "message": "Consider the selected node.",
+                "evidence": false
+            }))
+        );
+        assert!(reply.ok);
+        assert!(reply.error.is_none());
     }
 }
