@@ -156,7 +156,6 @@ async fn hello_world_production_flow_uses_only_digest_bound_bridge_authority() {
         super::super::grants::list_read_pairs(&conn, &identity, EXTENSION_ID),
         vec![(9, channel.clone())]
     );
-    drop(conn);
 
     let claim = super::super::frame_host::acquire_authorized(
         base.clone(),
