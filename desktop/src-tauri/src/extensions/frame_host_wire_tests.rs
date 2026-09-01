@@ -24,8 +24,10 @@ async fn the_host_starts_serves_and_leaves_no_listener_behind() {
     assert_eq!(running_port(), Some(port));
 
     let body = reqwest::get(format!(
-        "{}/{EXTENSION_ROUTE_PREFIX}/demo/index.html",
-        origin_for_port(port)
+        "{}/{EXTENSION_ROUTE_PREFIX}/{}/{}/demo/index.html",
+        origin_for_port(port),
+        claim.static_context,
+        claim.package_digest
     ))
     .await
     .expect("request");
@@ -159,10 +161,22 @@ async fn traversal_is_refused_over_the_wire_too() {
     // Sent raw so the client cannot normalise the traversal away before it
     // reaches the server — the point is what the server does with it.
     for attempt in [
-        "/ext/demo/../secret.txt",
-        "/ext/../secret.txt",
-        "/ext/demo/..%2fsecret.txt",
-        "/ext/demo%2f..%2fsecret.txt",
+        format!(
+            "/ext/{}/{}/demo/../secret.txt",
+            claim.static_context, claim.package_digest
+        ),
+        format!(
+            "/ext/{}/{}/../secret.txt",
+            claim.static_context, claim.package_digest
+        ),
+        format!(
+            "/ext/{}/{}/demo/..%2fsecret.txt",
+            claim.static_context, claim.package_digest
+        ),
+        format!(
+            "/ext/{}/{}/demo%2f..%2fsecret.txt",
+            claim.static_context, claim.package_digest
+        ),
     ] {
         let response = reqwest::get(format!("{origin}{attempt}"))
             .await
@@ -267,9 +281,14 @@ async fn the_wrapper_document_carries_the_navigation_wall() {
         "wrapper and package content must not share an origin"
     );
 
-    let response = reqwest::get(wrapper_url(&wrapper_origin, "demo"))
-        .await
-        .expect("request");
+    let response = reqwest::get(wrapper_url(
+        &wrapper_origin,
+        &claim.static_context,
+        &claim.package_digest,
+        "demo",
+    ))
+    .await
+    .expect("request");
     assert_eq!(response.status(), 200);
     let policy = response
         .headers()
@@ -292,7 +311,13 @@ async fn the_wrapper_document_carries_the_navigation_wall() {
     );
     // It embeds the entry from the manifest, sandboxed, and nothing else.
     assert!(
-        body.contains(&frame_url(&origin, "demo", "index.html")),
+        body.contains(&frame_url(
+            &origin,
+            &claim.static_context,
+            &claim.package_digest,
+            "demo",
+            "index.html",
+        )),
         "wrapper should embed the manifest entry; got: {body}"
     );
     assert!(
@@ -332,16 +357,26 @@ async fn the_wrapper_is_not_served_from_the_extension_origin() {
 
     // CONTROL: the wrapper really is reachable on its own origin, so the 404
     // below is the split working rather than a broken package or dead host.
-    let ok = reqwest::get(wrapper_url(&wrapper_origin, "demo"))
-        .await
-        .expect("wrapper request");
+    let ok = reqwest::get(wrapper_url(
+        &wrapper_origin,
+        &claim.static_context,
+        &claim.package_digest,
+        "demo",
+    ))
+    .await
+    .expect("wrapper request");
     assert_eq!(ok.status(), 200, "wrapper must serve on the wrapper origin");
 
     // The property: the extension's own origin has no wrapper route at all, so
     // package content cannot navigate to the privileged document.
-    let denied = reqwest::get(wrapper_url(&extension_origin, "demo"))
-        .await
-        .expect("request");
+    let denied = reqwest::get(wrapper_url(
+        &extension_origin,
+        &claim.static_context,
+        &claim.package_digest,
+        "demo",
+    ))
+    .await
+    .expect("request");
     assert_eq!(
         denied.status(),
         404,
@@ -363,15 +398,27 @@ async fn package_content_is_not_served_from_the_wrapper_origin() {
     let wrapper_origin = origin_for_port(claim.wrapper_port);
 
     // CONTROL: the asset is genuinely servable, on its own origin.
-    let ok = reqwest::get(frame_url(&extension_origin, "demo", "index.html"))
-        .await
-        .expect("asset request");
+    let ok = reqwest::get(frame_url(
+        &extension_origin,
+        &claim.static_context,
+        &claim.package_digest,
+        "demo",
+        "index.html",
+    ))
+    .await
+    .expect("asset request");
     assert_eq!(ok.status(), 200);
 
     // Nothing package-authored is ever served from the privileged origin.
-    let denied = reqwest::get(frame_url(&wrapper_origin, "demo", "index.html"))
-        .await
-        .expect("request");
+    let denied = reqwest::get(frame_url(
+        &wrapper_origin,
+        &claim.static_context,
+        &claim.package_digest,
+        "demo",
+        "index.html",
+    ))
+    .await
+    .expect("request");
     assert_eq!(
         denied.status(),
         404,
@@ -380,6 +427,90 @@ async fn package_content_is_not_served_from_the_wrapper_origin() {
 
     release(&claim.lease);
     assert!(wait_until_closed(claim.extension_port).await);
+}
+
+#[tokio::test]
+async fn exact_static_contexts_serve_only_their_own_csp_and_fail_as_identical_404s() {
+    let _guard = lifecycle_guard().await;
+    let base = installed(&[("index.html", b"<!doctype html>same package")]);
+    let digest =
+        super::super::management::package_digest(&base.path().join("demo")).expect("digest");
+    // Deliberately insert the wider B owner first. Exact routing must make map
+    // order irrelevant.
+    let b = acquire_authorized(
+        base.path().to_path_buf(),
+        "demo",
+        "identity-b",
+        &digest,
+        "index.html",
+        vec!["https://b.example".into()],
+    )
+    .await
+    .expect("B");
+    let a = acquire_authorized(
+        base.path().to_path_buf(),
+        "demo",
+        "identity-a",
+        &digest,
+        "index.html",
+        Vec::new(),
+    )
+    .await
+    .expect("A");
+    let origin = origin_for_port(a.extension_port);
+    let url_a = frame_url(&origin, &a.static_context, &digest, "demo", "index.html");
+    let url_b = frame_url(&origin, &b.static_context, &digest, "demo", "index.html");
+    super::super::management::reset_package_tree_walks(&base.path().join("demo"));
+    let write_fence = super::super::management::lifecycle_write_fence().await;
+    let request_url = url_a.clone();
+    let mut request_a = tokio::spawn(async move { reqwest::get(request_url).await });
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(75), &mut request_a)
+            .await
+            .is_err(),
+        "asset admission crossed the package-mutation write fence"
+    );
+    drop(write_fence);
+    let response_a = request_a.await.expect("A join").expect("A asset");
+    let response_b = reqwest::get(&url_b).await.expect("B asset");
+    let csp_a = response_a
+        .headers()
+        .get(header::CONTENT_SECURITY_POLICY)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    let csp_b = response_b
+        .headers()
+        .get(header::CONTENT_SECURITY_POLICY)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    assert!(csp_a.contains("connect-src 'none'"), "A: {csp_a}");
+    assert!(
+        csp_b.contains("connect-src https://b.example"),
+        "B: {csp_b}"
+    );
+    assert!(!csp_a.contains("b.example"), "A adopted B: {csp_a}");
+
+    let foreign = [
+        frame_url(&origin, "unknown", &digest, "demo", "index.html"),
+        frame_url(&origin, &a.static_context, "wrong", "demo", "index.html"),
+        frame_url(&origin, &a.static_context, &digest, "other", "index.html"),
+    ];
+    for url in foreign {
+        let response = reqwest::get(url).await.expect("foreign");
+        assert_eq!(response.status(), 404);
+        assert!(response.bytes().await.expect("body").is_empty());
+    }
+    release(&a.lease);
+    let stale = reqwest::get(url_a).await.expect("stale");
+    assert_eq!(stale.status(), 404);
+    assert!(stale.bytes().await.expect("body").is_empty());
+    assert_eq!(
+        super::super::management::package_tree_walks(),
+        0,
+        "HTTP asset admission must not walk the package tree"
+    );
+    release(&b.lease);
+    assert!(wait_until_closed(b.extension_port).await);
 }
 
 /// Origin the committed E2E fixture is generated for. Any literal works; it
@@ -479,9 +610,12 @@ async fn the_wrapper_refuses_an_unknown_or_invalid_extension() {
     let origin = origin_for_port(claim.wrapper_port);
 
     for id in ["../demo", "nope", "Evil"] {
-        let response = reqwest::get(format!("{origin}/{FRAME_ROUTE_PREFIX}/{id}"))
-            .await
-            .expect("request");
+        let response = reqwest::get(format!(
+            "{origin}/{FRAME_ROUTE_PREFIX}/{}/{}/{id}",
+            claim.static_context, claim.package_digest
+        ))
+        .await
+        .expect("request");
         assert_eq!(response.status(), 404, "id {id:?} must not get a wrapper");
     }
 
@@ -600,12 +734,15 @@ async fn html_is_locked_down_over_the_wire_and_other_types_are_untouched() {
         .expect("acquire");
     let origin = origin_for_port(claim.extension_port);
 
-    let html = reqwest::get(format!("{origin}/{EXTENSION_ROUTE_PREFIX}/demo/index.html"))
-        .await
-        .expect("request")
-        .text()
-        .await
-        .expect("body");
+    let html = reqwest::get(format!(
+        "{origin}/{EXTENSION_ROUTE_PREFIX}/{}/{}/demo/index.html",
+        claim.static_context, claim.package_digest
+    ))
+    .await
+    .expect("request")
+    .text()
+    .await
+    .expect("body");
     assert!(
         html.contains(LOCKDOWN_ROUTE),
         "served HTML must pull in the lockdown; got: {html}"
@@ -622,12 +759,15 @@ async fn html_is_locked_down_over_the_wire_and_other_types_are_untouched() {
     // A script asset is a subresource, not a realm, and is served byte-for-byte:
     // a worker derives its policy from its own response, so rewriting served
     // JavaScript would break legitimate workers and `importScripts`.
-    let js = reqwest::get(format!("{origin}/{EXTENSION_ROUTE_PREFIX}/demo/app.js"))
-        .await
-        .expect("request")
-        .text()
-        .await
-        .expect("body");
+    let js = reqwest::get(format!(
+        "{origin}/{EXTENSION_ROUTE_PREFIX}/{}/{}/demo/app.js",
+        claim.static_context, claim.package_digest
+    ))
+    .await
+    .expect("request")
+    .text()
+    .await
+    .expect("body");
     assert_eq!(js, "// RTCPeerConnection stays a word in JS source");
 
     release(&claim.lease);
@@ -695,9 +835,12 @@ async fn an_svg_asset_is_served_renderable_but_inert() {
         .expect("acquire");
     let origin = origin_for_port(claim.extension_port);
 
-    let response = reqwest::get(format!("{origin}/{EXTENSION_ROUTE_PREFIX}/demo/asset.svg"))
-        .await
-        .expect("request");
+    let response = reqwest::get(format!(
+        "{origin}/{EXTENSION_ROUTE_PREFIX}/{}/{}/demo/asset.svg",
+        claim.static_context, claim.package_digest
+    ))
+    .await
+    .expect("request");
     assert_eq!(response.status(), 200, "the SVG must still be servable");
     assert_eq!(
         response

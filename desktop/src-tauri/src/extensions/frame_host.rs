@@ -95,10 +95,11 @@ use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 
 use super::frame_authority::{
-    active_owner_for_tree, content_security_policy_with_egress, LeaseOwner,
+    content_security_policy_with_egress, static_owner, LeaseAuthority, LeaseOwner,
 };
 pub(crate) use super::frame_authority::{
-    extension_for_lease, lease_authority, release_for_extension_id, release_for_identity_extension,
+    extension_for_lease, lease_authority, lease_authority_snapshot, release_for_extension_id,
+    release_for_identity_extension,
 };
 #[cfg(test)]
 pub(crate) use super::frame_authority::{
@@ -529,7 +530,7 @@ fn build_extension_router(base_dir: PathBuf, extension_port: u16) -> Router {
     Router::new()
         .route(&format!("/{LOCKDOWN_ROUTE}"), get(serve_lockdown))
         .route(
-            &format!("/{EXTENSION_ROUTE_PREFIX}/{{id}}/{{*asset}}"),
+            &format!("/{EXTENSION_ROUTE_PREFIX}/{{context}}/{{digest}}/{{id}}/{{*asset}}"),
             get(serve_asset),
         )
         .with_state(state)
@@ -543,7 +544,10 @@ fn build_wrapper_router(base_dir: PathBuf, extension_port: u16) -> Router {
         extension_origin: origin_for_port(extension_port),
     };
     Router::new()
-        .route(&format!("/{FRAME_ROUTE_PREFIX}/{{id}}"), get(serve_wrapper))
+        .route(
+            &format!("/{FRAME_ROUTE_PREFIX}/{{context}}/{{digest}}/{{id}}"),
+            get(serve_wrapper),
+        )
         .with_state(state)
 }
 
@@ -563,8 +567,8 @@ pub(crate) fn origin_for_port(port: u16) -> String {
 /// Buzz must never frame the extension document directly — doing so removes the
 /// container whose `frame-src` is the navigation wall, which is exactly the
 /// arrangement that leaked.
-pub(crate) fn wrapper_url(origin: &str, id: &str) -> String {
-    format!("{origin}/{FRAME_ROUTE_PREFIX}/{id}")
+pub(crate) fn wrapper_url(origin: &str, context: &str, digest: &str, id: &str) -> String {
+    format!("{origin}/{FRAME_ROUTE_PREFIX}/{context}/{digest}/{id}")
 }
 
 /// The URL of an installed extension's entry document.
@@ -574,7 +578,13 @@ pub(crate) fn wrapper_url(origin: &str, id: &str) -> String {
 /// relative-path rules, so the only thing needed here is percent-encoding of
 /// each segment — a filename with a space or `#` would otherwise truncate or
 /// mis-address the request.
-pub(crate) fn frame_url(origin: &str, id: &str, entry: &str) -> String {
+pub(crate) fn frame_url(
+    origin: &str,
+    context: &str,
+    digest: &str,
+    id: &str,
+    entry: &str,
+) -> String {
     let encoded: Vec<String> = entry
         .split('/')
         .filter(|segment| !segment.is_empty())
@@ -591,7 +601,7 @@ pub(crate) fn frame_url(origin: &str, id: &str, entry: &str) -> String {
         })
         .collect();
     format!(
-        "{origin}/{EXTENSION_ROUTE_PREFIX}/{id}/{}",
+        "{origin}/{EXTENSION_ROUTE_PREFIX}/{context}/{digest}/{id}/{}",
         encoded.join("/")
     )
 }
@@ -616,18 +626,19 @@ async fn serve_lockdown(State(state): State<HostState>) -> Response {
 
 async fn serve_wrapper(
     State(state): State<HostState>,
-    RoutePath(id): RoutePath<String>,
+    RoutePath((context, digest, id)): RoutePath<(String, String, String)>,
 ) -> Response {
-    if active_owner_for_tree(&state.base_dir, &id).is_none() {
+    let _fence = super::management::lifecycle_read_fence().await;
+    let Some(owner) = static_owner(&context, &digest, &id) else {
         return empty(StatusCode::NOT_FOUND);
-    }
-    // The wrapper names the entry from the *installed manifest*, so a caller
-    // cannot ask this document to embed an arbitrary path.
-    let manifest = match super::resolve_frame_manifest(&state.base_dir, &id) {
-        Ok(manifest) => manifest,
-        Err(_) => return empty(StatusCode::NOT_FOUND),
     };
-    let entry_url = frame_url(&state.extension_origin, &manifest.id, &manifest.entry);
+    let entry_url = frame_url(
+        &state.extension_origin,
+        &context,
+        &digest,
+        &id,
+        &owner.entry,
+    );
 
     let mut response = Response::new(Body::from(wrapper_document(&entry_url)));
     let headers = response.headers_mut();
@@ -644,9 +655,10 @@ async fn serve_wrapper(
 
 async fn serve_asset(
     State(state): State<HostState>,
-    RoutePath((id, asset)): RoutePath<(String, String)>,
+    RoutePath((context, digest, id, asset)): RoutePath<(String, String, String, String)>,
 ) -> Response {
-    let Some(owner) = active_owner_for_tree(&state.base_dir, &id) else {
+    let _fence = super::management::lifecycle_read_fence().await;
+    let Some(owner) = static_owner(&context, &digest, &id) else {
         return empty(StatusCode::NOT_FOUND);
     };
     let path = match resolve_asset(&state.base_dir, &id, &asset) {
@@ -740,6 +752,12 @@ pub(super) struct FrameHostState {
     /// (rather than a set) is what lets the bridge resolve identity from a
     /// host-minted token instead of trusting a caller-supplied id.
     pub(super) leases: std::collections::BTreeMap<String, LeaseOwner>,
+    /// Exact opaque static context -> lease. Wrapper and asset routing are
+    /// direct map lookups; extension id is only a consistency check.
+    pub(super) contexts: std::collections::BTreeMap<String, String>,
+    /// Per-extension generation. A reinstall fence advances this even when no
+    /// lease is visible, invalidating a bind paused before lease installation.
+    extension_epochs: std::collections::BTreeMap<String, u64>,
 }
 
 static FRAME_HOST: OnceLock<Mutex<FrameHostState>> = OnceLock::new();
@@ -766,191 +784,16 @@ pub(crate) struct FrameLease {
     /// served from this origin.
     pub wrapper_port: u16,
     pub lease: String,
+    pub static_context: String,
+    pub package_digest: String,
 }
 
-/// Start the host if it is not running and issue a lease to one live frame.
-///
-/// Idempotent in the sense that matters: a second frame reuses the running
-/// listener, but gets its **own** lease.
+#[path = "frame_lifecycle.rs"]
+mod frame_lifecycle;
 #[cfg(test)]
-pub(crate) async fn acquire(base_dir: PathBuf, extension_id: &str) -> Result<FrameLease, String> {
-    acquire_inner(base_dir, extension_id, "", "", Vec::new()).await
-}
-
-pub(crate) async fn acquire_authorized(
-    base_dir: PathBuf,
-    extension_id: &str,
-    identity_pubkey: &str,
-    package_digest: &str,
-    egress: Vec<String>,
-) -> Result<FrameLease, String> {
-    if identity_pubkey.is_empty() || package_digest.is_empty() {
-        return Err("enabled extension authority is incomplete".to_string());
-    }
-    acquire_inner(
-        base_dir,
-        extension_id,
-        identity_pubkey,
-        package_digest,
-        egress,
-    )
-    .await
-}
-
-async fn acquire_inner(
-    base_dir: PathBuf,
-    extension_id: &str,
-    identity_pubkey: &str,
-    package_digest: &str,
-    egress: Vec<String>,
-) -> Result<FrameLease, String> {
-    let owner = LeaseOwner {
-        extension_id: extension_id.to_string(),
-        identity_pubkey: identity_pubkey.to_string(),
-        package_digest: package_digest.to_string(),
-        egress,
-    };
-    let lease = uuid::Uuid::new_v4().to_string();
-    let opening_epoch = {
-        let mut state = host_state();
-        if let Some(running) = &state.running {
-            let (extension_port, wrapper_port) = (running.extension_port, running.wrapper_port);
-            state.leases.insert(lease.clone(), owner.clone());
-            return Ok(FrameLease {
-                extension_port,
-                wrapper_port,
-                lease,
-            });
-        }
-        state.epoch
-    };
-
-    // Bind outside the lock: these are the only awaits in the path, and holding
-    // a std Mutex across them would be a deadlock waiting to happen.
-    let extension_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
-        .await
-        .map_err(|error| format!("could not start the extension frame host: {error}"))?;
-    let extension_port = extension_listener
-        .local_addr()
-        .map_err(|error| format!("could not read the frame host address: {error}"))?
-        .port();
-
-    let wrapper_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
-        .await
-        .map_err(|error| format!("could not start the extension wrapper host: {error}"))?;
-    let wrapper_port = wrapper_listener
-        .local_addr()
-        .map_err(|error| format!("could not read the wrapper host address: {error}"))?
-        .port();
-
-    let (shutdown_extension, extension_rx) = oneshot::channel();
-    let (shutdown_wrapper, wrapper_rx) = oneshot::channel();
-    let extension_router = build_extension_router(base_dir.clone(), extension_port);
-    let wrapper_router = build_wrapper_router(base_dir, extension_port);
-    tokio::spawn(async move {
-        axum::serve(extension_listener, extension_router)
-            .with_graceful_shutdown(async move {
-                extension_rx.await.ok();
-            })
-            .await
-            .ok();
-    });
-    tokio::spawn(async move {
-        axum::serve(wrapper_listener, wrapper_router)
-            .with_graceful_shutdown(async move {
-                wrapper_rx.await.ok();
-            })
-            .await
-            .ok();
-    });
-
-    #[cfg(test)]
-    frame_host_test_support::pause_before_install().await;
-
-    let mut state = host_state();
-    if state.epoch != opening_epoch {
-        // Release/shutdown won while the listeners were binding. Installing
-        // now would resurrect a host and lease after its lifecycle ended.
-        let _ = shutdown_extension.send(());
-        let _ = shutdown_wrapper.send(());
-        return Err("the extension frame closed while its host was opening".to_string());
-    }
-    if let Some(running) = &state.running {
-        // Another frame won the race while we were binding. Keep theirs and
-        // retire BOTH listeners we just created rather than leaking them.
-        let (extension_port, wrapper_port) = (running.extension_port, running.wrapper_port);
-        let _ = shutdown_extension.send(());
-        let _ = shutdown_wrapper.send(());
-        state.leases.insert(lease.clone(), owner.clone());
-        return Ok(FrameLease {
-            extension_port,
-            wrapper_port,
-            lease,
-        });
-    }
-    state.running = Some(RunningHost {
-        extension_port,
-        wrapper_port,
-        shutdown_extension,
-        shutdown_wrapper,
-    });
-    state.leases.insert(lease.clone(), owner.clone());
-    Ok(FrameLease {
-        extension_port,
-        wrapper_port,
-        lease,
-    })
-}
-
-/// Release one lease, stopping the host when the last one goes.
-///
-/// Idempotent and unforgeable-ish: releasing a lease that was never issued, or
-/// releasing the same one twice, does nothing. A frame that failed to open has
-/// no lease to present, so its cleanup is a no-op instead of a theft.
-pub(crate) fn release(lease: &str) {
-    let released = {
-        let mut state = host_state();
-        if state.leases.remove(lease).is_none() {
-            false
-        } else {
-            if state.leases.is_empty() {
-                state.epoch = state.epoch.wrapping_add(1);
-                if let Some(running) = state.running.take() {
-                    // Both listeners, or the wrapper origin outlives the frames.
-                    let _ = running.shutdown_extension.send(());
-                    let _ = running.shutdown_wrapper.send(());
-                }
-            }
-            true
-        }
-    };
-    if released {
-        // Outside the frame-host lock: relay teardown takes its own registry
-        // lock and may notify the connection writer.
-        super::query::close_subscriptions_for_lease(lease);
-    }
-}
-
-/// Stop the host unconditionally, whatever the holder count says.
-///
-/// Called on app shutdown. A frontend that never released — a crashed webview,
-/// a reload — must not leave a listener behind the process.
-pub(crate) fn shutdown_now() {
-    let leases = {
-        let mut state = host_state();
-        state.epoch = state.epoch.wrapping_add(1);
-        let leases: Vec<String> = state.leases.keys().cloned().collect();
-        state.leases.clear();
-        if let Some(running) = state.running.take() {
-            let _ = running.shutdown_extension.send(());
-            let _ = running.shutdown_wrapper.send(());
-        }
-        leases
-    };
-    for lease in leases {
-        super::query::close_subscriptions_for_lease(&lease);
-    }
-}
+pub(crate) use frame_lifecycle::acquire;
+pub(super) use frame_lifecycle::fence_extension;
+pub(crate) use frame_lifecycle::{acquire_authorized, release, shutdown_now};
 
 // ── Tests ────────────────────────────────────────────────────────────────────
 

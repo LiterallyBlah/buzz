@@ -180,6 +180,14 @@ pub async fn open_extension_frame(
     app: AppHandle,
     id: String,
 ) -> Result<ExtensionFrameTarget, String> {
+    open_extension_frame_for(app, id).await
+}
+
+pub(crate) async fn open_extension_frame_for<R: tauri::Runtime>(
+    app: AppHandle<R>,
+    id: String,
+) -> Result<ExtensionFrameTarget, String> {
+    let _fence = management::lifecycle_read_fence().await;
     let base_dir = extensions_base_dir(&app)?;
     let manifest = {
         let base_dir = base_dir.clone();
@@ -188,15 +196,20 @@ pub async fn open_extension_frame(
             .map_err(|error| format!("extension frame task failed: {error}"))??
     };
 
-    let (identity, digest, egress) = management::enabled_context_for_app(&app, &manifest.id)?;
+    let (identity, digest, entry, egress) =
+        management::enabled_context_for_app(&app, &manifest.id)?;
+    if entry != manifest.entry {
+        return Err("installed extension entry changed while opening".to_string());
+    }
     let claim =
-        frame_host::acquire_authorized(base_dir, &manifest.id, &identity, &digest, egress).await?;
+        frame_host::acquire_authorized(base_dir, &manifest.id, &identity, &digest, &entry, egress)
+            .await?;
     // Buzz frames the *wrapper*, so the origin the caller asserts against is
     // the wrapper origin — a different origin from the one serving package
     // content, which is the point of the split.
     let origin = frame_host::origin_for_port(claim.wrapper_port);
     Ok(ExtensionFrameTarget {
-        url: frame_host::wrapper_url(&origin, &manifest.id),
+        url: frame_host::wrapper_url(&origin, &claim.static_context, &digest, &manifest.id),
         origin,
         lease: claim.lease,
     })

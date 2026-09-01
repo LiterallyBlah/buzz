@@ -24,13 +24,55 @@ fn package_digest_binds_paths_and_exact_bytes() {
     assert_ne!(second, package_digest(root.path()).expect("digest"));
 }
 
-#[test]
-fn live_revalidation_resolves_the_installed_root_above_the_private_grant_directory() {
-    let path = Path::new("/app/extensions/.grants/extension-grants.db");
-    assert_eq!(
-        installed_base_from_grant_db(path),
-        Some(Path::new("/app/extensions"))
+#[tokio::test]
+async fn repeated_delivery_revalidation_performs_zero_package_tree_walks() {
+    let _guard = super::super::frame_host::lifecycle_guard().await;
+    let db_root = tempfile::tempdir().expect("db root");
+    let package_root = db_root.path().join("delivery-frozen");
+    package(&package_root, "delivery-frozen", "frozen");
+    let db_path = db_root.path().join(".grants/extension-grants.db");
+    let mut conn = super::super::grants::open_grant_db(&db_path).expect("db");
+    let keys = nostr::Keys::generate();
+    let identity = keys.public_key().to_hex();
+    let manifest = ExtensionManifest {
+        id: "delivery-frozen".into(),
+        name: "Delivery frozen".into(),
+        version: "1".into(),
+        entry: "index.html".into(),
+        scopes: Default::default(),
+        egress: Vec::new(),
+    };
+    let digest = "ab".repeat(32);
+    super::super::grants::replace_for_identity(
+        &mut conn,
+        &identity,
+        &manifest,
+        &digest,
+        &GrantSelection::default(),
+    )
+    .expect("consent");
+    super::super::grants::set_enabled(&conn, &identity, &manifest.id, &digest, true)
+        .expect("enable");
+    super::super::frame_host::insert_authorized_lease_for_test(
+        "delivery-lease",
+        &manifest.id,
+        &identity,
+        &digest,
     );
+    let state = crate::app_state::build_app_state();
+    *state.keys.lock().expect("keys") = keys;
+    reset_package_tree_walks(&package_root);
+    for _ in 0..50 {
+        assert!(revalidation_current(
+            &state,
+            Some(&db_path),
+            "delivery-lease",
+            &manifest.id,
+            &identity,
+        ));
+    }
+    assert_eq!(package_tree_walks(), 0);
+    super::super::frame_host::release("delivery-lease");
 }
 
 #[test]

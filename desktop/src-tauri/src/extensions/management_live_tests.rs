@@ -162,6 +162,7 @@ async fn hello_world_production_flow_uses_only_digest_bound_bridge_authority() {
         EXTENSION_ID,
         &identity,
         &prepared.digest,
+        &manifest.entry,
         Vec::new(),
     )
     .await

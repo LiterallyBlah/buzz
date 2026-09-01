@@ -44,6 +44,40 @@ pub struct RemoveExtensionResult {
 }
 
 static PREPARED: OnceLock<Mutex<HashMap<String, PreparedPackage>>> = OnceLock::new();
+static LIFECYCLE_FENCE: OnceLock<tokio::sync::RwLock<()>> = OnceLock::new();
+
+#[cfg(test)]
+static PACKAGE_TREE_WALKS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
+static PACKAGE_TREE_WALK_ROOT: OnceLock<Mutex<Option<PathBuf>>> = OnceLock::new();
+
+pub(crate) async fn lifecycle_read_fence() -> tokio::sync::RwLockReadGuard<'static, ()> {
+    LIFECYCLE_FENCE
+        .get_or_init(|| tokio::sync::RwLock::new(()))
+        .read()
+        .await
+}
+
+pub(crate) async fn lifecycle_write_fence() -> tokio::sync::RwLockWriteGuard<'static, ()> {
+    LIFECYCLE_FENCE
+        .get_or_init(|| tokio::sync::RwLock::new(()))
+        .write()
+        .await
+}
+
+#[cfg(test)]
+pub(crate) fn reset_package_tree_walks(root: &Path) {
+    *PACKAGE_TREE_WALK_ROOT
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(root.to_path_buf());
+    PACKAGE_TREE_WALKS.store(0, std::sync::atomic::Ordering::SeqCst);
+}
+
+#[cfg(test)]
+pub(crate) fn package_tree_walks() -> usize {
+    PACKAGE_TREE_WALKS.load(std::sync::atomic::Ordering::SeqCst)
+}
 
 fn prepared_registry() -> MutexGuard<'static, HashMap<String, PreparedPackage>> {
     let lock = PREPARED.get_or_init(|| Mutex::new(HashMap::new()));
@@ -134,6 +168,16 @@ fn walk_package(
 }
 
 pub(crate) fn package_digest(root: &Path) -> Result<String, String> {
+    #[cfg(test)]
+    if PACKAGE_TREE_WALK_ROOT
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .as_deref()
+        == Some(root)
+    {
+        PACKAGE_TREE_WALKS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
     let mut entries = Vec::new();
     walk_package(root, root, &mut entries)?;
     entries.sort_by(|left, right| left.0.cmp(&right.0));
@@ -242,10 +286,6 @@ pub async fn cancel_prepared_extension(app: AppHandle, token: String) -> Result<
     Ok(())
 }
 
-pub(crate) fn enabled_for_app<R: tauri::Runtime>(app: &AppHandle<R>, id: &str) -> bool {
-    enabled_context_for_app(app, id).is_ok()
-}
-
 pub(crate) fn revalidation_current(
     state: &crate::AppState,
     grant_db: Option<&Path>,
@@ -270,15 +310,6 @@ pub(crate) fn revalidation_current(
     {
         return false;
     }
-    let Some(base) = grant_db.and_then(installed_base_from_grant_db) else {
-        return false;
-    };
-    let Ok(digest) = package_digest(&base.join(extension_id)) else {
-        return false;
-    };
-    if digest != leased_digest {
-        return false;
-    }
     grant_db
         .and_then(|path| super::grants::open_grant_db(path).ok())
         .is_some_and(|conn| {
@@ -286,14 +317,30 @@ pub(crate) fn revalidation_current(
         })
 }
 
-fn installed_base_from_grant_db(path: &Path) -> Option<&Path> {
-    path.parent().and_then(Path::parent)
+pub(crate) fn lease_authority_current_for_app<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    authority: &super::frame_authority::LeaseAuthority,
+) -> bool {
+    if current_identity(app).as_deref() != Ok(authority.identity_pubkey.as_str()) {
+        return false;
+    }
+    super::dispatch::grant_db_path(app)
+        .ok()
+        .and_then(|path| super::grants::open_grant_db(&path).ok())
+        .is_some_and(|conn| {
+            super::grants::is_enabled(
+                &conn,
+                &authority.identity_pubkey,
+                &authority.extension_id,
+                &authority.package_digest,
+            )
+        })
 }
 
 pub(crate) fn enabled_context_for_app<R: tauri::Runtime>(
     app: &AppHandle<R>,
     id: &str,
-) -> Result<(String, String, Vec<String>), String> {
+) -> Result<(String, String, String, Vec<String>), String> {
     let identity = current_identity(app)?;
     let base = super::extensions_base_dir(app)?;
     let manifest = super::resolve_frame_manifest(&base, id)?;
@@ -304,7 +351,7 @@ pub(crate) fn enabled_context_for_app<R: tauri::Runtime>(
         return Err("extension is disabled for the current identity or package".to_string());
     }
     let selected = super::grants::list_selection(&conn, &identity, &manifest.id, &digest);
-    Ok((identity, digest, selected.egress))
+    Ok((identity, digest, manifest.entry, selected.egress))
 }
 
 fn decorate<R: tauri::Runtime>(
@@ -339,6 +386,7 @@ pub async fn approve_prepared_extension(
     let package = take_prepared(&token, &identity)?;
     let base = super::extensions_base_dir(&app)?;
     let staged = package.staged_path.clone();
+    let _fence = lifecycle_write_fence().await;
     let result = (|| {
         if package.expires_at <= now_unix() {
             return Err("prepared extension token expired".to_string());
@@ -352,20 +400,32 @@ pub async fn approve_prepared_extension(
             return Err("prepared extension manifest changed after review".to_string());
         }
         super::grants::validate_selection(&current_manifest, &selected)?;
-        super::frame_host::release_for_extension_id(&current_manifest.id);
-        let destination = base.join(&current_manifest.id);
-        super::install::swap_into_place(&base, &staged, &destination)?;
-        let installed = super::installed_from(current_manifest.clone(), &destination);
         let db_path = super::dispatch::grant_db_path(&app)?;
         let mut conn = super::grants::open_grant_db(&db_path)?;
-        super::grants::replace_for_install(
-            &mut conn,
-            &identity,
-            &current_manifest,
-            &current_digest,
-            &selected,
-        )?;
-        Ok(decorate(&app, installed))
+
+        // Fence activation before the first teardown. If replacement fails, the
+        // predecessor conservatively remains disabled.
+        super::grants::disable_all_for_extension(&conn, &current_manifest.id)?;
+        super::frame_host::release_for_extension_id(&current_manifest.id);
+
+        let destination = base.join(&current_manifest.id);
+        let replacement = (|| {
+            super::install::swap_into_place(&base, &staged, &destination)?;
+            super::grants::replace_for_install(
+                &mut conn,
+                &identity,
+                &current_manifest,
+                &current_digest,
+                &selected,
+            )?;
+            let installed = super::installed_from(current_manifest.clone(), &destination);
+            Ok(decorate(&app, installed))
+        })();
+
+        // Exact final sweep closes the pre-swap/open race, including binds that
+        // were paused before they could publish a lease.
+        super::frame_host::release_for_extension_id(&current_manifest.id);
+        replacement
     })();
     if staged.exists() {
         remove_staged(&staged);
@@ -393,6 +453,7 @@ pub async fn set_extension_enabled(
     id: String,
     enabled: bool,
 ) -> Result<super::InstalledExtension, String> {
+    let _fence = lifecycle_write_fence().await;
     let identity = current_identity(&app)?;
     let (path, manifest, digest) = load_installed_for_management(&app, &id)?;
     let db_path = super::dispatch::grant_db_path(&app)?;
@@ -410,6 +471,7 @@ pub async fn update_extension_grants(
     id: String,
     selected: GrantSelection,
 ) -> Result<super::InstalledExtension, String> {
+    let _fence = lifecycle_write_fence().await;
     let identity = current_identity(&app)?;
     let (path, manifest, digest) = load_installed_for_management(&app, &id)?;
     let db_path = super::dispatch::grant_db_path(&app)?;
@@ -421,17 +483,23 @@ pub async fn update_extension_grants(
 
 #[tauri::command]
 pub async fn remove_extension(app: AppHandle, id: String) -> Result<RemoveExtensionResult, String> {
+    let _fence = lifecycle_write_fence().await;
+    if !super::manifest::is_valid_extension_id(&id) {
+        return Err("extension could not be removed".to_string());
+    }
     let base = super::extensions_base_dir(&app)?;
-    let parked = park_extension_for_removal(&base, &id)?;
-    super::frame_host::release_for_extension_id(&id);
     let db_path = super::dispatch::grant_db_path(&app)?;
     let mut conn = super::grants::open_grant_db(&db_path)?;
+    super::grants::disable_all_for_extension(&conn, &id)?;
+    super::frame_host::release_for_extension_id(&id);
+    let parked = park_extension_for_removal(&base, &id)?;
     if let Err(error) = super::grants::delete_all_for_extension(&mut conn, &id) {
         return Err(format!(
             "{error}. The package is disabled and preserved at {}",
             parked.display()
         ));
     }
+    super::frame_host::release_for_extension_id(&id);
     match fs::remove_dir_all(&parked) {
         Ok(()) => Ok(RemoveExtensionResult {
             removed: true,

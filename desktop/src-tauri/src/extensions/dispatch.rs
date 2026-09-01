@@ -30,7 +30,9 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tauri::{AppHandle, Manager};
+use tauri::AppHandle;
+#[cfg(test)]
+use tauri::Manager;
 
 use super::grants;
 
@@ -289,17 +291,27 @@ pub(crate) async fn dispatch<R: tauri::Runtime>(
     method: &str,
     params: Option<Value>,
 ) -> BridgeReply {
+    let _fence = super::management::lifecycle_read_fence().await;
+    let authority = super::frame_host::lease_authority_snapshot(lease);
     let routed = route(
-        super::frame_host::extension_for_lease,
+        |candidate| {
+            (candidate == lease)
+                .then(|| authority.as_ref().map(|owner| owner.extension_id.clone()))
+                .flatten()
+        },
         lease,
         version,
         method,
     );
-    if routed
-        .extension_id()
-        .is_some_and(|extension_id| !super::management::enabled_for_app(app, extension_id))
+    if routed.extension_id().is_some()
+        && !authority
+            .as_ref()
+            .is_some_and(|owner| super::management::lease_authority_current_for_app(app, owner))
     {
-        return BridgeReply::err(code::DENIED, "extension is disabled");
+        // Exact-owner failure is terminal for this frame. In particular, a
+        // stale A frame cannot keep probing after the app switches to B.
+        super::frame_host::release(lease);
+        return BridgeReply::err(code::DENIED, "extension authority is no longer current");
     }
     match routed {
         Route::Refuse { code, message } => BridgeReply::err(code, message),
@@ -332,35 +344,25 @@ pub(crate) async fn dispatch<R: tauri::Runtime>(
             super::query::unsubscribe(lease, params)
         }
         Route::IdentityGetPublicKey { extension_id } => {
-            let state = app.state::<crate::AppState>();
-
-            // `signing_keys()` is the established authority gate: it refuses
-            // while `identity_lost` or `keyring_locked` is set. Locking
-            // `state.keys` directly would bypass it and hand back the
-            // **ephemeral boot key** those states carry — a real 64-char pubkey
-            // that is not the user's, which reads as a perfectly healthy
-            // identity (`app_state.rs`: "Both states boot with an ephemeral
-            // key").
-            let identity = resolve_identity_pubkey(&state);
-
-            // §7 grants are per identity. With no identity there is nothing to
-            // key a lookup by, so nothing can be granted — the extension is
-            // genuinely ungranted right now, not merely unreadable. Recovery is
-            // therefore invisible here: every caller sees `denied`, which is
-            // what keeps the code from being an oracle.
-            //
-            // Fail closed at every step: a path we cannot resolve or a store we
-            // cannot open has granted nothing either.
-            let granted = identity.as_deref().is_some_and(|pubkey| {
-                grant_db_path(app)
-                    .ok()
-                    .and_then(|path| grants::open_grant_db(&path).ok())
-                    .is_some_and(|conn| {
-                        grants::has_scope(&conn, pubkey, &extension_id, grants::SCOPE_IDENTITY)
-                    })
-            });
-
-            identity_get_public_key(identity.as_deref(), granted, &extension_id)
+            let Some(owner) = authority.as_ref() else {
+                return BridgeReply::err(code::DENIED, "extension authority is unavailable");
+            };
+            // The pubkey and grant lookup both come from the exact lease owner
+            // already proven current above. Neither may be rebound to whatever
+            // identity happens to be loaded after this frame was minted.
+            let granted = grant_db_path(app)
+                .ok()
+                .and_then(|path| grants::open_grant_db(&path).ok())
+                .is_some_and(|conn| {
+                    grants::list_selection(
+                        &conn,
+                        &owner.identity_pubkey,
+                        &owner.extension_id,
+                        &owner.package_digest,
+                    )
+                    .identity
+                });
+            identity_get_public_key(Some(&owner.identity_pubkey), granted, &extension_id)
         }
     }
 }

@@ -453,6 +453,158 @@ fn a_healthy_state_resolves_its_identity() {
     );
 }
 
+#[tokio::test]
+async fn stale_identity_a_lease_cannot_adopt_enabled_identity_b_authority() {
+    let _relay_gate = crate::relay_admission::gate_guard().await;
+    let _host_gate = super::super::frame_host::lifecycle_guard().await;
+    let extension_id = format!("identity-race-{}", uuid::Uuid::new_v4().simple());
+    let keys_a = nostr::Keys::generate();
+    let keys_b = nostr::Keys::generate();
+    let identity_a = keys_a.public_key().to_hex();
+    let identity_b = keys_b.public_key().to_hex();
+
+    let state = crate::app_state::build_app_state();
+    *state.keys.lock().expect("keys") = keys_b;
+    let app = tauri::test::mock_app();
+    app.manage(state);
+    let base = super::super::extensions_base_dir(app.handle()).expect("base");
+    let root = base.join(&extension_id);
+    std::fs::create_dir_all(&root).expect("root");
+    std::fs::write(
+        root.join("extension.json"),
+        serde_json::json!({
+            "id": extension_id,
+            "name": "Identity race",
+            "version": "1",
+            "entry": "index.html",
+            "scopes": { "identity": true },
+            "egress": []
+        })
+        .to_string(),
+    )
+    .expect("manifest");
+    std::fs::write(root.join("index.html"), "<!doctype html>").expect("entry");
+    let digest = super::super::management::package_digest(&root).expect("digest");
+    let manifest = super::super::manifest::load_and_validate_manifest(&root).expect("manifest");
+    let selected = super::super::grants::GrantSelection {
+        identity: true,
+        ..Default::default()
+    };
+    let db_path = grant_db_path(app.handle()).expect("db path");
+    let mut conn = super::super::grants::open_grant_db(&db_path).expect("db");
+    super::super::grants::delete_all_for_extension(&mut conn, &manifest.id).expect("clean");
+    super::super::grants::replace_for_identity(
+        &mut conn,
+        &identity_a,
+        &manifest,
+        &digest,
+        &selected,
+    )
+    .expect("A consent");
+    super::super::grants::replace_for_identity(
+        &mut conn,
+        &identity_b,
+        &manifest,
+        &digest,
+        &selected,
+    )
+    .expect("B consent");
+    super::super::grants::set_enabled(&conn, &identity_a, &manifest.id, &digest, true)
+        .expect("A enable");
+    super::super::grants::set_enabled(&conn, &identity_b, &manifest.id, &digest, true)
+        .expect("B enable");
+    super::super::frame_host::insert_authorized_lease_for_test(
+        "stale-a",
+        &manifest.id,
+        &identity_a,
+        &digest,
+    );
+
+    let reply = dispatch(app.handle(), "stale-a", 1, "identity.getPublicKey", None).await;
+    let rendered = serde_json::to_string(&reply).expect("reply");
+    assert_eq!(reply.error_code(), Some(code::DENIED));
+    assert!(
+        !rendered.contains(&identity_b),
+        "must never expose B: {rendered}"
+    );
+    assert!(
+        super::super::frame_host::extension_for_lease("stale-a").is_none(),
+        "the stale lease must be torn down"
+    );
+
+    super::super::grants::delete_all_for_extension(&mut conn, &manifest.id).expect("cleanup");
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn replacement_write_fence_blocks_frame_open_until_the_final_sweep() {
+    let _relay_gate = crate::relay_admission::gate_guard().await;
+    let _host_gate = super::super::frame_host::lifecycle_guard().await;
+    let extension_id = format!("replace-race-{}", uuid::Uuid::new_v4().simple());
+    let keys = nostr::Keys::generate();
+    let identity = keys.public_key().to_hex();
+    let state = crate::app_state::build_app_state();
+    *state.keys.lock().expect("keys") = keys;
+    let app = tauri::test::mock_app();
+    app.manage(state);
+    let base = super::super::extensions_base_dir(app.handle()).expect("base");
+    let root = base.join(&extension_id);
+    std::fs::create_dir_all(&root).expect("root");
+    std::fs::write(
+        root.join("extension.json"),
+        serde_json::json!({
+            "id": extension_id,
+            "name": "Replacement race",
+            "version": "1",
+            "entry": "index.html"
+        })
+        .to_string(),
+    )
+    .expect("manifest");
+    std::fs::write(root.join("index.html"), "<!doctype html>").expect("entry");
+    let manifest = super::super::manifest::load_and_validate_manifest(&root).expect("manifest");
+    let digest = super::super::management::package_digest(&root).expect("digest");
+    let db_path = grant_db_path(app.handle()).expect("db path");
+    let mut conn = super::super::grants::open_grant_db(&db_path).expect("db");
+    super::super::grants::delete_all_for_extension(&mut conn, &manifest.id).expect("clean");
+    super::super::grants::replace_for_identity(
+        &mut conn,
+        &identity,
+        &manifest,
+        &digest,
+        &Default::default(),
+    )
+    .expect("consent");
+    super::super::grants::set_enabled(&conn, &identity, &manifest.id, &digest, true)
+        .expect("enable");
+    drop(conn);
+
+    let write_fence = super::super::management::lifecycle_write_fence().await;
+    let handle = app.handle().clone();
+    let opening_id = extension_id.clone();
+    let mut opening =
+        tokio::spawn(
+            async move { super::super::open_extension_frame_for(handle, opening_id).await },
+        );
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(75), &mut opening)
+            .await
+            .is_err(),
+        "frame admission crossed the replacement write fence"
+    );
+    // Models commit plus exact final sweep while opening remains excluded.
+    super::super::frame_host::release_for_extension_id(&extension_id);
+    drop(write_fence);
+    let target = opening.await.expect("join").expect("opens after fence");
+    super::super::close_extension_frame(target.lease)
+        .await
+        .expect("close");
+
+    let mut conn = super::super::grants::open_grant_db(&db_path).expect("db");
+    super::super::grants::delete_all_for_extension(&mut conn, &extension_id).expect("cleanup");
+    std::fs::remove_dir_all(&root).ok();
+}
+
 #[test]
 fn an_empty_pubkey_is_treated_as_no_identity() {
     // The retired surrogate. Production recovery never produces `""` — it

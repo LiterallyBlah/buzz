@@ -172,8 +172,17 @@ fn the_document_policy_leaves_framing_to_the_parent() {
 
 #[test]
 fn the_frame_url_names_the_remote_class_origin() {
-    let url = frame_url("http://127.0.0.1:4321", "demo", "index.html");
-    assert_eq!(url, "http://127.0.0.1:4321/ext/demo/index.html");
+    let url = frame_url(
+        "http://127.0.0.1:4321",
+        "context",
+        "digest",
+        "demo",
+        "index.html",
+    );
+    assert_eq!(
+        url,
+        "http://127.0.0.1:4321/ext/context/digest/demo/index.html"
+    );
     // A registered custom scheme would be classified local by Tauri and would
     // void the BX-09 containment evidence — the origin must stay plain HTTP.
     assert!(url.starts_with("http://127.0.0.1:"), "got: {url}");
@@ -183,21 +192,46 @@ fn the_frame_url_names_the_remote_class_origin() {
 #[test]
 fn the_frame_url_keeps_nested_entries_and_encodes_awkward_names() {
     assert_eq!(
-        frame_url("http://127.0.0.1:1", "demo", "web/index.html"),
-        "http://127.0.0.1:1/ext/demo/web/index.html"
+        frame_url(
+            "http://127.0.0.1:1",
+            "context",
+            "digest",
+            "demo",
+            "web/index.html"
+        ),
+        "http://127.0.0.1:1/ext/context/digest/demo/web/index.html"
     );
     // A space or '#' would otherwise truncate or mis-address the request.
     assert_eq!(
-        frame_url("http://127.0.0.1:1", "demo", "my page.html"),
-        "http://127.0.0.1:1/ext/demo/my%20page.html"
+        frame_url(
+            "http://127.0.0.1:1",
+            "context",
+            "digest",
+            "demo",
+            "my page.html"
+        ),
+        "http://127.0.0.1:1/ext/context/digest/demo/my%20page.html"
     );
     assert_eq!(
-        frame_url("http://127.0.0.1:1", "demo", "a#b.html"),
-        "http://127.0.0.1:1/ext/demo/a%23b.html"
+        frame_url(
+            "http://127.0.0.1:1",
+            "context",
+            "digest",
+            "demo",
+            "a#b.html"
+        ),
+        "http://127.0.0.1:1/ext/context/digest/demo/a%23b.html"
     );
     // Separators survive as separators, so a nested entry still addresses one
     // file rather than becoming a single encoded segment.
-    assert!(!frame_url("http://127.0.0.1:1", "demo", "web/app.js").contains("%2F"));
+    assert!(!frame_url(
+        "http://127.0.0.1:1",
+        "context",
+        "digest",
+        "demo",
+        "web/app.js",
+    )
+    .contains("%2F"));
 }
 
 #[tokio::test]
@@ -221,9 +255,12 @@ async fn every_served_document_carries_the_egress_policy() {
     let origin = origin_for_port(port);
 
     for asset in ["index.html", "app.js", "app.css", "icon.png", "data.json"] {
-        let response = reqwest::get(format!("{origin}/{EXTENSION_ROUTE_PREFIX}/demo/{asset}"))
-            .await
-            .expect("request");
+        let response = reqwest::get(format!(
+            "{origin}/{EXTENSION_ROUTE_PREFIX}/{}/{}/demo/{asset}",
+            claim.static_context, claim.package_digest
+        ))
+        .await
+        .expect("request");
         assert_eq!(response.status(), 200, "{asset} should be served");
         let policy = response
             .headers()

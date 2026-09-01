@@ -1,12 +1,21 @@
-//! P5 identity/digest-bound frame authority and selected egress policy.
+//! P5 identity/digest-bound frame, bridge and static-host authority.
 
-use std::path::Path;
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LeaseAuthority {
+    pub(crate) extension_id: String,
+    pub(crate) identity_pubkey: String,
+    pub(crate) package_digest: String,
+}
 
 #[derive(Debug, Clone)]
 pub(super) struct LeaseOwner {
-    pub(super) extension_id: String,
-    pub(super) identity_pubkey: String,
-    pub(super) package_digest: String,
+    pub(super) authority: LeaseAuthority,
+    /// A separate opaque route capability for this one frame. It is never
+    /// derived from the extension id and is removed with the lease.
+    pub(super) static_context: String,
+    /// Frozen from the validated installed manifest at open time. Wrapper
+    /// requests never re-read a mutable package manifest.
+    pub(super) entry: String,
     pub(super) egress: Vec<String>,
 }
 
@@ -30,41 +39,41 @@ pub(super) fn content_security_policy_with_egress(origin: &str, egress: &[String
     )
 }
 
-fn active_owner(extension_id: &str) -> Option<LeaseOwner> {
-    super::frame_host::host_state()
-        .leases
-        .values()
-        .find(|owner| owner.extension_id == extension_id)
-        .cloned()
+/// Resolve one opaque static-host context to exactly one still-live lease owner.
+/// There is no extension-id scan and therefore no insertion-order authority.
+pub(super) fn static_owner(
+    context: &str,
+    package_digest: &str,
+    extension_id: &str,
+) -> Option<LeaseOwner> {
+    let state = super::frame_host::host_state();
+    let lease = state.contexts.get(context)?;
+    let owner = state.leases.get(lease)?;
+    (owner.static_context == context
+        && owner.authority.package_digest == package_digest
+        && owner.authority.extension_id == extension_id)
+        .then(|| owner.clone())
 }
 
-pub(super) fn active_owner_for_tree(base_dir: &Path, extension_id: &str) -> Option<LeaseOwner> {
-    let owner = active_owner(extension_id)?;
-    if owner.package_digest.is_empty() {
-        return Some(owner);
-    }
-    let digest = super::management::package_digest(&base_dir.join(extension_id)).ok()?;
-    (digest == owner.package_digest).then_some(owner)
+pub(crate) fn lease_authority_snapshot(lease: &str) -> Option<LeaseAuthority> {
+    super::frame_host::host_state()
+        .leases
+        .get(lease)
+        .map(|owner| owner.authority.clone())
 }
 
 pub(crate) fn extension_for_lease(lease: &str) -> Option<String> {
-    super::frame_host::host_state()
-        .leases
-        .get(lease)
-        .map(|owner| owner.extension_id.clone())
+    lease_authority_snapshot(lease).map(|owner| owner.extension_id)
 }
 
 pub(crate) fn lease_authority(lease: &str) -> Option<(String, String, String)> {
-    super::frame_host::host_state()
-        .leases
-        .get(lease)
-        .map(|owner| {
-            (
-                owner.extension_id.clone(),
-                owner.identity_pubkey.clone(),
-                owner.package_digest.clone(),
-            )
-        })
+    lease_authority_snapshot(lease).map(|owner| {
+        (
+            owner.extension_id,
+            owner.identity_pubkey,
+            owner.package_digest,
+        )
+    })
 }
 
 pub(crate) fn release_for_identity_extension(identity_pubkey: &str, extension_id: &str) -> usize {
@@ -72,7 +81,8 @@ pub(crate) fn release_for_identity_extension(identity_pubkey: &str, extension_id
         .leases
         .iter()
         .filter(|(_, owner)| {
-            owner.identity_pubkey == identity_pubkey && owner.extension_id == extension_id
+            owner.authority.identity_pubkey == identity_pubkey
+                && owner.authority.extension_id == extension_id
         })
         .map(|(lease, _)| lease.clone())
         .collect();
@@ -82,17 +92,10 @@ pub(crate) fn release_for_identity_extension(identity_pubkey: &str, extension_id
     leases.len()
 }
 
+/// Fence every current and in-flight open for an extension, not only leases
+/// visible at the instant of the sweep.
 pub(crate) fn release_for_extension_id(extension_id: &str) -> usize {
-    let leases: Vec<String> = super::frame_host::host_state()
-        .leases
-        .iter()
-        .filter(|(_, owner)| owner.extension_id == extension_id)
-        .map(|(lease, _)| lease.clone())
-        .collect();
-    for lease in &leases {
-        super::frame_host::release(lease);
-    }
-    leases.len()
+    super::frame_host::fence_extension(extension_id)
 }
 
 #[cfg(test)]
@@ -102,12 +105,19 @@ pub(crate) fn insert_authorized_lease_for_test(
     identity_pubkey: &str,
     package_digest: &str,
 ) {
-    super::frame_host::host_state().leases.insert(
+    let context = format!("test-context-{lease}");
+    let mut state = super::frame_host::host_state();
+    state.contexts.insert(context.clone(), lease.to_string());
+    state.leases.insert(
         lease.to_string(),
         LeaseOwner {
-            extension_id: extension_id.to_string(),
-            identity_pubkey: identity_pubkey.to_string(),
-            package_digest: package_digest.to_string(),
+            authority: LeaseAuthority {
+                extension_id: extension_id.to_string(),
+                identity_pubkey: identity_pubkey.to_string(),
+                package_digest: package_digest.to_string(),
+            },
+            static_context: context,
+            entry: "index.html".to_string(),
             egress: Vec::new(),
         },
     );
@@ -125,15 +135,7 @@ pub(crate) async fn lifecycle_guard() -> tokio::sync::MutexGuard<'static, ()> {
 
 #[cfg(test)]
 pub(crate) fn insert_lease_for_test(lease: &str, extension_id: &str) {
-    super::frame_host::host_state().leases.insert(
-        lease.to_string(),
-        LeaseOwner {
-            extension_id: extension_id.to_string(),
-            identity_pubkey: String::new(),
-            package_digest: String::new(),
-            egress: Vec::new(),
-        },
-    );
+    insert_authorized_lease_for_test(lease, extension_id, "", "");
 }
 
 #[cfg(test)]

@@ -647,6 +647,17 @@ pub(crate) fn is_enabled(
     .is_ok_and(|enabled| enabled == 1)
 }
 
+pub(crate) fn disable_all_for_extension(
+    conn: &Connection,
+    extension_id: &str,
+) -> Result<usize, String> {
+    conn.execute(
+        "UPDATE extension_activation SET enabled = 0 WHERE extension_id = ?1",
+        params![extension_id],
+    )
+    .map_err(|error| format!("could not fence extension activation: {error}"))
+}
+
 pub(crate) fn set_enabled(
     conn: &Connection,
     identity_pubkey: &str,
