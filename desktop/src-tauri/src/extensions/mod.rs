@@ -112,6 +112,10 @@ pub(crate) fn extensions_base_dir<R: tauri::Runtime>(
 /// (decision 008: updates are a manual re-install).
 #[tauri::command]
 #[cfg(test)]
+#[expect(
+    dead_code,
+    reason = "test-only Tauri command boundary retained for directory-install composition"
+)]
 pub async fn install_extension_from_directory(
     app: AppHandle,
     source_dir: String,
@@ -130,6 +134,10 @@ pub async fn install_extension_from_directory(
 /// count and total size.
 #[tauri::command]
 #[cfg(test)]
+#[expect(
+    dead_code,
+    reason = "test-only Tauri command boundary retained for ZIP-install composition"
+)]
 pub async fn install_extension_from_zip(
     app: AppHandle,
     archive_path: String,

@@ -38,6 +38,10 @@ fn eose(branch: &str) -> crate::relay::subscribe::RelayFrame {
     }
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "test helper names every registry-insertion authority and lifecycle input"
+)]
 fn register(
     registry: &SubscriptionRegistry,
     quota: &Arc<SubscriptionQuota>,
