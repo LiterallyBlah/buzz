@@ -205,6 +205,43 @@ fn storage_dispatch_requires_the_exact_live_scope_and_generation() {
         Some(code::DENIED),
         "a predecessor grant generation must not adopt current storage"
     );
+
+    let write = dispatch(
+        app.handle(),
+        &current,
+        "storage.set",
+        Some(serde_json::json!({"key":"state","value":{"private":"old"},"expectedRevision":null})),
+    );
+    assert!(write.ok);
+    super::super::grants::delete_all_for_extension(&mut grants, &extension_id)
+        .expect("remove grants but retain generation ledger");
+    super::super::grants::replace_for_install(
+        &mut grants,
+        &identity,
+        &manifest,
+        &digest,
+        &selected,
+    )
+    .expect("reinstall same bytes");
+    let reinstalled_generation =
+        super::super::grants::current_generation(&grants, &identity, &extension_id, &digest)
+            .expect("reinstalled generation");
+    assert!(reinstalled_generation > generation);
+    let reinstalled = LeaseAuthority {
+        grant_generation: reinstalled_generation,
+        ..owner.clone()
+    };
+    assert_eq!(
+        dispatch(
+            app.handle(),
+            &reinstalled,
+            "storage.get",
+            Some(serde_json::json!({"key":"state"})),
+        )
+        .result,
+        Some(serde_json::json!({"value":null,"revision":null})),
+        "an identical reinstall must not silently adopt the removed installation's state"
+    );
     super::super::grants::delete_all_for_extension(&mut grants, &extension_id).expect("cleanup");
     std::fs::remove_dir_all(root).ok();
 }

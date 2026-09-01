@@ -64,6 +64,12 @@ CREATE TABLE IF NOT EXISTS extension_activation (
     consented_at INTEGER NOT NULL,
     PRIMARY KEY (identity_pubkey, extension_id)
 );
+CREATE TABLE IF NOT EXISTS extension_grant_generations (
+    identity_pubkey TEXT NOT NULL,
+    extension_id TEXT NOT NULL,
+    generation INTEGER NOT NULL,
+    PRIMARY KEY (identity_pubkey, extension_id)
+);
 ";
 
 /// Open (creating if needed) the grant database.
@@ -575,6 +581,39 @@ fn insert_selection(
     Ok(())
 }
 
+fn allocate_generation(
+    tx: &rusqlite::Transaction<'_>,
+    identity_pubkey: &str,
+    extension_id: &str,
+) -> Result<u64, String> {
+    let retained = tx
+        .query_row(
+            "SELECT generation FROM extension_grant_generations WHERE identity_pubkey = ?1 AND extension_id = ?2",
+            params![identity_pubkey, extension_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap_or(0);
+    let active = tx
+        .query_row(
+            "SELECT grant_generation FROM extension_activation WHERE identity_pubkey = ?1 AND extension_id = ?2",
+            params![identity_pubkey, extension_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap_or(0);
+    let next = retained.max(active).saturating_add(1);
+    if next <= 0 {
+        return Err("could not allocate grant generation".to_string());
+    }
+    tx.execute(
+        "INSERT INTO extension_grant_generations (identity_pubkey, extension_id, generation)
+         VALUES (?1, ?2, ?3)
+         ON CONFLICT(identity_pubkey, extension_id) DO UPDATE SET generation = excluded.generation",
+        params![identity_pubkey, extension_id, next],
+    )
+    .map_err(|error| format!("could not retain grant generation: {error}"))?;
+    u64::try_from(next).map_err(|_| "could not allocate grant generation".to_string())
+}
+
 pub(crate) fn replace_for_install(
     conn: &mut Connection,
     identity_pubkey: &str,
@@ -586,6 +625,7 @@ pub(crate) fn replace_for_install(
     let tx = conn
         .transaction()
         .map_err(|error| format!("could not begin grant transaction: {error}"))?;
+    let generation = allocate_generation(&tx, identity_pubkey, &manifest.id)?;
     tx.execute(
         "DELETE FROM extension_grants WHERE extension_id = ?1",
         params![manifest.id],
@@ -603,8 +643,8 @@ pub(crate) fn replace_for_install(
     .map_err(|error| format!("could not replace activation state: {error}"))?;
     insert_selection(&tx, identity_pubkey, &manifest.id, digest, selected)?;
     tx.execute(
-        "INSERT INTO extension_activation (identity_pubkey, extension_id, package_digest, grant_generation, enabled, consented_at) VALUES (?1, ?2, ?3, 1, 0, ?4)",
-        params![identity_pubkey, manifest.id, digest, now_unix()],
+        "INSERT INTO extension_activation (identity_pubkey, extension_id, package_digest, grant_generation, enabled, consented_at) VALUES (?1, ?2, ?3, ?4, 0, ?5)",
+        params![identity_pubkey, manifest.id, digest, generation, now_unix()],
     )
     .map_err(|error| format!("could not record install consent: {error}"))?;
     tx.commit()
@@ -620,12 +660,10 @@ pub(crate) fn replace_for_identity(
 ) -> Result<(), String> {
     validate_selection(manifest, selected)?;
     let enabled = is_enabled(conn, identity_pubkey, &manifest.id, digest);
-    let next_generation = current_generation(conn, identity_pubkey, &manifest.id, digest)
-        .unwrap_or(0)
-        .saturating_add(1);
     let tx = conn
         .transaction()
         .map_err(|error| format!("could not begin grant transaction: {error}"))?;
+    let next_generation = allocate_generation(&tx, identity_pubkey, &manifest.id)?;
     tx.execute(
         "DELETE FROM extension_grants WHERE identity_pubkey = ?1 AND extension_id = ?2",
         params![identity_pubkey, manifest.id],
