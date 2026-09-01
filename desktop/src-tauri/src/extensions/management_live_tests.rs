@@ -145,6 +145,18 @@ async fn hello_world_production_flow_uses_only_digest_bound_bridge_authority() {
     ));
     super::super::grants::set_enabled(&conn, &identity, EXTENSION_ID, &prepared.digest, true)
         .expect("enable");
+    assert!(super::super::grants::has_read_scope(
+        &conn,
+        &identity,
+        EXTENSION_ID,
+        9,
+        &channel
+    ));
+    assert_eq!(
+        super::super::grants::list_read_pairs(&conn, &identity, EXTENSION_ID),
+        vec![(9, channel.clone())]
+    );
+    drop(conn);
 
     let claim = super::super::frame_host::acquire_authorized(
         base.clone(),
