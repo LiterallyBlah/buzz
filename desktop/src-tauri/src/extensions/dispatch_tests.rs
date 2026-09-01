@@ -28,6 +28,28 @@ fn a_known_method_routes_to_its_handler_for_the_leased_extension() {
 }
 
 #[test]
+fn storage_methods_route_to_the_exact_leased_extension() {
+    assert_eq!(
+        route(resolver(LIVE), "lease-a", 1, "storage.get"),
+        Route::StorageGet {
+            extension_id: "demo".to_string()
+        }
+    );
+    assert_eq!(
+        route(resolver(LIVE), "lease-a", 1, "storage.set"),
+        Route::StorageSet {
+            extension_id: "demo".to_string()
+        }
+    );
+    assert_eq!(
+        route(resolver(LIVE), "lease-a", 1, "storage.delete"),
+        Route::StorageDelete {
+            extension_id: "demo".to_string()
+        }
+    );
+}
+
+#[test]
 fn attribution_follows_the_lease_not_the_caller() {
     // Two live extensions. The lease alone decides which one a frame is.
     let a = route(resolver(LIVE), "lease-a", 1, "identity.getPublicKey");
@@ -102,7 +124,6 @@ fn an_unknown_method_is_refused() {
     for method in [
         "identity.getSecretKey",
         "publish.sign", // the cut `sign.event` shape — never exposed (§4)
-        "storage.set",  // a later increment's surface, not reachable yet
         "",
         "identity.getPublicKey ", // trailing space: no trimming, no near-miss
         "Publish.Event",          // case is significant
@@ -223,6 +244,7 @@ const SPEC_CODES: &[&str] = &[
     "invalid_params",
     "denied",
     "quota_exceeded",
+    "conflict",
     "rate_limited",
     "relay_error",
     "identity_unavailable",

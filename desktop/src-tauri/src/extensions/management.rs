@@ -340,7 +340,7 @@ pub(crate) fn lease_authority_current_for_app<R: tauri::Runtime>(
 pub(crate) fn enabled_context_for_app<R: tauri::Runtime>(
     app: &AppHandle<R>,
     id: &str,
-) -> Result<(String, String, String, Vec<String>), String> {
+) -> Result<(String, String, u64, String, Vec<String>), String> {
     let identity = current_identity(app)?;
     let base = super::extensions_base_dir(app)?;
     let manifest = super::resolve_frame_manifest(&base, id)?;
@@ -350,8 +350,16 @@ pub(crate) fn enabled_context_for_app<R: tauri::Runtime>(
     if !super::grants::is_enabled(&conn, &identity, &manifest.id, &digest) {
         return Err("extension is disabled for the current identity or package".to_string());
     }
+    let generation = super::grants::current_generation(&conn, &identity, &manifest.id, &digest)
+        .ok_or_else(|| "extension grant generation is unavailable".to_string())?;
     let selected = super::grants::list_selection(&conn, &identity, &manifest.id, &digest);
-    Ok((identity, digest, manifest.entry, selected.egress))
+    Ok((
+        identity,
+        digest,
+        generation,
+        manifest.entry,
+        selected.egress,
+    ))
 }
 
 fn decorate<R: tauri::Runtime>(

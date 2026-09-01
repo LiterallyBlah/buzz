@@ -36,6 +36,7 @@ mod package_path;
 mod preview;
 pub(crate) mod publish;
 pub(crate) mod query;
+pub(crate) mod storage;
 
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
@@ -204,14 +205,21 @@ pub(crate) async fn open_extension_frame_for<R: tauri::Runtime>(
             .map_err(|error| format!("extension frame task failed: {error}"))??
     };
 
-    let (identity, digest, entry, egress) =
+    let (identity, digest, generation, entry, egress) =
         management::enabled_context_for_app(&app, &manifest.id)?;
     if entry != manifest.entry {
         return Err("installed extension entry changed while opening".to_string());
     }
-    let claim =
-        frame_host::acquire_authorized(base_dir, &manifest.id, &identity, &digest, &entry, egress)
-            .await?;
+    let claim = frame_host::acquire_authorized_with_generation(
+        base_dir,
+        &manifest.id,
+        &identity,
+        &digest,
+        generation,
+        &entry,
+        egress,
+    )
+    .await?;
     // Buzz frames the *wrapper*, so the origin the caller asserts against is
     // the wrapper origin — a different origin from the one serving package
     // content, which is the point of the split.

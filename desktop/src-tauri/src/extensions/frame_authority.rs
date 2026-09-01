@@ -5,6 +5,7 @@ pub(crate) struct LeaseAuthority {
     pub(crate) extension_id: String,
     pub(crate) identity_pubkey: String,
     pub(crate) package_digest: String,
+    pub(crate) grant_generation: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -115,6 +116,7 @@ pub(crate) fn insert_authorized_lease_for_test(
                 extension_id: extension_id.to_string(),
                 identity_pubkey: identity_pubkey.to_string(),
                 package_digest: package_digest.to_string(),
+                grant_generation: 1,
             },
             static_context: context,
             entry: "index.html".to_string(),

@@ -13,12 +13,14 @@ pub(crate) async fn acquire(base_dir: PathBuf, extension_id: &str) -> Result<Fra
         extension_id,
         "test-identity",
         "test-digest",
+        1,
         "index.html",
         Vec::new(),
     )
     .await
 }
 
+#[cfg(test)]
 pub(crate) async fn acquire_authorized(
     base_dir: PathBuf,
     extension_id: &str,
@@ -27,7 +29,32 @@ pub(crate) async fn acquire_authorized(
     entry: &str,
     egress: Vec<String>,
 ) -> Result<FrameLease, String> {
-    if identity_pubkey.is_empty() || package_digest.is_empty() || entry.is_empty() {
+    acquire_authorized_with_generation(
+        base_dir,
+        extension_id,
+        identity_pubkey,
+        package_digest,
+        1,
+        entry,
+        egress,
+    )
+    .await
+}
+
+pub(crate) async fn acquire_authorized_with_generation(
+    base_dir: PathBuf,
+    extension_id: &str,
+    identity_pubkey: &str,
+    package_digest: &str,
+    grant_generation: u64,
+    entry: &str,
+    egress: Vec<String>,
+) -> Result<FrameLease, String> {
+    if identity_pubkey.is_empty()
+        || package_digest.is_empty()
+        || grant_generation == 0
+        || entry.is_empty()
+    {
         return Err("enabled extension authority is incomplete".to_string());
     }
     acquire_inner(
@@ -35,6 +62,7 @@ pub(crate) async fn acquire_authorized(
         extension_id,
         identity_pubkey,
         package_digest,
+        grant_generation,
         entry,
         egress,
     )
@@ -53,6 +81,7 @@ async fn acquire_inner(
     extension_id: &str,
     identity_pubkey: &str,
     package_digest: &str,
+    grant_generation: u64,
     entry: &str,
     egress: Vec<String>,
 ) -> Result<FrameLease, String> {
@@ -63,6 +92,7 @@ async fn acquire_inner(
             extension_id: extension_id.to_string(),
             identity_pubkey: identity_pubkey.to_string(),
             package_digest: package_digest.to_string(),
+            grant_generation,
         },
         static_context: static_context.clone(),
         entry: entry.to_string(),

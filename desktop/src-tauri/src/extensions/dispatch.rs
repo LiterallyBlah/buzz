@@ -74,6 +74,8 @@ pub(crate) mod code {
     /// Declared here as of §5's read path, which emits it *before* any network
     /// work. It was previously withheld on the rule below, which it now meets.
     pub(crate) const QUOTA_EXCEEDED: &str = "quota_exceeded";
+    /// An optimistic storage write or delete used a stale revision.
+    pub(crate) const CONFLICT: &str = "conflict";
     // §8 also defines `rate_limited`. That remains frontend-only — it is an
     // admission decision the spine makes before a request reaches Rust — so it
     // is not declared here. A constant nothing emits is a vocabulary entry
@@ -126,29 +128,56 @@ impl BridgeReply {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Route {
     /// Run `identity.getPublicKey` for this extension (§3).
-    IdentityGetPublicKey { extension_id: String },
+    IdentityGetPublicKey {
+        extension_id: String,
+    },
     /// Run `publish.event` for this extension (§4).
     ///
     /// Carries only the identity. The template travels separately, so the
     /// value that decides *who the caller is* is still produced by a function
     /// that never sees the payload.
-    PublishEvent { extension_id: String },
+    PublishEvent {
+        extension_id: String,
+    },
     /// Run `publish.extensionData` for this extension (§4).
     ///
     /// A distinct route from [`Route::PublishEvent`], not a flag on it: kind
     /// 30800 is refused outright by the generic signer, and the two methods
     /// keep separate authority owners all the way down.
-    PublishExtensionData { extension_id: String },
+    PublishExtensionData {
+        extension_id: String,
+    },
     /// Run `extensionData.get` for this extension (§4).
-    ExtensionDataGet { extension_id: String },
+    ExtensionDataGet {
+        extension_id: String,
+    },
+    /// Device-local, identity/digest/grant-generation-bound storage.
+    StorageGet {
+        extension_id: String,
+    },
+    StorageSet {
+        extension_id: String,
+    },
+    StorageDelete {
+        extension_id: String,
+    },
     /// §5 `query.events` — a one-shot channel-scoped read.
-    QueryEvents { extension_id: String },
+    QueryEvents {
+        extension_id: String,
+    },
     /// §5 `subscribe` — open a live channel-scoped stream.
-    Subscribe { extension_id: String },
+    Subscribe {
+        extension_id: String,
+    },
     /// §5 `unsubscribe` — ensure a subscription is not live on this lease.
-    Unsubscribe { extension_id: String },
+    Unsubscribe {
+        extension_id: String,
+    },
     /// Refuse, with this §8 code and message.
-    Refuse { code: &'static str, message: String },
+    Refuse {
+        code: &'static str,
+        message: String,
+    },
 }
 
 impl Route {
@@ -158,6 +187,9 @@ impl Route {
             | Route::PublishEvent { extension_id }
             | Route::PublishExtensionData { extension_id }
             | Route::ExtensionDataGet { extension_id }
+            | Route::StorageGet { extension_id }
+            | Route::StorageSet { extension_id }
+            | Route::StorageDelete { extension_id }
             | Route::QueryEvents { extension_id }
             | Route::Subscribe { extension_id }
             | Route::Unsubscribe { extension_id } => Some(extension_id),
@@ -209,6 +241,9 @@ pub(crate) fn route(
         "publish.event" => Route::PublishEvent { extension_id },
         "publish.extensionData" => Route::PublishExtensionData { extension_id },
         "extensionData.get" => Route::ExtensionDataGet { extension_id },
+        "storage.get" => Route::StorageGet { extension_id },
+        "storage.set" => Route::StorageSet { extension_id },
+        "storage.delete" => Route::StorageDelete { extension_id },
         "query.events" => Route::QueryEvents { extension_id },
         "subscribe" => Route::Subscribe { extension_id },
         "unsubscribe" => Route::Unsubscribe { extension_id },
@@ -329,6 +364,17 @@ pub(crate) async fn dispatch<R: tauri::Runtime>(
         }
         Route::ExtensionDataGet { extension_id } => {
             super::extension_data::extension_data_get(app, &extension_id, lease, params).await
+        }
+        Route::StorageGet { extension_id }
+        | Route::StorageSet { extension_id }
+        | Route::StorageDelete { extension_id } => {
+            let Some(owner) = authority.as_ref() else {
+                return BridgeReply::err(code::DENIED, "extension authority is unavailable");
+            };
+            if owner.extension_id != extension_id {
+                return BridgeReply::err(code::DENIED, "extension authority is no longer current");
+            }
+            super::storage::dispatch(app, owner, method, params)
         }
         Route::QueryEvents { extension_id } => {
             super::query::query_events(app, &extension_id, lease, params).await

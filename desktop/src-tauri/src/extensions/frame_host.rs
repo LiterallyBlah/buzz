@@ -792,8 +792,10 @@ pub(crate) struct FrameLease {
 mod frame_lifecycle;
 #[cfg(test)]
 pub(crate) use frame_lifecycle::acquire;
+#[cfg(test)]
+pub(crate) use frame_lifecycle::acquire_authorized;
 pub(super) use frame_lifecycle::fence_extension;
-pub(crate) use frame_lifecycle::{acquire_authorized, release, shutdown_now};
+pub(crate) use frame_lifecycle::{acquire_authorized_with_generation, release, shutdown_now};
 
 // ── Tests ────────────────────────────────────────────────────────────────────
 

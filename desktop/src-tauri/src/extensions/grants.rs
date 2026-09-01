@@ -59,6 +59,7 @@ CREATE TABLE IF NOT EXISTS extension_activation (
     identity_pubkey TEXT NOT NULL,
     extension_id TEXT NOT NULL,
     package_digest TEXT NOT NULL,
+    grant_generation INTEGER NOT NULL DEFAULT 1,
     enabled INTEGER NOT NULL DEFAULT 0,
     consented_at INTEGER NOT NULL,
     PRIMARY KEY (identity_pubkey, extension_id)
@@ -80,7 +81,31 @@ pub(crate) fn open_grant_db(path: &Path) -> Result<Connection, String> {
     conn.execute_batch(SCHEMA)
         .map_err(|error| format!("could not initialise the grant store: {error}"))?;
     ensure_package_digest_column(&conn)?;
+    ensure_grant_generation_column(&conn)?;
     Ok(conn)
+}
+
+fn ensure_grant_generation_column(conn: &Connection) -> Result<(), String> {
+    let mut statement = conn
+        .prepare("PRAGMA table_info(extension_activation)")
+        .map_err(|error| format!("could not inspect the grant store: {error}"))?;
+    let columns = statement
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(|error| format!("could not inspect the grant store: {error}"))?;
+    let mut present = false;
+    for column in columns {
+        if matches!(column, Ok(name) if name == "grant_generation") {
+            present = true;
+        }
+    }
+    if !present {
+        conn.execute(
+            "ALTER TABLE extension_activation ADD COLUMN grant_generation INTEGER NOT NULL DEFAULT 1",
+            [],
+        )
+        .map_err(|error| format!("could not migrate the grant store: {error}"))?;
+    }
+    Ok(())
 }
 
 fn ensure_package_digest_column(conn: &Connection) -> Result<(), String> {
@@ -578,7 +603,7 @@ pub(crate) fn replace_for_install(
     .map_err(|error| format!("could not replace activation state: {error}"))?;
     insert_selection(&tx, identity_pubkey, &manifest.id, digest, selected)?;
     tx.execute(
-        "INSERT INTO extension_activation (identity_pubkey, extension_id, package_digest, enabled, consented_at) VALUES (?1, ?2, ?3, 0, ?4)",
+        "INSERT INTO extension_activation (identity_pubkey, extension_id, package_digest, grant_generation, enabled, consented_at) VALUES (?1, ?2, ?3, 1, 0, ?4)",
         params![identity_pubkey, manifest.id, digest, now_unix()],
     )
     .map_err(|error| format!("could not record install consent: {error}"))?;
@@ -595,6 +620,9 @@ pub(crate) fn replace_for_identity(
 ) -> Result<(), String> {
     validate_selection(manifest, selected)?;
     let enabled = is_enabled(conn, identity_pubkey, &manifest.id, digest);
+    let next_generation = current_generation(conn, identity_pubkey, &manifest.id, digest)
+        .unwrap_or(0)
+        .saturating_add(1);
     let tx = conn
         .transaction()
         .map_err(|error| format!("could not begin grant transaction: {error}"))?;
@@ -610,8 +638,8 @@ pub(crate) fn replace_for_identity(
     .map_err(|error| format!("could not replace egress grants: {error}"))?;
     insert_selection(&tx, identity_pubkey, &manifest.id, digest, selected)?;
     tx.execute(
-        "INSERT OR REPLACE INTO extension_activation (identity_pubkey, extension_id, package_digest, enabled, consented_at) VALUES (?1, ?2, ?3, ?4, ?5)",
-        params![identity_pubkey, manifest.id, digest, if enabled { 1 } else { 0 }, now_unix()],
+        "INSERT OR REPLACE INTO extension_activation (identity_pubkey, extension_id, package_digest, grant_generation, enabled, consented_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![identity_pubkey, manifest.id, digest, next_generation, if enabled { 1 } else { 0 }, now_unix()],
     )
     .map_err(|error| format!("could not retain activation state: {error}"))?;
     tx.commit()
@@ -645,6 +673,22 @@ pub(crate) fn is_enabled(
         |row| row.get::<_, i64>(0),
     )
     .is_ok_and(|enabled| enabled == 1)
+}
+
+pub(crate) fn current_generation(
+    conn: &Connection,
+    identity_pubkey: &str,
+    extension_id: &str,
+    digest: &str,
+) -> Option<u64> {
+    conn.query_row(
+        "SELECT grant_generation FROM extension_activation WHERE identity_pubkey = ?1 AND extension_id = ?2 AND package_digest = ?3",
+        params![identity_pubkey, extension_id, digest],
+        |row| row.get::<_, i64>(0),
+    )
+    .ok()
+    .and_then(|value| u64::try_from(value).ok())
+    .filter(|value| *value > 0)
 }
 
 pub(crate) fn disable_all_for_extension(
