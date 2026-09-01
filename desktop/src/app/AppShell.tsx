@@ -145,6 +145,7 @@ export function AppShell() {
   const {
     goAgents,
     goChannel,
+    goExtensions,
     goHome,
     goNewMessage,
     goProjects,
@@ -878,6 +879,7 @@ export function AppShell() {
                             await goChannel(directMessage.id);
                           }}
                           onSelectAgents={() => void goAgents()}
+                          onSelectExtensions={() => void goExtensions()}
                           onSelectChannel={handleSidebarChannelSelect}
                           onOpenSearchResult={handleOpenSearchResult}
                           searchChannels={channels}

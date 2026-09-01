@@ -2148,6 +2148,27 @@ mod tests {
     }
 
     #[test]
+    fn extension_data_is_queryable_by_ordinary_kind_and_d_filter() {
+        let d_tag = SingleLetterTag::lowercase(Alphabet::D);
+        let query = filter_to_query_params(
+            &Filter::new()
+                .kind(nostr::Kind::Custom(
+                    buzz_core::kind::KIND_EXTENSION_DATA as u16,
+                ))
+                .custom_tags(d_tag, ["ext:equation-explorer:learner-state"]),
+            None,
+            buzz_core::tenant::CommunityId::from_uuid(uuid::Uuid::nil()),
+        );
+
+        assert_eq!(query.kinds, Some(vec![30_800]));
+        assert_eq!(
+            query.d_tag,
+            Some("ext:equation-explorer:learner-state".to_string())
+        );
+        assert_eq!(query.channel_id, None);
+    }
+
+    #[test]
     fn restricted_search_scope_excludes_global_results() {
         let channel_id = uuid::Uuid::new_v4();
 

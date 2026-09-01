@@ -10,6 +10,7 @@ mod deep_link;
 mod egress_guard;
 mod event_sync;
 mod events;
+mod extensions;
 mod huddle;
 mod identity_storage;
 mod initial_window;
@@ -136,6 +137,13 @@ pub fn run() {
         .plugin(tauri_plugin_deep_link::init())
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_opener::init())
+        // The extension bridge. Registering it does NOT expose it: plugin
+        // commands are always ACL-checked, and no capability grants
+        // `extension-bridge:allow-resolve-identity` yet, so it is denied from
+        // every origin including Buzz's own. That fail-closed default is
+        // deliberate — the capability's final shape is held pending the
+        // owner-run Windows wrapper-origin classification row.
+        .plugin(extensions::bridge::init())
         .plugin(
             tauri_plugin_window_state::Builder::default()
                 // Visibility is excluded: the native reveal plugin below
@@ -858,6 +866,19 @@ pub fn run() {
             archive::sync::announce_archive_sync_epoch,
             archive::sync::start_archive_sync,
             archive::sync::stop_archive_sync,
+            extensions::preview_extension_package,
+            extensions::open_extension_frame,
+            extensions::close_extension_frame,
+            extensions::management::prepare_extension_from_directory,
+            extensions::management::prepare_extension_from_zip,
+            extensions::management::approve_prepared_extension,
+            extensions::management::cancel_prepared_extension,
+            extensions::management::set_extension_enabled,
+            extensions::management::update_extension_grants,
+            extensions::management::remove_extension,
+            extensions::list_installed_extensions,
+            extensions::pick_extension_directory,
+            extensions::pick_extension_zip,
             is_auto_update_supported,
             set_window_vibrancy,
             #[cfg(target_os = "macos")]

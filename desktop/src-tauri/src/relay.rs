@@ -352,99 +352,18 @@ pub async fn relay_error_message(response: reqwest::Response) -> String {
 
 // ── HTTP bridge: POST /query ────────────────────────────────────────────────
 
-/// Execute a one-shot query via the relay's HTTP bridge (`POST /query`).
-///
-/// Filters are serialized as a JSON array. The request is authenticated with
-/// a NIP-98 event signed by the user's keys. Returns the deserialized array of
-/// events.
-pub async fn query_relay(
-    state: &AppState,
-    filters: &[serde_json::Value],
-) -> Result<Vec<nostr::Event>, String> {
-    query_relay_at(state, &relay_api_base_url_with_override(state), filters).await
-}
-
-/// Like [`query_relay`] but targets an explicit HTTP API base URL instead of
-/// the workspace override. Used when a query must hit a specific relay (e.g.
-/// reconciling an agent's profile on the relay where it was published).
-pub async fn query_relay_at(
-    state: &AppState,
-    api_base_url: &str,
-    filters: &[serde_json::Value],
-) -> Result<Vec<nostr::Event>, String> {
-    crate::relay_admission::wait_for_rate_limit().await;
-    let url = format!("{}/query", api_base_url);
-    let body_bytes =
-        serde_json::to_vec(filters).map_err(|e| format!("filter serialization failed: {e}"))?;
-    let auth = build_nip98_auth_header(&Method::POST, &url, &body_bytes, state)?;
-    send_query_request(
-        &state.http_client,
-        &url,
-        &auth,
-        None,
-        body_bytes,
-        QUERY_REQUEST_TIMEOUT,
-    )
-    .await
-}
-
-pub async fn query_relay_at_with_keys(
-    state: &AppState,
-    api_base_url: &str,
-    filters: &[serde_json::Value],
-    keys: &Keys,
-    auth_tag: Option<&str>,
-) -> Result<Vec<nostr::Event>, String> {
-    crate::relay_admission::wait_for_rate_limit().await;
-    let url = format!("{}/query", api_base_url);
-    let body_bytes =
-        serde_json::to_vec(filters).map_err(|e| format!("filter serialization failed: {e}"))?;
-    let auth = build_nip98_auth_header_for_keys(keys, &Method::POST, &url, &body_bytes)?;
-    send_query_request(
-        &state.http_client,
-        &url,
-        &auth,
-        auth_tag,
-        body_bytes,
-        QUERY_REQUEST_TIMEOUT,
-    )
-    .await
-}
-
-/// Issue an authenticated `POST /query` and parse the response, applying the
-/// per-request `timeout` that bounds a stalled or half-open relay connection.
-///
-/// Both `/query` builders funnel through this one helper so the timeout can
-/// never be applied to one builder and dropped from the other, and so a test
-/// can drive the real send/timeout/classify path with a short deadline against
-/// a stalled loopback. A timeout surfaces through `classify_request_error` as
-/// the stable `"relay unreachable: request timed out"` string.
-async fn send_query_request(
-    http_client: &reqwest::Client,
-    url: &str,
-    auth: &str,
-    auth_tag: Option<&str>,
-    body_bytes: Vec<u8>,
-    timeout: std::time::Duration,
-) -> Result<Vec<nostr::Event>, String> {
-    let mut request = http_client
-        .post(url)
-        .header("Authorization", auth)
-        .header("Content-Type", "application/json")
-        .timeout(timeout);
-    if let Some(tag) = auth_tag {
-        request = request.header("x-auth-tag", tag);
-    }
-    let response = request
-        .body(body_bytes)
-        .send()
-        .await
-        .map_err(|e| classify_request_error(&e))?;
-    if !response.status().is_success() {
-        return Err(relay_error_message(response).await);
-    }
-    parse_json_response(response).await
-}
+mod query;
+/// Extension-subscription WS transport (§5 subscribe). Authority lives in
+/// `extensions::query::subscription`; this is bytes-to-frames only.
+pub(crate) mod subscribe;
+/// The unread-response half of the query send, for callers that must bound the
+/// response themselves rather than let `parse_json_response` swallow it whole.
+pub(crate) use query::send_query_no_wait;
+#[cfg(test)]
+pub(crate) use query::send_query_request;
+pub use query::{
+    query_relay, query_relay_at, query_relay_at_with_keys, query_relay_at_with_keys_no_wait,
+};
 
 // ── Command response parsing ────────────────────────────────────────────────
 
@@ -640,10 +559,41 @@ pub async fn submit_signed_event_with_keys(
     keys: &Keys,
     auth_tag: Option<&str>,
 ) -> Result<SubmitEventResponse, String> {
+    submit_prepared_event(state, keys, auth_tag, || Ok(event.clone()))
+        .await
+        .map(|(response, _)| response)
+}
+
+/// Wait for the shared rate-limit gate, then build and submit the event.
+///
+/// `prepare` runs **after** the wait and is where an effectful caller
+/// revalidates its authority and signs. Splitting it this way is what makes
+/// "checked immediately before the POST" true rather than aspirational.
+///
+/// The wait is unbounded from the caller's point of view — it is a global gate
+/// another request may have closed — so a grant can be revoked, an identity can
+/// enter recovery, and a frame can be released while a request sits in that
+/// queue. `prepare` runs at the last moment where refusing still costs nothing.
+///
+/// This is **not** cancellation: a POST already in flight is not recalled, and
+/// nothing here recovers an effect that has already committed.
+pub async fn submit_prepared_event(
+    state: &AppState,
+    keys: &Keys,
+    auth_tag: Option<&str>,
+    prepare: impl FnOnce() -> Result<nostr::Event, String>,
+) -> Result<(SubmitEventResponse, nostr::Event), String> {
+    // The wait comes first, and `prepare` runs *after* it. That ordering is the
+    // point: the gate is global and unbounded from this caller's view, so an
+    // authority check made before it is a check made at the wrong time, and an
+    // event signed before it is signed under an identity that may since have
+    // changed. Everything between `prepare` and `.send()` below is local work
+    // with no await, so nothing can intervene.
+    crate::relay_admission::wait_for_rate_limit().await;
+    let event = prepare()?;
     if event.pubkey != keys.public_key() {
         return Err("signed event does not match the publishing identity".to_string());
     }
-    crate::relay_admission::wait_for_rate_limit().await;
     let url = format!("{}/events", relay_api_base_url_with_override(state));
     let body_bytes = event.as_json().into_bytes();
     crate::egress_guard::assert_no_key_backup_bytes(&body_bytes, "signed event submit (keys)")?;
@@ -674,7 +624,9 @@ pub async fn submit_signed_event_with_keys(
         return Err(format!("relay rejected event: {}", result.message));
     }
 
-    Ok(result)
+    // The event travels back with the response: an effectful caller needs the
+    // bytes that were actually signed and sent, not a reconstruction of them.
+    Ok((result, event))
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────────

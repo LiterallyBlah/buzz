@@ -464,6 +464,15 @@ type E2eConfig = {
     // equals this is treated as a moderation DM (composer disabled). Absent →
     // fail open (no mod-DM detection), matching the Rust command's contract.
     relaySelf?: string | null;
+    // Extension install flow. `extensionPickPath` is what the mocked pickers
+    // return (null = the user cancelled); `extensionPreviewManifest` is the raw
+    // extension.json the read-only preview command hands back for zod to check;
+    // `extensionInstallError` makes the authoritative Rust install command
+    // reject, so a spec can prove a loader rejection reaches the screen.
+    extensionPickPath?: string | null;
+    extensionFrameOrigin?: string;
+    extensionPreviewManifest?: string;
+    extensionInstallError?: string;
     oaOwnerIsMe?: boolean;
     /** Whether the mock relay advertises NIP-43 membership support. Defaults to false. */
     relayRequiresMembership?: boolean;
@@ -1600,6 +1609,22 @@ const STARTER_WELCOME_CHANNEL_NAME = "welcome-everyone";
 let mockIdentityLostCleared = false;
 // Same pattern for `mock.identityLocked`.
 let mockIdentityLockedCleared = false;
+/**
+ * Installed extensions the mocked host reports.
+ *
+ * Starts empty so the Extensions area's empty state is the default, and a
+ * successful install is observable by the package appearing here — the spec
+ * asserts on inventory rather than on the command having been called.
+ */
+let mockInstalledExtensions: Array<Record<string, unknown>> = [];
+/**
+ * Live extension frames the mocked host believes it has.
+ *
+ * Lets a spec assert the acquire/release pairing — the real leak this guards
+ * against is a frame that never releases, leaving a localhost listener behind.
+ */
+let mockExtensionFrameHolders = new Set<string>();
+let mockExtensionFrameLeases = 0;
 
 // ── get_event defer/release seam ────────────────────────────────────────────
 // When `window.__BUZZ_E2E_DEFER_GET_EVENT__` is set to a target event ID,
@@ -11146,6 +11171,9 @@ export function maybeInstallE2eTauriMocks() {
   resetMockManagedAgents(config);
   resetMockPersonas(config);
   resetMockTeams(config);
+  mockInstalledExtensions = [];
+  mockExtensionFrameHolders = new Set<string>();
+  mockExtensionFrameLeases = 0;
   seedMockSearchProfiles(config);
   resetMockWorkflows();
   resetMockMesh();
@@ -14300,6 +14328,169 @@ export function maybeInstallE2eTauriMocks() {
           ? (identity?.pubkey ?? DEFAULT_MOCK_IDENTITY.pubkey)
           : "ff".repeat(32);
         return { owner, is_me: isMe };
+      }
+      // ── Extensions (preview flag) ─────────────────────────────────────────
+      // Inventory lives in `mockInstalledExtensions` so a successful install is
+      // observable in the list afterwards, rather than the spec asserting the
+      // command was called.
+      case "open_extension_frame": {
+        // The mock stands in for the localhost frame host, which cannot run in
+        // the E2E harness. It returns the same *shape* the Rust command does —
+        // a remote-class http origin — so the spec can assert what the DOM does
+        // with it. It does NOT reproduce the containment itself; that is
+        // platform-probed (probe/bx09), not CI-pinned.
+        const frameId = String((payload as { id?: string })?.id ?? "");
+        const installed = mockInstalledExtensions.find(
+          (entry) => entry.id === frameId,
+        );
+        if (installed?.enabled !== true) {
+          throw new Error("extension is disabled");
+        }
+        const origin =
+          activeConfig?.mock?.extensionFrameOrigin ?? "http://127.0.0.1:51234";
+        mockExtensionFrameLeases += 1;
+        const lease = `mock-lease-${mockExtensionFrameLeases}`;
+        mockExtensionFrameHolders.add(lease);
+        // The wrapper URL, not the entry: Buzz must never frame the extension
+        // document directly, or the navigation wall has no container.
+        return { url: `${origin}/frame/${frameId}`, origin, lease };
+      }
+      case "close_extension_frame":
+        // Only the presented lease, mirroring the Rust side.
+        mockExtensionFrameHolders.delete(
+          String((payload as { lease?: string })?.lease ?? ""),
+        );
+        return null;
+      case "__mock_extension_frame_holders":
+        return mockExtensionFrameHolders.size;
+      case "list_installed_extensions":
+        return mockInstalledExtensions.slice();
+      case "pick_extension_directory":
+      case "pick_extension_zip": {
+        const picked = activeConfig?.mock?.extensionPickPath;
+        return picked === undefined ? "/tmp/mock-extension" : picked;
+      }
+      case "preview_extension_package":
+        return {
+          source:
+            (payload as { source?: string })?.source ?? "/tmp/mock-extension",
+          manifestJson:
+            activeConfig?.mock?.extensionPreviewManifest ??
+            JSON.stringify({
+              id: "mock-extension",
+              name: "Mock Extension",
+              version: "0.1.0",
+              entry: "index.html",
+            }),
+        };
+      case "prepare_extension_from_directory":
+      case "prepare_extension_from_zip": {
+        const manifest = JSON.parse(
+          activeConfig?.mock?.extensionPreviewManifest ??
+            JSON.stringify({
+              id: "mock-extension",
+              name: "Mock Extension",
+              version: "0.1.0",
+              entry: "index.html",
+            }),
+        ) as Record<string, unknown>;
+        return {
+          token: "mock-prepared-token",
+          digest: "ab".repeat(32),
+          manifest: {
+            id: String(manifest.id ?? "mock-extension"),
+            name: String(manifest.name ?? "Mock Extension"),
+            version: String(manifest.version ?? "0.1.0"),
+            entry: String(manifest.entry ?? "index.html"),
+            scopes: {
+              identity: false,
+              storage: false,
+              extensionData: false,
+              sign: [],
+              read: [],
+              ...(manifest.scopes as Record<string, unknown> | undefined),
+            },
+            egress: (manifest.egress as string[] | undefined) ?? [],
+          },
+          sourceType: command.endsWith("zip") ? "zip" : "directory",
+          expiresAt: Math.floor(Date.now() / 1000) + 600,
+        };
+      }
+      case "cancel_prepared_extension":
+        return null;
+      case "approve_prepared_extension": {
+        const rejection = activeConfig?.mock?.extensionInstallError;
+        if (rejection) throw rejection;
+        const manifest = JSON.parse(
+          activeConfig?.mock?.extensionPreviewManifest ??
+            JSON.stringify({
+              id: "mock-extension",
+              name: "Mock Extension",
+              version: "0.1.0",
+              entry: "index.html",
+            }),
+        ) as Record<string, unknown>;
+        const selected = (payload as { selected?: Record<string, unknown> })
+          ?.selected ?? {
+          identity: false,
+          storage: false,
+          extensionData: false,
+          sign: [],
+          read: [],
+          egress: [],
+        };
+        const installed = {
+          id: String(manifest.id ?? "mock-extension"),
+          name: String(manifest.name ?? "Mock Extension"),
+          version: String(manifest.version ?? "0.1.0"),
+          entry: String(manifest.entry ?? "index.html"),
+          path: `/mock/app-data/extensions/${String(manifest.id ?? "mock-extension")}`,
+          installedAt: 1_700_000_000,
+          scopes: {
+            identity: false,
+            storage: false,
+            extensionData: false,
+            sign: [],
+            read: [],
+            ...(manifest.scopes as Record<string, unknown> | undefined),
+          },
+          egress: (manifest.egress as string[] | undefined) ?? [],
+          digest: "ab".repeat(32),
+          enabled: false,
+          granted: selected,
+        };
+        mockInstalledExtensions = mockInstalledExtensions
+          .filter((entry) => entry.id !== installed.id)
+          .concat(installed);
+        return installed;
+      }
+      case "set_extension_enabled": {
+        const request = payload as { id?: string; enabled?: boolean };
+        const existing = mockInstalledExtensions.find(
+          (entry) => entry.id === request.id,
+        );
+        if (!existing) throw new Error("extension is not installed");
+        existing.enabled = request.enabled === true;
+        return { ...existing };
+      }
+      case "update_extension_grants": {
+        const request = payload as {
+          id?: string;
+          selected?: Record<string, unknown>;
+        };
+        const existing = mockInstalledExtensions.find(
+          (entry) => entry.id === request.id,
+        );
+        if (!existing) throw new Error("extension is not installed");
+        existing.granted = request.selected ?? {};
+        return { ...existing };
+      }
+      case "remove_extension": {
+        const id = String((payload as { id?: string })?.id ?? "");
+        mockInstalledExtensions = mockInstalledExtensions.filter(
+          (entry) => entry.id !== id,
+        );
+        return { removed: true, recoveryPath: null };
       }
       case "list_archived_identities": {
         const archived = activeConfig?.mock?.archivedIdentities ?? [];

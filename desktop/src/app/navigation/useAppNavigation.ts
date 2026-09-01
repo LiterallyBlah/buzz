@@ -104,6 +104,29 @@ export function useAppNavigation() {
     [commitNavigation],
   );
 
+  const goExtension = React.useCallback(
+    (extensionId: string, behavior?: NavigationBehavior) =>
+      commitNavigation(
+        {
+          to: "/extensions/$extensionId",
+          params: { extensionId },
+        },
+        behavior,
+      ),
+    [commitNavigation],
+  );
+
+  const goExtensions = React.useCallback(
+    (behavior?: NavigationBehavior) =>
+      commitNavigation(
+        {
+          to: "/extensions",
+        },
+        behavior,
+      ),
+    [commitNavigation],
+  );
+
   const goProfile = React.useCallback(
     (pubkey: string, behavior?: NavigationBehavior) =>
       commitNavigation(
@@ -462,6 +485,8 @@ export function useAppNavigation() {
     goChannel,
     goDuplicateWorkflow,
     goEditWorkflow,
+    goExtension,
+    goExtensions,
     goForumPost,
     goHome,
     goNewMessage,

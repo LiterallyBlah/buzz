@@ -133,12 +133,26 @@ fn main() {
     }
 
     tauri_build::try_build(
-        tauri_build::Attributes::new().plugin(
-            "websocket",
-            tauri_build::InlinedPlugin::new()
-                .commands(&["connect", "send", "disconnect", "disconnect_all"])
-                .default_permission(tauri_build::DefaultPermissionRule::AllowAllCommands),
-        ),
+        tauri_build::Attributes::new()
+            .plugin(
+                "websocket",
+                tauri_build::InlinedPlugin::new()
+                    .commands(&["connect", "send", "disconnect", "disconnect_all"])
+                    .default_permission(tauri_build::DefaultPermissionRule::AllowAllCommands),
+            )
+            // The extension bridge. Deliberately NO default permission: a
+            // capability must name `extension-bridge:allow-resolve-identity`
+            // explicitly, so the grant cannot widen by accident. A plugin (not
+            // an app) command because plugin commands are always ACL-checked,
+            // and Buzz has no `__app__` manifest to grant app commands through.
+            .plugin(
+                "extension-bridge",
+                tauri_build::InlinedPlugin::new().commands(&[
+                    "resolve_identity",
+                    "invoke",
+                    "stream_control",
+                ]),
+            ),
     )
     .expect("failed to build Tauri application");
 }

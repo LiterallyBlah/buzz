@@ -342,6 +342,10 @@ const EVENTS_INVENTORY: &[(&str, usize, usize)] = &[
     // Stub-relay route in the tombstone-flush gate tests; production flush
     // publishes through the guarded boundary-1 funnel.
     ("src/commands/teams/pending/tests/gate.rs", 1, 0),
+    // The 5b live-subscription proof publishes real signed events to a relay it
+    // owns. Guarded rather than listed as a test-only fixture: it is the one
+    // test-side site that builds a body from live material.
+    ("src/extensions/query_live_proof_tests.rs", 1, 1),
 ];
 
 // Needles are assembled at runtime so this scan file itself contains no

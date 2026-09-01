@@ -1,4 +1,4 @@
-import { Activity, Bot, Folders, Inbox, Zap } from "lucide-react";
+import { Activity, Bot, Folders, Inbox, Puzzle, Zap } from "lucide-react";
 
 import { TopbarSearch } from "@/features/search/ui/TopbarSearch";
 import { ProjectsUnreadBadge } from "@/features/sidebar/ui/ProjectsUnreadBadge";
@@ -21,7 +21,8 @@ type SidebarSelectedView =
   | "agents"
   | "workflows"
   | "pulse"
-  | "projects";
+  | "projects"
+  | "extensions";
 
 type AppSidebarPinnedHeaderProps = {
   channelLabels: Record<string, string>;
@@ -42,6 +43,7 @@ type AppSidebarPinnedHeaderProps = {
 type AppSidebarPrimaryMenuProps = {
   homeBadgeCount: number;
   onSelectAgents: () => void;
+  onSelectExtensions: () => void;
   onSelectHome: () => void;
   onSelectProjects: () => void;
   onSelectPulse: () => void;
@@ -92,6 +94,7 @@ export function AppSidebarPinnedHeader({
 export function AppSidebarPrimaryMenu({
   homeBadgeCount,
   onSelectAgents,
+  onSelectExtensions,
   onSelectHome,
   onSelectProjects,
   onSelectPulse,
@@ -169,6 +172,20 @@ export function AppSidebarPrimaryMenu({
               <SidebarMenuLabel>Agents</SidebarMenuLabel>
             </SidebarMenuButton>
           </SidebarMenuItem>
+          <FeatureGate feature="extensions">
+            <SidebarMenuItem>
+              <SidebarMenuButton
+                data-testid="open-extensions-view"
+                isActive={selectedView === "extensions"}
+                onClick={onSelectExtensions}
+                tooltip="Extensions"
+                type="button"
+              >
+                <Puzzle className="h-4 w-4" />
+                <SidebarMenuLabel>Extensions</SidebarMenuLabel>
+              </SidebarMenuButton>
+            </SidebarMenuItem>
+          </FeatureGate>
           <FeatureGate feature="workflows">
             <SidebarMenuItem>
               <SidebarMenuButton

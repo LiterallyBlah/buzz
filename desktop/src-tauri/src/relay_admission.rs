@@ -42,10 +42,6 @@ pub const MAX_HINT_SECONDS: u64 = 300;
 
 static GATE_EXPIRY: Mutex<Option<Instant>> = Mutex::new(None);
 
-// The gate is process-wide, so every test that can arm it must serialize.
-#[cfg(test)]
-pub(crate) static TEST_SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
 /// Arm (or extend) the admission gate from a relay 429.
 ///
 /// `retry_in_seconds` is the parsed `retry in Ns` hint, if the relay provided
@@ -104,13 +100,34 @@ pub fn reset_rate_limit_gate() {
     *GATE_EXPIRY.lock().unwrap_or_else(|e| e.into_inner()) = None;
 }
 
+/// The one guard every test that arms or traverses the gate must hold.
+///
+/// The gate is a process-wide static shared by every test in this binary, so
+/// armed expiries bleed between parallel test threads unless they serialize.
+/// It lives beside the gate rather than inside one module's `mod tests` so
+/// that *any* suite crossing `wait_for_rate_limit` can take it — a suite that
+/// traverses the gate without holding this is exposed to whatever another test
+/// armed, and will fail in ways that look like its own flakiness.
+#[cfg(test)]
+pub(crate) static TEST_SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Take [`TEST_SERIAL`] and start from a known-inactive gate.
+///
+/// The one fixture for every test that arms *or merely traverses* the gate.
+/// Holding the lock without resetting still inherits a previous test's armed
+/// expiry, and traversing without holding it races a test that arms one — so
+/// pairing the two in a single call is what makes "every traversing test is
+/// guarded" checkable rather than a convention each test restates.
+#[cfg(test)]
+pub(crate) async fn gate_guard() -> tokio::sync::MutexGuard<'static, ()> {
+    let guard = TEST_SERIAL.lock().await;
+    reset_rate_limit_gate();
+    guard
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // The gate is a process-wide static shared by every test in this binary,
-    // so all tests that arm it serialize on one async lock to keep expiries
-    // from bleeding between parallel test threads.
 
     #[tokio::test(start_paused = true)]
     async fn wait_returns_immediately_when_gate_is_inactive() {
