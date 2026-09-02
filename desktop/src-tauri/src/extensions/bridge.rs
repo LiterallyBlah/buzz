@@ -62,14 +62,34 @@ pub struct BridgeIdentity {
 /// `publish.event` over the framed port. This command remains the plumbing
 /// proof — plugin command, ACL-gated, identity from host state. Subscriptions
 /// and request cancellation are what is still held.
-#[tauri::command]
-pub(crate) async fn resolve_identity(lease: String) -> Result<BridgeIdentity, String> {
-    match frame_host::extension_for_lease(&lease) {
+fn caller_authorized<R: Runtime>(webview: &tauri::Webview<R>, lease: &str) -> bool {
+    let label = webview.label();
+    frame_host::lease_authority_for_caller(lease, label).is_some()
+        && (!label.starts_with(super::native_window::NATIVE_WINDOW_LABEL_PREFIX)
+            || webview.url().ok().is_some_and(|url| {
+                super::native_window::caller_authorized(label, lease, url.as_str())
+            }))
+}
+
+async fn resolve_identity_for_label(label: &str, lease: String) -> Result<BridgeIdentity, String> {
+    match frame_host::lease_authority_for_caller(&lease, label)
+        .is_some()
+        .then(|| frame_host::extension_for_lease(&lease))
+        .flatten()
+    {
         Some(extension_id) => Ok(BridgeIdentity { extension_id }),
         // One message for unknown and released alike: distinguishing them would
         // let a caller probe which leases have existed.
         None => Err("no live extension frame for this lease".to_string()),
     }
+}
+
+#[tauri::command]
+pub(crate) async fn resolve_identity<R: Runtime>(
+    webview: tauri::Webview<R>,
+    lease: String,
+) -> Result<BridgeIdentity, String> {
+    resolve_identity_for_label(webview.label(), lease).await
 }
 
 /// The §2 request entry point: one frame in, one reply out.
@@ -86,11 +106,18 @@ pub(crate) async fn resolve_identity(lease: String) -> Result<BridgeIdentity, St
 #[tauri::command]
 pub(crate) async fn invoke<R: Runtime>(
     app: tauri::AppHandle<R>,
+    webview: tauri::Webview<R>,
     lease: String,
     v: u32,
     method: String,
     params: Option<serde_json::Value>,
 ) -> super::dispatch::BridgeReply {
+    if !caller_authorized(&webview, &lease) {
+        return super::dispatch::BridgeReply::err(
+            super::dispatch::code::DENIED,
+            "extension caller is not authorised for this lease",
+        );
+    }
     super::dispatch::dispatch(&app, &lease, v, &method, params).await
 }
 
@@ -100,6 +127,7 @@ pub(crate) async fn invoke<R: Runtime>(
 #[tauri::command]
 pub(crate) async fn stream_control<R: Runtime>(
     app: tauri::AppHandle<R>,
+    webview: tauri::Webview<R>,
     lease: String,
     action: String,
     sub: String,
@@ -108,7 +136,11 @@ pub(crate) async fn stream_control<R: Runtime>(
     frame_count: Option<usize>,
     encoded_bytes: Option<usize>,
 ) {
-    if lease.len() > 128 || sub.is_empty() || sub.len() > 128 {
+    if !caller_authorized(&webview, &lease)
+        || lease.len() > 128
+        || sub.is_empty()
+        || sub.len() > 128
+    {
         return;
     }
     match action.as_str() {
@@ -132,6 +164,18 @@ pub(crate) async fn stream_control<R: Runtime>(
     }
 }
 
+/// The trusted native wrapper calls this only after it owns the host-created
+/// MessageChannel and installed its bounded stream listener. The hostile child
+/// has neither the matching URL capability nor the exact invoking label.
+#[tauri::command]
+pub(crate) async fn native_ready<R: Runtime>(
+    app: tauri::AppHandle<R>,
+    webview: tauri::Webview<R>,
+    lease: String,
+) -> Result<super::native_window::NativeExtensionWindowStatus, String> {
+    super::native_window::mark_ready(&app, webview.label(), &lease)
+}
+
 /// Plugin name. Must match the `tauri_build::InlinedPlugin` entry in `build.rs`
 /// or the generated ACL manifest will not resolve and every grant fails.
 pub(crate) const PLUGIN_NAME: &str = "extension-bridge";
@@ -141,7 +185,8 @@ pub(crate) fn init<R: Runtime>() -> TauriPlugin<R> {
         .invoke_handler(tauri::generate_handler![
             resolve_identity,
             invoke,
-            stream_control
+            stream_control,
+            native_ready
         ])
         .build()
 }
@@ -152,7 +197,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_unknown_lease_resolves_to_nothing() {
-        let outcome = resolve_identity("not-a-lease".to_string()).await;
+        let outcome = resolve_identity_for_label("main", "not-a-lease".to_string()).await;
         assert!(
             outcome.is_err(),
             "an invented lease must not resolve to an identity"
@@ -183,15 +228,23 @@ mod tests {
             .await
             .expect("acquire");
 
-        let identity = resolve_identity(claim.lease.clone())
+        let identity = resolve_identity_for_label("main", claim.lease.clone())
             .await
             .expect("a live lease must resolve");
         assert_eq!(identity.extension_id, "demo");
+        assert!(
+            resolve_identity_for_label("extension-secure-wrong", claim.lease.clone())
+                .await
+                .is_err(),
+            "a different invoking label must not reuse the lease"
+        );
 
         // Release is terminal: the same token stops working.
         frame_host::release(&claim.lease);
         assert!(
-            resolve_identity(claim.lease).await.is_err(),
+            resolve_identity_for_label("main", claim.lease)
+                .await
+                .is_err(),
             "a released lease must not keep resolving"
         );
     }

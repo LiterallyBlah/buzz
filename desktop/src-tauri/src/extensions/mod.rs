@@ -25,6 +25,7 @@ mod frame_host;
 mod agent_conversation;
 mod install;
 pub(crate) mod management;
+pub(crate) mod native_window;
 // `pub(crate)` so the signer enforcement in the bridge (P4) can import
 // `manifest::EXTENSION_SIGNABLE_KINDS` rather than re-declare the allowlist.
 // One writer, two consumers.
@@ -155,7 +156,8 @@ pub async fn install_extension_from_zip(
 ///
 /// Called from app shutdown so a listener can never outlive the process, even
 /// if a frame never released — a crashed or reloaded webview does exactly that.
-pub(crate) fn shutdown_frame_host() {
+pub(crate) fn shutdown_extension_surfaces<R: tauri::Runtime>(app: &AppHandle<R>) {
+    native_window::close_all(app);
     frame_host::shutdown_now();
     management::clear_prepared();
 }

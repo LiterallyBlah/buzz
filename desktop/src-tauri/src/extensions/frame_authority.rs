@@ -8,6 +8,16 @@ pub(crate) struct LeaseAuthority {
     pub(crate) grant_generation: u64,
 }
 
+/// Host-derived composition policy for the trusted wrapper.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WrapperMode {
+    /// Existing Linux/WebKit composition: Buzz's main DOM frames the wrapper.
+    LinuxIframe,
+    /// Windows composition: the wrapper is the top-level document of a
+    /// dedicated native WebView2 window.
+    WindowsTopLevel,
+}
+
 #[derive(Debug, Clone)]
 pub(super) struct LeaseOwner {
     pub(super) authority: LeaseAuthority,
@@ -18,6 +28,10 @@ pub(super) struct LeaseOwner {
     /// requests never re-read a mutable package manifest.
     pub(super) entry: String,
     pub(super) egress: Vec<String>,
+    /// Exact invoking webview label authorised for bridge plugin commands.
+    /// Linux binds to `main`; Windows binds to one fresh native label.
+    pub(super) caller_label: String,
+    pub(super) wrapper_mode: WrapperMode,
 }
 
 pub(super) fn content_security_policy_with_egress(origin: &str, egress: &[String]) -> String {
@@ -40,6 +54,20 @@ pub(super) fn content_security_policy_with_egress(origin: &str, egress: &[String
     )
 }
 
+pub(super) fn static_lease_owner(
+    context: &str,
+    package_digest: &str,
+    extension_id: &str,
+) -> Option<(String, LeaseOwner)> {
+    let state = super::frame_host::host_state();
+    let lease = state.contexts.get(context)?;
+    let owner = state.leases.get(lease)?;
+    (owner.static_context == context
+        && owner.authority.package_digest == package_digest
+        && owner.authority.extension_id == extension_id)
+        .then(|| (lease.clone(), owner.clone()))
+}
+
 /// Resolve one opaque static-host context to exactly one still-live lease owner.
 /// There is no extension-id scan and therefore no insertion-order authority.
 pub(super) fn static_owner(
@@ -47,13 +75,7 @@ pub(super) fn static_owner(
     package_digest: &str,
     extension_id: &str,
 ) -> Option<LeaseOwner> {
-    let state = super::frame_host::host_state();
-    let lease = state.contexts.get(context)?;
-    let owner = state.leases.get(lease)?;
-    (owner.static_context == context
-        && owner.authority.package_digest == package_digest
-        && owner.authority.extension_id == extension_id)
-        .then(|| owner.clone())
+    static_lease_owner(context, package_digest, extension_id).map(|(_, owner)| owner)
 }
 
 pub(crate) fn lease_authority_snapshot(lease: &str) -> Option<LeaseAuthority> {
@@ -63,18 +85,21 @@ pub(crate) fn lease_authority_snapshot(lease: &str) -> Option<LeaseAuthority> {
         .map(|owner| owner.authority.clone())
 }
 
-pub(crate) fn extension_for_lease(lease: &str) -> Option<String> {
-    lease_authority_snapshot(lease).map(|owner| owner.extension_id)
+/// Resolve authority only when the actual invoking webview label matches the
+/// host-issued lease. Payload identity can never select this relationship.
+pub(crate) fn lease_authority_for_caller(
+    lease: &str,
+    caller_label: &str,
+) -> Option<LeaseAuthority> {
+    super::frame_host::host_state()
+        .leases
+        .get(lease)
+        .filter(|owner| owner.caller_label == caller_label)
+        .map(|owner| owner.authority.clone())
 }
 
-pub(crate) fn lease_authority(lease: &str) -> Option<(String, String, String)> {
-    lease_authority_snapshot(lease).map(|owner| {
-        (
-            owner.extension_id,
-            owner.identity_pubkey,
-            owner.package_digest,
-        )
-    })
+pub(crate) fn extension_for_lease(lease: &str) -> Option<String> {
+    lease_authority_snapshot(lease).map(|owner| owner.extension_id)
 }
 
 pub(crate) fn release_for_identity_extension(identity_pubkey: &str, extension_id: &str) -> usize {
@@ -106,6 +131,23 @@ pub(crate) fn insert_authorized_lease_for_test(
     identity_pubkey: &str,
     package_digest: &str,
 ) {
+    insert_authorized_lease_with_generation_for_test(
+        lease,
+        extension_id,
+        identity_pubkey,
+        package_digest,
+        1,
+    );
+}
+
+#[cfg(test)]
+pub(crate) fn insert_authorized_lease_with_generation_for_test(
+    lease: &str,
+    extension_id: &str,
+    identity_pubkey: &str,
+    package_digest: &str,
+    grant_generation: u64,
+) {
     let context = format!("test-context-{lease}");
     let mut state = super::frame_host::host_state();
     state.contexts.insert(context.clone(), lease.to_string());
@@ -116,11 +158,13 @@ pub(crate) fn insert_authorized_lease_for_test(
                 extension_id: extension_id.to_string(),
                 identity_pubkey: identity_pubkey.to_string(),
                 package_digest: package_digest.to_string(),
-                grant_generation: 1,
+                grant_generation,
             },
             static_context: context,
             entry: "index.html".to_string(),
             egress: Vec::new(),
+            caller_label: "main".to_string(),
+            wrapper_mode: WrapperMode::LinuxIframe,
         },
     );
 }

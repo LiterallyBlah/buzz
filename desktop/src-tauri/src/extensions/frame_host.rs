@@ -26,11 +26,11 @@
 //! |---|---|
 //! | `fetch`, `XMLHttpRequest`, `WebSocket`, `EventSource`, `navigator.sendBeacon` | `connect-src 'none'` |
 //! | `location` / link / `window.open` / form submission | wrapper `frame-src <loopback>`; sandbox omits `allow-top-navigation` and `allow-popups` |
-//! | `RTCPeerConnection` (STUN/TURN) | `webrtc 'block'` where honoured, **plus** the realm lockdown below — which governs the **initial document only** |
+//! | `RTCPeerConnection` (STUN/TURN) | Linux retains `webrtc 'block'` plus the initial-document lockdown below; Windows uses the accepted all-frame script in a dedicated WebView2 environment |
 //! | `img`, `script`, `style`, `font`, `media`, `object` | `default-src 'none'`, widened only to the loopback origin per type |
 //! | `<iframe>` / `blob:` frame | `frame-src 'none'` (from `default-src`) |
 //! | `srcdoc` frame, **inline** child script | not a load, so `frame-src` misses it — the inherited policy has no `'unsafe-inline'`, so inline child script does not run |
-//! | `srcdoc` frame, **external** child script | **OPEN — this is route 1.** The child inherits `script-src <loopback>`, so `<script src="…">` pointing at a package asset still runs, in a fresh realm the prologue never reached. Assigned to the isolation phase; **no wall in this file closes it** |
+//! | `srcdoc` frame, **external** child script | Linux remains on its accepted WebKit iframe composition; on Windows the dedicated environment's all-frame injection reaches this fresh realm before package script |
 //! | `Worker` / `SharedWorker` | **unreachable** under the measured sandbox — a same-origin worker throws `SecurityError` (opaque origin) and `blob:` is not a `script-src` source. Measured on Chromium and WebKitGTK |
 //! | `import()` / dynamic module | `script-src` is loopback-only |
 //! | `<link rel=prefetch/prerender/dns-prefetch/preconnect>`, speculation rules | **Engine-specific, not a CSP theorem.** CSP's treatment of resource hints is unresolved upstream (`prefetch-src` was removed), so do not credit `default-src 'none'` generically. *Measured* on the shipping WebKitGTK: `preconnect` reached a live external TCP sink under a widened policy (1 connection) and reached it **0** times under the shipped default-deny policy, with `preconnect-attempted` true in both — and DNS prefetching is removed from that engine outright (getter deprecated, always FALSE). Treat as a per-engine row: re-measure on WebView2/WKWebView rather than assuming |
@@ -95,15 +95,17 @@ use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 
 use super::frame_authority::{
-    content_security_policy_with_egress, static_owner, LeaseAuthority, LeaseOwner,
+    content_security_policy_with_egress, static_lease_owner, static_owner, LeaseAuthority,
+    LeaseOwner, WrapperMode,
 };
 pub(crate) use super::frame_authority::{
-    extension_for_lease, lease_authority, lease_authority_snapshot, release_for_extension_id,
-    release_for_identity_extension,
+    extension_for_lease, lease_authority_for_caller, lease_authority_snapshot,
+    release_for_extension_id, release_for_identity_extension,
 };
 #[cfg(test)]
 pub(crate) use super::frame_authority::{
-    insert_authorized_lease_for_test, insert_lease_for_test, lifecycle_guard, running_port,
+    insert_authorized_lease_for_test, insert_authorized_lease_with_generation_for_test,
+    insert_lease_for_test, lifecycle_guard, running_port,
 };
 use super::manifest::is_valid_extension_id;
 use super::package_path::check_package_relative_path;
@@ -264,35 +266,22 @@ fn content_security_policy(origin: &str) -> String {
 /// `extension_origin` is the origin the wrapper is allowed to frame — a
 /// *different* origin from the one serving this document.
 ///
-/// # Why `frame-ancestors 'none'` is NOT here yet
+/// # Platform-specific `frame-ancestors`
 ///
-/// It belongs here eventually: it is the confused-deputy wall, stopping a
-/// hostile extension from embedding a wrapper to obtain a trusted instance with
-/// itself as parent. Unlike `frame-src` it is enforced by the embedded document
-/// against its embedder, so it binds even when the embedder is permissive.
-///
-/// **But Buzz currently frames this document itself.** `open_extension_frame`
-/// returns the wrapper URL and `ExtensionFrame.tsx` renders it as
-/// `<iframe src={target.url}>`, so `frame-ancestors 'none'` refuses the very
-/// composition that ships — the extension surface goes blank. That was measured
-/// in Chromium, not reasoned about: framed → 0 markers, top-level → 1.
-///
-/// **Reinstate it when, and only when, the wrapper becomes the top-level
-/// document of the dedicated native webview.** Adding it before that migration
-/// breaks the product.
-///
-/// Deferring is safe in the composition that ships today, for two independent
-/// reasons — this is a sequencing decision, not an accepted hole:
-///
-/// 1. the extension document's own policy is `default-src 'none'` with **no**
-///    `frame-src`, so a hostile package cannot frame anything at all, let alone
-///    a wrapper;
-/// 2. **no capability grants the bridge**, so a wrapper instance obtained by a
-///    confused deputy would hold no authority worth stealing.
-///
-/// Both of those change at the same migration that makes the header safe to add.
+/// Windows serves the wrapper as the top-level document of the dedicated native
+/// window, so it receives `frame-ancestors 'none'`. Linux must remain embeddable
+/// by Buzz's main DOM and therefore omits that directive. The mode is frozen in
+/// the host-issued lease; no query or package value selects it.
+#[cfg(test)]
 fn wrapper_content_security_policy(extension_origin: &str) -> String {
-    format!(
+    wrapper_content_security_policy_for_mode(extension_origin, WrapperMode::LinuxIframe)
+}
+
+pub(crate) fn wrapper_content_security_policy_for_mode(
+    extension_origin: &str,
+    mode: WrapperMode,
+) -> String {
+    let mut policy = format!(
         "default-src 'none'; \
          frame-src {extension_origin}; \
          script-src 'unsafe-inline'; \
@@ -300,7 +289,11 @@ fn wrapper_content_security_policy(extension_origin: &str) -> String {
          connect-src 'none'; \
          base-uri 'none'; \
          form-action 'none'"
-    )
+    );
+    if mode == WrapperMode::WindowsTopLevel {
+        policy.push_str("; frame-ancestors 'none'");
+    }
+    policy
 }
 
 /// The trusted wrapper document that hosts one extension frame.
@@ -317,8 +310,9 @@ fn wrapper_content_security_policy(extension_origin: &str) -> String {
 ///    itself created — and the wrapper embeds exactly one extension, so the
 ///    attribution stays one-to-one.
 ///
-/// This relays; it does not interpret. No bridge, no `window.buzz`, no method
-/// dispatch — those are P4.
+/// This Linux form relays; it does not interpret. The Windows top-level form is
+/// emitted separately and owns the host-created channel because it has no DOM
+/// parent. Both converge on the same Rust dispatch and authority functions.
 fn wrapper_document(entry_url: &str) -> String {
     format!(
         r#"<!doctype html>
@@ -355,6 +349,29 @@ fn wrapper_document(entry_url: &str) -> String {
 </script>
 "#
     )
+}
+
+fn native_wrapper_document(entry_url: &str, lease: &str) -> String {
+    let lease_json = serde_json::to_string(lease).unwrap_or_else(|_| "null".to_string());
+    let template = include_str!("native_wrapper.js");
+    debug_assert_eq!(template.matches("__BUZZ_NATIVE_LEASE_JSON__").count(), 1);
+    let script = template.replace("__BUZZ_NATIVE_LEASE_JSON__", &lease_json);
+    format!(
+        r#"<!doctype html>
+<meta charset="utf-8">
+<title>Buzz secure extension</title>
+<style>html,body{{margin:0;height:100%;background:#fff}}iframe{{display:block;border:0;width:100%;height:100%}}</style>
+<iframe id="ext" sandbox="allow-scripts" src="{entry_url}"></iframe>
+<script>{script}</script>
+"#
+    )
+}
+
+fn wrapper_document_for_owner(entry_url: &str, lease: &str, owner: &LeaseOwner) -> String {
+    match owner.wrapper_mode {
+        WrapperMode::LinuxIframe => wrapper_document(entry_url),
+        WrapperMode::WindowsTopLevel => native_wrapper_document(entry_url, lease),
+    }
 }
 
 /// The realm lockdown, served as a file and injected as an external script.
@@ -629,7 +646,7 @@ async fn serve_wrapper(
     RoutePath((context, digest, id)): RoutePath<(String, String, String)>,
 ) -> Response {
     let _fence = super::management::lifecycle_read_fence().await;
-    let Some(owner) = static_owner(&context, &digest, &id) else {
+    let Some((lease, owner)) = static_lease_owner(&context, &digest, &id) else {
         return empty(StatusCode::NOT_FOUND);
     };
     let entry_url = frame_url(
@@ -640,13 +657,15 @@ async fn serve_wrapper(
         &owner.entry,
     );
 
-    let mut response = Response::new(Body::from(wrapper_document(&entry_url)));
+    let mut response = Response::new(Body::from(wrapper_document_for_owner(
+        &entry_url, &lease, &owner,
+    )));
     let headers = response.headers_mut();
     insert(headers, header::CONTENT_TYPE, "text/html; charset=utf-8");
     insert(
         headers,
         header::CONTENT_SECURITY_POLICY,
-        &wrapper_content_security_policy(&state.extension_origin),
+        &wrapper_content_security_policy_for_mode(&state.extension_origin, owner.wrapper_mode),
     );
     insert(headers, header::X_CONTENT_TYPE_OPTIONS, "nosniff");
     insert(headers, header::CACHE_CONTROL, "no-store");
@@ -795,7 +814,10 @@ pub(crate) use frame_lifecycle::acquire;
 #[cfg(test)]
 pub(crate) use frame_lifecycle::acquire_authorized;
 pub(super) use frame_lifecycle::fence_extension;
-pub(crate) use frame_lifecycle::{acquire_authorized_with_generation, release, shutdown_now};
+pub(crate) use frame_lifecycle::{
+    acquire_authorized_with_generation, acquire_authorized_with_generation_and_label, release,
+    shutdown_now,
+};
 
 // ── Tests ────────────────────────────────────────────────────────────────────
 

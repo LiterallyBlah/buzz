@@ -131,6 +131,79 @@ test("leaving the tab releases the frame host", async ({ page }) => {
   await expect.poll(holders).toBe(0);
 });
 
+test("Windows uses one explicit secure native window and reopen rotates its label", async ({
+  page,
+}) => {
+  await installMockBridge(page, {
+    extensionPickPath: "/tmp/equation-explorer",
+    extensionPreviewManifest: MANIFEST,
+    extensionSurfaceMode: "windows-native-window",
+  });
+  await installOne(page);
+  await page.getByTestId("open-extension-equation-explorer").click();
+
+  await expect(
+    page.getByTestId("extension-native-window-status"),
+  ).toBeVisible();
+  await expect(page.getByTestId("extension-frame")).toHaveCount(0);
+  const windows = async () =>
+    (await page.evaluate(() =>
+      window.__BUZZ_E2E_INVOKE_MOCK_COMMAND__?.(
+        "__mock_native_extension_windows",
+      ),
+    )) as Array<{ label: string }>;
+
+  expect(await windows()).toEqual([]);
+  await page.getByTestId("extension-native-window-open").click();
+  await expect(page.getByTestId("extension-native-window-state")).toHaveText(
+    "Secure window is open.",
+  );
+  const first = await windows();
+  expect(first).toHaveLength(1);
+
+  // Repeated Open is a focus operation, not a duplicate surface.
+  await page.getByTestId("extension-native-window-open").click();
+  expect(await windows()).toEqual(first);
+
+  await page.getByTestId("extension-native-window-close").click();
+  await expect(page.getByTestId("extension-native-window-state")).toHaveText(
+    "Secure window is closed.",
+  );
+  expect(await windows()).toEqual([]);
+
+  await page.getByTestId("extension-native-window-open").click();
+  const second = await windows();
+  expect(second).toHaveLength(1);
+  expect(second[0]?.label).not.toBe(first[0]?.label);
+
+  await page.getByTestId("extension-frame-back").click();
+  await expect(page.getByTestId("extensions-view")).toBeVisible();
+  await expect.poll(windows).toEqual([]);
+});
+
+test("Windows native creation failure is visible and leaks no window", async ({
+  page,
+}) => {
+  await installMockBridge(page, {
+    extensionPickPath: "/tmp/equation-explorer",
+    extensionPreviewManifest: MANIFEST,
+    extensionSurfaceMode: "windows-native-window",
+    extensionNativeWindowError: "WebView2 creation refused",
+  });
+  await installOne(page);
+  await page.getByTestId("open-extension-equation-explorer").click();
+  await page.getByTestId("extension-native-window-open").click();
+  await expect(page.getByTestId("extension-native-window-state")).toContainText(
+    "WebView2 creation refused",
+  );
+  const windows = await page.evaluate(() =>
+    window.__BUZZ_E2E_INVOKE_MOCK_COMMAND__?.(
+      "__mock_native_extension_windows",
+    ),
+  );
+  expect(windows).toEqual([]);
+});
+
 test("the frame does not render when the preview flag is off", async ({
   page,
 }) => {

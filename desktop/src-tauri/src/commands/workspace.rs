@@ -211,6 +211,10 @@ pub async fn apply_workspace(
         assert_current_apply_generation(&state.workspace_apply_generation, apply_generation)?;
 
         // ── Apply all state changes (nothing below can fail) ──────────────────
+        // A workspace/identity transition is a terminal boundary for native
+        // extension labels, ports and UDF authority. Close before mutating the
+        // signer so no old window can observe the new identity.
+        crate::extensions::native_window::close_all(&app);
         {
             let mut override_guard = state.relay_url_override.lock().map_err(|e| e.to_string())?;
             *override_guard = Some(relay_url);

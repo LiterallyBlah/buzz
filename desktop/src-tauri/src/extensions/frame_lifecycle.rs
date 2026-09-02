@@ -16,6 +16,8 @@ pub(crate) async fn acquire(base_dir: PathBuf, extension_id: &str) -> Result<Fra
         1,
         "index.html",
         Vec::new(),
+        "main",
+        WrapperMode::LinuxIframe,
     )
     .await
 }
@@ -50,10 +52,37 @@ pub(crate) async fn acquire_authorized_with_generation(
     entry: &str,
     egress: Vec<String>,
 ) -> Result<FrameLease, String> {
+    acquire_authorized_with_generation_and_label(
+        base_dir,
+        extension_id,
+        identity_pubkey,
+        package_digest,
+        grant_generation,
+        entry,
+        egress,
+        "main",
+        WrapperMode::LinuxIframe,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn acquire_authorized_with_generation_and_label(
+    base_dir: PathBuf,
+    extension_id: &str,
+    identity_pubkey: &str,
+    package_digest: &str,
+    grant_generation: u64,
+    entry: &str,
+    egress: Vec<String>,
+    caller_label: &str,
+    wrapper_mode: WrapperMode,
+) -> Result<FrameLease, String> {
     if identity_pubkey.is_empty()
         || package_digest.is_empty()
         || grant_generation == 0
         || entry.is_empty()
+        || caller_label.is_empty()
     {
         return Err("enabled extension authority is incomplete".to_string());
     }
@@ -65,6 +94,8 @@ pub(crate) async fn acquire_authorized_with_generation(
         grant_generation,
         entry,
         egress,
+        caller_label,
+        wrapper_mode,
     )
     .await
 }
@@ -76,6 +107,7 @@ fn install_owner(state: &mut FrameHostState, lease: &str, owner: &LeaseOwner) {
     state.leases.insert(lease.to_string(), owner.clone());
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn acquire_inner(
     base_dir: PathBuf,
     extension_id: &str,
@@ -84,6 +116,8 @@ async fn acquire_inner(
     grant_generation: u64,
     entry: &str,
     egress: Vec<String>,
+    caller_label: &str,
+    wrapper_mode: WrapperMode,
 ) -> Result<FrameLease, String> {
     let lease = uuid::Uuid::new_v4().to_string();
     let static_context = uuid::Uuid::new_v4().to_string();
@@ -97,6 +131,8 @@ async fn acquire_inner(
         static_context: static_context.clone(),
         entry: entry.to_string(),
         egress,
+        caller_label: caller_label.to_string(),
+        wrapper_mode,
     };
     let (opening_epoch, opening_extension_epoch) = {
         let mut state = host_state();

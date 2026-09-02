@@ -93,7 +93,9 @@ fn now_unix() -> u64 {
         .map_or(0, |duration| duration.as_secs())
 }
 
-fn current_identity<R: tauri::Runtime>(app: &AppHandle<R>) -> Result<String, String> {
+pub(crate) fn current_identity_for_app<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+) -> Result<String, String> {
     let state = app.state::<crate::AppState>();
     super::dispatch::resolve_identity_pubkey(&state)
         .ok_or_else(|| "no usable identity is available".to_string())
@@ -241,7 +243,7 @@ async fn prepare<R: tauri::Runtime>(
     source_type: &'static str,
 ) -> Result<PreparedExtension, String> {
     expire_prepared();
-    let identity = current_identity(&app)?;
+    let identity = current_identity_for_app(&app)?;
     let base_dir = super::extensions_base_dir(&app)?;
     let source = PathBuf::from(source);
     tokio::task::spawn_blocking(move || prepare_in(&base_dir, &source, source_type, identity))
@@ -280,7 +282,7 @@ fn take_prepared(token: &str, identity: &str) -> Result<PreparedPackage, String>
 
 #[tauri::command]
 pub async fn cancel_prepared_extension(app: AppHandle, token: String) -> Result<(), String> {
-    let identity = current_identity(&app)?;
+    let identity = current_identity_for_app(&app)?;
     let package = take_prepared(&token, &identity)?;
     remove_staged(&package.staged_path);
     Ok(())
@@ -293,19 +295,17 @@ pub(crate) fn revalidation_current(
     extension_id: &str,
     identity_at_entry: &str,
 ) -> bool {
-    let Some((leased_extension, leased_identity, leased_digest)) =
-        super::frame_host::lease_authority(lease)
-    else {
+    let Some(authority) = super::frame_host::lease_authority_snapshot(lease) else {
         return false;
     };
-    if leased_extension != extension_id {
+    if authority.extension_id != extension_id {
         return false;
     }
     #[cfg(test)]
-    if leased_identity.is_empty() && leased_digest.is_empty() {
+    if authority.identity_pubkey.is_empty() && authority.package_digest.is_empty() {
         return true;
     }
-    if leased_identity != identity_at_entry
+    if authority.identity_pubkey != identity_at_entry
         || super::dispatch::resolve_identity_pubkey(state).as_deref() != Some(identity_at_entry)
     {
         return false;
@@ -313,7 +313,17 @@ pub(crate) fn revalidation_current(
     grant_db
         .and_then(|path| super::grants::open_grant_db(path).ok())
         .is_some_and(|conn| {
-            super::grants::is_enabled(&conn, identity_at_entry, extension_id, &leased_digest)
+            super::grants::is_enabled(
+                &conn,
+                identity_at_entry,
+                extension_id,
+                &authority.package_digest,
+            ) && super::grants::current_generation(
+                &conn,
+                identity_at_entry,
+                extension_id,
+                &authority.package_digest,
+            ) == Some(authority.grant_generation)
         })
 }
 
@@ -321,7 +331,7 @@ pub(crate) fn lease_authority_current_for_app<R: tauri::Runtime>(
     app: &AppHandle<R>,
     authority: &super::frame_authority::LeaseAuthority,
 ) -> bool {
-    if current_identity(app).as_deref() != Ok(authority.identity_pubkey.as_str()) {
+    if current_identity_for_app(app).as_deref() != Ok(authority.identity_pubkey.as_str()) {
         return false;
     }
     super::dispatch::grant_db_path(app)
@@ -333,7 +343,12 @@ pub(crate) fn lease_authority_current_for_app<R: tauri::Runtime>(
                 &authority.identity_pubkey,
                 &authority.extension_id,
                 &authority.package_digest,
-            )
+            ) && super::grants::current_generation(
+                &conn,
+                &authority.identity_pubkey,
+                &authority.extension_id,
+                &authority.package_digest,
+            ) == Some(authority.grant_generation)
         })
 }
 
@@ -341,7 +356,7 @@ pub(crate) fn enabled_context_for_app<R: tauri::Runtime>(
     app: &AppHandle<R>,
     id: &str,
 ) -> Result<(String, String, u64, String, Vec<String>), String> {
-    let identity = current_identity(app)?;
+    let identity = current_identity_for_app(app)?;
     let base = super::extensions_base_dir(app)?;
     let manifest = super::resolve_frame_manifest(&base, id)?;
     let digest = package_digest(&base.join(id))?;
@@ -366,7 +381,7 @@ fn decorate<R: tauri::Runtime>(
     app: &AppHandle<R>,
     mut installed: super::InstalledExtension,
 ) -> super::InstalledExtension {
-    let identity = current_identity(app).ok();
+    let identity = current_identity_for_app(app).ok();
     if let Some(identity) = identity {
         if let Ok(path) = super::dispatch::grant_db_path(app) {
             if let Ok(conn) = super::grants::open_grant_db(&path) {
@@ -390,7 +405,7 @@ pub async fn approve_prepared_extension(
     token: String,
     selected: GrantSelection,
 ) -> Result<super::InstalledExtension, String> {
-    let identity = current_identity(&app)?;
+    let identity = current_identity_for_app(&app)?;
     let package = take_prepared(&token, &identity)?;
     let base = super::extensions_base_dir(&app)?;
     let staged = package.staged_path.clone();
@@ -416,6 +431,7 @@ pub async fn approve_prepared_extension(
         // Fence activation before the first teardown. If replacement fails, the
         // predecessor conservatively remains disabled.
         super::grants::disable_all_for_extension(&conn, &current_manifest.id)?;
+        super::native_window::close_for_extension(&app, &current_manifest.id);
         super::frame_host::release_for_extension_id(&current_manifest.id);
 
         let destination = base.join(&current_manifest.id);
@@ -435,6 +451,7 @@ pub async fn approve_prepared_extension(
 
         // Exact final sweep closes the pre-swap/open race, including binds that
         // were paused before they could publish a lease.
+        super::native_window::close_for_extension(&app, &current_manifest.id);
         super::frame_host::release_for_extension_id(&current_manifest.id);
         replacement
     })();
@@ -465,12 +482,13 @@ pub async fn set_extension_enabled(
     enabled: bool,
 ) -> Result<super::InstalledExtension, String> {
     let _fence = lifecycle_write_fence().await;
-    let identity = current_identity(&app)?;
+    let identity = current_identity_for_app(&app)?;
     let (path, manifest, digest) = load_installed_for_management(&app, &id)?;
     let db_path = super::dispatch::grant_db_path(&app)?;
     let conn = super::grants::open_grant_db(&db_path)?;
     super::grants::set_enabled(&conn, &identity, &manifest.id, &digest, enabled)?;
     if !enabled {
+        super::native_window::close_for_identity_extension(&app, &identity, &manifest.id);
         super::frame_host::release_for_identity_extension(&identity, &manifest.id);
     }
     Ok(decorate(&app, super::installed_from(manifest, &path)))
@@ -483,11 +501,12 @@ pub async fn update_extension_grants(
     selected: GrantSelection,
 ) -> Result<super::InstalledExtension, String> {
     let _fence = lifecycle_write_fence().await;
-    let identity = current_identity(&app)?;
+    let identity = current_identity_for_app(&app)?;
     let (path, manifest, digest) = load_installed_for_management(&app, &id)?;
     let db_path = super::dispatch::grant_db_path(&app)?;
     let mut conn = super::grants::open_grant_db(&db_path)?;
     super::grants::replace_for_identity(&mut conn, &identity, &manifest, &digest, &selected)?;
+    super::native_window::close_for_identity_extension(&app, &identity, &manifest.id);
     super::frame_host::release_for_identity_extension(&identity, &manifest.id);
     Ok(decorate(&app, super::installed_from(manifest, &path)))
 }
@@ -502,6 +521,7 @@ pub async fn remove_extension(app: AppHandle, id: String) -> Result<RemoveExtens
     let db_path = super::dispatch::grant_db_path(&app)?;
     let mut conn = super::grants::open_grant_db(&db_path)?;
     super::grants::disable_all_for_extension(&conn, &id)?;
+    super::native_window::close_for_extension(&app, &id);
     super::frame_host::release_for_extension_id(&id);
     let parked = park_extension_for_removal(&base, &id)?;
     if let Err(error) = super::grants::delete_all_for_extension(&mut conn, &id) {
@@ -510,6 +530,7 @@ pub async fn remove_extension(app: AppHandle, id: String) -> Result<RemoveExtens
             parked.display()
         ));
     }
+    super::native_window::close_for_extension(&app, &id);
     super::frame_host::release_for_extension_id(&id);
     match fs::remove_dir_all(&parked) {
         Ok(()) => Ok(RemoveExtensionResult {

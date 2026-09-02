@@ -471,6 +471,8 @@ type E2eConfig = {
     // reject, so a spec can prove a loader rejection reaches the screen.
     extensionPickPath?: string | null;
     extensionFrameOrigin?: string;
+    extensionSurfaceMode?: "linux-iframe" | "windows-native-window";
+    extensionNativeWindowError?: string;
     extensionPreviewManifest?: string;
     extensionInstallError?: string;
     oaOwnerIsMe?: boolean;
@@ -1625,6 +1627,16 @@ let mockInstalledExtensions: Array<Record<string, unknown>> = [];
  */
 let mockExtensionFrameHolders = new Set<string>();
 let mockExtensionFrameLeases = 0;
+let mockNativeExtensionWindows = new Map<
+  string,
+  {
+    extensionId: string;
+    state: "opening" | "open" | "closed" | "failed";
+    label: string | null;
+    error: string | null;
+  }
+>();
+let mockNativeExtensionWindowGeneration = 0;
 
 // ── get_event defer/release seam ────────────────────────────────────────────
 // When `window.__BUZZ_E2E_DEFER_GET_EVENT__` is set to a target event ID,
@@ -11174,6 +11186,8 @@ export function maybeInstallE2eTauriMocks() {
   mockInstalledExtensions = [];
   mockExtensionFrameHolders = new Set<string>();
   mockExtensionFrameLeases = 0;
+  mockNativeExtensionWindows = new Map();
+  mockNativeExtensionWindowGeneration = 0;
   seedMockSearchProfiles(config);
   resetMockWorkflows();
   resetMockMesh();
@@ -14333,6 +14347,47 @@ export function maybeInstallE2eTauriMocks() {
       // Inventory lives in `mockInstalledExtensions` so a successful install is
       // observable in the list afterwards, rather than the spec asserting the
       // command was called.
+      case "extension_surface_mode":
+        return activeConfig?.mock?.extensionSurfaceMode ?? "linux-iframe";
+      case "native_extension_window_status": {
+        const id = String((payload as { id?: string })?.id ?? "");
+        return (
+          mockNativeExtensionWindows.get(id) ?? {
+            extensionId: id,
+            state: "closed",
+            label: null,
+            error: null,
+          }
+        );
+      }
+      case "open_native_extension_window": {
+        const id = String((payload as { id?: string })?.id ?? "");
+        const installed = mockInstalledExtensions.find(
+          (entry) => entry.id === id,
+        );
+        if (installed?.enabled !== true)
+          throw new Error("extension is disabled");
+        const error = activeConfig?.mock?.extensionNativeWindowError;
+        if (error) throw new Error(error);
+        const existing = mockNativeExtensionWindows.get(id);
+        if (existing) return existing;
+        mockNativeExtensionWindowGeneration += 1;
+        const opened = {
+          extensionId: id,
+          state: "open" as const,
+          label: `extension-secure-mock-${mockNativeExtensionWindowGeneration}`,
+          error: null,
+        };
+        mockNativeExtensionWindows.set(id, opened);
+        return opened;
+      }
+      case "close_native_extension_window": {
+        const id = String((payload as { id?: string })?.id ?? "");
+        mockNativeExtensionWindows.delete(id);
+        return { extensionId: id, state: "closed", label: null, error: null };
+      }
+      case "__mock_native_extension_windows":
+        return Array.from(mockNativeExtensionWindows.values());
       case "open_extension_frame": {
         // The mock stands in for the localhost frame host, which cannot run in
         // the E2E harness. It returns the same *shape* the Rust command does —

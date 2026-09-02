@@ -26,7 +26,7 @@ pub(crate) fn shut_down_app(app: &tauri::AppHandle, shutdown_done: &std::sync::a
         // Stop the extension frame host. A webview that crashed or reloaded
         // never released its holder, so the refcount alone cannot be trusted to
         // bring the listener down at exit.
-        crate::extensions::shutdown_frame_host();
+        crate::extensions::shutdown_extension_surfaces(app);
         if let Err(error) = shutdown_managed_agents(app) {
             eprintln!("buzz-desktop: failed to stop managed agents: {error}");
         }

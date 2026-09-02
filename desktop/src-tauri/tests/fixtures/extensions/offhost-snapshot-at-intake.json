@@ -1,0 +1,116 @@
+{
+  "lanes": {
+    "control-initial": {
+      "stun_udp": {
+        "nonce_bound": 0,
+        "packets": 1,
+        "valid": 1
+      },
+      "turn_tcp": {
+        "nonce_bound": 1,
+        "packets": 2,
+        "valid": 2
+      },
+      "turn_udp": {
+        "nonce_bound": 1,
+        "packets": 7,
+        "valid": 2
+      },
+      "turns_tls": {
+        "nonce_bound": 1,
+        "packets": 2,
+        "valid": 2
+      }
+    },
+    "control-srcdoc": {
+      "stun_udp": {
+        "nonce_bound": 0,
+        "packets": 1,
+        "valid": 1
+      },
+      "turn_tcp": {
+        "nonce_bound": 1,
+        "packets": 2,
+        "valid": 2
+      },
+      "turn_udp": {
+        "nonce_bound": 1,
+        "packets": 7,
+        "valid": 2
+      },
+      "turns_tls": {
+        "nonce_bound": 1,
+        "packets": 2,
+        "valid": 2
+      }
+    },
+    "huddle": {
+      "stun_udp": {
+        "nonce_bound": 0,
+        "packets": 1,
+        "valid": 1
+      },
+      "turn_tcp": {
+        "nonce_bound": 1,
+        "packets": 2,
+        "valid": 2
+      },
+      "turn_udp": {
+        "nonce_bound": 1,
+        "packets": 7,
+        "valid": 2
+      },
+      "turns_tls": {
+        "nonce_bound": 1,
+        "packets": 2,
+        "valid": 2
+      }
+    },
+    "protected-initial": {
+      "stun_udp": {
+        "nonce_bound": 0,
+        "packets": 0,
+        "valid": 0
+      },
+      "turn_tcp": {
+        "nonce_bound": 0,
+        "packets": 0,
+        "valid": 0
+      },
+      "turn_udp": {
+        "nonce_bound": 0,
+        "packets": 0,
+        "valid": 0
+      },
+      "turns_tls": {
+        "nonce_bound": 0,
+        "packets": 0,
+        "valid": 0
+      }
+    },
+    "protected-srcdoc": {
+      "stun_udp": {
+        "nonce_bound": 0,
+        "packets": 0,
+        "valid": 0
+      },
+      "turn_tcp": {
+        "nonce_bound": 0,
+        "packets": 0,
+        "valid": 0
+      },
+      "turn_udp": {
+        "nonce_bound": 0,
+        "packets": 0,
+        "valid": 0
+      },
+      "turns_tls": {
+        "nonce_bound": 0,
+        "packets": 0,
+        "valid": 0
+      }
+    }
+  },
+  "schema": "buzz-controlled-webrtc-sink-snapshot/v1",
+  "token": "acb12e603e4cd3bf0d523cbb827189bb59d224033cc2410ae7a85566d305bbd4"
+}

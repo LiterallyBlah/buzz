@@ -141,7 +141,7 @@ fn main() {
                     .default_permission(tauri_build::DefaultPermissionRule::AllowAllCommands),
             )
             // The extension bridge. Deliberately NO default permission: a
-            // capability must name `extension-bridge:allow-resolve-identity`
+            // capability must name each `extension-bridge:allow-*` permission
             // explicitly, so the grant cannot widen by accident. A plugin (not
             // an app) command because plugin commands are always ACL-checked,
             // and Buzz has no `__app__` manifest to grant app commands through.
@@ -151,6 +151,7 @@ fn main() {
                     "resolve_identity",
                     "invoke",
                     "stream_control",
+                    "native_ready",
                 ]),
             ),
     )

@@ -53,11 +53,15 @@ async fn repeated_delivery_revalidation_performs_zero_package_tree_walks() {
     .expect("consent");
     super::super::grants::set_enabled(&conn, &identity, &manifest.id, &digest, true)
         .expect("enable");
-    super::super::frame_host::insert_authorized_lease_for_test(
+    let generation =
+        super::super::grants::current_generation(&conn, &identity, &manifest.id, &digest)
+            .expect("generation");
+    super::super::frame_host::insert_authorized_lease_with_generation_for_test(
         "delivery-lease",
         &manifest.id,
         &identity,
         &digest,
+        generation,
     );
     let state = crate::app_state::build_app_state();
     *state.keys.lock().expect("keys") = keys;
@@ -72,6 +76,25 @@ async fn repeated_delivery_revalidation_performs_zero_package_tree_walks() {
         ));
     }
     assert_eq!(package_tree_walks(), 0);
+
+    // A grant replacement preserves enabled=true but advances the durable
+    // generation. The old lease must fail centrally before any method-specific
+    // grant path can observe or return data.
+    super::super::grants::replace_for_identity(
+        &mut conn,
+        &identity,
+        &manifest,
+        &digest,
+        &GrantSelection::default(),
+    )
+    .expect("replace grants");
+    assert!(!revalidation_current(
+        &state,
+        Some(&db_path),
+        "delivery-lease",
+        &manifest.id,
+        &identity,
+    ));
     super::super::frame_host::release("delivery-lease");
 }
 

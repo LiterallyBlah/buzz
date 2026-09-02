@@ -1,0 +1,729 @@
+{
+  "architecture": "x86_64",
+  "browser_arguments": "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection --ignore-certificate-errors",
+  "candidate": {
+    "mechanism": "tauri initialization_script_for_all_frames / WebView2 document-created injection",
+    "production_migration": false,
+    "protected_only": true
+  },
+  "injected_script_sha256": "c4328966c35974dc87a7a43a55b470633819d38956289e33601072e47c319324",
+  "measurement_config_sha256": "812d55d5727a0f11ed3bfdfa455a8232609942611d4aafb57289cf92e3c40b3e",
+  "notes": [
+    "VOID means a candidate-off or huddle validity control was missing, dead, nonce-invalid, or could not reach the off-host sink.",
+    "PASS requires constructor denial in both protected realms and zero protected loopback and off-host sink traffic.",
+    "This successor does not import or reinterpret the completed predecessor harness result."
+  ],
+  "overall": "PASS",
+  "platform": "windows",
+  "rows": [
+    {
+      "evidence": {
+        "candidate_off_reports_live": true,
+        "huddle_report_live": true,
+        "loopback_controls_live": true,
+        "loopback_snapshot": {
+          "lanes": {
+            "control-initial": {
+              "stun_udp": {
+                "nonce_bound": 0,
+                "packets": 1,
+                "valid": 1
+              },
+              "turn_tcp": {
+                "nonce_bound": 1,
+                "packets": 2,
+                "valid": 2
+              },
+              "turn_udp": {
+                "nonce_bound": 1,
+                "packets": 7,
+                "valid": 2
+              },
+              "turns_tls": {
+                "nonce_bound": 1,
+                "packets": 2,
+                "valid": 2
+              }
+            },
+            "control-srcdoc": {
+              "stun_udp": {
+                "nonce_bound": 0,
+                "packets": 1,
+                "valid": 1
+              },
+              "turn_tcp": {
+                "nonce_bound": 1,
+                "packets": 2,
+                "valid": 2
+              },
+              "turn_udp": {
+                "nonce_bound": 1,
+                "packets": 7,
+                "valid": 2
+              },
+              "turns_tls": {
+                "nonce_bound": 1,
+                "packets": 2,
+                "valid": 2
+              }
+            },
+            "huddle": {
+              "stun_udp": {
+                "nonce_bound": 0,
+                "packets": 1,
+                "valid": 1
+              },
+              "turn_tcp": {
+                "nonce_bound": 1,
+                "packets": 2,
+                "valid": 2
+              },
+              "turn_udp": {
+                "nonce_bound": 1,
+                "packets": 7,
+                "valid": 2
+              },
+              "turns_tls": {
+                "nonce_bound": 1,
+                "packets": 2,
+                "valid": 2
+              }
+            },
+            "protected-initial": {
+              "stun_udp": {
+                "nonce_bound": 0,
+                "packets": 0,
+                "valid": 0
+              },
+              "turn_tcp": {
+                "nonce_bound": 0,
+                "packets": 0,
+                "valid": 0
+              },
+              "turn_udp": {
+                "nonce_bound": 0,
+                "packets": 0,
+                "valid": 0
+              },
+              "turns_tls": {
+                "nonce_bound": 0,
+                "packets": 0,
+                "valid": 0
+              }
+            },
+            "protected-srcdoc": {
+              "stun_udp": {
+                "nonce_bound": 0,
+                "packets": 0,
+                "valid": 0
+              },
+              "turn_tcp": {
+                "nonce_bound": 0,
+                "packets": 0,
+                "valid": 0
+              },
+              "turn_udp": {
+                "nonce_bound": 0,
+                "packets": 0,
+                "valid": 0
+              },
+              "turns_tls": {
+                "nonce_bound": 0,
+                "packets": 0,
+                "valid": 0
+              }
+            }
+          },
+          "schema": "buzz-controlled-webrtc-sink-snapshot/v1",
+          "token": "acb12e603e4cd3bf0d523cbb827189bb59d224033cc2410ae7a85566d305bbd4"
+        },
+        "matrix_complete": true,
+        "offhost_controls_live": true,
+        "offhost_snapshot": {
+          "lanes": {
+            "control-initial": {
+              "stun_udp": {
+                "nonce_bound": 0,
+                "packets": 1,
+                "valid": 1
+              },
+              "turn_tcp": {
+                "nonce_bound": 1,
+                "packets": 2,
+                "valid": 2
+              },
+              "turn_udp": {
+                "nonce_bound": 1,
+                "packets": 7,
+                "valid": 2
+              },
+              "turns_tls": {
+                "nonce_bound": 1,
+                "packets": 2,
+                "valid": 2
+              }
+            },
+            "control-srcdoc": {
+              "stun_udp": {
+                "nonce_bound": 0,
+                "packets": 1,
+                "valid": 1
+              },
+              "turn_tcp": {
+                "nonce_bound": 1,
+                "packets": 2,
+                "valid": 2
+              },
+              "turn_udp": {
+                "nonce_bound": 1,
+                "packets": 7,
+                "valid": 2
+              },
+              "turns_tls": {
+                "nonce_bound": 1,
+                "packets": 2,
+                "valid": 2
+              }
+            },
+            "huddle": {
+              "stun_udp": {
+                "nonce_bound": 0,
+                "packets": 1,
+                "valid": 1
+              },
+              "turn_tcp": {
+                "nonce_bound": 1,
+                "packets": 2,
+                "valid": 2
+              },
+              "turn_udp": {
+                "nonce_bound": 1,
+                "packets": 7,
+                "valid": 2
+              },
+              "turns_tls": {
+                "nonce_bound": 1,
+                "packets": 2,
+                "valid": 2
+              }
+            },
+            "protected-initial": {
+              "stun_udp": {
+                "nonce_bound": 0,
+                "packets": 0,
+                "valid": 0
+              },
+              "turn_tcp": {
+                "nonce_bound": 0,
+                "packets": 0,
+                "valid": 0
+              },
+              "turn_udp": {
+                "nonce_bound": 0,
+                "packets": 0,
+                "valid": 0
+              },
+              "turns_tls": {
+                "nonce_bound": 0,
+                "packets": 0,
+                "valid": 0
+              }
+            },
+            "protected-srcdoc": {
+              "stun_udp": {
+                "nonce_bound": 0,
+                "packets": 0,
+                "valid": 0
+              },
+              "turn_tcp": {
+                "nonce_bound": 0,
+                "packets": 0,
+                "valid": 0
+              },
+              "turn_udp": {
+                "nonce_bound": 0,
+                "packets": 0,
+                "valid": 0
+              },
+              "turns_tls": {
+                "nonce_bound": 0,
+                "packets": 0,
+                "valid": 0
+              }
+            }
+          },
+          "schema": "buzz-controlled-webrtc-sink-snapshot/v1",
+          "token": "acb12e603e4cd3bf0d523cbb827189bb59d224033cc2410ae7a85566d305bbd4"
+        },
+        "protected_reports_blocked": true,
+        "protected_sinks_zero": true,
+        "reports": {
+          "control-initial": {
+            "constructorTypes": {
+              "RTCDataChannel": "function",
+              "RTCPeerConnection": "function",
+              "mozRTCDataChannel": "undefined",
+              "mozRTCPeerConnection": "undefined",
+              "webkitRTCDataChannel": "undefined",
+              "webkitRTCPeerConnection": "function"
+            },
+            "href": "http://127.0.0.1:62283/arm/control",
+            "lane": "control-initial",
+            "probes": {
+              "loopback": {
+                "stun_udp": {
+                  "constructed": true,
+                  "iceGatheringState": "complete",
+                  "localDescriptionPresent": true,
+                  "name": "stun_udp",
+                  "offerCreated": true,
+                  "setLocalResolved": true,
+                  "url": "stun:127.0.0.1:65521"
+                },
+                "turn_tcp": {
+                  "constructed": true,
+                  "iceGatheringState": "complete",
+                  "localDescriptionPresent": true,
+                  "name": "turn_tcp",
+                  "offerCreated": true,
+                  "setLocalResolved": true,
+                  "url": "turn:127.0.0.1:62260?transport=tcp"
+                },
+                "turn_udp": {
+                  "constructed": true,
+                  "iceGatheringState": "gathering",
+                  "localDescriptionPresent": true,
+                  "name": "turn_udp",
+                  "offerCreated": true,
+                  "setLocalResolved": true,
+                  "url": "turn:127.0.0.1:65522?transport=udp"
+                },
+                "turns_tls": {
+                  "constructed": true,
+                  "iceGatheringState": "complete",
+                  "localDescriptionPresent": true,
+                  "name": "turns_tls",
+                  "offerCreated": true,
+                  "setLocalResolved": true,
+                  "url": "turns:127.0.0.1:62261?transport=tcp"
+                }
+              },
+              "offhost": {
+                "stun_udp": {
+                  "constructed": true,
+                  "iceGatheringState": "complete",
+                  "localDescriptionPresent": true,
+                  "name": "stun_udp",
+                  "offerCreated": true,
+                  "setLocalResolved": true,
+                  "url": "stun:192.168.1.124:33827"
+                },
+                "turn_tcp": {
+                  "constructed": true,
+                  "iceGatheringState": "complete",
+                  "localDescriptionPresent": true,
+                  "name": "turn_tcp",
+                  "offerCreated": true,
+                  "setLocalResolved": true,
+                  "url": "turn:192.168.1.124:41935?transport=tcp"
+                },
+                "turn_udp": {
+                  "constructed": true,
+                  "iceGatheringState": "gathering",
+                  "localDescriptionPresent": true,
+                  "name": "turn_udp",
+                  "offerCreated": true,
+                  "setLocalResolved": true,
+                  "url": "turn:192.168.1.124:45285?transport=udp"
+                },
+                "turns_tls": {
+                  "constructed": true,
+                  "iceGatheringState": "complete",
+                  "localDescriptionPresent": true,
+                  "name": "turns_tls",
+                  "offerCreated": true,
+                  "setLocalResolved": true,
+                  "url": "turns:192.168.1.124:38095?transport=tcp"
+                }
+              }
+            },
+            "scriptRan": true,
+            "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36 Edg/152.0.0.0"
+          },
+          "control-srcdoc": {
+            "constructorTypes": {
+              "RTCDataChannel": "function",
+              "RTCPeerConnection": "function",
+              "mozRTCDataChannel": "undefined",
+              "mozRTCPeerConnection": "undefined",
+              "webkitRTCDataChannel": "undefined",
+              "webkitRTCPeerConnection": "function"
+            },
+            "href": "about:srcdoc",
+            "lane": "control-srcdoc",
+            "probes": {
+              "loopback": {
+                "stun_udp": {
+                  "constructed": true,
+                  "iceGatheringState": "complete",
+                  "localDescriptionPresent": true,
+                  "name": "stun_udp",
+                  "offerCreated": true,
+                  "setLocalResolved": true,
+                  "url": "stun:127.0.0.1:65523"
+                },
+                "turn_tcp": {
+                  "constructed": true,
+                  "iceGatheringState": "complete",
+                  "localDescriptionPresent": true,
+                  "name": "turn_tcp",
+                  "offerCreated": true,
+                  "setLocalResolved": true,
+                  "url": "turn:127.0.0.1:62262?transport=tcp"
+                },
+                "turn_udp": {
+                  "constructed": true,
+                  "iceGatheringState": "gathering",
+                  "localDescriptionPresent": true,
+                  "name": "turn_udp",
+                  "offerCreated": true,
+                  "setLocalResolved": true,
+                  "url": "turn:127.0.0.1:65524?transport=udp"
+                },
+                "turns_tls": {
+                  "constructed": true,
+                  "iceGatheringState": "complete",
+                  "localDescriptionPresent": true,
+                  "name": "turns_tls",
+                  "offerCreated": true,
+                  "setLocalResolved": true,
+                  "url": "turns:127.0.0.1:62263?transport=tcp"
+                }
+              },
+              "offhost": {
+                "stun_udp": {
+                  "constructed": true,
+                  "iceGatheringState": "complete",
+                  "localDescriptionPresent": true,
+                  "name": "stun_udp",
+                  "offerCreated": true,
+                  "setLocalResolved": true,
+                  "url": "stun:192.168.1.124:53480"
+                },
+                "turn_tcp": {
+                  "constructed": true,
+                  "iceGatheringState": "complete",
+                  "localDescriptionPresent": true,
+                  "name": "turn_tcp",
+                  "offerCreated": true,
+                  "setLocalResolved": true,
+                  "url": "turn:192.168.1.124:44999?transport=tcp"
+                },
+                "turn_udp": {
+                  "constructed": true,
+                  "iceGatheringState": "gathering",
+                  "localDescriptionPresent": true,
+                  "name": "turn_udp",
+                  "offerCreated": true,
+                  "setLocalResolved": true,
+                  "url": "turn:192.168.1.124:49538?transport=udp"
+                },
+                "turns_tls": {
+                  "constructed": true,
+                  "iceGatheringState": "complete",
+                  "localDescriptionPresent": true,
+                  "name": "turns_tls",
+                  "offerCreated": true,
+                  "setLocalResolved": true,
+                  "url": "turns:192.168.1.124:45869?transport=tcp"
+                }
+              }
+            },
+            "scriptRan": true,
+            "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36 Edg/152.0.0.0"
+          },
+          "huddle": {
+            "constructorTypes": {
+              "RTCDataChannel": "function",
+              "RTCPeerConnection": "function",
+              "mozRTCDataChannel": "undefined",
+              "mozRTCPeerConnection": "undefined",
+              "webkitRTCDataChannel": "undefined",
+              "webkitRTCPeerConnection": "function"
+            },
+            "href": "http://127.0.0.1:62283/huddle",
+            "lane": "huddle",
+            "localPair": {
+              "answerCreated": true,
+              "connected": true,
+              "constructed": true,
+              "nonceReceived": true,
+              "offerCreated": true
+            },
+            "probes": {
+              "loopback": {
+                "stun_udp": {
+                  "constructed": true,
+                  "iceGatheringState": "complete",
+                  "localDescriptionPresent": true,
+                  "name": "stun_udp",
+                  "offerCreated": true,
+                  "setLocalResolved": true,
+                  "url": "stun:127.0.0.1:65525"
+                },
+                "turn_tcp": {
+                  "constructed": true,
+                  "iceGatheringState": "complete",
+                  "localDescriptionPresent": true,
+                  "name": "turn_tcp",
+                  "offerCreated": true,
+                  "setLocalResolved": true,
+                  "url": "turn:127.0.0.1:62264?transport=tcp"
+                },
+                "turn_udp": {
+                  "constructed": true,
+                  "iceGatheringState": "gathering",
+                  "localDescriptionPresent": true,
+                  "name": "turn_udp",
+                  "offerCreated": true,
+                  "setLocalResolved": true,
+                  "url": "turn:127.0.0.1:65526?transport=udp"
+                },
+                "turns_tls": {
+                  "constructed": true,
+                  "iceGatheringState": "complete",
+                  "localDescriptionPresent": true,
+                  "name": "turns_tls",
+                  "offerCreated": true,
+                  "setLocalResolved": true,
+                  "url": "turns:127.0.0.1:62265?transport=tcp"
+                }
+              },
+              "offhost": {
+                "stun_udp": {
+                  "constructed": true,
+                  "iceGatheringState": "complete",
+                  "localDescriptionPresent": true,
+                  "name": "stun_udp",
+                  "offerCreated": true,
+                  "setLocalResolved": true,
+                  "url": "stun:192.168.1.124:36182"
+                },
+                "turn_tcp": {
+                  "constructed": true,
+                  "iceGatheringState": "complete",
+                  "localDescriptionPresent": true,
+                  "name": "turn_tcp",
+                  "offerCreated": true,
+                  "setLocalResolved": true,
+                  "url": "turn:192.168.1.124:45551?transport=tcp"
+                },
+                "turn_udp": {
+                  "constructed": true,
+                  "iceGatheringState": "gathering",
+                  "localDescriptionPresent": true,
+                  "name": "turn_udp",
+                  "offerCreated": true,
+                  "setLocalResolved": true,
+                  "url": "turn:192.168.1.124:44382?transport=udp"
+                },
+                "turns_tls": {
+                  "constructed": true,
+                  "iceGatheringState": "complete",
+                  "localDescriptionPresent": true,
+                  "name": "turns_tls",
+                  "offerCreated": true,
+                  "setLocalResolved": true,
+                  "url": "turns:192.168.1.124:44273?transport=tcp"
+                }
+              }
+            },
+            "scriptRan": true,
+            "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36 Edg/152.0.0.0"
+          },
+          "protected-initial": {
+            "constructorTypes": {
+              "RTCDataChannel": "undefined",
+              "RTCPeerConnection": "undefined",
+              "mozRTCDataChannel": "undefined",
+              "mozRTCPeerConnection": "undefined",
+              "webkitRTCDataChannel": "undefined",
+              "webkitRTCPeerConnection": "undefined"
+            },
+            "href": "http://127.0.0.1:62283/arm/protected",
+            "lane": "protected-initial",
+            "probes": {
+              "loopback": {
+                "stun_udp": {
+                  "constructed": false,
+                  "error": "constructor-unavailable",
+                  "name": "stun_udp",
+                  "offerCreated": false,
+                  "setLocalResolved": false,
+                  "url": "stun:127.0.0.1:65517"
+                },
+                "turn_tcp": {
+                  "constructed": false,
+                  "error": "constructor-unavailable",
+                  "name": "turn_tcp",
+                  "offerCreated": false,
+                  "setLocalResolved": false,
+                  "url": "turn:127.0.0.1:62256?transport=tcp"
+                },
+                "turn_udp": {
+                  "constructed": false,
+                  "error": "constructor-unavailable",
+                  "name": "turn_udp",
+                  "offerCreated": false,
+                  "setLocalResolved": false,
+                  "url": "turn:127.0.0.1:65518?transport=udp"
+                },
+                "turns_tls": {
+                  "constructed": false,
+                  "error": "constructor-unavailable",
+                  "name": "turns_tls",
+                  "offerCreated": false,
+                  "setLocalResolved": false,
+                  "url": "turns:127.0.0.1:62257?transport=tcp"
+                }
+              },
+              "offhost": {
+                "stun_udp": {
+                  "constructed": false,
+                  "error": "constructor-unavailable",
+                  "name": "stun_udp",
+                  "offerCreated": false,
+                  "setLocalResolved": false,
+                  "url": "stun:192.168.1.124:56097"
+                },
+                "turn_tcp": {
+                  "constructed": false,
+                  "error": "constructor-unavailable",
+                  "name": "turn_tcp",
+                  "offerCreated": false,
+                  "setLocalResolved": false,
+                  "url": "turn:192.168.1.124:34883?transport=tcp"
+                },
+                "turn_udp": {
+                  "constructed": false,
+                  "error": "constructor-unavailable",
+                  "name": "turn_udp",
+                  "offerCreated": false,
+                  "setLocalResolved": false,
+                  "url": "turn:192.168.1.124:40356?transport=udp"
+                },
+                "turns_tls": {
+                  "constructed": false,
+                  "error": "constructor-unavailable",
+                  "name": "turns_tls",
+                  "offerCreated": false,
+                  "setLocalResolved": false,
+                  "url": "turns:192.168.1.124:46017?transport=tcp"
+                }
+              }
+            },
+            "scriptRan": true,
+            "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36 Edg/152.0.0.0"
+          },
+          "protected-srcdoc": {
+            "constructorTypes": {
+              "RTCDataChannel": "undefined",
+              "RTCPeerConnection": "undefined",
+              "mozRTCDataChannel": "undefined",
+              "mozRTCPeerConnection": "undefined",
+              "webkitRTCDataChannel": "undefined",
+              "webkitRTCPeerConnection": "undefined"
+            },
+            "href": "about:srcdoc",
+            "lane": "protected-srcdoc",
+            "probes": {
+              "loopback": {
+                "stun_udp": {
+                  "constructed": false,
+                  "error": "constructor-unavailable",
+                  "name": "stun_udp",
+                  "offerCreated": false,
+                  "setLocalResolved": false,
+                  "url": "stun:127.0.0.1:65519"
+                },
+                "turn_tcp": {
+                  "constructed": false,
+                  "error": "constructor-unavailable",
+                  "name": "turn_tcp",
+                  "offerCreated": false,
+                  "setLocalResolved": false,
+                  "url": "turn:127.0.0.1:62258?transport=tcp"
+                },
+                "turn_udp": {
+                  "constructed": false,
+                  "error": "constructor-unavailable",
+                  "name": "turn_udp",
+                  "offerCreated": false,
+                  "setLocalResolved": false,
+                  "url": "turn:127.0.0.1:65520?transport=udp"
+                },
+                "turns_tls": {
+                  "constructed": false,
+                  "error": "constructor-unavailable",
+                  "name": "turns_tls",
+                  "offerCreated": false,
+                  "setLocalResolved": false,
+                  "url": "turns:127.0.0.1:62259?transport=tcp"
+                }
+              },
+              "offhost": {
+                "stun_udp": {
+                  "constructed": false,
+                  "error": "constructor-unavailable",
+                  "name": "stun_udp",
+                  "offerCreated": false,
+                  "setLocalResolved": false,
+                  "url": "stun:192.168.1.124:33208"
+                },
+                "turn_tcp": {
+                  "constructed": false,
+                  "error": "constructor-unavailable",
+                  "name": "turn_tcp",
+                  "offerCreated": false,
+                  "setLocalResolved": false,
+                  "url": "turn:192.168.1.124:44301?transport=tcp"
+                },
+                "turn_udp": {
+                  "constructed": false,
+                  "error": "constructor-unavailable",
+                  "name": "turn_udp",
+                  "offerCreated": false,
+                  "setLocalResolved": false,
+                  "url": "turn:192.168.1.124:36782?transport=udp"
+                },
+                "turns_tls": {
+                  "constructed": false,
+                  "error": "constructor-unavailable",
+                  "name": "turns_tls",
+                  "offerCreated": false,
+                  "setLocalResolved": false,
+                  "url": "turns:192.168.1.124:38451?transport=tcp"
+                }
+              }
+            },
+            "scriptRan": true,
+            "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36 Edg/152.0.0.0"
+          }
+        },
+        "snapshots_valid": true
+      },
+      "name": "extension_environment_webrtc_disable_is_realm_complete_and_scoped",
+      "status": "PASS"
+    }
+  ],
+  "schema": "buzz-webview2-realm-disable-measurement/v1",
+  "tauri_version": "2.11.5",
+  "token": "acb12e603e4cd3bf0d523cbb827189bb59d224033cc2410ae7a85566d305bbd4",
+  "user_data_folders": {
+    "control": "C:\\src\\webview2-realm-disable-52d13fe8-run1-correction1\\buzz-webview2-realm-disable-harness\\target\\webview2-realm-disable\\acb12e603e4cd3bf0d523cbb827189bb59d224033cc2410ae7a85566d305bbd4\\control-extension",
+    "huddle": "C:\\src\\webview2-realm-disable-52d13fe8-run1-correction1\\buzz-webview2-realm-disable-harness\\target\\webview2-realm-disable\\acb12e603e4cd3bf0d523cbb827189bb59d224033cc2410ae7a85566d305bbd4\\huddle",
+    "protected": "C:\\src\\webview2-realm-disable-52d13fe8-run1-correction1\\buzz-webview2-realm-disable-harness\\target\\webview2-realm-disable\\acb12e603e4cd3bf0d523cbb827189bb59d224033cc2410ae7a85566d305bbd4\\protected-extension"
+  },
+  "webview2_com_version": "0.38.2",
+  "wry_version": "0.55.1"
+}

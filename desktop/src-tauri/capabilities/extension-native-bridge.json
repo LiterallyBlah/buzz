@@ -1,0 +1,18 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "extension-native-bridge",
+  "description": "Grants only a Windows secure-extension top-level wrapper the narrow bridge transport. The URL pattern excludes package /ext documents, and Rust additionally binds the exact invoking label to one live identity/digest/generation lease.",
+  "local": false,
+  "windows": ["extension-secure-*"],
+  "remote": {
+    "urls": ["http://127.0.0.1:*/frame/*"]
+  },
+  "permissions": [
+    "extension-bridge:allow-invoke",
+    "extension-bridge:allow-stream-control",
+    "extension-bridge:allow-native-ready",
+    "core:event:allow-listen",
+    "core:event:allow-unlisten"
+  ],
+  "platforms": ["windows"]
+}

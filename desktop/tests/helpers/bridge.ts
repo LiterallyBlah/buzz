@@ -394,6 +394,10 @@ type MockBridgeOptions = {
   extensionPickPath?: string | null;
   /** Origin the mocked frame host claims to serve from. */
   extensionFrameOrigin?: string;
+  /** Host-selected production surface. Windows is always explicit native-window UX. */
+  extensionSurfaceMode?: "linux-iframe" | "windows-native-window";
+  /** Native creation/watchdog failure surfaced to the route. */
+  extensionNativeWindowError?: string;
   extensionPreviewManifest?: string;
   extensionInstallError?: string;
   /**

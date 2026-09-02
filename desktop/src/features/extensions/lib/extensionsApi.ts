@@ -160,3 +160,44 @@ export function openExtensionFrame(id: string): Promise<ExtensionFrameTarget> {
 export function closeExtensionFrame(lease: string): Promise<void> {
   return invoke<void>("close_extension_frame", { lease });
 }
+
+export type ExtensionSurfaceMode = "linux-iframe" | "windows-native-window";
+export type NativeExtensionWindowState =
+  | "opening"
+  | "open"
+  | "closed"
+  | "failed";
+export type NativeExtensionWindowStatus = {
+  extensionId: string;
+  state: NativeExtensionWindowState;
+  label: string | null;
+  error: string | null;
+};
+
+export function getExtensionSurfaceMode(): Promise<ExtensionSurfaceMode> {
+  return invoke<ExtensionSurfaceMode>("extension_surface_mode");
+}
+
+export function getNativeExtensionWindowStatus(
+  id: string,
+): Promise<NativeExtensionWindowStatus> {
+  return invoke<NativeExtensionWindowStatus>("native_extension_window_status", {
+    id,
+  });
+}
+
+export function openNativeExtensionWindow(
+  id: string,
+): Promise<NativeExtensionWindowStatus> {
+  return invoke<NativeExtensionWindowStatus>("open_native_extension_window", {
+    id,
+  });
+}
+
+export function closeNativeExtensionWindow(
+  id: string,
+): Promise<NativeExtensionWindowStatus> {
+  return invoke<NativeExtensionWindowStatus>("close_native_extension_window", {
+    id,
+  });
+}

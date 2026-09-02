@@ -869,6 +869,10 @@ pub fn run() {
             extensions::preview_extension_package,
             extensions::open_extension_frame,
             extensions::close_extension_frame,
+            extensions::native_window::extension_surface_mode,
+            extensions::native_window::native_extension_window_status,
+            extensions::native_window::open_native_extension_window,
+            extensions::native_window::close_native_extension_window,
             extensions::management::prepare_extension_from_directory,
             extensions::management::prepare_extension_from_zip,
             extensions::management::approve_prepared_extension,
@@ -915,6 +919,13 @@ pub fn run() {
                     eprintln!("buzz-desktop: failed to hide main window: {error}");
                 }
             }
+        }
+        RunEvent::WindowEvent {
+            label,
+            event: WindowEvent::CloseRequested { .. },
+            ..
+        } if label.starts_with(extensions::native_window::NATIVE_WINDOW_LABEL_PREFIX) => {
+            extensions::native_window::handle_window_closed(app_handle, &label);
         }
         RunEvent::WindowEvent {
             label,
