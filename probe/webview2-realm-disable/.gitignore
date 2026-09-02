@@ -1,0 +1,12 @@
+target/
+gen/
+__pycache__/
+.pytest_cache/
+webview2-realm-disable-results.json
+webview2-realm-disable-run.log
+measurement-config.json
+loopback-endpoints.json
+offhost-endpoints.json
+sink-local.stdout.log
+sink-local.stderr.log
+*.zip

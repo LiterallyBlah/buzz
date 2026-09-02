@@ -1,0 +1,19 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "WebView2 realm-complete disable measurement",
+  "version": "0.1.0",
+  "identifier": "dev.buzz.webview2-realm-disable-measurement",
+  "build": {
+    "frontendDist": "./ui"
+  },
+  "bundle": {
+    "active": false,
+    "icon": ["icons/icon.png", "icons/icon.ico"]
+  },
+  "app": {
+    "windows": [],
+    "security": {
+      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self'"
+    }
+  }
+}
