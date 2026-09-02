@@ -85,6 +85,13 @@ pub(crate) fn lease_authority_snapshot(lease: &str) -> Option<LeaseAuthority> {
         .map(|owner| owner.authority.clone())
 }
 
+pub(crate) fn lease_uses_native_window(lease: &str) -> Option<bool> {
+    super::frame_host::host_state()
+        .leases
+        .get(lease)
+        .map(|owner| owner.wrapper_mode == WrapperMode::WindowsTopLevel)
+}
+
 /// Resolve authority only when the actual invoking webview label matches the
 /// host-issued lease. Payload identity can never select this relationship.
 pub(crate) fn lease_authority_for_caller(
@@ -148,6 +155,28 @@ pub(crate) fn insert_authorized_lease_with_generation_for_test(
     package_digest: &str,
     grant_generation: u64,
 ) {
+    insert_authorized_lease_with_label_for_test(
+        lease,
+        extension_id,
+        identity_pubkey,
+        package_digest,
+        grant_generation,
+        "main",
+        WrapperMode::LinuxIframe,
+    );
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn insert_authorized_lease_with_label_for_test(
+    lease: &str,
+    extension_id: &str,
+    identity_pubkey: &str,
+    package_digest: &str,
+    grant_generation: u64,
+    caller_label: &str,
+    wrapper_mode: WrapperMode,
+) {
     let context = format!("test-context-{lease}");
     let mut state = super::frame_host::host_state();
     state.contexts.insert(context.clone(), lease.to_string());
@@ -163,8 +192,8 @@ pub(crate) fn insert_authorized_lease_with_generation_for_test(
             static_context: context,
             entry: "index.html".to_string(),
             egress: Vec::new(),
-            caller_label: "main".to_string(),
-            wrapper_mode: WrapperMode::LinuxIframe,
+            caller_label: caller_label.to_string(),
+            wrapper_mode,
         },
     );
 }

@@ -137,6 +137,14 @@ pub(crate) fn cancel_lease(lease: &str) {
     }
 }
 
+#[cfg(test)]
+pub(crate) fn live_admission_count_for_test() -> usize {
+    admissions()
+        .lock()
+        .map(|all| all.len())
+        .unwrap_or(0)
+}
+
 fn selection_has_converse<R: tauri::Runtime>(
     app: &AppHandle<R>,
     owner: &LeaseAuthority,

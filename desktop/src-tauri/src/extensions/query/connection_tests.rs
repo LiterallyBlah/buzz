@@ -25,6 +25,29 @@ fn dummy(generation: u64, alive_now: bool) -> (Arc<Connection>, DataRx, DataRx) 
     )
 }
 
+#[tokio::test]
+async fn native_lease_without_bound_channel_never_falls_back_to_global_event_sink() {
+    let _guard = super::super::super::frame_host::lifecycle_guard().await;
+    let app = tauri::test::mock_app();
+    let lease = "88888888-8888-4888-8888-888888888888";
+    let label = "extension-secure-unbound";
+    super::super::super::frame_host::insert_authorized_lease_with_label_for_test(
+        lease,
+        "equation-explorer",
+        &"66".repeat(32),
+        &"ff".repeat(32),
+        14,
+        label,
+        super::super::super::frame_authority::WrapperMode::WindowsTopLevel,
+    );
+    let refused = match stream_sink_for_lease(app.handle(), lease) {
+        Ok(_) => panic!("native lease without a channel must not get a global sink"),
+        Err(refused) => refused,
+    };
+    assert_eq!(refused.error_code(), Some(code::DENIED));
+    super::super::super::frame_host::release(lease);
+}
+
 #[test]
 fn reader_death_invalidates_reuse_while_the_writer_channel_is_open() {
     let (connection, _data, _control) = dummy(1, false);

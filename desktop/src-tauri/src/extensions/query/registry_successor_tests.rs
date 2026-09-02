@@ -83,6 +83,54 @@ fn wire(delivery: &Delivery) -> Vec<serde_json::Value> {
 }
 
 #[test]
+fn shared_connection_routes_each_subscription_through_its_stored_sink() {
+    let quota = SubscriptionQuota::new();
+    let registry = SubscriptionRegistry::new();
+    let connection = instance(41);
+    let seen_a = Arc::new(Mutex::new(Vec::<String>::new()));
+    let seen_b = Arc::new(Mutex::new(Vec::<String>::new()));
+    for (lease, sub, branch, seen) in [
+        ("lease-a", "sub-a", "branch-a", Arc::clone(&seen_a)),
+        ("lease-b", "sub-b", "branch-b", Arc::clone(&seen_b)),
+    ] {
+        let reservation = quota
+            .reserve(IDENTITY, EXTENSION, 1)
+            .expect("reserve")
+            .commit();
+        let aggregate = Aggregate::new(vec![branch.to_string()]).expect("aggregate");
+        registry.insert(
+            lease,
+            sub,
+            aggregate,
+            admission(),
+            Arc::new(move |batch| {
+                seen.lock().unwrap().push(batch.generation.clone());
+                Ok(())
+            }),
+            Box::new(|_| {}),
+            reservation,
+            connection.clone(),
+        );
+        let (_, activated) = registry
+            .activate_with_sink(lease, sub)
+            .expect("activate exact sink");
+        assert!(activated.batches.is_empty());
+    }
+
+    for (branch, expected_lease) in [("branch-a", "lease-a"), ("branch-b", "lease-b")] {
+        let (sink, delivery) = registry
+            .route_by_branch_with_sink(&connection, branch, eose(branch))
+            .expect("route exact branch");
+        for batch in delivery.batches {
+            sink(&batch).expect("deliver exact batch");
+        }
+        assert_eq!(delivery.lease, expected_lease);
+    }
+    assert_eq!(&*seen_a.lock().unwrap(), &["lease-a".to_string()]);
+    assert_eq!(&*seen_b.lock().unwrap(), &["lease-b".to_string()]);
+}
+
+#[test]
 fn g1_frames_and_cleanup_cannot_touch_g2_on_the_same_key() {
     let quota = SubscriptionQuota::new();
     let registry = SubscriptionRegistry::new();

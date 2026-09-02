@@ -152,6 +152,7 @@ fn main() {
                     "invoke",
                     "stream_control",
                     "native_ready",
+                    "native_stream_bind",
                 ]),
             ),
     )

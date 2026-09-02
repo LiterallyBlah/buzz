@@ -157,6 +157,7 @@ pub async fn apply_workspace(
     agent_managed_profiles: Option<bool>,
     app: AppHandle,
 ) -> Result<(), String> {
+    let _extension_lifecycle = crate::extensions::management::lifecycle_write_fence().await;
     let state = app.state::<AppState>();
     // Take the generation only after entering the serialized transaction. An
     // apply that is already running remains authoritative until it releases

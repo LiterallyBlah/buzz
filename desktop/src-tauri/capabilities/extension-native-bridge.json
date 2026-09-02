@@ -11,8 +11,7 @@
     "extension-bridge:allow-invoke",
     "extension-bridge:allow-stream-control",
     "extension-bridge:allow-native-ready",
-    "core:event:allow-listen",
-    "core:event:allow-unlisten"
+    "extension-bridge:allow-native-stream-bind"
   ],
   "platforms": ["windows"]
 }

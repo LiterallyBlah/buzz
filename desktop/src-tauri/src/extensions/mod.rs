@@ -192,13 +192,25 @@ pub async fn open_extension_frame(
     app: AppHandle,
     id: String,
 ) -> Result<ExtensionFrameTarget, String> {
-    open_extension_frame_for(app, id).await
+    open_extension_frame_for_mode(app, id, native_window::ExtensionSurfaceMode::current()).await
 }
 
+#[cfg(test)]
 pub(crate) async fn open_extension_frame_for<R: tauri::Runtime>(
     app: AppHandle<R>,
     id: String,
 ) -> Result<ExtensionFrameTarget, String> {
+    open_extension_frame_for_mode(app, id, native_window::ExtensionSurfaceMode::current()).await
+}
+
+pub(crate) async fn open_extension_frame_for_mode<R: tauri::Runtime>(
+    app: AppHandle<R>,
+    id: String,
+    mode: native_window::ExtensionSurfaceMode,
+) -> Result<ExtensionFrameTarget, String> {
+    if mode != native_window::ExtensionSurfaceMode::LinuxIframe {
+        return Err("legacy extension frames are unavailable on Windows".to_string());
+    }
     let _fence = management::lifecycle_read_fence().await;
     let base_dir = extensions_base_dir(&app)?;
     let manifest = {

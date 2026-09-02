@@ -62,13 +62,15 @@ pub struct BridgeIdentity {
 /// `publish.event` over the framed port. This command remains the plumbing
 /// proof — plugin command, ACL-gated, identity from host state. Subscriptions
 /// and request cancellation are what is still held.
-fn caller_authorized<R: Runtime>(webview: &tauri::Webview<R>, lease: &str) -> bool {
-    let label = webview.label();
+fn caller_authorized_parts(label: &str, url: Option<&str>, lease: &str) -> bool {
     frame_host::lease_authority_for_caller(lease, label).is_some()
         && (!label.starts_with(super::native_window::NATIVE_WINDOW_LABEL_PREFIX)
-            || webview.url().ok().is_some_and(|url| {
-                super::native_window::caller_authorized(label, lease, url.as_str())
-            }))
+            || url.is_some_and(|url| super::native_window::caller_authorized(label, lease, url)))
+}
+
+fn caller_authorized<R: Runtime>(webview: &tauri::Webview<R>, lease: &str) -> bool {
+    let url = webview.url().ok();
+    caller_authorized_parts(webview.label(), url.as_ref().map(|url| url.as_str()), lease)
 }
 
 async fn resolve_identity_for_label(label: &str, lease: String) -> Result<BridgeIdentity, String> {
@@ -173,7 +175,38 @@ pub(crate) async fn native_ready<R: Runtime>(
     webview: tauri::Webview<R>,
     lease: String,
 ) -> Result<super::native_window::NativeExtensionWindowStatus, String> {
-    super::native_window::mark_ready(&app, webview.label(), &lease)
+    let url = webview
+        .url()
+        .map_err(|_| "native extension wrapper URL is unavailable".to_string())?;
+    native_ready_for_caller(&app, webview.label(), url.as_str(), &lease)
+}
+
+pub(crate) fn native_ready_for_caller<R: Runtime>(
+    app: &tauri::AppHandle<R>,
+    label: &str,
+    wrapper_url: &str,
+    lease: &str,
+) -> Result<super::native_window::NativeExtensionWindowStatus, String> {
+    if !caller_authorized_parts(label, Some(wrapper_url), lease) {
+        return Err("native extension caller is not authorised for this lease".to_string());
+    }
+    super::native_window::mark_ready(app, label, lease)
+}
+
+#[tauri::command]
+pub(crate) async fn native_stream_bind<R: Runtime>(
+    app: tauri::AppHandle<R>,
+    webview: tauri::Webview<R>,
+    lease: String,
+    channel: tauri::ipc::Channel<super::query::StreamBatch>,
+) -> Result<(), String> {
+    if !caller_authorized(&webview, &lease) {
+        return Err("native extension caller is not authorised for this lease".to_string());
+    }
+    let url = webview
+        .url()
+        .map_err(|_| "native extension wrapper URL is unavailable".to_string())?;
+    super::native_window::bind_stream_channel(&app, webview.label(), &lease, url.as_str(), channel)
 }
 
 /// Plugin name. Must match the `tauri_build::InlinedPlugin` entry in `build.rs`
@@ -186,7 +219,8 @@ pub(crate) fn init<R: Runtime>() -> TauriPlugin<R> {
             resolve_identity,
             invoke,
             stream_control,
-            native_ready
+            native_ready,
+            native_stream_bind
         ])
         .build()
 }

@@ -5,7 +5,7 @@
   const lease = __BUZZ_NATIVE_LEASE_JSON__;
   const frame = document.getElementById("ext");
   const internals = window.__TAURI_INTERNALS__;
-  const eventInternals = window.__TAURI_EVENT_PLUGIN_INTERNALS__;
+
   const VERSION = 1;
   const MAX_FRAME_BYTES = 256 * 1024;
   const MAX_DEPTH = 32;
@@ -25,7 +25,7 @@
   let port = null;
   let settled = false;
   let disposed = false;
-  let eventId = null;
+  let nativeStreamChannel = null;
   let drainScheduled = false;
   let queuedBytes = 0;
   const inFlight = new Set();
@@ -228,8 +228,8 @@
     }
   }
 
-  function onStream(event) {
-    const batch = parseBatch(event?.payload);
+  function onStream(payload) {
+    const batch = parseBatch(payload);
     if (!batch) return;
     const totals = queuedBySub.get(batch.sub) || { batches: 0, bytes: 0 };
     if (
@@ -254,16 +254,52 @@
     }
   }
 
-  async function listenStreams() {
+  function createNativeStreamChannel(onmessage) {
     if (!internals || typeof internals.transformCallback !== "function") {
-      throw new Error("Tauri event callbacks are unavailable");
+      throw new Error("Tauri channel callbacks are unavailable");
     }
-    const callback = internals.transformCallback(onStream);
-    eventId = await invoke("plugin:event|listen", {
-      event: "extension-stream",
-      target: { kind: "Any" },
-      handler: callback,
+    let nextIndex = 0;
+    let endIndex = null;
+    const pending = new Map();
+    const callbackId = internals.transformCallback((raw) => {
+      if (!raw || !Number.isSafeInteger(raw.index) || raw.index < 0) {
+        dispose();
+        return;
+      }
+      if (Object.hasOwn(raw, "end")) {
+        endIndex = raw.index;
+      } else if (raw.index === nextIndex) {
+        onmessage(raw.message);
+        nextIndex += 1;
+        while (pending.has(nextIndex)) {
+          const message = pending.get(nextIndex);
+          pending.delete(nextIndex);
+          onmessage(message);
+          nextIndex += 1;
+        }
+      } else if (raw.index > nextIndex && pending.size < 16) {
+        pending.set(raw.index, raw.message);
+      } else if (raw.index !== nextIndex) {
+        dispose();
+      }
+      if (endIndex === nextIndex) channel.cleanup();
     });
+    const channel = {
+      id: callbackId,
+      __TAURI_TO_IPC_KEY__() {
+        return `__CHANNEL__:${callbackId}`;
+      },
+      toJSON() {
+        return `__CHANNEL__:${callbackId}`;
+      },
+      cleanup() {
+        pending.clear();
+        if (typeof internals.unregisterCallback === "function") {
+          internals.unregisterCallback(callbackId);
+        }
+      },
+    };
+    return channel;
   }
 
   function parseAck(value) {
@@ -368,21 +404,8 @@
     for (const sub of Array.from(subscriptions.keys())) {
       closeSubscription(sub, "unsubscribed");
     }
-    if (eventId !== null) {
-      try {
-        if (
-          eventInternals &&
-          typeof eventInternals.unregisterListener === "function"
-        ) {
-          eventInternals.unregisterListener("extension-stream", eventId);
-        }
-        void invoke("plugin:event|unlisten", {
-          event: "extension-stream",
-          eventId,
-        }).catch(() => {});
-      } catch (_) {}
-      eventId = null;
-    }
+    nativeStreamChannel?.cleanup();
+    nativeStreamChannel = null;
     if (port) {
       port.removeEventListener("message", onPortMessage);
       port.close();
@@ -391,7 +414,11 @@
   }
 
   async function establish() {
-    await listenStreams();
+    nativeStreamChannel = createNativeStreamChannel(onStream);
+    await invoke("plugin:extension-bridge|native_stream_bind", {
+      lease,
+      channel: nativeStreamChannel,
+    });
     const channel = new MessageChannel();
     port = channel.port1;
     port.addEventListener("message", onPortMessage);

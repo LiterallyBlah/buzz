@@ -398,6 +398,8 @@ type MockBridgeOptions = {
   extensionSurfaceMode?: "linux-iframe" | "windows-native-window";
   /** Native creation/watchdog failure surfaced to the route. */
   extensionNativeWindowError?: string;
+  /** Deterministic in-flight Open delay for route/unmount race coverage. */
+  extensionNativeOpenDelayMs?: number;
   extensionPreviewManifest?: string;
   extensionInstallError?: string;
   /**

@@ -30,8 +30,8 @@ function readableState(status: NativeExtensionWindowStatus | null): string {
  * Windows route surface for one dedicated extension WebView2 environment.
  *
  * Opening is always explicit. Rust owns label/lease/UDF authority and repeated
- * opens focus the one exact live window. Unmount is a route/preview boundary and
- * closes the native surface rather than orphaning it.
+ * opens focus the one exact live window. Unmount invalidates the ownership epoch;
+ * any late Open completion immediately closes itself instead of becoming orphaned.
  */
 export function NativeExtensionWindow({
   extensionId,
@@ -41,9 +41,13 @@ export function NativeExtensionWindow({
   const [status, setStatus] =
     React.useState<NativeExtensionWindowStatus | null>(null);
   const [busy, setBusy] = React.useState(false);
+  const mounted = React.useRef(false);
+  const ownershipEpoch = React.useRef(0);
 
   React.useEffect(() => {
     let live = true;
+    mounted.current = true;
+    const setupEpoch = ownershipEpoch.current;
     let unlisten: (() => void) | undefined;
     void (async () => {
       unlisten = await listen<NativeExtensionWindowStatus>(
@@ -55,9 +59,9 @@ export function NativeExtensionWindow({
         },
       );
       const current = await getNativeExtensionWindowStatus(extensionId);
-      if (live) setStatus(current);
+      if (live && ownershipEpoch.current === setupEpoch) setStatus(current);
     })().catch((cause: unknown) => {
-      if (live) {
+      if (live && ownershipEpoch.current === setupEpoch) {
         setStatus({
           extensionId,
           state: "failed",
@@ -69,16 +73,26 @@ export function NativeExtensionWindow({
 
     return () => {
       live = false;
+      mounted.current = false;
+      ownershipEpoch.current += 1;
       unlisten?.();
       void closeNativeExtensionWindow(extensionId);
     };
   }, [extensionId]);
 
   const open = React.useCallback(async () => {
+    const epoch = ownershipEpoch.current + 1;
+    ownershipEpoch.current = epoch;
     setBusy(true);
     try {
-      setStatus(await openNativeExtensionWindow(extensionId));
+      const opened = await openNativeExtensionWindow(extensionId);
+      if (!mounted.current || ownershipEpoch.current !== epoch) {
+        await closeNativeExtensionWindow(extensionId);
+        return;
+      }
+      setStatus(opened);
     } catch (cause) {
+      if (!mounted.current || ownershipEpoch.current !== epoch) return;
       setStatus({
         extensionId,
         state: "failed",
@@ -86,16 +100,20 @@ export function NativeExtensionWindow({
         error: typeof cause === "string" ? cause : String(cause),
       });
     } finally {
-      setBusy(false);
+      if (mounted.current && ownershipEpoch.current === epoch) setBusy(false);
     }
   }, [extensionId]);
 
   const close = React.useCallback(async () => {
+    const epoch = ownershipEpoch.current + 1;
+    ownershipEpoch.current = epoch;
     setBusy(true);
     try {
-      setStatus(await closeNativeExtensionWindow(extensionId));
+      const closed = await closeNativeExtensionWindow(extensionId);
+      if (mounted.current && ownershipEpoch.current === epoch)
+        setStatus(closed);
     } finally {
-      setBusy(false);
+      if (mounted.current && ownershipEpoch.current === epoch) setBusy(false);
     }
   }, [extensionId]);
 

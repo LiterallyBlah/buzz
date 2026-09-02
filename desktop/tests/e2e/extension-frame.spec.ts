@@ -181,6 +181,30 @@ test("Windows uses one explicit secure native window and reopen rotates its labe
   await expect.poll(windows).toEqual([]);
 });
 
+test("route-back during delayed Windows Open closes the late completion", async ({
+  page,
+}) => {
+  await installMockBridge(page, {
+    extensionPickPath: "/tmp/equation-explorer",
+    extensionPreviewManifest: MANIFEST,
+    extensionSurfaceMode: "windows-native-window",
+    extensionNativeOpenDelayMs: 120,
+  });
+  await installOne(page);
+  await page.getByTestId("open-extension-equation-explorer").click();
+  await page.getByTestId("extension-native-window-open").click();
+  await page.getByTestId("extension-frame-back").click();
+  await expect(page.getByTestId("extensions-view")).toBeVisible();
+  const windows = async () =>
+    (await page.evaluate(() =>
+      window.__BUZZ_E2E_INVOKE_MOCK_COMMAND__?.(
+        "__mock_native_extension_windows",
+      ),
+    )) as Array<{ label: string }>;
+  await page.waitForTimeout(200);
+  await expect.poll(windows).toEqual([]);
+});
+
 test("Windows native creation failure is visible and leaks no window", async ({
   page,
 }) => {

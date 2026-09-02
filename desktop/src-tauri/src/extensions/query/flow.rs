@@ -25,15 +25,15 @@ pub(super) const STREAM_ACK_TIMEOUT: std::time::Duration = std::time::Duration::
 
 #[derive(Debug, Clone, serde::Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
-pub(super) struct StreamBatch {
-    pub(super) generation: String,
-    pub(super) sub: String,
-    pub(super) seq: u64,
-    pub(super) token: String,
-    pub(super) frames: Vec<serde_json::Value>,
-    pub(super) frame_count: usize,
-    pub(super) encoded_bytes: usize,
-    pub(super) terminal: bool,
+pub(crate) struct StreamBatch {
+    pub(crate) generation: String,
+    pub(crate) sub: String,
+    pub(crate) seq: u64,
+    pub(crate) token: String,
+    pub(crate) frames: Vec<serde_json::Value>,
+    pub(crate) frame_count: usize,
+    pub(crate) encoded_bytes: usize,
+    pub(crate) terminal: bool,
 }
 
 #[derive(Debug, Clone)]

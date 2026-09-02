@@ -16,7 +16,7 @@ pub(super) type ConnectionKey = (String, String);
 /// Where this subscription's stream frames go. Retained with the subscription
 /// so lifecycle teardown that originates outside a Tauri command still has the
 /// exact production sink that admitted the stream.
-pub(super) type StreamSink = Arc<dyn Fn(&StreamBatch) -> Result<(), ()> + Send + Sync>;
+pub(crate) type StreamSink = Arc<dyn Fn(&StreamBatch) -> Result<(), ()> + Send + Sync>;
 
 /// One authenticated socket. The key can be reused; the generation cannot.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -149,12 +149,12 @@ impl SubscriptionRegistry {
         }
     }
 
-    pub(super) fn route_by_branch(
+    pub(super) fn route_by_branch_with_sink(
         &self,
         connection: &ConnectionInstance,
         branch_id: &str,
         frame: crate::relay::subscribe::RelayFrame,
-    ) -> Option<Delivery> {
+    ) -> Option<(StreamSink, Delivery)> {
         let mut subs = self.subs.lock().ok()?;
         let key = subs
             .iter()
@@ -164,6 +164,7 @@ impl SubscriptionRegistry {
             .map(|(key, _)| key.clone())?;
         let lease = key.0.clone();
         let sub = key.1.clone();
+        let sink = Arc::clone(&subs.get(&key)?.sink);
         let all_port_queued = Self::port_queued_totals(&subs, &lease);
         let own_queued = subs.get(&key)?.flow.queued_totals();
         let port_queued = (
@@ -240,12 +241,28 @@ impl SubscriptionRegistry {
         if remove {
             subs.remove(&key);
         }
-        Some(delivery)
+        Some((sink, delivery))
     }
 
-    pub(super) fn activate(&self, lease: &str, sub: &str) -> Option<Delivery> {
+    #[cfg(test)]
+    pub(super) fn route_by_branch(
+        &self,
+        connection: &ConnectionInstance,
+        branch_id: &str,
+        frame: crate::relay::subscribe::RelayFrame,
+    ) -> Option<Delivery> {
+        self.route_by_branch_with_sink(connection, branch_id, frame)
+            .map(|(_, delivery)| delivery)
+    }
+
+    pub(super) fn activate_with_sink(
+        &self,
+        lease: &str,
+        sub: &str,
+    ) -> Option<(StreamSink, Delivery)> {
         let mut subs = self.subs.lock().ok()?;
         let key = (lease.to_string(), sub.to_string());
+        let sink = Arc::clone(&subs.get(&key)?.sink);
         let all_port_queued = Self::port_queued_totals(&subs, lease);
         let own_queued = subs.get(&key)?.flow.queued_totals();
         let port_queued = (
@@ -296,9 +313,55 @@ impl SubscriptionRegistry {
         if remove {
             subs.remove(&key);
         }
-        Some(delivery)
+        Some((sink, delivery))
     }
 
+    #[cfg(test)]
+    pub(super) fn activate(&self, lease: &str, sub: &str) -> Option<Delivery> {
+        self.activate_with_sink(lease, sub)
+            .map(|(_, delivery)| delivery)
+    }
+
+    pub(super) fn acknowledge_with_sink(
+        &self,
+        lease: &str,
+        sub: &str,
+        seq: u64,
+        token: &str,
+        frame_count: usize,
+        encoded_bytes: usize,
+    ) -> Option<(StreamSink, Delivery)> {
+        let mut subs = self.subs.lock().ok()?;
+        let key = (lease.to_string(), sub.to_string());
+        let sink = Arc::clone(&subs.get(&key)?.sink);
+        let acked = {
+            let live = subs.get_mut(&key)?;
+            live.flow.ack(seq, token, frame_count, encoded_bytes)
+        };
+        if acked == Err(FlowError::AckViolation) {
+            let mut live = subs.remove(&key)?;
+            live.aggregate.close(CloseReason::BoundExceeded);
+            return Some((
+                sink,
+                Self::terminal_delivery(lease, sub, &mut live, CloseReason::BoundExceeded),
+            ));
+        }
+        let port_in_flight = Self::port_in_flight_totals(&subs, lease);
+        let live = subs.get_mut(&key)?;
+        Some((
+            sink,
+            Delivery {
+                lease: lease.to_string(),
+                batches: live
+                    .flow
+                    .drain(lease, sub, port_in_flight.0, port_in_flight.1),
+                arm_gate: false,
+            },
+        ))
+    }
+
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn acknowledge(
         &self,
         lease: &str,
@@ -308,33 +371,32 @@ impl SubscriptionRegistry {
         frame_count: usize,
         encoded_bytes: usize,
     ) -> Option<Delivery> {
-        let mut subs = self.subs.lock().ok()?;
-        let key = (lease.to_string(), sub.to_string());
-        let acked = {
-            let live = subs.get_mut(&key)?;
-            live.flow.ack(seq, token, frame_count, encoded_bytes)
-        };
-        if acked == Err(FlowError::AckViolation) {
-            let mut live = subs.remove(&key)?;
-            live.aggregate.close(CloseReason::BoundExceeded);
-            return Some(Self::terminal_delivery(
-                lease,
-                sub,
-                &mut live,
-                CloseReason::BoundExceeded,
-            ));
-        }
-        let port_in_flight = Self::port_in_flight_totals(&subs, lease);
-        let live = subs.get_mut(&key)?;
-        Some(Delivery {
-            lease: lease.to_string(),
-            batches: live
-                .flow
-                .drain(lease, sub, port_in_flight.0, port_in_flight.1),
-            arm_gate: false,
-        })
+        self.acknowledge_with_sink(lease, sub, seq, token, frame_count, encoded_bytes)
+            .map(|(_, delivery)| delivery)
     }
 
+    pub(super) fn close_on_ack_timeout_with_sink(
+        &self,
+        lease: &str,
+        sub: &str,
+        seq: u64,
+        token: &str,
+    ) -> Option<(StreamSink, Delivery)> {
+        let mut subs = self.subs.lock().ok()?;
+        let key = (lease.to_string(), sub.to_string());
+        if !subs.get(&key)?.flow.has_in_flight(seq, token) {
+            return None;
+        }
+        let mut live = subs.remove(&key)?;
+        let sink = Arc::clone(&live.sink);
+        live.aggregate.close(CloseReason::BoundExceeded);
+        Some((
+            sink,
+            Self::terminal_delivery(lease, sub, &mut live, CloseReason::BoundExceeded),
+        ))
+    }
+
+    #[cfg(test)]
     pub(super) fn close_on_ack_timeout(
         &self,
         lease: &str,
@@ -342,31 +404,23 @@ impl SubscriptionRegistry {
         seq: u64,
         token: &str,
     ) -> Option<Delivery> {
-        let mut subs = self.subs.lock().ok()?;
-        let key = (lease.to_string(), sub.to_string());
-        if !subs.get(&key)?.flow.has_in_flight(seq, token) {
-            return None;
-        }
-        let mut live = subs.remove(&key)?;
-        live.aggregate.close(CloseReason::BoundExceeded);
-        Some(Self::terminal_delivery(
-            lease,
-            sub,
-            &mut live,
-            CloseReason::BoundExceeded,
-        ))
+        self.close_on_ack_timeout_with_sink(lease, sub, seq, token)
+            .map(|(_, delivery)| delivery)
     }
 
-    pub(super) fn close_for_flow_violation(&self, lease: &str, sub: &str) -> Option<Delivery> {
+    pub(super) fn close_for_flow_violation_with_sink(
+        &self,
+        lease: &str,
+        sub: &str,
+    ) -> Option<(StreamSink, Delivery)> {
         let mut subs = self.subs.lock().ok()?;
         let key = (lease.to_string(), sub.to_string());
         let mut live = subs.remove(&key)?;
+        let sink = Arc::clone(&live.sink);
         live.aggregate.close(CloseReason::BoundExceeded);
-        Some(Self::terminal_delivery(
-            lease,
-            sub,
-            &mut live,
-            CloseReason::BoundExceeded,
+        Some((
+            sink,
+            Self::terminal_delivery(lease, sub, &mut live, CloseReason::BoundExceeded),
         ))
     }
 
@@ -429,7 +483,10 @@ impl SubscriptionRegistry {
         }
     }
 
-    pub(super) fn close_for_connection(&self, connection: &ConnectionInstance) -> Vec<Delivery> {
+    pub(super) fn close_for_connection_with_sinks(
+        &self,
+        connection: &ConnectionInstance,
+    ) -> Vec<(StreamSink, Delivery)> {
         let Ok(mut subs) = self.subs.lock() else {
             return Vec::new();
         };
@@ -446,11 +503,10 @@ impl SubscriptionRegistry {
                     continue;
                 };
                 live.aggregate.close(CloseReason::RelayClosed);
-                closed.push(Self::terminal_delivery(
-                    &key.0,
-                    &key.1,
-                    &mut live,
-                    CloseReason::RelayClosed,
+                let sink = Arc::clone(&live.sink);
+                closed.push((
+                    sink,
+                    Self::terminal_delivery(&key.0, &key.1, &mut live, CloseReason::RelayClosed),
                 ));
             } else if let Some(live) = subs.get_mut(&key) {
                 live.aggregate.close(CloseReason::RelayClosed);
@@ -460,30 +516,45 @@ impl SubscriptionRegistry {
         closed
     }
 
-    pub(super) fn close_on_eose_deadline(&self, lease: &str, sub: &str) -> Option<Delivery> {
+    #[cfg(test)]
+    pub(super) fn close_for_connection(&self, connection: &ConnectionInstance) -> Vec<Delivery> {
+        self.close_for_connection_with_sinks(connection)
+            .into_iter()
+            .map(|(_, delivery)| delivery)
+            .collect()
+    }
+
+    pub(super) fn close_on_eose_deadline_with_sink(
+        &self,
+        lease: &str,
+        sub: &str,
+    ) -> Option<(StreamSink, Delivery)> {
         let mut subs = self.subs.lock().ok()?;
         let key = (lease.to_string(), sub.to_string());
+        let sink = Arc::clone(&subs.get(&key)?.sink);
         let live = subs.get_mut(&key)?;
         if live.aggregate.has_eosed() || live.aggregate.is_closed() {
             return None;
         }
         let _ = on_initial_eose_deadline(&mut live.aggregate);
         live.terminate();
-        if live.flow.is_activated() {
+        let delivery = if live.flow.is_activated() {
             let mut live = subs.remove(&key)?;
-            Some(Self::terminal_delivery(
-                lease,
-                sub,
-                &mut live,
-                CloseReason::EoseDeadline,
-            ))
+            Self::terminal_delivery(lease, sub, &mut live, CloseReason::EoseDeadline)
         } else {
-            Some(Delivery {
+            Delivery {
                 lease: lease.to_string(),
                 batches: Vec::new(),
                 arm_gate: false,
-            })
-        }
+            }
+        };
+        Some((sink, delivery))
+    }
+
+    #[cfg(test)]
+    pub(super) fn close_on_eose_deadline(&self, lease: &str, sub: &str) -> Option<Delivery> {
+        self.close_on_eose_deadline_with_sink(lease, sub)
+            .map(|(_, delivery)| delivery)
     }
 }
 

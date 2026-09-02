@@ -47,6 +47,9 @@ function harness() {
   const listeners = new Map();
   const invocations = [];
   const childMessages = [];
+  const callbacks = new Map();
+  let nextCallback = 1;
+  let nativeChannel;
   const childWindow = {
     postMessage(data, _origin, ports) {
       childMessages.push({ data, ports });
@@ -54,13 +57,29 @@ function harness() {
   };
   const frame = { contentWindow: childWindow };
   const window = {
-    __TAURI_EVENT_PLUGIN_INTERNALS__: { unregisterListener() {} },
     __TAURI_INTERNALS__: {
-      transformCallback: (handler) => handler,
+      transformCallback(handler) {
+        const id = nextCallback;
+        nextCallback += 1;
+        callbacks.set(id, handler);
+        return id;
+      },
+      unregisterCallback(id) {
+        callbacks.delete(id);
+      },
       async invoke(command, args) {
         invocations.push({ command, args });
-        if (command === "plugin:event|listen") return 7;
+        if (command === "plugin:extension-bridge|native_stream_bind") {
+          nativeChannel = args.channel;
+          return null;
+        }
         if (command === "plugin:extension-bridge|invoke") {
+          if (args.method === "subscribe") {
+            return {
+              ok: true,
+              result: { sub: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" },
+            };
+          }
           return { ok: true, result: { publicKey: "owner" } };
         }
         return null;
@@ -104,7 +123,16 @@ function harness() {
     RegExp,
     console,
   });
-  return { window, childWindow, childMessages, invocations };
+  return {
+    window,
+    childWindow,
+    childMessages,
+    invocations,
+    emitNative(batch, index = 0) {
+      const callback = nativeChannel && callbacks.get(nativeChannel.id);
+      if (callback) callback({ message: batch, index });
+    },
+  };
 }
 
 const settle = () => new Promise((resolve) => setTimeout(resolve, 0));
@@ -131,6 +159,19 @@ test("native wrapper accepts ready only from its child and originates one channe
     JSON.stringify({ buzz: "port", v: 1 }),
   );
   assert.equal(h.childMessages[0].ports.length, 1);
+  assert.ok(
+    h.invocations.some(
+      ({ command, args }) =>
+        command === "plugin:extension-bridge|native_stream_bind" &&
+        args.lease === "11111111-1111-4111-8111-111111111111" &&
+        args.channel.__TAURI_TO_IPC_KEY__().startsWith("__CHANNEL__:") &&
+        args.channel.toJSON().startsWith("__CHANNEL__:"),
+    ),
+  );
+  assert.equal(
+    h.invocations.some(({ command }) => command.startsWith("plugin:event|")),
+    false,
+  );
   assert.ok(
     h.invocations.some(
       ({ command, args }) =>
@@ -210,4 +251,48 @@ test("native wrapper rejects replay without a second Rust dispatch", async () =>
     1,
   );
   assert.equal(replies.at(-1).error.code, "replayed_request");
+});
+
+test("native wrapper receives stream batches only through its dedicated channel", async () => {
+  const h = harness();
+  h.window.dispatch("message", {
+    source: h.childWindow,
+    data: { buzz: "ready" },
+  });
+  await settle();
+  const childPort = h.childMessages[0].ports[0];
+  const replies = [];
+  childPort.addEventListener("message", (event) => replies.push(event.data));
+  childPort.postMessage({
+    id: "66666666-6666-4666-8666-666666666666",
+    v: 1,
+    method: "subscribe",
+    params: { filter: { kinds: [9], "#h": ["channel"] } },
+  });
+  await settle();
+  await settle();
+  const sub = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+  const frames = [{ sub, kind: "eose" }];
+  h.emitNative({
+    generation: "11111111-1111-4111-8111-111111111111",
+    sub,
+    seq: 1,
+    token: "77777777-7777-4777-8777-777777777777",
+    frames,
+    frameCount: 1,
+    encodedBytes: new TextEncoder().encode(JSON.stringify(frames[0]))
+      .byteLength,
+    terminal: false,
+  });
+  await settle();
+  assert.ok(
+    replies.some(
+      (reply) =>
+        reply.buzz === "stream-batch" && reply.sub === sub && reply.seq === 1,
+    ),
+  );
+  assert.equal(
+    h.invocations.some(({ command }) => command.startsWith("plugin:event|")),
+    false,
+  );
 });

@@ -115,7 +115,7 @@ impl From<&LeaseAuthority> for SurfaceKey {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct NativeRecord {
     key: SurfaceKey,
     label: String,
@@ -124,6 +124,7 @@ struct NativeRecord {
     data_directory: PathBuf,
     state: NativeWindowState,
     error: Option<String>,
+    stream_sink: Option<super::query::StreamSink>,
 }
 
 #[derive(Default)]
@@ -200,21 +201,33 @@ fn remove_record(label: &str) -> Option<NativeRecord> {
     Some(record)
 }
 
-fn cleanup_record<R: tauri::Runtime>(
+fn remove_record_if_state(label: &str, expected: NativeWindowState) -> Option<NativeRecord> {
+    let mut state = registry();
+    if state.by_label.get(label)?.state != expected {
+        return None;
+    }
+    let record = state.by_label.remove(label)?;
+    state.by_surface.remove(&record.key);
+    Some(record)
+}
+
+fn finish_cleanup<R: tauri::Runtime>(
     app: &AppHandle<R>,
-    label: &str,
+    mut record: NativeRecord,
     close_window: bool,
     state: NativeWindowState,
     error: Option<String>,
-) -> Option<NativeExtensionWindowStatus> {
-    let mut record = remove_record(label)?;
+) -> NativeExtensionWindowStatus {
     if close_window {
-        if let Some(window) = app.get_webview_window(label) {
+        if let Some(window) = app.get_webview_window(&record.label) {
             if let Err(close_error) = window.close() {
                 eprintln!("buzz-desktop: failed to close native extension window: {close_error}");
             }
         }
     }
+    // The native stream sink disappears from the registry before lease teardown,
+    // so any already-cloned sender rechecks and fails without delivering bytes.
+    record.stream_sink.take();
     super::frame_host::release(&record.lease);
     record.state = state;
     record.error = error;
@@ -231,7 +244,29 @@ fn cleanup_record<R: tauri::Runtime>(
             }
         }
     });
-    Some(status)
+    status
+}
+
+fn cleanup_record<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    label: &str,
+    close_window: bool,
+    state: NativeWindowState,
+    error: Option<String>,
+) -> Option<NativeExtensionWindowStatus> {
+    remove_record(label).map(|record| finish_cleanup(app, record, close_window, state, error))
+}
+
+fn cleanup_record_if_state<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    label: &str,
+    expected: NativeWindowState,
+    close_window: bool,
+    state: NativeWindowState,
+    error: Option<String>,
+) -> Option<NativeExtensionWindowStatus> {
+    remove_record_if_state(label, expected)
+        .map(|record| finish_cleanup(app, record, close_window, state, error))
 }
 
 pub(crate) fn caller_authorized(label: &str, lease: &str, wrapper_url: &str) -> bool {
@@ -239,6 +274,112 @@ pub(crate) fn caller_authorized(label: &str, lease: &str, wrapper_url: &str) -> 
         .by_label
         .get(label)
         .is_some_and(|record| record.lease == lease && record.wrapper_url == wrapper_url)
+}
+
+fn stream_delivery_authorized(label: &str, lease: &str, wrapper_url: &str) -> bool {
+    registry().by_label.get(label).is_some_and(|record| {
+        record.lease == lease
+            && record.wrapper_url == wrapper_url
+            && record.stream_sink.is_some()
+            && matches!(
+                record.state,
+                NativeWindowState::Opening | NativeWindowState::Open
+            )
+    })
+}
+
+fn bind_stream_sink(
+    label: &str,
+    lease: &str,
+    wrapper_url: &str,
+    authority: &LeaseAuthority,
+    sink: super::query::StreamSink,
+) -> Result<(), String> {
+    if !caller_authorized(label, lease, wrapper_url) {
+        return Err("native extension stream caller is not authorised".to_string());
+    }
+    let mut state = registry();
+    let record = state
+        .by_label
+        .get_mut(label)
+        .filter(|record| {
+            record.lease == lease
+                && record.wrapper_url == wrapper_url
+                && record.key == SurfaceKey::from(authority)
+                && record.state == NativeWindowState::Opening
+                && record.stream_sink.is_none()
+        })
+        .ok_or_else(|| "native extension stream is not bindable".to_string())?;
+    record.stream_sink = Some(sink);
+    Ok(())
+}
+
+fn guarded_stream_sink(
+    label: &str,
+    lease: &str,
+    wrapper_url: &str,
+    deliver: impl Fn(&super::query::StreamBatch) -> Result<(), ()> + Send + Sync + 'static,
+) -> super::query::StreamSink {
+    let sink_label = label.to_string();
+    let sink_lease = lease.to_string();
+    let sink_url = wrapper_url.to_string();
+    std::sync::Arc::new(move |batch| {
+        if batch.generation != sink_lease
+            || !stream_delivery_authorized(&sink_label, &sink_lease, &sink_url)
+        {
+            return Err(());
+        }
+        deliver(batch)
+    })
+}
+
+pub(crate) fn bind_stream_channel<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    label: &str,
+    lease: &str,
+    wrapper_url: &str,
+    channel: tauri::ipc::Channel<super::query::StreamBatch>,
+) -> Result<(), String> {
+    let authority = super::frame_host::lease_authority_for_caller(lease, label)
+        .ok_or_else(|| "native extension stream caller is not authorised".to_string())?;
+    if !super::management::lease_authority_current_for_app(app, &authority) {
+        return Err("native extension authority changed while binding its stream".to_string());
+    }
+    let sink = guarded_stream_sink(label, lease, wrapper_url, move |batch| {
+        channel.send(batch.clone()).map_err(|_| ())
+    });
+    bind_stream_sink(label, lease, wrapper_url, &authority, sink)
+}
+
+pub(crate) fn stream_sink_for_lease(lease: &str) -> Option<super::query::StreamSink> {
+    registry()
+        .by_label
+        .values()
+        .find(|record| {
+            record.lease == lease
+                && record.stream_sink.is_some()
+                && matches!(
+                    record.state,
+                    NativeWindowState::Opening | NativeWindowState::Open
+                )
+        })
+        .and_then(|record| record.stream_sink.clone())
+}
+
+fn transition_to_open(label: &str, lease: &str) -> Result<NativeExtensionWindowStatus, String> {
+    let mut state = registry();
+    let record = state
+        .by_label
+        .get_mut(label)
+        .filter(|record| {
+            record.lease == lease
+                && record.state == NativeWindowState::Opening
+                && record.stream_sink.is_some()
+        })
+        .ok_or_else(|| "native extension window is no longer opening".to_string())?;
+    record.state = NativeWindowState::Open;
+    record.error = None;
+    Ok(status_for(record))
 }
 
 pub(crate) fn mark_ready<R: tauri::Runtime>(
@@ -259,17 +400,7 @@ pub(crate) fn mark_ready<R: tauri::Runtime>(
         return Err("extension authority changed while opening".to_string());
     }
 
-    let status = {
-        let mut state = registry();
-        let record = state
-            .by_label
-            .get_mut(label)
-            .filter(|record| record.lease == lease)
-            .ok_or_else(|| "native extension window is no longer opening".to_string())?;
-        record.state = NativeWindowState::Open;
-        record.error = None;
-        status_for(record)
-    };
+    let status = transition_to_open(label, lease)?;
     emit_status(app, &status);
     Ok(status)
 }
@@ -406,6 +537,7 @@ async fn open_native_extension_window_for<R: tauri::Runtime>(
                 data_directory: plan.data_directory.clone(),
                 state: NativeWindowState::Opening,
                 error: None,
+                stream_sink: None,
             },
         );
     }
@@ -425,19 +557,14 @@ async fn open_native_extension_window_for<R: tauri::Runtime>(
     let watchdog_label = label.clone();
     tauri::async_runtime::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_secs(NATIVE_READY_TIMEOUT_SECONDS)).await;
-        let still_opening = registry()
-            .by_label
-            .get(&watchdog_label)
-            .is_some_and(|record| record.state == NativeWindowState::Opening);
-        if still_opening {
-            cleanup_record(
-                &watchdog_app,
-                &watchdog_label,
-                true,
-                NativeWindowState::Failed,
-                Some("the secure extension window did not become ready".to_string()),
-            );
-        }
+        cleanup_record_if_state(
+            &watchdog_app,
+            &watchdog_label,
+            NativeWindowState::Opening,
+            true,
+            NativeWindowState::Failed,
+            Some("the secure extension window did not become ready".to_string()),
+        );
     });
 
     let status = registry()
@@ -479,25 +606,33 @@ fn build_native_window<R: tauri::Runtime>(
     Err("native extension windows are available only on Windows".to_string())
 }
 
+async fn close_native_extension_window_serialized<R, F>(
+    app: &AppHandle<R>,
+    id: &str,
+    resolve_identity: F,
+) -> Result<NativeExtensionWindowStatus, String>
+where
+    R: tauri::Runtime,
+    F: FnOnce() -> Result<String, String>,
+{
+    let _open_guard = NATIVE_OPEN_LOCK.lock().await;
+    let identity = resolve_identity()?;
+    close_for_identity_extension(app, &identity, id);
+    Ok(NativeExtensionWindowStatus::closed(id))
+}
+
 #[tauri::command]
-pub fn close_native_extension_window(
+pub async fn close_native_extension_window(
     app: AppHandle,
     id: String,
 ) -> Result<NativeExtensionWindowStatus, String> {
     if !super::manifest::is_valid_extension_id(&id) {
         return Err("extension id is not valid".to_string());
     }
-    let identity = super::management::current_identity_for_app(&app)?;
-    let labels: Vec<String> = registry()
-        .by_label
-        .values()
-        .filter(|record| record.key.identity_pubkey == identity && record.key.extension_id == id)
-        .map(|record| record.label.clone())
-        .collect();
-    for label in labels {
-        cleanup_record(&app, &label, true, NativeWindowState::Closed, None);
-    }
-    Ok(NativeExtensionWindowStatus::closed(&id))
+    close_native_extension_window_serialized(&app, &id, || {
+        super::management::current_identity_for_app(&app)
+    })
+    .await
 }
 
 pub(crate) fn close_for_identity_extension<R: tauri::Runtime>(
@@ -548,298 +683,5 @@ pub(crate) fn handle_window_closed<R: tauri::Runtime>(app: &AppHandle<R>, label:
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn authority(identity: &str, digest: &str, generation: u64) -> LeaseAuthority {
-        LeaseAuthority {
-            extension_id: "equation-explorer".to_string(),
-            identity_pubkey: identity.to_string(),
-            package_digest: digest.to_string(),
-            grant_generation: generation,
-        }
-    }
-
-    #[test]
-    fn accepted_all_frame_script_bytes_and_constructor_list_are_exact() {
-        assert_eq!(
-            hex::encode(Sha256::digest(WEBRTC_DISABLE_SCRIPT.as_bytes())),
-            ACCEPTED_SCRIPT_SHA256
-        );
-        for name in [
-            "RTCPeerConnection",
-            "webkitRTCPeerConnection",
-            "mozRTCPeerConnection",
-            "RTCDataChannel",
-            "webkitRTCDataChannel",
-            "mozRTCDataChannel",
-        ] {
-            assert_eq!(
-                WEBRTC_DISABLE_SCRIPT
-                    .matches(&format!("\"{name}\""))
-                    .count(),
-                1,
-                "{name}"
-            );
-        }
-        assert!(WEBRTC_DISABLE_SCRIPT.contains("writable: false"));
-        assert!(WEBRTC_DISABLE_SCRIPT.contains("configurable: false"));
-    }
-
-    #[test]
-    fn plan_binds_unique_udf_to_identity_digest_generation_and_label() {
-        let root = Path::new("C:/Buzz/private-webview2");
-        let digest = "ab".repeat(32);
-        let first = plan_native_window(
-            root,
-            authority("identity-a", &digest, 7),
-            "extension-secure-first".to_string(),
-            "http://127.0.0.1:3001/frame/context/digest/equation-explorer".to_string(),
-        )
-        .unwrap();
-        let second = plan_native_window(
-            root,
-            authority("identity-a", &digest, 7),
-            "extension-secure-second".to_string(),
-            "http://127.0.0.1:3001/frame/context/digest/equation-explorer".to_string(),
-        )
-        .unwrap();
-        assert_ne!(first.data_directory, second.data_directory);
-        assert!(first.data_directory.ends_with(
-            Path::new("equation-explorer")
-                .join(&digest)
-                .join("7")
-                .join("extension-secure-first")
-        ));
-        assert_ne!(
-            first.data_directory,
-            plan_native_window(
-                root,
-                authority("identity-b", &digest, 7),
-                "extension-secure-first".to_string(),
-                first.wrapper_url.clone(),
-            )
-            .unwrap()
-            .data_directory
-        );
-    }
-
-    #[test]
-    fn production_plan_contains_no_measurement_browser_arguments() {
-        let source = include_str!("native_window.rs");
-        let production = source.split("#[cfg(test)]").next().unwrap();
-        let ignored_cert = ["ignore", "certificate", "errors"].join("-");
-        let proxy_flag = ["disable", "non", "proxied", "udp"].join("_");
-        let browser_args = ["additional", "browser", "args"].join("_");
-        assert!(!production.contains(&ignored_cert));
-        assert!(!production.contains(&proxy_flag));
-        assert!(!production.contains(&browser_args));
-        assert_eq!(
-            production
-                .matches("initialization_script_for_all_frames")
-                .count(),
-            1
-        );
-        assert!(production.contains("data_directory(plan.data_directory.clone())"));
-        assert!(
-            !include_str!("../huddle/window.rs").contains("initialization_script_for_all_frames")
-        );
-    }
-
-    #[test]
-    fn linux_surface_mode_retains_the_iframe_path() {
-        #[cfg(not(target_os = "windows"))]
-        assert_eq!(
-            ExtensionSurfaceMode::current(),
-            ExtensionSurfaceMode::LinuxIframe
-        );
-    }
-
-    #[test]
-    fn native_wrapper_originates_one_channel_and_rejects_frame_ports() {
-        let source = include_str!("native_wrapper.js");
-        assert_eq!(source.matches("new MessageChannel()").count(), 1);
-        assert!(!source.contains("event.ports"));
-        assert!(source.contains("event.source !== frame.contentWindow"));
-        assert!(source.contains("plugin:extension-bridge|invoke"));
-        assert!(source.contains("plugin:extension-bridge|stream_control"));
-        assert!(source.contains("plugin:extension-bridge|native_ready"));
-    }
-
-    #[test]
-    fn wrapper_policy_is_platform_specific_and_host_derived() {
-        let origin = "http://127.0.0.1:43123";
-        let linux = super::super::frame_host::wrapper_content_security_policy_for_mode(
-            origin,
-            super::super::frame_authority::WrapperMode::LinuxIframe,
-        );
-        let windows = super::super::frame_host::wrapper_content_security_policy_for_mode(
-            origin,
-            super::super::frame_authority::WrapperMode::WindowsTopLevel,
-        );
-        assert!(!linux.contains("frame-ancestors"));
-        assert!(windows.contains("frame-ancestors 'none'"));
-        assert!(linux.contains(&format!("frame-src {origin}")));
-        assert!(windows.contains(&format!("frame-src {origin}")));
-    }
-
-    #[test]
-    fn terminal_pass_fixture_pins_initial_srcdoc_controls_and_server_snapshot() {
-        let result_bytes =
-            include_bytes!("../../tests/fixtures/extensions/webview2-realm-disable-results.json");
-        assert_eq!(
-            hex::encode(Sha256::digest(result_bytes)),
-            "41238014f32883efcae15b33b8c886d262f4cd560705da0648b5094b5f6d96f3"
-        );
-        let result: serde_json::Value = serde_json::from_slice(result_bytes).unwrap();
-        assert_eq!(result["overall"], "PASS");
-        assert_eq!(result["injected_script_sha256"], ACCEPTED_SCRIPT_SHA256);
-        assert_eq!(result["rows"].as_array().unwrap().len(), 1);
-        let evidence = &result["rows"][0]["evidence"];
-        for field in [
-            "matrix_complete",
-            "snapshots_valid",
-            "candidate_off_reports_live",
-            "huddle_report_live",
-            "loopback_controls_live",
-            "offhost_controls_live",
-            "protected_reports_blocked",
-            "protected_sinks_zero",
-        ] {
-            assert_eq!(evidence[field], true, "{field}");
-        }
-        for lane in ["protected-initial", "protected-srcdoc"] {
-            let report = &evidence["reports"][lane];
-            for constructor in [
-                "RTCPeerConnection",
-                "webkitRTCPeerConnection",
-                "mozRTCPeerConnection",
-                "RTCDataChannel",
-                "webkitRTCDataChannel",
-                "mozRTCDataChannel",
-            ] {
-                assert_eq!(report["constructorTypes"][constructor], "undefined");
-            }
-        }
-        let snapshot_bytes =
-            include_bytes!("../../tests/fixtures/extensions/offhost-snapshot-at-intake.json");
-        assert_eq!(
-            hex::encode(Sha256::digest(snapshot_bytes)),
-            "ae0e926765e9e34ce778269dc36581ab55bf44a6c978a4d40c7ae91562f8ff44"
-        );
-        let snapshot: serde_json::Value = serde_json::from_slice(snapshot_bytes).unwrap();
-        assert_eq!(evidence["offhost_snapshot"], snapshot);
-    }
-
-    #[tokio::test]
-    async fn lifecycle_close_is_exact_idempotent_and_reopen_uses_fresh_authority() {
-        let _guard = super::super::frame_host::lifecycle_guard().await;
-        let app = tauri::test::mock_app();
-        let identity = "11".repeat(32);
-        let digest = "ab".repeat(32);
-        let extension_id = "equation-explorer";
-        let first_label = "extension-secure-lifecycle-first".to_string();
-        let first_lease = "44444444-4444-4444-8444-444444444444";
-        super::super::frame_host::insert_authorized_lease_with_generation_for_test(
-            first_lease,
-            extension_id,
-            &identity,
-            &digest,
-            9,
-        );
-        let first_key = SurfaceKey {
-            identity_pubkey: identity.clone(),
-            extension_id: extension_id.to_string(),
-            package_digest: digest.clone(),
-            grant_generation: 9,
-        };
-        {
-            let mut state = registry();
-            state
-                .by_surface
-                .insert(first_key.clone(), first_label.clone());
-            state.by_label.insert(
-                first_label.clone(),
-                NativeRecord {
-                    key: first_key,
-                    label: first_label.clone(),
-                    lease: first_lease.to_string(),
-                    wrapper_url: "http://127.0.0.1:41000/frame/first".to_string(),
-                    data_directory: std::env::temp_dir().join(&first_label),
-                    state: NativeWindowState::Open,
-                    error: None,
-                },
-            );
-        }
-        assert_eq!(
-            close_for_identity_extension(app.handle(), &identity, extension_id),
-            1
-        );
-        assert!(registry().by_label.is_empty());
-        assert!(super::super::frame_host::lease_authority_snapshot(first_lease).is_none());
-        assert_eq!(
-            close_for_identity_extension(app.handle(), &identity, extension_id),
-            0
-        );
-
-        let second_label = "extension-secure-lifecycle-second".to_string();
-        assert_ne!(first_label, second_label);
-        let second_lease = "55555555-5555-4555-8555-555555555555";
-        super::super::frame_host::insert_authorized_lease_with_generation_for_test(
-            second_lease,
-            extension_id,
-            &identity,
-            &digest,
-            10,
-        );
-        let second_key = SurfaceKey {
-            identity_pubkey: identity.clone(),
-            extension_id: extension_id.to_string(),
-            package_digest: digest,
-            grant_generation: 10,
-        };
-        {
-            let mut state = registry();
-            state
-                .by_surface
-                .insert(second_key.clone(), second_label.clone());
-            state.by_label.insert(
-                second_label.clone(),
-                NativeRecord {
-                    key: second_key,
-                    label: second_label.clone(),
-                    lease: second_lease.to_string(),
-                    wrapper_url: "http://127.0.0.1:42000/frame/second".to_string(),
-                    data_directory: std::env::temp_dir().join(&second_label),
-                    state: NativeWindowState::Opening,
-                    error: None,
-                },
-            );
-        }
-        assert_eq!(close_for_extension(app.handle(), extension_id), 1);
-        assert!(registry().by_label.is_empty());
-        assert!(super::super::frame_host::lease_authority_snapshot(second_lease).is_none());
-    }
-
-    #[test]
-    fn native_capability_is_windows_remote_wrapper_only() {
-        let capability: serde_json::Value = serde_json::from_str(include_str!(
-            "../../capabilities/extension-native-bridge.json"
-        ))
-        .unwrap();
-        assert_eq!(capability["local"], false);
-        assert_eq!(
-            capability["windows"],
-            serde_json::json!(["extension-secure-*"])
-        );
-        assert_eq!(
-            capability["remote"]["urls"],
-            serde_json::json!(["http://127.0.0.1:*/frame/*"])
-        );
-        assert_eq!(capability["platforms"], serde_json::json!(["windows"]));
-        let permissions = capability["permissions"].as_array().unwrap();
-        assert_eq!(permissions.len(), 5);
-        assert!(!capability.to_string().contains("/ext/*"));
-        assert!(!capability.to_string().contains("*://*"));
-    }
-}
+#[path = "native_window_tests.rs"]
+mod tests;

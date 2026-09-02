@@ -764,6 +764,9 @@ mod flow;
 /// The shared, authenticated relay socket the branches are opened on.
 mod connection;
 
+pub(crate) use flow::StreamBatch;
+pub(crate) use registry::StreamSink;
+
 /// §5 `unsubscribe({ sub }) → { ok }` — the crate-visible bridge handler.
 ///
 /// Re-exported from the private child so `dispatch` can route to it without
@@ -786,6 +789,11 @@ pub(crate) fn close_subscriptions_for_lease(lease: &str) -> usize {
         connection::deliver(&sink, delivery);
     }
     closed.closed
+}
+
+#[cfg(test)]
+pub(crate) fn live_subscription_count_for_test() -> usize {
+    registry::registry().live_count()
 }
 
 pub(crate) fn activate_subscription<R: tauri::Runtime>(

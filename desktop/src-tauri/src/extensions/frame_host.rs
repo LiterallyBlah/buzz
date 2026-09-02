@@ -100,12 +100,13 @@ use super::frame_authority::{
 };
 pub(crate) use super::frame_authority::{
     extension_for_lease, lease_authority_for_caller, lease_authority_snapshot,
-    release_for_extension_id, release_for_identity_extension,
+    lease_uses_native_window, release_for_extension_id, release_for_identity_extension,
 };
 #[cfg(test)]
 pub(crate) use super::frame_authority::{
     insert_authorized_lease_for_test, insert_authorized_lease_with_generation_for_test,
-    insert_lease_for_test, lifecycle_guard, running_port,
+    insert_authorized_lease_with_label_for_test, insert_lease_for_test, lifecycle_guard,
+    running_port,
 };
 use super::manifest::is_valid_extension_id;
 use super::package_path::check_package_relative_path;

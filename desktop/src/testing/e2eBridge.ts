@@ -473,6 +473,7 @@ type E2eConfig = {
     extensionFrameOrigin?: string;
     extensionSurfaceMode?: "linux-iframe" | "windows-native-window";
     extensionNativeWindowError?: string;
+    extensionNativeOpenDelayMs?: number;
     extensionPreviewManifest?: string;
     extensionInstallError?: string;
     oaOwnerIsMe?: boolean;
@@ -14369,6 +14370,9 @@ export function maybeInstallE2eTauriMocks() {
           throw new Error("extension is disabled");
         const error = activeConfig?.mock?.extensionNativeWindowError;
         if (error) throw new Error(error);
+        const delay = activeConfig?.mock?.extensionNativeOpenDelayMs ?? 0;
+        if (delay > 0)
+          await new Promise((resolve) => setTimeout(resolve, delay));
         const existing = mockNativeExtensionWindows.get(id);
         if (existing) return existing;
         mockNativeExtensionWindowGeneration += 1;

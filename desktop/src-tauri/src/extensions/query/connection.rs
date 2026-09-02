@@ -149,7 +149,6 @@ impl ConnectionManager {
         &self,
         relay_url: &str,
         keys: &nostr::Keys,
-        sink: &StreamSink,
     ) -> Result<Arc<Connection>, TransportError> {
         let key: ConnectionKey = (relay_url.to_string(), keys.public_key().to_hex());
         let mut conns = self.conns.lock().await;
@@ -163,7 +162,7 @@ impl ConnectionManager {
             conns.remove(&key);
         }
 
-        let opened = open(relay_url, keys, key.clone(), Arc::clone(sink)).await?;
+        let opened = open(relay_url, keys, key.clone()).await?;
         conns.insert(key, Arc::clone(&opened));
         Ok(opened)
     }
@@ -218,7 +217,6 @@ async fn open(
     relay_url: &str,
     keys: &nostr::Keys,
     key: ConnectionKey,
-    sink: StreamSink,
 ) -> Result<Arc<Connection>, TransportError> {
     // Decoder ceilings are installed before tungstenite reads a frame. The
     // application-side check remains defence in depth, not the allocation wall.
@@ -269,7 +267,7 @@ async fn open(
     let reader_cancel = cancel.clone();
     let reader_instance = instance.clone();
     tokio::spawn(async move {
-        pump(read, sink, reader_instance.clone(), cancel_rx).await;
+        pump(read, reader_instance.clone(), cancel_rx).await;
         reader_alive.store(false, Ordering::Release);
         let _ = reader_cancel.send(true);
         connections().remove_if_current(&reader_instance).await;
@@ -302,12 +300,8 @@ fn branch_of(frame: &RelayFrame) -> Option<&str> {
 /// subscription this socket carried: v1 has no reconnect, and leaving them live
 /// against a dead socket would hold their branch budget forever while
 /// delivering nothing.
-async fn pump<S>(
-    mut read: S,
-    sink: StreamSink,
-    instance: ConnectionInstance,
-    mut cancel: watch::Receiver<bool>,
-) where
+async fn pump<S>(mut read: S, instance: ConnectionInstance, mut cancel: watch::Receiver<bool>)
+where
     S: StreamExt<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin,
 {
     loop {
@@ -348,14 +342,16 @@ async fn pump<S>(
             }
             Some(branch) => {
                 let branch = branch.to_string();
-                if let Some(delivery) = registry().route_by_branch(&instance, &branch, frame) {
+                if let Some((sink, delivery)) =
+                    registry().route_by_branch_with_sink(&instance, &branch, frame)
+                {
                     deliver(&sink, delivery);
                 }
             }
         }
     }
 
-    for delivery in registry().close_for_connection(&instance) {
+    for (sink, delivery) in registry().close_for_connection_with_sinks(&instance) {
         deliver(&sink, delivery);
     }
 }
@@ -367,11 +363,11 @@ pub(super) fn deliver(sink: &StreamSink, delivery: Delivery) {
     }
     for batch in delivery.batches {
         if sink(&batch).is_err() {
-            if let Some(terminal) =
-                registry().close_for_flow_violation(&batch.generation, &batch.sub)
+            if let Some((terminal_sink, terminal)) =
+                registry().close_for_flow_violation_with_sink(&batch.generation, &batch.sub)
             {
                 for terminal_batch in terminal.batches {
-                    let _ = sink(&terminal_batch);
+                    let _ = terminal_sink(&terminal_batch);
                 }
             }
             continue;
@@ -381,11 +377,12 @@ pub(super) fn deliver(sink: &StreamSink, delivery: Delivery) {
             let sub = batch.sub.clone();
             let seq = batch.seq;
             let token = batch.token.clone();
-            let sink = Arc::clone(sink);
             tokio::spawn(async move {
                 tokio::time::sleep(STREAM_ACK_TIMEOUT).await;
-                if let Some(timeout) = registry().close_on_ack_timeout(&lease, &sub, seq, &token) {
-                    deliver(&sink, timeout);
+                if let Some((timeout_sink, timeout)) =
+                    registry().close_on_ack_timeout_with_sink(&lease, &sub, seq, &token)
+                {
+                    deliver(&timeout_sink, timeout);
                 }
             });
         }
@@ -420,18 +417,18 @@ pub(super) fn app_sink<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> StreamSi
 }
 
 pub(super) fn activate_prepared<R: tauri::Runtime>(
-    app: &tauri::AppHandle<R>,
+    _app: &tauri::AppHandle<R>,
     lease: &str,
     sub: &str,
 ) {
-    if let Some(delivery) = registry().activate(lease, sub) {
-        deliver(&app_sink(app), delivery);
+    if let Some((sink, delivery)) = registry().activate_with_sink(lease, sub) {
+        deliver(&sink, delivery);
     }
 }
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn acknowledge_batch<R: tauri::Runtime>(
-    app: &tauri::AppHandle<R>,
+    _app: &tauri::AppHandle<R>,
     lease: &str,
     sub: &str,
     seq: u64,
@@ -439,20 +436,20 @@ pub(super) fn acknowledge_batch<R: tauri::Runtime>(
     frame_count: usize,
     encoded_bytes: usize,
 ) {
-    if let Some(delivery) =
-        registry().acknowledge(lease, sub, seq, token, frame_count, encoded_bytes)
+    if let Some((sink, delivery)) =
+        registry().acknowledge_with_sink(lease, sub, seq, token, frame_count, encoded_bytes)
     {
-        deliver(&app_sink(app), delivery);
+        deliver(&sink, delivery);
     }
 }
 
 pub(super) fn report_flow_violation<R: tauri::Runtime>(
-    app: &tauri::AppHandle<R>,
+    _app: &tauri::AppHandle<R>,
     lease: &str,
     sub: &str,
 ) {
-    if let Some(delivery) = registry().close_for_flow_violation(lease, sub) {
-        deliver(&app_sink(app), delivery);
+    if let Some((sink, delivery)) = registry().close_for_flow_violation_with_sink(lease, sub) {
+        deliver(&sink, delivery);
     }
 }
 
@@ -481,6 +478,19 @@ where
 /// request. From there a subscription differs in that its authority must keep
 /// holding, so the revalidation closure and the per-event verifier are stored
 /// with the subscription rather than run once.
+fn stream_sink_for_lease<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    lease: &str,
+) -> Result<StreamSink, BridgeReply> {
+    match super::super::frame_host::lease_uses_native_window(lease) {
+        Some(true) => super::super::native_window::stream_sink_for_lease(lease).ok_or_else(|| {
+            BridgeReply::err(code::DENIED, "the native extension stream is not bound")
+        }),
+        Some(false) => Ok(app_sink(app)),
+        None => Err(BridgeReply::err(code::DENIED, "missing scope: read")),
+    }
+}
+
 pub(super) async fn subscribe<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
     extension_id: &str,
@@ -551,7 +561,10 @@ pub(super) async fn subscribe<R: tauri::Runtime>(
     };
 
     let relay_url = crate::relay::relay_ws_url_with_override(&state);
-    let sink = app_sink(app);
+    let sink = match stream_sink_for_lease(app, lease) {
+        Ok(sink) => sink,
+        Err(reply) => return reply,
+    };
 
     // The helper owns both steps, so a quota mutant cannot accidentally leave
     // connect/auth ahead of the reservation while a pure quota test stays green.
@@ -562,7 +575,7 @@ pub(super) async fn subscribe<R: tauri::Runtime>(
         branches,
         || async {
             connections()
-                .get_or_open(&relay_url, &keys, &sink)
+                .get_or_open(&relay_url, &keys)
                 .await
                 .map_err(|_| ())
         },
@@ -648,11 +661,12 @@ pub(super) async fn subscribe<R: tauri::Runtime>(
     {
         let lease = lease.to_string();
         let sub = sub.clone();
-        let sink = Arc::clone(&sink);
         tokio::spawn(async move {
             tokio::time::sleep(INITIAL_EOSE_DEADLINE).await;
-            if let Some(delivery) = registry().close_on_eose_deadline(&lease, &sub) {
-                deliver(&sink, delivery);
+            if let Some((deadline_sink, delivery)) =
+                registry().close_on_eose_deadline_with_sink(&lease, &sub)
+            {
+                deliver(&deadline_sink, delivery);
             }
         });
     }

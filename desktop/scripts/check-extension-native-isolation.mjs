@@ -10,6 +10,8 @@ const actual = {
   native: read("src-tauri/src/extensions/native_window.rs"),
   authority: read("src-tauri/src/extensions/frame_authority.rs"),
   bridge: read("src-tauri/src/extensions/bridge.rs"),
+  query: read("src-tauri/src/extensions/query/connection.rs"),
+  extensionMod: read("src-tauri/src/extensions/mod.rs"),
   wrapper: read("src-tauri/src/extensions/native_wrapper.js"),
   huddle: read("src-tauri/src/huddle/window.rs"),
   capability: read("src-tauri/capabilities/extension-native-bridge.json"),
@@ -78,8 +80,9 @@ function validate(files) {
   );
   requireCondition(
     files.bridge.includes("lease_authority_for_caller(lease, label)") &&
+      files.bridge.includes("native_ready_for_caller(") &&
       files.bridge.includes(
-        "native_window::caller_authorized(label, lease, url.as_str())",
+        "caller_authorized_parts(label, Some(wrapper_url), lease)",
       ) &&
       files.native.includes("record.wrapper_url == wrapper_url"),
     "plugin command lost label/lease/origin/path admission",
@@ -104,9 +107,53 @@ function validate(files) {
     "native capability escaped Windows",
   );
   requireCondition(
+    capability.permissions.length === 4 &&
+      capability.permissions.every((permission) =>
+        permission.startsWith("extension-bridge:"),
+      ) &&
+      capability.permissions.includes(
+        "extension-bridge:allow-native-stream-bind",
+      ) &&
+      !files.capability.includes("core:event"),
+    "native capability regained generic event authority",
+  );
+  requireCondition(
     files.wrapper.match(/new MessageChannel\(\)/g)?.length === 1 &&
-      !files.wrapper.includes("event.ports"),
+      !files.wrapper.includes("event.ports") &&
+      !files.wrapper.includes("plugin:event|") &&
+      !files.wrapper.includes("__TAURI_EVENT_PLUGIN_INTERNALS__") &&
+      files.wrapper.includes("plugin:extension-bridge|native_stream_bind") &&
+      files.wrapper.includes("__TAURI_TO_IPC_KEY__") &&
+      files.wrapper.includes("__CHANNEL__:"),
     "wrapper no longer solely originates one MessageChannel",
+  );
+  requireCondition(
+    files.query.includes("route_by_branch_with_sink") &&
+      files.query.includes("close_for_connection_with_sinks") &&
+      files.query.includes("native_window::stream_sink_for_lease(lease)"),
+    "stream delivery lost its subscription-owned native sink",
+  );
+  requireCondition(
+    files.native.includes(
+      "async fn close_native_extension_window_serialized",
+    ) &&
+      files.native.includes(
+        "let _open_guard = NATIVE_OPEN_LOCK.lock().await;",
+      ) &&
+      files.native.indexOf("NATIVE_OPEN_LOCK.lock().await") <
+        files.native.indexOf("lifecycle_read_fence().await") &&
+      files.native.includes("cleanup_record_if_state(") &&
+      files.native.includes("NativeWindowState::Opening"),
+    "native close/open/watchdog serialization drifted",
+  );
+  requireCondition(
+    files.extensionMod.includes(
+      "if mode != native_window::ExtensionSurfaceMode::LinuxIframe",
+    ) &&
+      files.extensionMod.indexOf(
+        "if mode != native_window::ExtensionSurfaceMode::LinuxIframe",
+      ) < files.extensionMod.indexOf("lifecycle_read_fence().await"),
+    "Windows can reach the legacy iframe opener",
   );
 }
 
@@ -147,9 +194,9 @@ const mutants = [
     name: "remove-wrapper-origin-path-binding",
     files: {
       ...actual,
-      native: actual.native.replace(
-        " && record.wrapper_url == wrapper_url",
-        "",
+      native: actual.native.replaceAll(
+        "record.wrapper_url == wrapper_url",
+        "true",
       ),
     },
   },
@@ -160,6 +207,56 @@ const mutants = [
       capability: actual.capability.replace(
         "http://127.0.0.1:*/frame/*",
         "http://127.0.0.1:*/*",
+      ),
+    },
+  },
+  {
+    name: "restore-generic-event-permission",
+    files: {
+      ...actual,
+      capability: actual.capability.replace(
+        '"extension-bridge:allow-native-stream-bind"',
+        '"extension-bridge:allow-native-stream-bind", "core:event:allow-listen"',
+      ),
+    },
+  },
+  {
+    name: "restore-global-stream-routing",
+    files: {
+      ...actual,
+      query: actual.query.replace(
+        "registry().route_by_branch_with_sink",
+        "registry().route_by_branch",
+      ),
+    },
+  },
+  {
+    name: "remove-close-serialization",
+    files: {
+      ...actual,
+      native: actual.native.replace(
+        "async fn close_native_extension_window_serialized",
+        "async fn close_native_extension_window_unserialized",
+      ),
+    },
+  },
+  {
+    name: "remove-ready-url-admission",
+    files: {
+      ...actual,
+      bridge: actual.bridge.replace(
+        "caller_authorized_parts(label, Some(wrapper_url), lease)",
+        "frame_host::lease_authority_for_caller(lease, label).is_some()",
+      ),
+    },
+  },
+  {
+    name: "restore-windows-legacy-iframe",
+    files: {
+      ...actual,
+      extensionMod: actual.extensionMod.replace(
+        "if mode != native_window::ExtensionSurfaceMode::LinuxIframe",
+        "if false",
       ),
     },
   },
