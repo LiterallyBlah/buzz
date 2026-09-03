@@ -75,40 +75,125 @@ fn accepted_all_frame_script_bytes_and_constructor_list_are_exact() {
 }
 
 #[test]
-fn plan_binds_unique_udf_to_identity_digest_generation_and_label() {
-    let root = Path::new("C:/Buzz/private-webview2");
+fn observed_windows_udf_hierarchy_is_shortened_below_the_product_budget() {
+    let root = Path::new(r"C:\Users\micha\AppData\Roaming\xyz.block.buzz.app\extension-webview2");
+    let identity = "00".repeat(32);
+    let digest = "9009ff7bc3aa039b3c85c5e3b74333acf493260f181a26fd69975dd1c37e74d4";
+    let label = "extension-secure-00000000-0000-4000-8000-000000000000";
+    let old_data_directory = root
+        .join(hex::encode(Sha256::digest(identity.as_bytes())))
+        .join("equation-explorer")
+        .join(digest)
+        .join("2")
+        .join(label);
+    assert_eq!(path_utf16_units(&old_data_directory), 272);
+    assert!(path_utf16_units(&old_data_directory) > 260);
+
+    let plan = plan_native_window(
+        root,
+        authority(&identity, digest, 2),
+        label.to_string(),
+        "http://127.0.0.1:3001/frame/context/digest/equation-explorer".to_string(),
+    )
+    .unwrap();
+    assert_eq!(path_utf16_units(&plan.data_directory), 133);
+    assert!(path_utf16_units(&plan.data_directory) <= NATIVE_UDF_MAX_UTF16_UNITS);
+}
+
+#[test]
+fn udf_is_one_opaque_direct_child_without_raw_authority_segments() {
+    let root = Path::new("C:/Buzz/extension-webview2");
+    let identity = "11".repeat(32);
     let digest = "ab".repeat(32);
-    let first = plan_native_window(
+    let label = "extension-secure-first";
+    let plan = plan_native_window(
         root,
-        authority("identity-a", &digest, 7),
-        "extension-secure-first".to_string(),
+        authority(&identity, &digest, 7),
+        label.to_string(),
         "http://127.0.0.1:3001/frame/context/digest/equation-explorer".to_string(),
     )
     .unwrap();
-    let second = plan_native_window(
-        root,
-        authority("identity-a", &digest, 7),
-        "extension-secure-second".to_string(),
-        "http://127.0.0.1:3001/frame/context/digest/equation-explorer".to_string(),
-    )
-    .unwrap();
-    assert_ne!(first.data_directory, second.data_directory);
-    assert!(first.data_directory.ends_with(
-        Path::new("equation-explorer")
-            .join(&digest)
-            .join("7")
-            .join("extension-secure-first")
-    ));
-    assert_ne!(
-        first.data_directory,
+    assert_eq!(plan.data_directory.parent(), Some(root));
+    let leaf = plan.data_directory.file_name().unwrap().to_string_lossy();
+    assert_eq!(leaf.len(), 64);
+    assert!(leaf.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    for raw_segment in [
+        identity.as_str(),
+        "equation-explorer",
+        digest.as_str(),
+        "7",
+        label,
+    ] {
+        assert_ne!(leaf, raw_segment);
+    }
+}
+
+#[test]
+fn udf_is_deterministic_and_changes_when_each_bound_field_changes() {
+    let root = Path::new("C:/Buzz/extension-webview2");
+    let digest = "ab".repeat(32);
+    let label = "extension-secure-first";
+    let base_authority = authority("identity-a", &digest, 7);
+    let derive = |authority: LeaseAuthority, label: &str| {
         plan_native_window(
             root,
-            authority("identity-b", &digest, 7),
-            "extension-secure-first".to_string(),
-            first.wrapper_url.clone(),
+            authority,
+            label.to_string(),
+            "http://127.0.0.1:3001/frame/context/digest/equation-explorer".to_string(),
         )
         .unwrap()
         .data_directory
+    };
+    let base = derive(base_authority.clone(), label);
+    assert_eq!(base, derive(base_authority.clone(), label));
+
+    let mut changed_extension = base_authority.clone();
+    changed_extension.extension_id = "equation-viewer".to_string();
+    let mut changed_digest = base_authority.clone();
+    changed_digest.package_digest = "cd".repeat(32);
+    for changed in [
+        derive(authority("identity-b", &digest, 7), label),
+        derive(changed_extension, label),
+        derive(changed_digest, label),
+        derive(authority("identity-a", &digest, 8), label),
+        derive(base_authority.clone(), "extension-secure-second"),
+    ] {
+        assert_ne!(base, changed);
+    }
+
+    let mut reassigned_boundary_a = authority("alpha", &digest, 7);
+    reassigned_boundary_a.extension_id = "bc".to_string();
+    let mut reassigned_boundary_b = authority("alphab", &digest, 7);
+    reassigned_boundary_b.extension_id = "c".to_string();
+    assert_eq!(
+        format!(
+            "{}{}",
+            reassigned_boundary_a.identity_pubkey, reassigned_boundary_a.extension_id
+        ),
+        format!(
+            "{}{}",
+            reassigned_boundary_b.identity_pubkey, reassigned_boundary_b.extension_id
+        )
+    );
+    assert_ne!(
+        derive(reassigned_boundary_a, label),
+        derive(reassigned_boundary_b, label)
+    );
+}
+
+#[test]
+fn unusually_long_udf_root_fails_before_window_creation() {
+    let root = PathBuf::from(format!("C:/{}", "r".repeat(100)));
+    let error = plan_native_window(
+        &root,
+        authority("identity-a", &"ab".repeat(32), 7),
+        "extension-secure-first".to_string(),
+        "http://127.0.0.1:3001/frame/context/digest/equation-explorer".to_string(),
+    )
+    .unwrap_err();
+    assert_eq!(
+        error,
+        "secure extension data path exceeds Buzz's supported Windows path budget of 160 UTF-16 code units"
     );
 }
 
@@ -128,8 +213,59 @@ fn production_plan_contains_no_measurement_browser_arguments() {
             .count(),
         1
     );
-    assert!(production.contains("data_directory(plan.data_directory.clone())"));
+    assert_eq!(
+        production
+            .matches("data_directory(plan.data_directory.clone())")
+            .count(),
+        1
+    );
     assert!(!include_str!("../huddle/window.rs").contains("initialization_script_for_all_frames"));
+}
+
+#[tokio::test]
+async fn registry_and_cleanup_retain_the_exact_planned_udf() {
+    let _guard = super::super::frame_host::lifecycle_guard().await;
+    let app = tauri::test::mock_app();
+    close_all(app.handle());
+    let root = tempfile::tempdir().unwrap();
+    let identity = "22".repeat(32);
+    let digest = "bc".repeat(32);
+    let authority = authority(&identity, &digest, 9);
+    let label = "extension-secure-planned-cleanup";
+    let lease = "77777777-7777-4777-8777-777777777777";
+    let wrapper_url = "http://127.0.0.1:41001/frame/context/digest/equation-explorer";
+    let plan = plan_native_window(
+        root.path(),
+        authority.clone(),
+        label.to_string(),
+        wrapper_url.to_string(),
+    )
+    .unwrap();
+    std::fs::create_dir_all(&plan.data_directory).unwrap();
+    std::fs::write(plan.data_directory.join("owned.txt"), "owned").unwrap();
+    insert_record(
+        &authority,
+        label,
+        lease,
+        wrapper_url,
+        plan.data_directory.clone(),
+        NativeWindowState::Opening,
+    );
+    assert_eq!(
+        registry().by_label.get(label).unwrap().data_directory,
+        plan.data_directory
+    );
+
+    cleanup_record(app.handle(), label, false, NativeWindowState::Closed, None);
+    for _ in 0..50 {
+        if !plan.data_directory.exists() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(!plan.data_directory.exists());
+    assert!(root.path().exists());
+    assert!(registry().by_label.is_empty());
 }
 
 #[test]

@@ -17,6 +17,8 @@ use super::frame_authority::LeaseAuthority;
 pub(crate) const NATIVE_WINDOW_LABEL_PREFIX: &str = "extension-secure-";
 pub(crate) const NATIVE_STATUS_EVENT: &str = "extension-native-window-status";
 pub(crate) const NATIVE_READY_TIMEOUT_SECONDS: u64 = 12;
+const NATIVE_UDF_DOMAIN: &[u8] = b"buzz.desktop.extension-webview2.udf/v1\0";
+const NATIVE_UDF_MAX_UTF16_UNITS: usize = 160;
 pub(crate) const ACCEPTED_SCRIPT_SHA256: &str =
     "c4328966c35974dc87a7a43a55b470633819d38956289e33601072e47c319324";
 
@@ -143,8 +145,59 @@ fn registry() -> MutexGuard<'static, NativeRegistry> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-fn identity_directory(identity_pubkey: &str) -> String {
-    hex::encode(Sha256::digest(identity_pubkey.as_bytes()))
+fn hash_udf_field(hasher: &mut Sha256, field_name: &[u8], value: &[u8]) {
+    hasher.update((field_name.len() as u64).to_be_bytes());
+    hasher.update(field_name);
+    hasher.update((value.len() as u64).to_be_bytes());
+    hasher.update(value);
+}
+
+fn data_directory_leaf(authority: &LeaseAuthority, label: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(NATIVE_UDF_DOMAIN);
+    hash_udf_field(
+        &mut hasher,
+        b"identity-pubkey",
+        authority.identity_pubkey.as_bytes(),
+    );
+    hash_udf_field(
+        &mut hasher,
+        b"extension-id",
+        authority.extension_id.as_bytes(),
+    );
+    hash_udf_field(
+        &mut hasher,
+        b"package-digest",
+        authority.package_digest.as_bytes(),
+    );
+    hash_udf_field(
+        &mut hasher,
+        b"grant-generation",
+        &authority.grant_generation.to_be_bytes(),
+    );
+    hash_udf_field(&mut hasher, b"native-label", label.as_bytes());
+    hex::encode(hasher.finalize())
+}
+
+#[cfg(target_os = "windows")]
+fn path_utf16_units(path: &Path) -> usize {
+    use std::os::windows::ffi::OsStrExt as _;
+
+    path.as_os_str().encode_wide().count()
+}
+
+#[cfg(not(target_os = "windows"))]
+fn path_utf16_units(path: &Path) -> usize {
+    path.to_string_lossy().encode_utf16().count()
+}
+
+fn ensure_data_directory_path_budget(path: &Path) -> Result<(), String> {
+    if path_utf16_units(path) > NATIVE_UDF_MAX_UTF16_UNITS {
+        return Err(format!(
+            "secure extension data path exceeds Buzz's supported Windows path budget of {NATIVE_UDF_MAX_UTF16_UNITS} UTF-16 code units"
+        ));
+    }
+    Ok(())
 }
 
 pub(crate) fn plan_native_window(
@@ -164,12 +217,8 @@ pub(crate) fn plan_native_window(
     {
         return Err("native extension window authority is incomplete".to_string());
     }
-    let data_directory = udf_root
-        .join(identity_directory(&authority.identity_pubkey))
-        .join(&authority.extension_id)
-        .join(&authority.package_digest)
-        .join(authority.grant_generation.to_string())
-        .join(&label);
+    let data_directory = udf_root.join(data_directory_leaf(&authority, &label));
+    ensure_data_directory_path_budget(&data_directory)?;
     Ok(NativeWindowPlan {
         label,
         wrapper_url,

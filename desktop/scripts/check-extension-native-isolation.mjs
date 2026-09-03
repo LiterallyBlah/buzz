@@ -57,17 +57,34 @@ function validate(files) {
     "Windows builder lost its exact UDF",
   );
   requireCondition(
-    production.includes("identity_directory(&authority.identity_pubkey)"),
-    "UDF lost identity binding",
+    production.includes(
+      "udf_root.join(data_directory_leaf(&authority, &label))",
+    ),
+    "UDF is not one direct opaque child of the fixed root",
+  );
+  requireCondition(
+    production.includes('b"buzz.desktop.extension-webview2.udf/v1\\0"') &&
+      production.includes("field_name.len() as u64") &&
+      production.includes("value.len() as u64"),
+    "UDF lost domain or length separation",
   );
   for (const fragment of [
-    ".join(&authority.extension_id)",
-    ".join(&authority.package_digest)",
-    ".join(authority.grant_generation.to_string())",
-    ".join(&label)",
+    'b"identity-pubkey",',
+    "authority.identity_pubkey.as_bytes(),",
+    'b"extension-id",',
+    "authority.extension_id.as_bytes(),",
+    'b"package-digest",',
+    "authority.package_digest.as_bytes(),",
+    'b"grant-generation",',
+    "&authority.grant_generation.to_be_bytes(),",
+    'b"native-label", label.as_bytes()',
   ]) {
     requireCondition(production.includes(fragment), `UDF lost ${fragment}`);
   }
+  requireCondition(
+    production.includes("ensure_data_directory_path_budget(&data_directory)?"),
+    "UDF lost the pre-open Windows path budget",
+  );
   requireCondition(
     !production.includes(["ignore", "certificate", "errors"].join("-")) &&
       !production.includes(["disable", "non", "proxied", "udp"].join("_")) &&
@@ -157,6 +174,34 @@ function validate(files) {
   );
 }
 
+const udfFieldMutations = [
+  {
+    name: "identity",
+    before: "authority.identity_pubkey.as_bytes(),",
+    after: 'b"missing-identity",',
+  },
+  {
+    name: "extension",
+    before: "authority.extension_id.as_bytes(),",
+    after: 'b"missing-extension",',
+  },
+  {
+    name: "package",
+    before: "authority.package_digest.as_bytes(),",
+    after: 'b"missing-package",',
+  },
+  {
+    name: "generation",
+    before: "&authority.grant_generation.to_be_bytes(),",
+    after: 'b"missing-generation",',
+  },
+  {
+    name: "label",
+    before: 'b"native-label", label.as_bytes()',
+    after: 'b"missing-label", b"value"',
+  },
+];
+
 validate(actual);
 
 const mutants = [
@@ -177,6 +222,23 @@ const mutants = [
       native: actual.native.replace(
         ".data_directory(plan.data_directory.clone())",
         "/* data directory removed */",
+      ),
+    },
+  },
+  ...udfFieldMutations.map(({ name, before, after }) => ({
+    name: `remove-udf-${name}-binding`,
+    files: {
+      ...actual,
+      native: actual.native.replace(before, after),
+    },
+  })),
+  {
+    name: "remove-udf-path-budget",
+    files: {
+      ...actual,
+      native: actual.native.replace(
+        "ensure_data_directory_path_budget(&data_directory)?;",
+        "/* path budget removed */",
       ),
     },
   },
